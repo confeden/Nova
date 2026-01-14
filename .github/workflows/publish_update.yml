@@ -1,0 +1,68 @@
+name: Update Auto-Updater JSON
+
+# Запускать только когда релиз ОПУБЛИКОВАН (нажата кнопка Publish)
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-version-json:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Получаем информацию о релизе
+      - name: Get Release Info
+        id: get_info
+        run: |
+          # Убираем букву 'v' из тега (если она есть), чтобы получить чистую версию "0.999"
+          TAG_NAME=${{ github.ref_name }}
+          CLEAN_VERSION=${TAG_NAME#v} 
+          echo "VERSION=$CLEAN_VERSION" >> $GITHUB_ENV
+          
+          # Формируем ссылку на скачивание (GitHub стандартно делает такие ссылки)
+          # ВАЖНО: Имя файла должно быть всегда одинаковым, например Nova.exe
+          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/Nova.exe"
+          echo "ASSET_URL=$ASSET_URL" >> $GITHUB_ENV
+
+      # 2. Скачиваем EXE файл, чтобы посчитать хеш
+      - name: Download Asset
+        run: |
+          wget "${{ env.ASSET_URL }}" -O Nova.exe
+
+      # 3. Считаем SHA256
+      - name: Calculate SHA256
+        id: shasum
+        run: |
+          HASH=$(sha256sum Nova.exe | awk '{print $1}')
+          echo "SHA256=$HASH" >> $GITHUB_ENV
+          echo "Calculated Hash: $HASH"
+
+      # 4. Клонируем репозиторий с обновлениями (nova_updates)
+      - name: Checkout Updates Repo
+        uses: actions/checkout@v4
+        with:
+          repository: confeden/nova_updates
+          token: ${{ secrets.UPDATES_TOKEN }} # Используем токен из Шага 2
+          path: updates_repo
+
+      # 5. Обновляем файл version.json и отправляем обратно
+      - name: Update version.json and Push
+        run: |
+          cd updates_repo
+          
+          # Создаем новый JSON с актуальными данными
+          echo '{
+            "version": "${{ env.VERSION }}",
+            "url": "${{ env.ASSET_URL }}",
+            "sha256": "${{ env.SHA256 }}"
+          }' > version.json
+          
+          # Настраиваем Git (чтобы коммит был от имени бота)
+          git config user.name "Nova Update Bot"
+          git config user.email "bot@nova.app"
+          
+          # Фиксируем изменения
+          git add version.json
+          git commit -m "Auto-update to version ${{ env.VERSION }}"
+          
+          # Отправляем на GitHub
+          git push
