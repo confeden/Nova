@@ -8644,7 +8644,7 @@ try:
             if ARGS_PARSED.get('updated', False):
                 log_print("Установлена последняя версия Nova.")
                 # Сообщаем об очистке, если она была
-                if old_cleaned:
+                if OLD_VERSION_CLEANED:
                      log_print("Следы прежней версии программы удалены")
             
             if ARGS_PARSED.get('fresh', False):
@@ -8993,18 +8993,6 @@ try:
 
     # ================= STARTUP =================
     if __name__ == "__main__":
-        # === ADMIN CHECK ===
-        def is_admin():
-            try:
-                return ctypes.windll.shell32.IsUserAnAdmin()
-            except:
-                return False
-
-        if not is_admin():
-            # Re-run with admin rights
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-            sys.exit()
-
         # === ARGUMENT PARSING: Order-independent, but execution in correct sequence ===
         # Parse all arguments first
         ARGS_PARSED = {
@@ -9177,25 +9165,18 @@ try:
 
         import struct # Импорт struct для работы с IP
         
-        if __name__ == "__main__":
-             try:
-                 old_exe_chk = sys.argv[0] + ".old" # Используем sys.argv[0] для надежности
-                 if os.path.exists(old_exe_chk):
-                      # Пытаемся удалить старый exe.
-                      for _ in range(3):
-                          try: 
-                              os.remove(old_exe_chk)
-                              OLD_VERSION_CLEANED = True
-                              break
-                          except: 
-                              time.sleep(0.5)
-             except: pass
-        
-        if not is_admin():
-            # Pass only arguments, not the executable path again
-            args = " ".join(sys.argv[1:])
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args, None, 1)
-            sys.exit()
+        try:
+            old_exe_chk = sys.argv[0] + ".old" # Используем sys.argv[0] для надежности
+            if os.path.exists(old_exe_chk):
+                 # Пытаемся удалить старый exe.
+                 for _ in range(3):
+                     try:
+                         os.remove(old_exe_chk)
+                         OLD_VERSION_CLEANED = True
+                         break
+                     except:
+                         time.sleep(0.5)
+        except: pass
 
         app_mutex = check_single_instance()
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Nova.App.Main.1")
