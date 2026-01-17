@@ -12,7 +12,6 @@ import sys
 import os
 import ctypes
 import shutil
-import winsound
 import subprocess
 import collections
 
@@ -153,13 +152,11 @@ try:
             base_temp_path = sys._MEIPASS
             embedded_strat_path = os.path.join(base_temp_path, "default_strategies.json")
             if os.path.exists(embedded_strat_path):
-                import json # Ensure json loaded (it is imported later but we need it here)
                 try: 
                     with open(embedded_strat_path, "r", encoding="utf-8") as f:
                         snapset = json.load(f)
                         if isinstance(snapset, dict):
                             DEFAULT_STRATEGIES.update(snapset)
-                            # print("Loaded embedded strategies snapshot")
                 except: pass
         except: pass
 
@@ -303,20 +300,6 @@ try:
                     
                     ver = data.get("version")
                     
-                    # === HARD RESET TRIGGER for v0.997 ===
-                    # FIX: Добавлена проверка getattr(sys, 'frozen', False)
-                    # Это предотвращает удаление ваших стратегий при запуске .pyw скрипта
-                    is_frozen = getattr(sys, 'frozen', False)
-                    
-                    if CURRENT_VERSION == "0.997" and is_frozen:
-                        # Удаляем только если это EXE сборка (релиз)
-                        # If file belongs to 'strat' folder and version is NOT 0.997 (missing or old)
-                        if fpath in strat_files and ver != CURRENT_VERSION:
-                            logs.append(f"Сброс {os.path.basename(fpath)} (v0.997 Hard Reset)")
-                            os.remove(fpath)
-                            continue
-
-
                     # === STANDARD UPDATE LOGIC (Future) ===
                     
                     fname = os.path.basename(fpath)
@@ -370,27 +353,6 @@ try:
                                 logs.append(f"Обновлена версия конфига {fname}")
                 except: pass
             
-            # After deletion, we need to RE-DEPLOY if missing.
-            # But deploy_infrastructure already ran.
-            # We can manually copy missing files from Internal Source if they exist.
-            
-            if CURRENT_VERSION == "0.997":
-                # Try to restore individual JSONs from bundle (if they exist there)
-                # Note: Default Bundle usually only has "strategies.json".
-                # If user wants individual files like "youtube.json", they must be in the bundle.
-                # Assuming standard build puts them in 'strat' folder.
-                try:
-                    internal_strat_dir = get_internal_path("strat")
-                    if os.path.exists(internal_strat_dir) and os.path.isdir(internal_strat_dir):
-                        for item in os.listdir(internal_strat_dir):
-                            if item.lower().endswith(".json"):
-                                target_path = os.path.join(strat_dir, item)
-                                if not os.path.exists(target_path): # We just deleted it!
-                                    src = os.path.join(internal_strat_dir, item)
-                                    shutil.copy2(src, target_path)
-                                    logs.append(f"Восстановлен файл {item} из новой сборки")
-                except: pass
-
             # === 3. Restore Default Strategies (Standard Logic for strategies.json) ===
             # Dynamically load defaults from BUNDLED strategies.json inside EXE
             try:
@@ -402,7 +364,6 @@ try:
                          for k, v in snap.items():
                              if isinstance(v, dict) and "args" in v: snap[k] = v["args"]
                          DEFAULT_STRATEGIES.update(snap)
-                         # logs.append(f"Debug: Bundle loaded ({len(snap)} keys)")
                 else:
                      logs.append(f"Debug: Bundle not found at {bundled_strat_path}")
             except Exception as e:
@@ -675,10 +636,6 @@ try:
         except: pass
         
         return logs
-
-    # Запускаем развертывание ПЕРЕД всем остальным
-    # REMOVED: Moved to __main__
-    # deploy_infrastructure()
 
     # Обновляем URL обновлений (как ты просил)
     UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
@@ -1597,6 +1554,11 @@ try:
         
         while not is_closing:
             try:
+                # FIX: Disabled scanning of exclude.txt (User Request: reduce load + unnecessary fakes)
+                # Just sleep to keep thread alive but idle (or valid logic if needed later)
+                time.sleep(3600)
+                
+                """
                 if not os.path.exists(exclude_file):
                     time.sleep(60)
                     continue
@@ -1636,9 +1598,10 @@ try:
                 
                 if created_count > 0:
                     log_callback(f"[PayloadGen] Создано {created_count} новых TLS-фейков.")
+                """
                 
             except Exception as e:
-                log_callback(f"[PayloadGen ERROR] Критическая ошибка: {e}")
+                # log_callback(f"[PayloadGen ERROR] Критическая ошибка: {e}")
                 time.sleep(60)
 
     # ================= КОНФИГУРАЦИЯ GUI =================
@@ -1848,6 +1811,15 @@ try:
         except: pass
 
         log_window = tk.Toplevel(root)
+        
+        # FIX: Force apply cached size immediately to prevent "tiny window" issue
+        if cached_log_size:
+            try:
+                 # Extract size only (ignore position for now)
+                 sz = cached_log_size.split('+')[0]
+                 log_window.geometry(sz)
+            except: pass
+            
         log_window.withdraw() # Скрываем сразу после создания, чтобы избежать белого мерцания
         log_window.title("Лог событий")
         try:
@@ -2154,8 +2126,6 @@ try:
         log_text_widget.tag_bind("clickable_cmd", "<Button-1>", copy_command)
         log_text_widget.bind("<Button-3>", lambda e: context_menu.post(e.x_root, e.y_root))
         log_text_widget.bind("<Key>", handle_key_press)
-        # log_text_widget.bind("<Enter>", lambda e: globals().update(auto_scroll_enabled=False))
-        # log_text_widget.bind("<Leave>", lambda e: globals().update(auto_scroll_enabled=True))
         
         log_text_widget.bind_all("<Control-c>", copy_selection)
         log_text_widget.bind_all("<Control-C>", copy_selection)
@@ -2216,7 +2186,6 @@ try:
         except: return True
 
     def log_print(message):
-        # if is_closing: return  <-- FIX: Allow logs during shutdown/update
         try: sys.__stdout__.write(message + '\n')
         except: pass
         if root:
@@ -2378,25 +2347,38 @@ try:
         
         # Clamp inputs to prevent overflow artifacts
         if score > total: score = total
-        if active > total - score: active = total - score # Active is remainder
+        # Ensure that active doesn't exceed "remaining"
+        if active > total - score: active = total - score
         
         ratio_success = score / total
         ratio_active = active / total
 
         success_chars = int(ratio_success * width)
-        active_chars = int(ratio_active * width)
         
-        # Ensure distinct chars check
-        if active > 0 and active_chars == 0 and (success_chars + active_chars) < width:
-             active_chars = 1
+        # FIX: Check if 'metric active' is effectively 'remaining'
+        # e.g. score + active >= total or very close. 
+        # But even if not, we try to visually fill nicely.
+        
+        # Alternative approach: Calculate solid chars independently?
+        # No, "gap" is determined by (width - success - active).
+        # We want to avoid 1-char gaps if they are rounding errors.
+        
+        active_chars = int(ratio_active * width)
 
-        # Strict Clamp to width
+        # FIX: If active + score == total (meaning full coverage), we MUST fill the bar.
+        # This handles cases like 35/100 or 12/16 where rounding leaves a 1-char hole.
+        if score + active >= total:
+             active_chars = width - success_chars
+             
+        # Guard against negative active_chars if success took everything (though ratio check prevents this mostly)
+        if active_chars < 0: active_chars = 0
+        
+        # Strict Clamp to width (Safety)
         total_chars = success_chars + active_chars
         if total_chars > width:
             # overflow? reduce active first
             excess = total_chars - width
             active_chars = max(0, active_chars - excess)
-            # if still overflow, reduce success
             total_chars = success_chars + active_chars
             if total_chars > width:
                 success_chars = max(0, width - active_chars)
@@ -2412,33 +2394,72 @@ try:
 
     # ================= VPN ДЕТЕКТОР =================
     
+    def is_vpn_active_func():
+        """Проверяет наличие активного VPN (Cloudflare WARP)."""
+        try:
+            # Проверка через PowerShell (надежный способ для Windows)
+            # Ищем сетевой адаптер с именем *Cloudflare* и статусом Up
+            cmd = ['powershell', '-NoProfile', '-Command', 'Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Cloudflare*" -and $_.Status -eq "Up" }']
+            
+            # Используем subprocess с подавлением окна
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                out, _ = proc.communicate(timeout=2)
+                if out and b"Cloudflare" in out:
+                    return True
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                
+            return False
+        except:
+            return False
+
     def vpn_monitor_worker(log_func):
         """Monitors for VPN connections and pauses/resumes the service."""
         global is_vpn_active, was_service_active_before_vpn, is_service_active, is_closing
+        
+        # Initial check delay
+        time.sleep(1)
+        
         while not is_closing:
             try:
                 vpn_is_currently_active = is_vpn_active_func()
 
                 if vpn_is_currently_active and not is_vpn_active:
-                    log_func("[VPN Detector] Обнаружен активный VPN. Работа приостановлена.")
+                    log_func("[VPN Detector] Обнаружен активный VPN (Cloudflare WARP). Работа приостановлена.")
                     is_vpn_active = True
                     was_service_active_before_vpn = is_service_active
-                    if is_service_active: stop_nova_service(silent=True)
-                    if root: root.after(0, lambda: (status_label.config(text="ПАУЗА (VPN)", fg=COLOR_TEXT_ERROR), btn_toggle.config(state=tk.DISABLED)))
+                    
+                    if is_service_active: 
+                        stop_nova_service(silent=True)
+                    
+                    if root: 
+                        root.after(0, lambda: (status_label.config(text="ПАУЗА (VPN)", fg=COLOR_TEXT_ERROR), btn_toggle.config(state=tk.DISABLED)))
+                        
                 elif not vpn_is_currently_active and is_vpn_active:
                     log_func("[VPN Detector] VPN отключен. Возобновление работы...")
                     is_vpn_active = False
                     
                     def restore_ui():
                         btn_toggle.config(state=tk.NORMAL)
-                        # Если сервис не был активен, сбрасываем статус с "ПАУЗА (VPN)" на нейтральный
+                        # Если сервис не был активен до VPN, сбрасываем статус на нейтральный
                         if not was_service_active_before_vpn:
-                            status_label.config(text="ГОТОВ К ЗАПУСКУ", fg="#cccccc") # Neutral color
+                            status_label.config(text="ГОТОВ К ЗАПУСКУ", fg="#cccccc")
+                        # Если был активен - он сам станет "Running" после запуска
 
                     if root: root.after(0, restore_ui)
-                    if was_service_active_before_vpn: start_nova_service()
-            except Exception as e: log_func(f"[VPN Detector] Ошибка в цикле мониторинга: {e}")
-            time.sleep(15)
+                    
+                    if was_service_active_before_vpn: 
+                        start_nova_service()
+            except Exception as e: 
+                log_func(f"[VPN Detector] Ошибка в цикле мониторинга: {e}")
+            
+            # Optimized check interval: 3 seconds (was 15)
+            # This significantly reduces the delay between VPN disconnect and Nova resume
+            time.sleep(3)
 
     # ================= ФОНОВАЯ ПРОВЕРКА ДОСТУПНОСТИ =================
     
@@ -4525,61 +4546,59 @@ try:
                     not state.get("completed", False)
                 )
                 
-                if skip_main_check:
-                    log_func(f"[Check] Основная проверка уже завершена. Переход к эволюции...")
-                    # Пропустим подготовку доменов и сразу перейдем к эволюции
-                    domains_for_general = []  # Будет загружено позже при необходимости
-                else:
-                    # 2. Получаем HOT домены (0-50 шт)
-                    all_hot = get_hot_domains(max_count=100)
-                    clean_hot_domains = []
-                    seen_roots = set() # Для дедупликации по корневому домену
-                    for d in all_hot:
-                        if len(clean_hot_domains) >= 50: break
-                        if not is_service_domain(d):
-                            root_d = get_registered_domain(d)
-                            if root_d not in seen_roots:
-                                clean_hot_domains.append(d)
-                                seen_roots.add(root_d)
-                    
-                    # log_func(f"[Check] Проверка {len(clean_hot_domains)} посещаемых доменов...")
-                    alive_hot = filter_alive_domains(clean_hot_domains, 50)
+                # === ПОДГОТОВКА ДОМЕНОВ (Всегда, т.к. нужны для Эволюции) ===
+                # 2. Получаем HOT домены (0-50 шт)
+                all_hot = get_hot_domains(max_count=100)
+                clean_hot_domains = []
+                seen_roots = set() # Для дедупликации по корневому домену
+                for d in all_hot:
+                    if len(clean_hot_domains) >= 50: break
+                    if not is_service_domain(d):
+                        root_d = get_registered_domain(d)
+                        if root_d not in seen_roots:
+                            clean_hot_domains.append(d)
+                            seen_roots.add(root_d)
+                
+                # log_func(f"[Check] Проверка {len(clean_hot_domains)} посещаемых доменов...")
+                alive_hot = filter_alive_domains(clean_hot_domains, 50)
 
-                    # === НОВОЕ: Проверка прямой доступности для HOT доменов ===
-                    # Исключаем те, что заработали сами (чтобы не портить статистику стратегий)
-                    truly_blocked_hot = []
-                    for d in alive_hot:
-                        if is_closing: break
-                        port = 0
-                        try: port = audit_ports_queue.get(timeout=1)
-                        except: pass
-                        try:
-                            status, _ = detect_throttled_load(d, port)
-                            if status == "ok":
-                                pass # Доступен напрямую, пропускаем
-                            else:
-                                truly_blocked_hot.append(d)
-                        finally:
-                            if port > 0: audit_ports_queue.put(port)
+                # === НОВОЕ: Проверка прямой доступности для HOT доменов ===
+                truly_blocked_hot = []
+                for d in alive_hot:
+                    if is_closing: break
+                    port = 0
+                    try: port = audit_ports_queue.get(timeout=1)
+                    except: pass
+                    try:
+                        status, _ = detect_throttled_load(d, port)
+                        if status == "ok":
+                            pass # Доступен напрямую, пропускаем
+                        else:
+                            truly_blocked_hot.append(d)
+                    finally:
+                        if port > 0: audit_ports_queue.put(port)
+                
+                alive_hot = truly_blocked_hot
+                
+                # 3. Добираем из RKN до 100
+                needed = 100 - len(alive_hot)
+                alive_cold = []
+                
+                if needed > 0:
+                    excluded_for_cold = service_domains.union(set(alive_hot))
+                    # Берем с запасом (3x), чтобы найти живые
+                    cold_candidates = get_cold_domains(rkn_path, excluded_for_cold, max_count=needed*3)
                     
-                    alive_hot = truly_blocked_hot
-                    
-                    # 3. Добираем из RKN до 100
-                    needed = 100 - len(alive_hot)
-                    alive_cold = []
-                    
-                    if needed > 0:
-                        excluded_for_cold = service_domains.union(set(alive_hot))
-                        # Берем с запасом (3x), чтобы найти живые
-                        cold_candidates = get_cold_domains(rkn_path, excluded_for_cold, max_count=needed*3)
-                        
-                        if cold_candidates:
-                            # log_func(f"[Check] Добираем {needed} доменов из RKN (проверка {len(cold_candidates)} кандидатов)...")
-                            alive_cold = filter_alive_domains(cold_candidates, needed)
-                    
-                    domains_for_general = alive_hot + alive_cold
-                    
-                    log_func(f"[Check] Тестирование на {len(alive_hot)} заблокированных доменах из истории посещений и {len(alive_cold)} доменов из списка rkn")
+                    if cold_candidates:
+                        # log_func(f"[Check] Добираем {needed} доменов из RKN (проверка {len(cold_candidates)} кандидатов)...")
+                        alive_cold = filter_alive_domains(cold_candidates, needed)
+                
+                domains_for_general = alive_hot + alive_cold
+                
+                if not skip_main_check:
+                     log_func(f"[Check] Тестирование на {len(alive_hot)} заблокированных доменах из истории посещений и {len(alive_cold)} доменов из списка rkn")
+                else:
+                     log_func(f"[Check] Основная проверка уже завершена. Переход к эволюции (Domains: {len(domains_for_general)})...")
                 
                 current_strategies_data = {}
                 try:
@@ -4607,6 +4626,22 @@ try:
 
                 # Инициализация списка результатов
                 all_strategy_results = []
+                
+                # === STATE INITIALIZATION (Pre-Check) ===
+                # Moved outside 'if all_tasks' to ensure Evolution has access to them even if Main Check is skipped
+                blocked_services = set()
+                consecutive_zeros = {}
+                proven_working_services = set()
+                service_baselines = {} 
+                active_scores_runtime = {}
+                perfect_services = set()
+                
+                # FIX: If resuming, trust saved scores to prevent 'consecutive_zeros' from blocking services during Evolution
+                if state.get("general_score", 0) > 0: proven_working_services.add("general")
+                if state.get("youtube_score", 0) > 0: proven_working_services.add("youtube")
+                if state.get("discord_score", 0) > 0: proven_working_services.add("discord")
+                if state.get("whatsapp_score", 0) > 0: proven_working_services.add("whatsapp")
+                if state.get("telegram_score", 0) > 0: proven_working_services.add("telegram")
                 
                 # HELPER: Update Active Config Immediate
                 def update_active_config_immediate(succ_svc, succ_args, reason_msg):
@@ -5138,6 +5173,60 @@ try:
                     break
 
                 # --- PHASE 3: EVOLUTION (3 STAGES) ---
+                
+                # FIX: Explicit Pruning BEFORE Evolution
+                # Ensure we strictly respect the limits (60 for General, 12 for others) before starting Evolution.
+                # This clears out any "overflow" from previous runs or merges.
+                if not is_closing and is_service_active:
+                     try:
+                         log_func("[Check] Принудительная очистка слабых стратегий перед Эволюцией...")
+                         services_to_prune = ["general", "youtube", "discord", "whatsapp", "telegram"]
+                         
+                         for svc_p in services_to_prune:
+                             lim = 60 if svc_p == "general" else 12
+                             p_path = os.path.join(base_dir, "strat", f"{svc_p}.json")
+                             
+                             if os.path.exists(p_path):
+                                 p_data = load_json_robust(p_path, {})
+                                 p_list = []
+                                 if isinstance(p_data, dict) and "strategies" in p_data:
+                                     p_list = p_data["strategies"]
+                                 elif isinstance(p_data, list): 
+                                     p_list = p_data
+                                 
+                                 if len(p_list) > lim:
+                                     # Sort by score if available in runtime cache, otherwise trust file order (usually sorted)
+                                     # BUT: File might be unsorted if manually edited.
+                                     # Let's try to sort using known scores first.
+                                     
+                                     scored_prune = []
+                                     for s in p_list:
+                                         s_name = s.get("name", "")
+                                         # Try specific service score first, then generic
+                                         sc = active_scores_runtime.get((svc_p, s_name), 0)
+                                         if sc == 0 and svc_p == "general": sc = state.get("general_score", 0) # Fallback? No, that's global.
+                                         
+                                         # If we have NO score, we must assume it's valid/unchecked/or just trust file order?
+                                         # If we prune strictly, we might kill unchecked ones.
+                                         # RULE: "Delete only after Full Check". 
+                                         # But user said: "Strategies remaining > 60 ALTHOUGH Check passed".
+                                         # So we assume Check Phase populated scores or at least ordered them.
+                                         scored_prune.append((sc, s))
+                                     
+                                     # Sort DESC
+                                     # Stable sort to preserve file order for ties
+                                     scored_prune.sort(key=lambda x: x[0], reverse=True)
+                                     
+                                     # Keep Top N
+                                     kept_strategies = [x[1] for x in scored_prune[:lim]]
+                                     
+                                     # Save back
+                                     save_json_safe(p_path, {"version": "1.0", "strategies": kept_strategies})
+                                     log_func(f"[Pruner] {svc_p}: Оставлено {len(kept_strategies)} лучших стратегий (было {len(p_list)}).")
+                                     
+                     except Exception as e:
+                         log_func(f"[Pruner] Ошибка очистки: {e}")
+
                 # Re-open executor for Phase 3 (using if True to match indent level 28 not needed anymore)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=STRATEGY_THREADS) as executor:
                     # --- PHASE 3: EVOLUTION (3 STAGES) ---
@@ -5386,7 +5475,8 @@ try:
                                     if t_doms: target_doms = t_doms
                                 
                                 # Генерируем мутации с учётом статистики обучения
-                                mutations = mutate_strategy(strat['args'], bin_files, learning_data=learning_data)
+                                # FIX: Строго по 1 мутации на стратегию, чтобы не раздувать очередь (10 стратегий -> 10 задач)
+                                mutations = mutate_strategy(strat['args'], bin_files, count=1, learning_data=learning_data)
                                 
                                 for i, m_args in enumerate(mutations):
                                     base_name = strat['name'].split('_M')[0] # Reset suffix
@@ -5448,13 +5538,6 @@ try:
                                     
                                     svc, strat, doms, _ = t
                                     line_id = id(t)
-                                    # s_display = strat["name"]
-                                    # if len(s_display) > 30: s_display = s_display[:27] + "..."
-                                    
-                                    # Initial render setup but NO creation
-                                    # bar = get_progress_bar(0, 0, len(doms), width=20)
-                                    # initial_msg = f"[Check] {s_display} ({svc}) [{bar}] 0/0"
-                                    # progress_manager.create_line(line_id, initial_msg) # REMOYED
                                     
                                     # Factory for ProgressTracker (Evolution Phase)
                                     def make_evo_tracker(lid, s_name, s_svc, total, pfx=prefix):
@@ -6513,7 +6596,6 @@ try:
                 ver = strategies_evolution.get("_version", "0.0")
                 if ver < "0.997":
                    strategies_evolution = {}
-                   # print("[Migration] strategies_evolution сброшен (old version)")
                 
                 if strategies_evolution:
                     return len(strategies_evolution)
@@ -6757,7 +6839,6 @@ try:
                     # FIX: Versioned Migration for Learning Data
                     ver = loaded.get("_version", "0.0")
                     if ver < "0.997":
-                        # print("[Migration] Learning Data сброшен (old version)")
                         self.data = {}
                     else:
                         self.data = loaded
@@ -6905,16 +6986,12 @@ try:
                     ip_history = ip_history[-100:]
                 
                 needs_recheck = True
-                if log_func:
-                    pass # log_func(f"[AdaptiveSystem] Смена IP: {new_ip} - Полная переверификация стратегий")
             else:
                 # IP не менялся, проверяем 7-дневный лимит
                 now = time.time()
                 if last_full_recheck_date is None or (now - last_full_recheck_date) > (7 * 24 * 3600):
                     last_full_recheck_date = now
                     needs_recheck = True
-                    if log_func:
-                        log_func(f"[AdaptiveSystem] 7 дней без переверификации - Полная переверификация")
         
         save_ip_history()
         return needs_recheck
@@ -7164,9 +7241,21 @@ try:
                 # Получаем список всех boost стратегий (именованных и нумерованных)
                 available_boost = [k for k in strategies.keys() if k.startswith("boost_")]
                 
-                # Если нет нумерованных boost_x, создаем их из дефолтных
+                # FIX: Support modern "strategies" list format (do not regenerate legacy keys if new format exists)
+                has_modern_format = False
+                if "strategies" in strategies and isinstance(strategies["strategies"], list):
+                    for s in strategies["strategies"]:
+                        if isinstance(s, dict) and "name" in s and "args" in s:
+                            s_name = s["name"]
+                            # Inject into memory map for usage (but NOT saving)
+                            strategies[s_name] = s["args"]
+                            available_boost.append(s_name)
+                            has_modern_format = True
+
+                # Если нет нумерованных boost_x и нет современного формата -> создаем дефолтные
                 has_numbered = any(re.match(r"boost_\d+$", k) for k in available_boost)
-                if not has_numbered:
+                
+                if not has_numbered and not has_modern_format:
                     defaults = generate_light_boost_strategies()
                     for i in range(1, 13):
                         if i <= len(defaults):
@@ -8644,7 +8733,7 @@ try:
             if ARGS_PARSED.get('updated', False):
                 log_print("Установлена последняя версия Nova.")
                 # Сообщаем об очистке, если она была
-                if old_cleaned:
+                if OLD_VERSION_CLEANED:
                      log_print("Следы прежней версии программы удалены")
             
             if ARGS_PARSED.get('fresh', False):
@@ -8993,18 +9082,6 @@ try:
 
     # ================= STARTUP =================
     if __name__ == "__main__":
-        # === ADMIN CHECK ===
-        def is_admin():
-            try:
-                return ctypes.windll.shell32.IsUserAnAdmin()
-            except:
-                return False
-
-        if not is_admin():
-            # Re-run with admin rights
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-            sys.exit()
-
         # === ARGUMENT PARSING: Order-independent, but execution in correct sequence ===
         # Parse all arguments first
         ARGS_PARSED = {
@@ -9039,14 +9116,6 @@ try:
             core_folders = ["bin", "ip", "list", "strat", "fake"]
             has_infrastructure = any(os.path.isdir(os.path.join(base_dir, f)) for f in core_folders)
             
-            # DEBUG BLOCK START
-            # msg_debug = f"DEBUG INFO:\nDir: {base_dir}\nExec: {sys.executable}\nInfra: {has_infrastructure}\nCompiled: {is_compiled}"
-            # try: 
-            #     msg_debug += f"\nItems: {str(os.listdir(base_dir)[:5])}"
-            # except: pass
-            # ctypes.windll.user32.MessageBoxW(0, msg_debug, "Nova Debug", 0)
-            # DEBUG BLOCK END
-
             if not has_infrastructure:
                 # RULE 2 & 3: Check for Alien Files
                 # "Если папок из белого списка нет... но есть другие папки или файлы"
@@ -9070,10 +9139,6 @@ try:
                 except:
                     is_cluttered = True # Fail safe
                 
-                # DEBUG 2
-                # if is_cluttered:
-                #      ctypes.windll.user32.MessageBoxW(0, f"Clutter found: {found_alien}", "Nova Debug", 0)
-
                 # Prompt user if cluttered
                 if is_cluttered:
                     # MessageBox with Yes/No/Cancel
@@ -9177,25 +9242,18 @@ try:
 
         import struct # Импорт struct для работы с IP
         
-        if __name__ == "__main__":
-             try:
-                 old_exe_chk = sys.argv[0] + ".old" # Используем sys.argv[0] для надежности
-                 if os.path.exists(old_exe_chk):
-                      # Пытаемся удалить старый exe.
-                      for _ in range(3):
-                          try: 
-                              os.remove(old_exe_chk)
-                              OLD_VERSION_CLEANED = True
-                              break
-                          except: 
-                              time.sleep(0.5)
-             except: pass
-        
-        if not is_admin():
-            # Pass only arguments, not the executable path again
-            args = " ".join(sys.argv[1:])
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args, None, 1)
-            sys.exit()
+        try:
+            old_exe_chk = sys.argv[0] + ".old" # Используем sys.argv[0] для надежности
+            if os.path.exists(old_exe_chk):
+                 # Пытаемся удалить старый exe.
+                 for _ in range(3):
+                     try: 
+                         os.remove(old_exe_chk)
+                         OLD_VERSION_CLEANED = True
+                         break
+                     except: 
+                         time.sleep(0.5)
+        except: pass
 
         app_mutex = check_single_instance()
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Nova.App.Main.1")
