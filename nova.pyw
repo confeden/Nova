@@ -82,11 +82,25 @@ if not is_admin():
     try:
         # Re-run the script with Admin rights
         # For pythonw/python:
+        result = 0
         if getattr(sys, 'frozen', False):
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1)
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1)
         else:
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{sys.argv[0]}" ' + " ".join(sys.argv[1:]), None, 1)
-        sys.exit()
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{sys.argv[0]}" ' + " ".join(sys.argv[1:]), None, 1)
+            
+        # ShellExecuteW returns > 32 on success. If <= 32, it failed.
+        if result <= 32:
+            # Common errors: 5 (Access Denied), 1223 (Cancelled by user)
+            msg = f"Failed to elevate privileges.\nError Code: {result}"
+            if result == 5: msg += " (Access Denied)"
+            elif result == 1223: msg += " (Cancelled by User)"
+            
+            ctypes.windll.user32.MessageBoxW(0, msg + "\nPlease run the application as Administrator.", "Nova Boot Error", 0x10)
+            sys.exit(1)
+        
+        # If success, the new process is starting. We can exit.
+        sys.exit(0)
+            
     except Exception as e:
         ctypes.windll.user32.MessageBoxW(0, f"Failed to elevate privileges: {e}\nPlease run as Administrator.", "Nova Admin Error", 0x10)
         sys.exit(1)
