@@ -19,8 +19,10 @@ import collections
 # === FIX: Force Hide Console (Safeguard) ===
 # Проверяем, запущено ли как скомпилированный EXE
 is_compiled = getattr(sys, 'frozen', False) or (sys.argv[0].lower().endswith(".exe"))
+# Check debug flag early to allow console visibility on demand
+is_debug_launch = "--debug" in sys.argv or "-debug" in sys.argv
 
-if is_compiled:
+if is_compiled and not is_debug_launch:
     try:
         # Nuclear option: Find window and HIDE it immediately
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
@@ -91,18 +93,18 @@ if not is_admin():
         # ShellExecuteW returns > 32 on success. If <= 32, it failed.
         if result <= 32:
             # Common errors: 5 (Access Denied), 1223 (Cancelled by user)
-            msg = f"Failed to elevate privileges.\nError Code: {result}"
-            if result == 5: msg += " (Access Denied)"
-            elif result == 1223: msg += " (Cancelled by User)"
+            msg = f"Для модификации трафика необходимы повышенные права.\nКод ошибки: {result}"
+            if result == 5: msg += " (Доступ запрещён)"
+            elif result == 1223: msg += " (Отменено пользователем)"
             
-            ctypes.windll.user32.MessageBoxW(0, msg + "\nPlease run the application as Administrator.", "Nova Boot Error", 0x10)
+            ctypes.windll.user32.MessageBoxW(0, msg + "\nПожалуйста, запустите программу от имени Администратора.", "Ошибка запуска Nova", 0x10)
             sys.exit(1)
         
         # If success, the new process is starting. We can exit.
         sys.exit(0)
             
     except Exception as e:
-        ctypes.windll.user32.MessageBoxW(0, f"Failed to elevate privileges: {e}\nPlease run as Administrator.", "Nova Admin Error", 0x10)
+        ctypes.windll.user32.MessageBoxW(0, f"Не удалось получить права администратора: {e}\nПожалуйста, запустите программу от имени Администратора.", "Ошибка запуска Nova", 0x10)
         sys.exit(1)
 
 # Обертка для отлова ошибок при запуске
@@ -136,7 +138,7 @@ try:
     WINWS_FILENAME = "winws.exe"
     # === AUTO-UPDATE CONFIG ===
     UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
-    CURRENT_VERSION = "1.0"
+    CURRENT_VERSION = "1.1"
     
     # Debug Flag: Check args OR existence of "debug" file
     # Centralized argument parsing for consistency
@@ -183,92 +185,232 @@ try:
             if not os.path.exists(strat_dir): os.makedirs(strat_dir)
             
             # === 1. General List Version Management ===
-            # Load Reference Domains from BUNDLED file (sys._MEIPASS for PyInstaller)
-            # This ensures we use the latest list packaged with the EXE, not a hardcoded minimal set.
-            ref_domains = set()
-            
-            # Fallback minimal list in case bundle read fails
-            HARDCODED_DEFAULTS = ["youtube.com", "discord.com", "facebook.com", "instagram.com", "twitter.com"]
-            for d in HARDCODED_DEFAULTS: ref_domains.add(d)
-
             try:
-                internal_gen_path = get_internal_path(os.path.join("list", "general.txt"))
-                if os.path.exists(internal_gen_path):
-                    with open(internal_gen_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            clean = line.split('#')[0].strip()
-                            if clean: ref_domains.add(clean)
-            except: pass
-            
-            # Sort for consistency
-            REFERENCE_DOMAINS_SORTED = sorted(list(ref_domains))
-            
-            gen_path = os.path.join(base_dir, "list", "general.txt")
-            
-            # Read existing file
-            existing_lines = []
-            existing_version = None
-            existing_domains = set()
-            
-            if os.path.exists(gen_path):
-                try:
-                    with open(gen_path, "r", encoding="utf-8") as f:
-                        existing_lines = f.readlines()
+                gen_path = os.path.join(base_dir, "list", "general.txt")
+                is_frozen_exe = getattr(sys, 'frozen', False)
+                
+                # Check existing file
+                target_lines = []
+                has_version = False
+                current_ver_in_file = None
+                
+                if os.path.exists(gen_path):
+                    try:
+                        with open(gen_path, "r", encoding="utf-8") as f:
+                            target_lines = f.readlines()
+                        if target_lines and target_lines[0].strip().startswith("# version:"):
+                            has_version = True
+                            try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
+                            except: pass
+                    except: pass
+                
+                g_action = ""
+                
+                # --- SCRIPT MODE (.pyw) ---
+                if not is_frozen_exe:
+                    if not os.path.exists(gen_path):
+                        pass # Do nothing
+                    elif not has_version:
+                        # Append header
+                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                        with open(gen_path, "w", encoding="utf-8") as f:
+                            f.writelines(target_lines)
+                        g_action = "Header Added (Script)"
+                    elif current_ver_in_file != CURRENT_VERSION:
+                        # Update header
+                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
+                        with open(gen_path, "w", encoding="utf-8") as f:
+                            f.writelines(target_lines)
+                        g_action = "Header Updated (Script)"
+                
+                # --- FROZEN EXE MODE ---
+                else:
+                    internal_gen = get_internal_path(os.path.join("list", "general.txt"))
                     
-                    # Extract version from first line
-                    if existing_lines and existing_lines[0].strip().startswith("# version:"):
-                        try:
-                            existing_version = existing_lines[0].strip().split(":", 1)[1].strip()
+                    if not os.path.exists(gen_path):
+                        # Missing -> Restore
+                         if os.path.exists(internal_gen):
+                             shutil.copy2(internal_gen, gen_path)
+                             g_action = "Restored from Bundle (Missing)"
+                    
+                    elif not has_version:
+                         # No Version -> Replace
+                         if os.path.exists(internal_gen):
+                             shutil.copy2(internal_gen, gen_path)
+                             g_action = "Restored from Bundle (No Version)"
+                    
+                    elif current_ver_in_file != CURRENT_VERSION:
+                         # Version Mismatch -> Replace
+                         if os.path.exists(internal_gen):
+                             shutil.copy2(internal_gen, gen_path)
+                             g_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
+                
+                if g_action:
+                    logs.append(f"[Init] general.txt: {g_action}")
+
+            except Exception as e:
+                logs.append(f"[Init] Ошибка проверки версии general.txt: {e}")
+
+            
+            # === 1.5 Discord List Independent Version Check ===
+            # Ensure discord.txt has a version header or replace it (EXE) / update it (Script)
+            try:
+                discord_path = os.path.join(base_dir, "list", "discord.txt")
+                is_frozen_exe = getattr(sys, 'frozen', False)
+                
+                # Читаем текущий файл
+                target_lines = []
+                has_version = False
+                current_ver_in_file = None
+                
+                if os.path.exists(discord_path):
+                    with open(discord_path, "r", encoding="utf-8") as f:
+                        target_lines = f.readlines()
+                    if target_lines and target_lines[0].strip().startswith("# version:"):
+                        has_version = True
+                        try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
                         except: pass
+                
+                d_action = ""
+                
+                # --- SCRIPT MODE (.pyw) ---
+                if not is_frozen_exe:
+                    if not os.path.exists(discord_path):
+                        pass # Do nothing in script mode
+                    elif not has_version:
+                        # Append header to beginning
+                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                        with open(discord_path, "w", encoding="utf-8") as f:
+                            f.writelines(target_lines)
+                        d_action = "Header Added (Script)"
+                    elif current_ver_in_file != CURRENT_VERSION:
+                        # Update header only
+                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
+                        with open(discord_path, "w", encoding="utf-8") as f:
+                            f.writelines(target_lines)
+                        d_action = "Header Updated (Script)"
+
+                # --- FROZEN EXE MODE ---
+                else:
+                    internal_discord = get_internal_path(os.path.join("list", "discord.txt"))
                     
-                    # Extract domains (skip comments)
-                    for line in existing_lines:
-                        clean = line.split('#')[0].strip()
-                        if clean:
-                            existing_domains.add(clean)
-                            
-                except Exception as e:
-                    print(f"[Init] Ошибка чтения general.txt: {e}")
-            
-            # Decision logic
-            should_rewrite = False
-            new_content_lines = []
-            
-            if not existing_lines or not existing_domains:
-                # Case 1: File is empty or missing -> Create with reference domains
-                logs.append(f"Создан general.txt (v{CURRENT_VERSION} - восстановлен из EXE)")
-                new_content_lines = [f"# version: {CURRENT_VERSION}\n"]
-                new_content_lines.extend([f"{d}\n" for d in REFERENCE_DOMAINS_SORTED])
-                should_rewrite = True
+                    if not os.path.exists(discord_path):
+                         # Missing -> Copy from bundle
+                         if os.path.exists(internal_discord):
+                             shutil.copy2(internal_discord, discord_path)
+                             d_action = "Restored from Bundle (Missing)"
+                    
+                    elif not has_version:
+                         # No Version in User File -> Force Replace (Assume corrupted/unknown)
+                         if os.path.exists(internal_discord):
+                             shutil.copy2(internal_discord, discord_path)
+                             d_action = "Restored from Bundle (No Version)"
+                    
+                    elif current_ver_in_file != CURRENT_VERSION:
+                         # Version Mismatch -> Force Replace from Bundle
+                         if os.path.exists(internal_discord):
+                             shutil.copy2(internal_discord, discord_path)
+                             d_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
+
+                if d_action:
+                    logs.append(f"[Init] discord.txt: {d_action}")
+
+            except Exception as e:
+                logs.append(f"[Init] Ошибка проверки версии discord.txt: {e}")
+
+            # === 1.6 Standardized Strat JSON Versioning ===
+            try:
+                # Список ожидаемых JSON в папке strat
+                # Можно брать все, но strategies.json - особое исключение
+                strat_dir_internal = get_internal_path("strat")
+                expected_jsons = []
+                if os.path.exists(strat_dir_internal):
+                    expected_jsons = [f for f in os.listdir(strat_dir_internal) if f.endswith(".json")]
                 
-            elif existing_version is None:
-                # Case 2: No version header -> Delete and recreate
-                logs.append(f"Пересоздан general.txt (v{CURRENT_VERSION} - восстановлен из EXE)")
-                new_content_lines = [f"# version: {CURRENT_VERSION}\n"]
-                new_content_lines.extend([f"{d}\n" for d in REFERENCE_DOMAINS_SORTED])
-                should_rewrite = True
+                # Добавим дефолтные, если вдруг internal не прочитался (для Script mode)
+                defaults = ["youtube.json", "discord.json", "general.json", "strategies.json"]
+                for d in defaults:
+                    if d not in expected_jsons: expected_jsons.append(d)
                 
-            elif existing_version == CURRENT_VERSION:
-                # Case 3: Same version -> Do nothing
-                pass
+                is_frozen_exe = getattr(sys, 'frozen', False)
                 
-            elif existing_version < CURRENT_VERSION:
-                # Case 4: Old version -> Merge reference domains with existing
-                merged_domains = existing_domains.copy()
-                added_count = 0
-                for ref_domain in REFERENCE_DOMAINS_SORTED:
-                    if ref_domain not in merged_domains:
-                        merged_domains.add(ref_domain)
-                        added_count += 1
-                
-                msg = f"Обновлен general.txt: v{existing_version} -> v{CURRENT_VERSION}"
-                if added_count > 0: msg += f" (+{added_count} новых доменов из обновления)"
-                logs.append(msg)
-                
-                # Write merged list
-                new_content_lines = [f"# version: {CURRENT_VERSION}\n"]
-                new_content_lines.extend([f"{d}\n" for d in sorted(merged_domains)])
-                should_rewrite = True
+                for json_file in expected_jsons:
+                     target_path = os.path.join(base_dir, "strat", json_file)
+                     internal_path = get_internal_path(os.path.join("strat", json_file))
+                     
+                     j_action = ""
+                     
+                     try:
+                         # Load current
+                         current_data = {}
+                         has_ver_key = False
+                         cur_ver = None
+                         
+                         if os.path.exists(target_path):
+                             try:
+                                 with open(target_path, "r", encoding="utf-8") as f:
+                                     current_data = json.load(f)
+                                     if isinstance(current_data, dict):
+                                         cur_ver = current_data.get("version")
+                                         if "version" in current_data: has_ver_key = True
+                             except: pass # corrupted
+                         
+                         # === EXCEPTION: strategies.json ===
+                         if json_file == "strategies.json":
+                             # Special logic: Preserve content on update in EXE
+                             if not is_frozen_exe:
+                                 # SCRIPT: Update Header
+                                 if not os.path.exists(target_path): pass
+                                 elif cur_ver != CURRENT_VERSION:
+                                     current_data["version"] = CURRENT_VERSION
+                                     save_json_safe(target_path, current_data)
+                                     j_action = "Version Updated (Script)"
+                             else:
+                                 # EXE
+                                 if not os.path.exists(target_path):
+                                     if os.path.exists(internal_path):
+                                         shutil.copy2(internal_path, target_path)
+                                         j_action = "Restored from Bundle (Missing)"
+                                 elif not has_ver_key:
+                                      # No version -> Restore
+                                      if os.path.exists(internal_path):
+                                         shutil.copy2(internal_path, target_path)
+                                         j_action = "Restored from Bundle (No Version)"
+                                 elif cur_ver != CURRENT_VERSION:
+                                      # Old Version -> Update Version ONLY (Preserve user strategies)
+                                      current_data["version"] = CURRENT_VERSION
+                                      save_json_safe(target_path, current_data)
+                                      j_action = f"Version Updated ({cur_ver}->{CURRENT_VERSION})"
+                                      
+                         # === STANDARD JSON (youtube.json, etc.) ===
+                         else:
+                             if not is_frozen_exe:
+                                 # SCRIPT: Update Header
+                                 if not os.path.exists(target_path): pass
+                                 elif cur_ver != CURRENT_VERSION:
+                                     current_data["version"] = CURRENT_VERSION
+                                     save_json_safe(target_path, current_data)
+                                     j_action = "Version Updated (Script)"
+                             else:
+                                 # EXE: Force Replace
+                                 if not os.path.exists(target_path):
+                                     if os.path.exists(internal_path):
+                                         shutil.copy2(internal_path, target_path)
+                                         j_action = "Restored from Bundle (Missing)"
+                                 elif cur_ver != CURRENT_VERSION: # incl has_ver_key=False (cur_ver=None)
+                                      if os.path.exists(internal_path):
+                                         shutil.copy2(internal_path, target_path)
+                                         j_action = "Restored from Bundle (Version Mismatch)"
+                         
+                         if j_action:
+                             logs.append(f"[Init] {json_file}: {j_action}")
+                             
+                     except Exception as ex_j:
+                         logs.append(f"[Init] Error checking {json_file}: {ex_j}")
+
+            except Exception as e:
+                logs.append(f"[Init] Strat JSON check error: {e}")
+
             
             # Write if needed
             if should_rewrite:
@@ -283,6 +425,134 @@ try:
                 ov_path = os.path.join(base_dir, "list", "general.version")
                 if os.path.exists(ov_path): os.remove(ov_path)
             except: pass
+
+
+            # === 1.1 Exclude List Version Management (list/exclude.txt) ===
+            try:
+                ex_path = os.path.join(base_dir, "list", "exclude.txt")
+                
+                # Check execution mode
+                is_frozen_exe = getattr(sys, 'frozen', False)
+
+                # --- Script Mode (.pyw) ---
+                if not is_frozen_exe:
+                    # Logic: Ensure Header is present and up-to-date
+                    target_lines = []
+                    if os.path.exists(ex_path):
+                        with open(ex_path, "r", encoding="utf-8") as f:
+                             target_lines = f.readlines()
+                    
+                    msg = ""
+                    if not target_lines:
+                        # Case: Empty or Missing -> Create with Header
+                        target_lines = [f"# version: {CURRENT_VERSION}\n"]
+                        msg = "Create Header"
+                        # Ensure dir exists just in case
+                        os.makedirs(os.path.dirname(ex_path), exist_ok=True)
+                    elif target_lines[0].strip().startswith("# version:"):
+                         # Case: Header exists -> Check version
+                         v_str = target_lines[0].strip().split(":", 1)[1].strip()
+                         if v_str != CURRENT_VERSION:
+                             target_lines[0] = f"# version: {CURRENT_VERSION}\n"
+                             msg = "Update Header"
+                    else:
+                         # Case: No Header -> Prepend
+                         target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                         msg = "Append Header"
+                    
+                    if msg:     
+                         with open(ex_path, "w", encoding="utf-8") as f:
+                             f.writelines(target_lines)
+
+                # --- Frozen EXE Mode ---
+                else:
+                    internal_ex = get_internal_path(os.path.join("list", "exclude.txt"))
+                    
+                    # 1. Read Target (User File)
+                    target_lines = []
+                    target_ver = None
+                    target_domains = set()
+                    
+                    if os.path.exists(ex_path):
+                        with open(ex_path, "r", encoding="utf-8") as f:
+                             target_lines = f.readlines()
+                        
+                        # Parse
+                        if target_lines and target_lines[0].strip().startswith("# version:"):
+                            try: target_ver = target_lines[0].strip().split(":", 1)[1].strip()
+                            except: pass
+                        
+                        for line in target_lines:
+                             c = line.split('#')[0].strip()
+                             if c: target_domains.add(c)
+                    
+                    # 2. Decision
+                    needs_update = False
+                    
+                    if not os.path.exists(ex_path):
+                        # Case A: Missing -> Full Copy from Bundle
+                        if os.path.exists(internal_ex):
+                            shutil.copy2(internal_ex, ex_path)
+                            logs.append(f"Создан exclude.txt (v{CURRENT_VERSION})")
+                    
+                    elif not target_ver:
+                        # Case B: No Version -> Replace with Bundle (as requested)
+                        if os.path.exists(internal_ex):
+                            shutil.copy2(internal_ex, ex_path)
+                            logs.append(f"Пересоздан exclude.txt (нет версии) -> v{CURRENT_VERSION}")
+                            
+                    elif target_ver != CURRENT_VERSION:
+                        # Case C: Old/Diff Version -> Fix Header + Supplement List
+                        # Read Source Bundle
+                        source_lines = []
+                        if os.path.exists(internal_ex):
+                             with open(internal_ex, "r", encoding="utf-8") as f:
+                                 source_lines = f.readlines()
+                        
+                        # Prepare new content
+                        new_lines = []
+                        # 1. New Header
+                        new_lines.append(f"# version: {CURRENT_VERSION}\n")
+                        
+                        # 2. Existing User Content (skip old header if present)
+                        for i, line in enumerate(target_lines):
+                             if i == 0 and line.strip().startswith("# version:"): continue
+                             new_lines.append(line)
+                        
+                        # 3. Append Missing from Bundle
+                        # Iterate source lines to find missing domains
+                        added_count = 0
+                        first_add = True
+                        
+                        for line in source_lines:
+                             c = line.split('#')[0].strip()
+                             # Ignore source comments/empty lines for the purpose of "missing domain" check
+                             if c and c not in target_domains:
+                                 # It's a new domain!
+                                 if first_add:
+                                     new_lines.append(f"\n# --- New from v{CURRENT_VERSION} ---\n")
+                                     first_add = False
+                                 
+                                 # We append the original line from source (formatting preserved) 
+                                 # OR just the clean domain? 
+                                 # Source line might be "doubleclick.net # ad tracker"
+                                 # Ideally preserve source comment.
+                                 new_lines.append(line)
+                                 
+                                 target_domains.add(c) # Prevent duplicates
+                                 added_count += 1
+                        
+                        # Write
+                        with open(ex_path, "w", encoding="utf-8") as f:
+                             f.writelines(new_lines)
+                        
+                        if added_count > 0:
+                             logs.append(f"exclude.txt обновлен (v{target_ver}->v{CURRENT_VERSION}): добавлено {added_count} записей")
+                        else:
+                             logs.append(f"exclude.txt обновлена версия (v{target_ver}->v{CURRENT_VERSION})")
+
+            except Exception as e:
+                logs.append(f"Ошибка обновления exclude.txt: {e}")
 
 
             # === 2. JSON Version Injection & Hard Reset Logic (v0.997) ===
@@ -519,7 +789,7 @@ try:
             except: pass
 
         # 2. Список папок (img исключена, она остается внутри)
-        folders_to_deploy = ["bin", "fake", "list", "strat", "ip"]
+        folders_to_deploy = ["bin", "fake", "list", "strat", "ip"] # img removed per request
         
         for folder in folders_to_deploy:
             target_folder_path = os.path.join(base_dir, folder)
@@ -648,7 +918,7 @@ try:
         try:
              with open(marker_path, "w") as f: f.write(CURRENT_VERSION)
         except: pass
-        
+
         return logs
 
     # Обновляем URL обновлений (как ты просил)
@@ -770,21 +1040,46 @@ try:
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
 
-        # === НОВОЕ: Создаем необходимые temp файлы ===
+        # === НОВОЕ: Создаем необходимые temp файлы с версионированием ===
         temp_files = {
             "exclude_auto.txt": "",
             "hard.txt": "",
-            "visited_domains_stats.json": "{}",
-            "strategies_evolution.json": "{}",
-            "ip_history.json": "[]",
-            "checker_state.json": "{}",
-            "ip_cache_state.json": "{}",
-            "direct_check_cache.json": "{}",
-            "window_state.json": "{}",
-            "learning_data.json": "{}"
+            "visited_domains_stats.json": json.dumps({"version": CURRENT_VERSION}),
+            "strategies_evolution.json": json.dumps({"version": CURRENT_VERSION}),
+            "ip_history.json": json.dumps({"version": CURRENT_VERSION, "history": []}), # Array wrapper? No, let's keep it consistent dict or list? ip_history usually list. Warning.
+            # ip_history code usually expects list. Adding version logic to list file is tricky. 
+            # Let's skip ip_history for now or wrap it. History usually just list of IPs.
+            "ip_history.json": "[]", 
+            
+            "checker_state.json": json.dumps({"version": CURRENT_VERSION}),
+            "ip_cache_state.json": json.dumps({"version": CURRENT_VERSION}),
+            "direct_check_cache.json": json.dumps({"version": CURRENT_VERSION}),
+            "window_state.json": json.dumps({"version": CURRENT_VERSION}),
+            "learning_data.json": json.dumps({"version": CURRENT_VERSION})
         }
+        
         for name, content in temp_files.items():
             path = os.path.join(base_dir, "temp", name)
+            
+            # 1. Version Check & Cleanup (JSON only)
+            if os.path.exists(path) and name.endswith(".json") and name != "ip_history.json":
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                         d = json.load(f)
+                         if isinstance(d, dict):
+                             v = d.get("version")
+                             if v != CURRENT_VERSION:
+                                 os.remove(path) # Delete old version
+                                 # log_func not available here yet, print or silent? Silent is safest in init.
+                         else:
+                             # Not a dict (maybe corrupted or old format)
+                             os.remove(path)
+                except:
+                    # Corrupted file
+                    try: os.remove(path)
+                    except: pass
+            
+            # 2. Create if missing
             if not os.path.exists(path):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
@@ -831,7 +1126,7 @@ try:
                 # In script mode, we accept any valid JSON to allow testing without version headers
                 is_frozen = getattr(sys, 'frozen', False)
                 if is_frozen and isinstance(data, dict):
-                    ver = data.get("_version", "0.0")
+                    ver = data.get("version", "0.0")
                     if ver < "0.997": return {}
                 return data
         except: return {}
@@ -1339,6 +1634,23 @@ try:
             
             # All DNS servers timed out or failed - KEEP domain (don't delete on network errors)
             return True
+    
+    def check_internet_connectivity():
+        """
+        Check internet connectivity using Google's official endpoint.
+        Returns True if internet is available, False otherwise.
+        Uses http://connectivitycheck.gstatic.com/generate_204
+        """
+        try:
+            response = requests.get(
+                "http://connectivitycheck.gstatic.com/generate_204",
+                timeout=3,
+                allow_redirects=False
+            )
+            # Google returns 204 No Content if internet is working
+            return response.status_code == 204
+        except:
+            return False
 
     def smart_update_general(new_domains_list=None):
         with general_list_lock:
@@ -2041,6 +2353,21 @@ try:
             log_text_widget.tag_config(tag, foreground=col)
 
         log_text_widget.tag_config("warning", foreground="#E6C200") # Тускло-желтый для предупреждений
+        
+        # FIX: Track manual scrolling to prevent unwanted autoscroll
+        def on_mouse_wheel(e):
+            # User scrolled manually -> disable autoscroll
+            LOG_SCROLL_STATE["user_scrolled"] = True
+            # Check if scrolled to bottom -> re-enable autoscroll
+            try:
+                if log_text_widget.yview()[1] >= 0.99:  # Within 1% of bottom
+                    LOG_SCROLL_STATE["user_scrolled"] = False
+            except: pass
+            # Return "break" to prevent event propagation if needed
+            # return "break"
+        
+        log_text_widget.bind("<MouseWheel>", on_mouse_wheel)
+        
         # Стиль для ссылок обновления (желтый + подчеркивание)
         log_text_widget.tag_config("link_yellow", foreground="#FFD700", underline=True)
         log_text_widget.tag_bind("link_yellow", "<Enter>", lambda e: log_text_widget.config(cursor="hand2"))
@@ -2186,7 +2513,12 @@ try:
         else: show_log_window()
     
     # === SCROLL LOGIC HELPER ===
-    LOG_SCROLL_STATE = {"in_window": False, "focused": False, "last_leave": 0}
+    LOG_SCROLL_STATE = {
+        "in_window": False,
+        "focused": False,
+        "last_leave": 0,
+        "user_scrolled": False  # FIX: Track manual scroll
+    }
 
     def should_auto_scroll():
         try:
@@ -2194,10 +2526,13 @@ try:
              if not LOG_SCROLL_STATE["focused"]: return True
              # 2. In window -> Pause
              if LOG_SCROLL_STATE["in_window"]: return False
-             # 3. Delay
+             # 3. User manually scrolled -> Pause until they scroll to bottom
+             if LOG_SCROLL_STATE["user_scrolled"]: return False
+             # 4. Delay
              if time.time() - LOG_SCROLL_STATE["last_leave"] < 1.0: return False
              return True
         except: return True
+
 
     def log_print(message):
         try: sys.__stdout__.write(message + '\n')
@@ -2409,11 +2744,11 @@ try:
     # ================= VPN ДЕТЕКТОР =================
     
     def is_vpn_active_func():
-        """Проверяет наличие активного VPN (Cloudflare WARP)."""
+        """Проверяет наличие активного VPN (Cloudflare, WireGuard, TUN/TAP)."""
         try:
             # Проверка через PowerShell (надежный способ для Windows)
-            # Ищем сетевой адаптер с именем *Cloudflare* и статусом Up
-            cmd = ['powershell', '-NoProfile', '-Command', 'Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Cloudflare*" -and $_.Status -eq "Up" }']
+            # Ищем адаптеры по ключевым словам: Cloudflare, WireGuard, OpenVPN, tun, tap
+            cmd = ['powershell', '-NoProfile', '-Command', 'Get-NetAdapter | Where-Object { ($_.InterfaceDescription -match "Cloudflare|WireGuard|OpenVPN|tun|tap" -or $_.Name -match "Cloudflare|WireGuard|OpenVPN|tun|tap") -and ($_.Status -eq "Up") }']
             
             # Используем subprocess с подавлением окна
             startupinfo = subprocess.STARTUPINFO()
@@ -2422,7 +2757,8 @@ try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW)
             try:
                 out, _ = proc.communicate(timeout=2)
-                if out and b"Cloudflare" in out:
+                # Если вывод есть - значит адаптер найден
+                if out and out.strip():
                     return True
             except subprocess.TimeoutExpired:
                 proc.kill()
@@ -2502,6 +2838,7 @@ try:
     # Audit Ports (16400-16500)
     audit_ports_queue = queue.Queue()
     for _p in range(16400, 16500): 
+        if _p == 16450: continue # Skip reserved cleaner port
         audit_ports_queue.put(_p)
         
     # Strategy Ports (16000-16400, Step 10)
@@ -3041,12 +3378,10 @@ try:
                     need_update = True
                 elif time.time() - last_full_update > 86400:
                     need_update = True
-                else:
-                    cache_mtime = os.path.getmtime(IP_CACHE_FILE)
-                    for fpath in [paths['list_exclude'], paths['ip_exclude']]:
-                        if os.path.exists(fpath) and os.path.getmtime(fpath) > cache_mtime:
-                            need_update = True
-                            break
+                # FIX: Removed mtime check that was bypassing 24h cooldown
+                # Old logic: if exclude.txt was modified -> force update
+                # New logic: Only update once per 24h, regardless of file changes
+                # Files are merged at startup anyway, so IP resolution can wait
                 
                 # Проверка на дисбаланс количества доменов и IP (защита от пустого кэша)
                 if not need_update and os.path.exists(IP_CACHE_FILE) and os.path.exists(paths['list_exclude_auto']):
@@ -3101,48 +3436,32 @@ try:
             except Exception as e:
                 log_func(f"[IP Exclude ERROR] Критическая ошибка в цикле: {e}")
 
-            # Пауза 60 секунд перед следующей полной проверкой
-            for _ in range(60):
+            # Пауза 1 час перед следующей проверкой (24ч кулдаун проверяется внутри)
+            for _ in range(3600):
                 if is_closing: return
                 time.sleep(1)
 
     def domain_cleaner_worker(log_func):
         """Периодически проверяет все списки на "мертвые" домены и удаляет их."""
-        global last_strategy_check_time
+        global last_strategy_check_time, is_closing, is_scanning
         
         # Initial delay: 1 minute
         time.sleep(60)
         
         while not is_closing:
             try:
-                # Wait for strategy checks to complete
+                # Wait for 10-minute cooldown after strategy checks
                 while not is_closing:
-                    if is_scanning:
-                        # Strategy checks are running, wait
-                        time.sleep(10)
-                        continue
-                    
-                    # Check if strategy checks happened recently
                     time_since_last = time.time() - last_strategy_check_time
-                    if time_since_last < 60:  # 1 minute cooldown
-                        # Wait for cooldown, but check every 5 seconds if new checks started
-                        remaining = 60 - time_since_last
-                        for _ in range(int(remaining / 5) + 1):
-                            if is_closing: break
-                            if is_scanning:
-                                # New strategy check started, reset timer
-                                break
-                            time.sleep(min(5, remaining))
-                            remaining = 60 - (time.time() - last_strategy_check_time)
-                            if remaining <= 0:
-                                break
-                        
-                        # If strategy check started during wait, restart loop
-                        if is_scanning:
-                            continue
+                    if time_since_last >= 600:  # 10 minutes
+                        # Cooldown complete
+                        break
                     
-                    # Cooldown complete and no active checks
-                    break
+                    if is_closing:
+                        break
+                    
+                    # Wait and check periodically
+                    time.sleep(30)  # Check every 30 seconds
                 
                 if is_closing:
                     break
@@ -3151,93 +3470,126 @@ try:
                 base_dir = get_base_dir()
                 list_dir = os.path.join(base_dir, "list")
                 
+                # State File
+                progress_state_file = os.path.join(base_dir, "temp", "domain_cleaner_progress.json")
                 files_to_check = glob.glob(os.path.join(list_dir, "*.txt"))
                 
+                # Load State
+                saved_state = {}
+                try: saved_state = load_json_robust(progress_state_file, {})
+                except: pass
+
                 dead_domains_found = set()
                 total_checked = 0
+
+                log_func("[DomainCleaner] Запуск проверки доменов на доступность...")
 
                 for file_path in files_to_check:
                     if is_closing: break
                     
-                    # CRITICAL: Stop if strategy checks started
+                    # CRITICAL: Stop if strategy checks started (Suspend)
                     if is_scanning:
                         log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
-                        # Wait for strategy checks to complete, then restart
-                        while not is_closing and is_scanning:
-                            time.sleep(10)
-                        continue  # Restart from beginning
+                        while not is_closing and is_scanning: time.sleep(10)
+                        # Resume loop (state preserved or reloaded below)
+
+                    fname = os.path.basename(file_path)
                     
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             lines = f.readlines()
                         
-                        domains_in_file = [line.split('#')[0].strip().lower() for line in lines if line.strip() and not line.startswith('#')]
-                        if not domains_in_file:
-                            continue
-
-                            start_idx = 0
-                        new_lines = []
-                        # FIX: Store progress in temp/ to allow easy cleanup
-                        progress_filename = os.path.basename(file_path) + ".progress"
-                        progress_path = os.path.join(base_dir, "temp", progress_filename)
+                        # Resume Index
+                        start_idx = 0
+                        if fname in saved_state:
+                            start_idx = saved_state[fname].get("idx", 0)
+                            # Validity check (file shrank?)
+                            if start_idx >= len(lines): start_idx = 0
                         
-                        # Resume logic
-                        if os.path.exists(progress_path):
+                        if start_idx > 0:
+                             log_func(f"[DomainCleaner] Возобновление проверки {fname} с позиции {start_idx}...")
+
+                        lock = general_list_lock if "general" in fname else None
+                        batch_dead = set()
+                        lines_processed_count = 0 
+                        deleted_in_session = 0 
+
+                        
+                        def flush_batch_cleaner():
+                            nonlocal deleted_in_session
+                            if not batch_dead: return
                             try:
-                                p_data = load_json_robust(progress_path)
-                                start_idx = p_data.get("idx", 0)
-                                new_lines = p_data.get("lines", [])
-                                if start_idx > 0:
-                                    log_func(f"[DomainCleaner] Восстановление проверки {os.path.basename(file_path)} с строки {start_idx}")
-                            except: pass
+                                def _update():
+                                    if not os.path.exists(file_path): return 0
+                                    with open(file_path, "r", encoding="utf-8") as f: cur = f.readlines()
+                                    out = []
+                                    rem = 0
+                                    for ln in cur:
+                                        d = ln.split('#')[0].strip().lower().split('/')[0].split(':')[0]
+                                        if d in batch_dead: rem += 1
+                                        else: out.append(ln)
+                                    if rem > 0:
+                                        with open(file_path, "w", encoding="utf-8") as f:
+                                            f.writelines(out)
+                                            f.flush()
+                                            os.fsync(f.fileno())
+                                        log_func(f"[DomainCleaner] Удалено {rem} несуществующих доменов из {os.path.basename(file_path)}.")
+                                    return rem
 
-                        for idx, line in enumerate(lines):
-                            if idx < start_idx: continue
+                                if lock: 
+                                    with lock: r = _update()
+                                else: r = _update()
+                                
+                                deleted_in_session += r
+                                batch_dead.clear()
+                            except Exception as ex:
+                                log_func(f"[DomainCleaner] Ошибка сохранения: {ex}")
 
+                        for idx, line in enumerate(lines[start_idx:], start=start_idx):
                             if is_closing: break
                             
-                            # CRITICAL: Stop if strategy checks started
-                            if is_scanning:
-                                log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
-                                # Save progress explicitly before yield
-                                save_json_safe(progress_path, {"idx": idx, "lines": new_lines})
-                                
-                                # Wait for strategy checks to complete
-                                while not is_closing and is_scanning:
-                                    time.sleep(10)
-                                # Restart (Resume from saved progress)
-                                break
-                            
-                            domain_part = line.split('#')[0].strip().lower()
-                            if not domain_part:
-                                new_lines.append(line)
-                                continue
-
-                            # DNS validation with rate limit (5/sec via cleanup_limiter)
-                            domain_exists = dns_manager.validate_domain_exists(domain_part, dns_manager.cleanup_limiter)
-                            total_checked += 1
-                            
-                            if not domain_exists:
-                                # Domain confirmed as NXDOMAIN
-                                dead_domains_found.add(domain_part)
-                                rewritten = True
-                                log_func(f"[DomainCleaner] Удалён: {domain_part} (не существует)")
-                            else:
-                                new_lines.append(line)
-                            
-                            # Periodic Autosave (every 10 lines)
                             if idx % 10 == 0:
-                                save_json_safe(progress_path, {"idx": idx + 1, "lines": new_lines})
-                        
-                        # Completion
-                        if not is_scanning and not is_closing:
-                            # Apply changes
-                            if len(new_lines) < len(lines): # Something removed
-                                lock = general_list_lock if "general" in os.path.basename(file_path) else None
-                                _remove_domain_from_file(None, file_path, lock=lock, rewrite_lines=new_lines)
+                                t_diff = time.time() - last_strategy_check_time
+                                if t_diff < 600:
+                                    flush_batch_cleaner()
+                                    
+                                    # Save Resume State
+                                    cur_idx = max(0, idx - deleted_in_session)
+                                    saved_state[fname] = {"idx": cur_idx, "timestamp": int(time.time())}
+                                    try: save_json_safe(progress_state_file, saved_state)
+                                    except: pass
+                                    
+                                    log_func(f"[DomainCleaner] Пауза (активность стратегий)")
+                                    break
                             
-                            # Clean progress
-                            if os.path.exists(progress_path): os.remove(progress_path)
+                            line_s = line.strip()
+                            if not line_s or line_s.startswith('#'): continue
+                            d_part = line_s.split('/')[0].split(':')[0].strip().lower()
+                            if not d_part or '.' not in d_part: continue
+
+                            exists = dns_manager.validate_domain_exists(d_part, dns_manager.cleanup_limiter)
+                            
+                            if not exists:
+                                batch_dead.add(d_part)
+                                log_func(f"[DomainCleaner] {d_part} не существует")
+                                
+                                if len(batch_dead) >= 10:
+                                    flush_batch_cleaner()
+                            
+                            if idx % 50 == 0:
+                                cur_idx = max(0, (idx+1) - deleted_in_session)
+                                save_json_safe(progress_path, {"idx": cur_idx})
+                        
+                        flush_batch_cleaner()
+                        
+                        if not is_closing and (time.time() - last_strategy_check_time >= 600):
+                             if os.path.exists(progress_path): os.remove(progress_path)
+
+                    except Exception as e:
+                        pass
+
+                        # Clean progress
+                        if os.path.exists(progress_path): os.remove(progress_path)
 
                     except Exception as e:
                         # Silent error handling
@@ -3374,15 +3726,25 @@ try:
                         best_strat = new_list[0]
                         best_score = s_results[0][0]
                         if log_func: 
-                            log_func(f"[Sorter] {svc}: Новая текущая стратегия -> {best_strat.get('name', 'Unknown')} (Score: {best_score})")
-                            log_func(f"[Sorter] {svc}: Список стратегий обновлен и отсортирован.")
+                            # Extract previous best name for comparison
+                            if isinstance(existing_strategies, dict) and "strategies" in existing_strategies:
+                                prev_best_name = existing_strategies["strategies"][0].get("name", "None") if existing_strategies["strategies"] else "None"
+                            elif isinstance(existing_strategies, list) and existing_strategies:
+                                prev_best_name = existing_strategies[0].get("name", "None")
+                            else:
+                                prev_best_name = "Unknown"
+                                
+                            new_best = best_strat.get('name', 'Unknown')
+                            diff = "CHANGED" if new_best != prev_best_name else "SAME"
+                            
+                            log_func(f"[Sorter] {svc}: Top={diff} ({prev_best_name} -> {new_best}). Score: {best_score}. Saved: {len(new_list)}.")
                 except Exception as e:
                      if log_func: log_func(f"[Sorter] Ошибка сортировки {svc}: {e}")
     
     STANDBY_LOG_TIMERS = {} # ThreadId -> timestamp
 
     def advanced_strategy_checker_worker(log_func):
-        global is_closing, is_scanning, restart_requested_event, is_service_active
+        global is_closing, is_scanning, restart_requested_event, is_service_active, last_strategy_check_time
         import random
         import shutil
         import glob
@@ -3390,21 +3752,38 @@ try:
         import queue
         import concurrent.futures
         import hashlib
+        import time as time_sys
+        time = time_sys # FIX: Initialize local 'time' variable to prevent "free variable" errors in closures
         
         # Обертываем всю логику в бесконечный цикл для мониторинга смены IP
         was_active = False # State to detect service start/restart transitions
+        log_func("[Trace] Advanced Strategy Checker STARTED")
+
         while not is_closing:
             try:
+                # Re-enable trace with rate limit (1 log per 3 sec)
+                if not hasattr(advanced_strategy_checker_worker, "last_loop_log"):
+                     advanced_strategy_checker_worker.last_loop_log = 0
+                
+                # import time
+                if time_sys.time() - advanced_strategy_checker_worker.last_loop_log > 3:
+                     # log_func(f"[Trace] Loop. VPN={is_vpn_active}, Svc={is_service_active}")
+                     advanced_strategy_checker_worker.last_loop_log = time_sys.time()
+
+
                 if is_vpn_active:
-                    time.sleep(5)
+                    # debug_file_log("VPN Active, sleep 5")
+                    time_sys.sleep(5)
                     continue
 
                 if not is_service_active:
-                    time.sleep(1)
+                    # debug_file_log("Service Inactive, sleep 1")
+                    time_sys.sleep(1)
                     continue
                 
-                # Capture current ID for this cycle's tasks (managed by toggle_worker)
+                # log_func(f"[Trace] Cycle Start. RunID={SERVICE_RUN_ID}")
                 current_run_id = SERVICE_RUN_ID
+
                 
                 # === Init: Prepare isolated test executable ===
                 try:
@@ -3479,6 +3858,7 @@ try:
                     continue
                 
                 # === НОВОЕ: Фильтрация живых доменов для стабилизации оценки ===
+
                 # === НОВОЕ: Фильтрация живых доменов для стабилизации оценки ===
                 def filter_alive_domains(domain_list, max_count=100):
                     # 24h Check Cooldown
@@ -3632,10 +4012,12 @@ try:
                                 if os.path.exists(os.path.join(base_dir, "fake", fname)):
                                     continue
                                     
-                                log_func(f"[Check] Пропуск: отсутствует файл {val}")
+                                # FIX: More informative error message
+                                log_func(f"[Check] Пропуск стратегии: отсутствует файл '{fname}' (путь: {val})")
                                 return None
                             except:
                                 pass
+
                     
                     if target_domains is None:
                         target_domains = domains
@@ -3725,19 +4107,11 @@ try:
                             # Логируем только если это не штатная остановка
                             if proc.returncode != 0:
                                 log_func(f"[Check] WinWS упал (код {proc.returncode}). Порт: {port_start}. Попытка {attempt+1}/2")
-                                if attempt == 0:
-                                    if stderr_out: log_func(f"[Check] Ошибка WinWS: {stderr_out.strip()}")
+                                if stderr_out: log_func(f"[Check] Ошибка WinWS: {stderr_out.strip()}")
                                 if attempt == 1:
                                     log_func(f"[Check] Стратегия вызывает сбой процесса. Пропускаем.")
-                                    return 0
-                            log_func(f"[Check] WinWS упал (код {proc.returncode}). Порт: {port_start}. Попытка {attempt+1}/2")
-                            if attempt == 0:
-                                # log_func(f"[Check] Аргументы сбоя: {' '.join(final_args)}")
-                                if stderr_out: log_func(f"[Check] Ошибка WinWS: {stderr_out.strip()}")
-                            if attempt == 1:
-                                log_func(f"[Check] Стратегия вызывает сбой процесса. Пропускаем.")
-                                return 0 # Возвращаем 0 (blocked), чтобы не ломать воркер возвратом None
-                            time.sleep(2)
+                                    return 0 # Возвращаем 0 (blocked), чтобы не ломать воркер возвратом None
+                            time.sleep(2) # Delay before retry
                         
                         time.sleep(3.0) # Увеличиваем время на инициализацию winws для надежности
                         
@@ -4194,7 +4568,16 @@ try:
                             has_fake_tls = any("--dpi-desync-fake-tls=" in a for a in seg)
                             
                             # Выбор bin на основе статистики
-                            tls_bins = [b for b in bin_files if "tls" in b.lower() or "clienthello" in b.lower()]
+                            # FIX: Validate that files actually exist before using them
+                            tls_bins = []
+                            for b in bin_files:
+                                if "tls" in b.lower() or "clienthello" in b.lower():
+                                    # Verify file exists
+                                    fname = os.path.basename(b)
+                                    full_path = os.path.join(get_base_dir(), "fake", fname)
+                                    if os.path.exists(full_path):
+                                        tls_bins.append(b)
+                            
                             if tls_bins:
                                 selected_bin = select_by_weight(
                                     tls_bins,
@@ -4223,6 +4606,7 @@ try:
 
                 bin_files = glob.glob(os.path.join(bin_dir, "*.bin"))
                 bin_files = [os.path.relpath(p, base_dir).replace("\\", "/") for p in bin_files]
+
                 
                 # Оставляем только надежные бинарники для ускорения и эффективности
                 priority_keywords = ["google", "microsoft", "facebook", "discord", "rutracker", "instagram", "twitter", "youtube"]
@@ -4295,6 +4679,7 @@ try:
 
                 # --- Логика проверки IP и необходимости запуска ---
                 # Повторная проверка VPN непосредственно перед получением IP, чтобы избежать гонки состояний при запуске.
+
                 if is_vpn_active_func():
                     log_print("[Check] Обнаружен VPN, проверка IP отложена.")
                     time.sleep(5)
@@ -4304,9 +4689,14 @@ try:
                 try:
                     current_ip = get_public_ip_isolated()
                 except Exception as e:
-                    # log_func(f"[Check] Не удалось определить IP: {e}. Повтор через 60 сек.")
+                    log_func(f"[Check] Не удалось определить IP: {e}. Повтор через 60 сек.")
                     time.sleep(60)
                     continue
+
+                # DEBUG: Print loaded state critical flags
+                if True:
+                    pass
+
 
                 # Еще одна проверка после получения IP, чтобы гарантировать, что это не IP от VPN
                 if is_vpn_active_func():
@@ -4315,6 +4705,7 @@ try:
                 
                 # === FIX: Если IP None (ошибка сети), не продолжаем, чтобы не сбросить прогресс ===
                 if not current_ip:
+                    log_func("[Check] IP не определен (None). Пропускаем цикл.")
                     time.sleep(10)
                     continue
 
@@ -4331,7 +4722,14 @@ try:
                 
                 is_timeout = days_passed > 7
 
-                if needs_ip_recheck or is_timeout:
+                # FIX: Check if already completed for same IP - if so, skip full reset
+                # This prevents restart loops when IP hasn't changed but timeout triggered
+                loaded_completed = state.get("completed", False)
+                loaded_ip = state.get("last_checked_ip", None)  # May not exist in old states
+                same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
+                
+
+                if (needs_ip_recheck or is_timeout) and not same_ip_and_completed:
                     need_check = True
                     # FIX: Correct message for default timestamp
                     if last_full_ts == 0:
@@ -4340,6 +4738,10 @@ try:
                         reason = f"смена IP ({current_ip})" if needs_ip_recheck else f"плановая ревалидация ({int(days_passed)} дн.)"
                     
                     log_func(f"Обнаружена {reason}. Запуск полной проверки стратегий")
+                    
+                    # FIX: Removed preservation of blocked status to allow fresh re-check on IP change/Timeout
+                    # preserved_status was here
+
                     state = {
                         "wave": 1, "idx": 0, "current_wave_strategies": [],
                         "best_strategies": [], "bin_performance": {b: 0 for b in bin_files},
@@ -4350,11 +4752,24 @@ try:
                         "cloudflare_checked": False,
                         "whatsapp_checked": False,
                         "last_wave_count": 0,
-                        "evolution_stage": 0
+                        "evolution_stage": 0,
+                        "checks_completed": False,
+                        "last_checked_ip": current_ip,  # Save IP for next restart check
+                        "app_version": CURRENT_VERSION  # FIX: Preserve app_version to prevent version mismatch on restart
                     }
+                    
+
+                    # Removed restoration loop
                     save_state()
                 
                 if not need_check:
+                    # DEBUG STATE
+                    if IS_DEBUG_MODE or True: # Force log for diagnosis
+                         s_cc = state.get("checks_completed", False)
+                         s_es = state.get("evolution_stage", 0)
+                         s_c = state.get("completed", False)
+                         # log_func(f"[State-Debug] checks_completed={s_cc}, evolution_stage={s_es}, completed={s_c}")
+                    
                     # === НОВОЕ: Проверка необходимости продолжения эволюции ===
                     # Если completed=False, но все основные проверки завершены -> нужно продолжить эволюцию
                     all_checks_done = (
@@ -4363,12 +4778,15 @@ try:
                         state.get("discord_checked", False) and
                         state.get("cloudflare_checked", False) and
                         state.get("whatsapp_checked", False)
-                    )
+                    ) or state.get("evolution_stage", 0) > 0 or state.get("checks_completed", False)
                     
                     if not state.get("completed", False):
                         if all_checks_done:
                             # Основная проверка завершена, но эволюция не закончена
                             if IS_DEBUG_MODE: log_func(f"[StrategyChecker-Debug] Продолжение эволюции (все проверки завершены, но completed=False)")
+                            if not state.get("checks_completed", False):
+                                state["checks_completed"] = True
+                                save_state()
                             need_check = True
                         else:
                             # Основная проверка еще не завершена
@@ -4392,11 +4810,37 @@ try:
                     time.sleep(5) 
                     continue
 
+                # === STATE INITIALIZATION (Pre-Check) ===
+                # Moved outside 'if all_tasks' to ensure Evolution has access to them even if Main Check is skipped
+                blocked_services = set()
+                consecutive_zeros = {}
+                proven_working_services = set()
+                service_baselines = {} 
+                active_scores_runtime = {}
+                perfect_services = set()
+                
+                # FIX: If resuming, trust saved scores to prevent 'consecutive_zeros' from blocking services during Evolution
+                if state.get("general_score", 0) > 0: proven_working_services.add("general")
+                if state.get("youtube_score", 0) > 0: proven_working_services.add("youtube")
+                if state.get("discord_score", 0) > 0: proven_working_services.add("discord")
+                if state.get("whatsapp_score", 0) > 0: proven_working_services.add("whatsapp")
+                if state.get("telegram_score", 0) > 0: proven_working_services.add("telegram")
+
+                # Restore Blocked Services (Checked but Score <= 0)
+                for svc in ["general", "youtube", "discord", "whatsapp", "telegram", "cloudflare"]:
+                    if state.get(f"{svc}_checked", False) and state.get(f"{svc}_score", 0) <= 0:
+                        blocked_services.add(svc)
+
                 # --- Подготовка задач для всех сервисов ---
                 all_tasks = [] # (service_key, strategy_entry, domains, json_path)
                 is_scanning = True # FIX: Ensure flag set here
+                last_strategy_check_time = time.time()  # Update check timestamp
+                check_phase_scores = {}  # FIX: Словарь для накопления scores {(service, name): score}
 
                 def prepare_service_tasks(service_key, json_path, test_domains, state_key):
+                    # FIX: Strict Block Check - if service is blocked runtime, do not generate tasks
+                    if service_key in blocked_services: return []
+                    
                     if state.get(state_key, False): return []
                     
                     service_strategies = []
@@ -4442,6 +4886,9 @@ try:
                             current_args_str = str(service_strategies[0]["args"]) if service_strategies else ""
                             
                             for s in file_strats:
+                                # Start with type check
+                                if not isinstance(s, dict): continue
+
                                 # We want to check ALL strategies. 
                                 # But if "Current" is identical to "youtube_5", we don't need to check "youtube_5" twice?
                                 # Actually, checking twice is waste.
@@ -4456,7 +4903,8 @@ try:
                     
                     tasks = []
                     for s in service_strategies:
-                        tasks.append((service_key, s, test_domains, strat_path))
+                        if isinstance(s, dict) and "name" in s:
+                             tasks.append((service_key, s, test_domains, strat_path))
                     return tasks
 
                 def read_domains_from_file(filepath):
@@ -4473,33 +4921,50 @@ try:
                 warmup_file = os.path.join(base_dir, "temp", "dns_warmup.txt")
                 threading.Thread(target=resolve_domains_to_ips, args=(domains, warmup_file), daemon=True).start()
 
-                # --- 0. Cloudflare Strategy Check ---
-                cloudflare_list_path = os.path.join(base_dir, "list", "cloudflare.txt")
-                cf_domains = read_domains_from_file(cloudflare_list_path)
-                if not cf_domains:
-                    cf_domains = ["www.cloudflare.com", "cloudflare.com"]
-                all_tasks.extend(prepare_service_tasks("cloudflare", cloudflare_strat_path, cf_domains, "cloudflare_checked"))
-
-                # --- 1. YouTube Strategy Check ---
-                youtube_list_path = os.path.join(base_dir, "list", "youtube.txt")
-                yt_domains = read_domains_from_file(youtube_list_path)
-                if not yt_domains:
-                    yt_domains = ["www.youtube.com", "i.ytimg.com", "yt3.ggpht.com", "redirector.googlevideo.com"]
-                all_tasks.extend(prepare_service_tasks("youtube", youtube_strat_path, yt_domains, "youtube_checked"))
-
-                # --- 2. Discord Strategy Check ---
-                discord_list_path = os.path.join(base_dir, "list", "discord.txt")
-                ds_domains = read_domains_from_file(discord_list_path)
-                if not ds_domains:
-                    ds_domains = ["discord.com", "gateway.discord.gg", "cdn.discordapp.com", "discordapp.com"]
-                all_tasks.extend(prepare_service_tasks("discord", discord_strat_path, ds_domains, "discord_checked"))
+                # === НОВОЕ: Проверка - нужно ли пропустить основную проверку и перейти к эволюции ===
+                skip_main_check = (
+                    state.get("checks_completed", False) or 
+                    state.get("evolution_stage", 0) > 0 or
+                    (
+                        state.get("hard_checked", False) and
+                        state.get("youtube_checked", False) and
+                        state.get("discord_checked", False) and
+                        state.get("cloudflare_checked", False) and
+                        state.get("whatsapp_checked", False) and
+                        not state.get("completed", False)
+                    )
+                )
                 
-                # --- 3. WhatsApp Strategy Check ---
-                whatsapp_list_path = os.path.join(base_dir, "list", "whatsapp.txt")
-                wa_domains = read_domains_from_file(whatsapp_list_path)
-                if not wa_domains:
-                    wa_domains = ["whatsapp.com", "whatsapp.net"]
-                all_tasks.extend(prepare_service_tasks("whatsapp", whatsapp_strat_path, wa_domains, "whatsapp_checked"))
+
+                
+                if not skip_main_check:
+                    # --- 0. Cloudflare Strategy Check ---
+                    cloudflare_list_path = os.path.join(base_dir, "list", "cloudflare.txt")
+                    cf_domains = read_domains_from_file(cloudflare_list_path)
+                    if not cf_domains:
+                        cf_domains = ["www.cloudflare.com", "cloudflare.com"]
+                    all_tasks.extend(prepare_service_tasks("cloudflare", cloudflare_strat_path, cf_domains, "cloudflare_checked"))
+
+                    # --- 1. YouTube Strategy Check ---
+                    youtube_list_path = os.path.join(base_dir, "list", "youtube.txt")
+                    yt_domains = read_domains_from_file(youtube_list_path)
+                    if not yt_domains:
+                        yt_domains = ["www.youtube.com", "i.ytimg.com", "yt3.ggpht.com", "redirector.googlevideo.com"]
+                    all_tasks.extend(prepare_service_tasks("youtube", youtube_strat_path, yt_domains, "youtube_checked"))
+
+                    # --- 2. Discord Strategy Check ---
+                    discord_list_path = os.path.join(base_dir, "list", "discord.txt")
+                    ds_domains = read_domains_from_file(discord_list_path)
+                    if not ds_domains:
+                        ds_domains = ["discord.com", "gateway.discord.gg", "cdn.discordapp.com", "discordapp.com"]
+                    all_tasks.extend(prepare_service_tasks("discord", discord_strat_path, ds_domains, "discord_checked"))
+                    
+                    # --- 3. WhatsApp Strategy Check ---
+                    whatsapp_list_path = os.path.join(base_dir, "list", "whatsapp.txt")
+                    wa_domains = read_domains_from_file(whatsapp_list_path)
+                    if not wa_domains:
+                        wa_domains = ["whatsapp.com", "whatsapp.net"]
+                    all_tasks.extend(prepare_service_tasks("whatsapp", whatsapp_strat_path, wa_domains, "whatsapp_checked"))
                 
                 # --- General / Hard Strategy Check ---
                 # === НОВОЕ: Правильный выбор доменов для General (всегда 100 доменов) ===
@@ -4550,15 +5015,7 @@ try:
                         if ".".join(parts[i:]) in service_domains: return True
                     return False
 
-                # === НОВОЕ: Проверка - нужно ли пропустить основную проверку и перейти к эволюции ===
-                skip_main_check = (
-                    state.get("hard_checked", False) and
-                    state.get("youtube_checked", False) and
-                    state.get("discord_checked", False) and
-                    state.get("cloudflare_checked", False) and
-                    state.get("whatsapp_checked", False) and
-                    not state.get("completed", False)
-                )
+
                 
                 # === ПОДГОТОВКА ДОМЕНОВ (Всегда, т.к. нужны для Эволюции) ===
                 # 2. Получаем HOT домены (0-50 шт)
@@ -4611,7 +5068,8 @@ try:
                 
                 if not skip_main_check:
                      log_func(f"[Check] Тестирование на {len(alive_hot)} заблокированных доменах из истории посещений и {len(alive_cold)} доменов из списка rkn")
-                else:
+                elif state.get("evolution_stage", 0) > 0 and not state.get("completed", False):
+                     # Log ONLY if we are actually resuming an incomplete session
                      log_func(f"[Check] Основная проверка уже завершена. Переход к эволюции (Domains: {len(domains_for_general)})...")
                 
                 current_strategies_data = {}
@@ -4622,7 +5080,10 @@ try:
                 old_hard_strategies = {k: v for k, v in current_strategies_data.items() if k.startswith("hard_")}
 
                 # Добавляем в общий пул, если нужна проверка и мы НЕ пропускаем основную проверку
-                if not skip_main_check and (state["general_score"] <= 0 or not state.get("hard_checked", False)):
+                # FIX: Always add general tasks if check is running. 
+                # Resume logic (filtering against completed_tasks) will handle what's already done.
+                # Do NOT block based on 'general_score > 0' because that stops testing after finding just one.
+                if not skip_main_check:
                     general_args = []
                     try:
                         with open(strat_path, "r", encoding="utf-8") as f:
@@ -4635,27 +5096,35 @@ try:
                     for h_name, h_args in old_hard_strategies.items():
                         all_tasks.append(("general", {"name": h_name, "args": h_args}, domains_for_general, strat_path))
 
+                    # === FIX: Добавить стратегии из general.json ===
+                    # Проверяем не только hard_1-12, но и эволюционировавшие стратегии из пула
+                    try:
+                        gen_pool_path = os.path.join(base_dir, "strat", "general.json")
+                        if os.path.exists(gen_pool_path):
+                            gen_data = load_json_robust(gen_pool_path, {})
+                            gen_list = []
+                            if isinstance(gen_data, dict) and "strategies" in gen_data:
+                                gen_list = gen_data["strategies"]
+                            elif isinstance(gen_data, list):
+                                gen_list = gen_data
+                            
+                            added_count = 0
+                            for s in gen_list[:36]:  # Top 36 проверенных
+                                if isinstance(s, dict) and "args" in s and "name" in s:
+                                    all_tasks.append(("general", s, domains_for_general, strat_path))
+                                    added_count += 1
+                            
+                            if added_count > 0:
+                                log_func(f"[Check-Init] Добавлено {added_count} стратегий из general.json")
+                    except Exception as e:
+                        log_func(f"[Check-Init] Ошибка загрузки general.json: {e}")
 
 
 
                 # Инициализация списка результатов
                 all_strategy_results = []
                 
-                # === STATE INITIALIZATION (Pre-Check) ===
-                # Moved outside 'if all_tasks' to ensure Evolution has access to them even if Main Check is skipped
-                blocked_services = set()
-                consecutive_zeros = {}
-                proven_working_services = set()
-                service_baselines = {} 
-                active_scores_runtime = {}
-                perfect_services = set()
-                
-                # FIX: If resuming, trust saved scores to prevent 'consecutive_zeros' from blocking services during Evolution
-                if state.get("general_score", 0) > 0: proven_working_services.add("general")
-                if state.get("youtube_score", 0) > 0: proven_working_services.add("youtube")
-                if state.get("discord_score", 0) > 0: proven_working_services.add("discord")
-                if state.get("whatsapp_score", 0) > 0: proven_working_services.add("whatsapp")
-                if state.get("telegram_score", 0) > 0: proven_working_services.add("telegram")
+
                 
                 # HELPER: Update Active Config Immediate
                 def update_active_config_immediate(succ_svc, succ_args, reason_msg):
@@ -4684,6 +5153,11 @@ try:
                     return False
 
                 # --- Запуск параллельной проверки ВСЕХ стратегий ---
+                task_queue = [] # FIX: Initialize to prevent UnboundLocalError
+                aborted_by_service = False
+                active_futures = {}
+                
+
                 if all_tasks:
                     if "standby_log_ts" in state:
                         del state["standby_log_ts"] # Cleanup old key just in case
@@ -4793,6 +5267,10 @@ try:
                     consecutive_zeros = {}
                     proven_working_services = set() # Services that had at least one success
                     
+                    # Internet Outage Detection
+                    recent_results = []  # Track last N results (True/False)
+                    OUTAGE_WINDOW = 10   # Check last 10 results
+                    OUTAGE_THRESHOLD = 0.8  # 80% failures = likely outage
 
                     # Reset Baselines for this session strictly! 
                     # We rely on "Current ..." strategies (checked first) to establish the baseline.
@@ -4902,6 +5380,10 @@ try:
                                         continue
                                     
                                     s_name = strat["name"]
+                                    
+                                    # FIX: Сохраняем score для последующего использования в Evolution
+                                    check_phase_scores[(svc, s_name)] = sc
+                                    
                                     is_current = s_name.startswith("Current ") or s_name.startswith("Текущая ")
 
                                     # Обновляем базовый счетчик, если это текущая стратегия
@@ -4955,18 +5437,66 @@ try:
                                          update_active_config_immediate(svc, strat["args"], "   Применена новая стратегия")
 
 
-                                    # Blockage Logic
+                                    # Track results for outage detection
+                                    recent_results.append(sc > 0)
+                                    if len(recent_results) > OUTAGE_WINDOW:
+                                        recent_results.pop(0)
+                                    
+                                    # Blockage Logic with Smart Internet Outage Detection
                                     if sc == 0:
                                         consecutive_zeros[svc] = consecutive_zeros.get(svc, 0) + 1
-                                        if consecutive_zeros[svc] > 2 and svc not in blocked_services and svc not in proven_working_services:
+                                        
+                                        # Check if multiple services are failing (pattern detection)
+                                        if len(recent_results) >= 5:  # Need at least 5 results
+                                            failure_rate = 1.0 - (sum(recent_results) / len(recent_results))
+                                            
+                                            # If 80%+ failures in recent results → likely internet outage
+                                            if failure_rate >= OUTAGE_THRESHOLD:
+                                                # Verify with Google connectivity check (single call)
+                                                if not check_internet_connectivity():
+                                                    # Internet is down!
+                                                    log_func("[Пауза] Обнаружен обрыв интернета (множественные отказы). Ожидание восстановления...")
+                                                    
+                                                    # Wait for internet with 1-second polling
+                                                    while not is_closing and is_service_active:
+                                                        time.sleep(1)
+                                                        if check_internet_connectivity():
+                                                            log_func("[Пауза] Интернет восстановлен. Продолжение проверки...")
+                                                            break
+                                                    
+                                                    if is_closing or not is_service_active:
+                                                        break
+                                                    
+                                                    # Reset tracking
+                                                    recent_results.clear()
+                                                    for k in list(consecutive_zeros.keys()):
+                                                        consecutive_zeros[k] = 0
+                                                    # Continue checking from current position
+                                                    continue
+                                        
+                                        
+                                        # Normal blockage logic (service-specific)
+                                        # FIX: Don't block services with a proven baseline (persists across restarts)
+                                        has_saved_baseline = False
+                                        if svc == "general":
+                                            has_saved_baseline = state.get("general_score", 0) > 0
+                                        else:
+                                            has_saved_baseline = state.get(f"{svc}_score", 0) > 0
+                                        
+                                        if consecutive_zeros[svc] > 2 and svc not in blocked_services and svc not in proven_working_services and not has_saved_baseline:
                                             blocked_services.add(svc)
                                             log_func(f"[Warning] {svc} не отвечает (3 раза по 0). Пропуск остальных.")
+                                            state[f"{svc}_checked"] = True
+                                            state[f"{svc}_score"] = 0 # Explicitly zero to persist block
+                                            save_state()
                                             task_queue = [t for t in task_queue if t[0] != svc]
                                             for f, t in active_futures.items():
                                                 if t[0] == svc: f.cancel()
                                     else:
+                                        # Success - reset counter and mark as working
                                         consecutive_zeros[svc] = 0
-                                        proven_working_services.add(svc)
+                                        if sc > 0:
+                                            proven_working_services.add(svc)
                                     
                                     # Save progress
                                     completed_tasks.add(s_name)
@@ -4982,10 +5512,18 @@ try:
                     finally:
                         executor.shutdown(wait=not aborted_by_service, cancel_futures=True)
 
-                # Check abort status
-                if aborted_by_service or (not is_service_active and not is_closing):
-                    # FIX: Prevent looped logging. If stopped, clear remaining tasks and break outer loop effectively.
-                    is_scanning = False
+                # === BREAK CONDITIONS ===
+                # 1. Service Stop
+                if not is_service_active or is_closing:
+                    # Emergency: User Disabled. Cancel all futures and purge queue
+                    for fut in active_futures.copy():
+                        fut.cancel()
+                    active_futures.clear()
+                    
+                    task_queue = []
+                    
+                    # FIX: Do NOT reset is_scanning here - it should stay True until Evolution completes
+                    # is_scanning = False  # REMOVED: This was too early, Evolution phase still needs it
                     
                     # Only log if we were actually doing something
                     if task_queue or active_futures:
@@ -4996,7 +5534,41 @@ try:
                     task_queue = []
                     
                     time.sleep(2) # Give UI time to breathe
-                    continue 
+                    time.sleep(2) # Give UI time to breathe
+                    
+                    # FIX: Do not continue if we just finished normally! 
+                    # Only continue if actually ABORTED.
+                    if aborted_by_service:
+                        continue 
+                    # If simply empty queue (finished Check), FALL TROUGH to Evo logic! 
+
+                # === FIX: Mark Checks Completed Immediately After Loop ===
+                # If we exited the loop normally (not aborted, service active), it means queue is empty (all checks done)
+                if not aborted_by_service and is_service_active:
+                     if not state.get("checks_completed", False):
+                         log_func("[Check] Основная проверка завершена. Фиксация состояния.")
+                         state["checks_completed"] = True
+                         save_state() 
+                         
+                         # === СОХРАНЕНИЕ SCORES ПОСЛЕ CHECK PHASE ===
+                         try:
+                             log_func("[Score-Save] Сохранение результатов тестирования...")
+                             scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                             strategy_scores_data = {}
+                             
+                             for (svc, name), score in check_phase_scores.items():
+                                 if svc not in strategy_scores_data:
+                                     strategy_scores_data[svc] = {}
+                                 strategy_scores_data[svc][name] = {
+                                     "score": score,
+                                     "timestamp": int(time.time())
+                                 }
+                             
+                             save_json_safe(scores_path, strategy_scores_data)
+                             total = sum(len(v) for v in strategy_scores_data.values())
+                             log_func(f"[Score-Save] Сохранено {total} scores")
+                         except Exception as e:
+                             log_func(f"[Score-Save] Ошибка: {e}")
 
                 def sort_and_distribute_results(results_list, score_cache=None, log_func=log_func):
                     # Sort by Score DESC
@@ -5023,7 +5595,7 @@ try:
 
                         # Save SORTED lists back to files
                         # Save SORTED lists back to files
-                        target_limit = 60 if svc == "general" else 12
+                        target_limit = 36 if svc == "general" else 12  # FIX: Reduced from 60
                         start_path = os.path.join(base_dir, "strat", f"{svc}.json")
                         
                         try:
@@ -5038,7 +5610,17 @@ try:
                             # 2. Partition: Checked vs Unchecked
                             # Checked = In 'items' (New Results) OR In 'score_cache' (Old results we know)
                             
-                            checked_names_current = set(st['name'] for sc, st in items)
+                            checked_names_current = set()
+                            for sc, st in items:
+                                raw_name = st.get('name', '')
+                                # Normalize (Strip "Current ", lowercase start)
+                                if raw_name.startswith('Current '):
+                                    clean = raw_name[8:]
+                                    if clean and clean[0].isupper(): clean = clean[0].lower() + clean[1:]
+                                    checked_names_current.add(clean)
+                                else:
+                                    checked_names_current.add(raw_name)
+                                checked_names_current.add(raw_name) # Add raw too just in case
                             
                             unchecked_strategies = []
                             cached_strategies_to_add = []
@@ -5047,10 +5629,10 @@ try:
                                 s_name = s['name']
                                 if s_name in checked_names_current:
                                     pass # Already in 'items' (new result overrides cache)
-                                elif (svc, s_name) in score_cache:
+                                elif svc in score_cache and s_name in score_cache[svc]:
                                     # Found in Cache! Treat as Checked/Verified baseline.
                                     # Add to pool with Cached Score to complete in Tournament.
-                                    cached_score = score_cache[(svc, s_name)]
+                                    cached_score = score_cache[svc][s_name]
                                     cached_strategies_to_add.append({"score": cached_score, "strat": s})
                                 else:
                                     unchecked_strategies.append(s)
@@ -5061,7 +5643,17 @@ try:
                             active_candidates = [] # list of dict(score, strat)
                             
                             for sc, st in items:
-                                active_candidates.append({"score": sc, "strat": st})
+                                # FIX: Strip "Current " prefix before saving
+                                clean_strat = st.copy()
+                                name = clean_strat.get('name', '')
+                                if name.startswith('Current '):
+                                    # Remove prefix: "Current youtube" -> "youtube", "Current General_M38F" -> "General_M38F"
+                                    clean_name = name[8:]  # len('Current ') = 8
+                                    # Normalize case: "General_M38F" -> "general_M38F"
+                                    if clean_name and clean_name[0].isupper():
+                                        clean_name = clean_name[0].lower() + clean_name[1:]
+                                    clean_strat['name'] = clean_name
+                                active_candidates.append({"score": sc, "strat": clean_strat})
                             
                             # Add Cached (Old Verified)
                             active_candidates.extend(cached_strategies_to_add)
@@ -5110,7 +5702,7 @@ try:
                                     
                                     if updated_active:
                                         save_json_safe(strat_main_path, main_data)
-                                        log_func(f"[Sorter] strategies.json обновлен для {svc} (Best: {best_strat.get('name')})")
+                                        # log_func(f"[Sorter] strategies.json обновлен для {svc} (Best: {best_strat.get('name')})")
                                         
                                 except Exception as e:
                                     log_func(f"[Sorter] Ошибка обновления strategies.json для {svc}: {e}")
@@ -5139,12 +5731,35 @@ try:
                                 # Logic: Keep Top 60 verified. And Keep All Unchecked.
                                 # This ensures mutations don't pile up infinitely.
                                 
+                                # Logic: Keep Top 36 verified. And Keep All Unchecked.
+                                # This ensures mutations don't pile up infinitely.
+                                
                                 limit_verified = target_limit
                                 # FIX: Strict constraint to ensure we don't float above limit
                                 if len(active_candidates) > limit_verified:
                                     active_candidates = active_candidates[:limit_verified]
                                 
                                 final_active = [x["strat"] for x in active_candidates]
+                                
+                            # LOGGING
+                            if IS_DEBUG_MODE:
+                                 top_names = [x.get('name', 'Unknown') for x in final_active[:5]]
+                                 
+                                 # Comparison
+                                 old_top = existing_list[0].get('name', 'Unknown') if existing_list else "None"
+                                 new_top = final_active[0].get('name', 'Unknown') if final_active else "None"
+                                 diff = "CHANGED" if old_top != new_top else "SAME"
+                                 
+                                 log_func(f"[Sorter-Merge] {svc}: Top={diff} ({old_top} -> {new_top}). Saved: {len(final_active) + len(unchecked_strategies)}. Top-5: {top_names}")
+                                 
+                                 # Diff
+                                 old_names = set(s.get('name', '') for s in existing_list)
+                                 new_names = set(s.get('name', '') for s in final_active)
+                                 added = new_names - old_names
+                                 removed = old_names - new_names
+                                 
+                                 if added and IS_DEBUG_MODE: log_func(f"[Sorter-Diff] {svc}: +ADDED: {list(added)}")
+                                 if removed and IS_DEBUG_MODE: log_func(f"[Sorter-Diff] {svc}: -REMOVED: {list(removed)}")
                             
                             # 5. Combine and Save
                             final_list = final_active + unchecked_strategies
@@ -5153,7 +5768,38 @@ try:
                             new_data = {"version": "1.0", "strategies": final_list}
                             save_json_safe(start_path, new_data)
                             
-                            log_func(f"[Sorter] {svc}: Оптимизация. Проверено: {len(active_candidates)}, Оставлено: {len(final_active)}, Не тронуто: {len(unchecked_strategies)}. Всего: {len(final_list)}")
+                            # === СОХРАНЕНИЕ SCORES В temp/strategy_scores.json ===
+                            # FIX: Отдельное хранилище для результатов (не распространяется, удаляется при --fresh)
+                            if IS_DEBUG_MODE: log_func(f"[DEBUG-SAVE] Попытка сохранения scores для {svc}...")
+                            try:
+                                scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                                existing_scores = load_json_robust(scores_path, {})
+                                
+                                if IS_DEBUG_MODE: log_func(f"[Sorter-Scores-Debug] Сохранение scores для {svc}. Кандидатов: {len(active_candidates)}")
+                                
+                                # Обновляем scores для текущего сервиса
+                                if svc not in existing_scores:
+                                    existing_scores[svc] = {}
+                                
+                                import time
+                                current_time = int(time.time())
+                                
+                                saved_count = 0
+                                for candidate in active_candidates:
+                                    strat_name = candidate["strat"].get("name", "")
+                                    if strat_name:
+                                        existing_scores[svc][strat_name] = {
+                                            "score": candidate["score"],
+                                            "timestamp": current_time
+                                        }
+                                        saved_count += 1
+                                
+                                save_json_safe(scores_path, existing_scores)
+                                if IS_DEBUG_MODE: log_func(f"[Sorter-Scores] {svc}: Сохранено {saved_count} scores в {scores_path}")
+                            except Exception as e:
+                                if True: log_func(f"[Sorter-Scores] Ошибка сохранения scores для {svc}: {e}")
+                            
+                            if IS_DEBUG_MODE: log_func(f"[Sorter] {svc}: Оптимизация. Проверено: {len(active_candidates)}, Оставлено: {len(final_active)}, Не тронуто: {len(unchecked_strategies)}. Всего: {len(final_list)}")
                             
                         except Exception as e:
                             log_func(f"[Sorter] Ошибка сохранения {svc}: {e}")
@@ -5165,7 +5811,35 @@ try:
 
                 # === CALL SORTER for Phase 1 Results ===
                 # This prunes the files to the strict limits (Tournament Phase 1)
-                sort_and_distribute_results(all_strategy_results, score_cache=active_scores_runtime)
+                # FIX: Run this OUTSIDE 'if all_tasks' so that even if we skipped checks, we can sort/evo
+                pass
+                
+                if all_strategy_results:
+                     # === INLINED SCORE SAVING ===
+                     try:
+                         scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                         existing_scores = load_json_robust(scores_path, {})
+                         
+                         log_func(f"[Score-Saver-Direct] Saving {len(all_strategy_results)} results to {scores_path}")
+                         
+                         import time
+                         current_time = int(time.time())
+                         
+                         for score, strat, svc in all_strategy_results:
+                             if svc not in existing_scores: existing_scores[svc] = {}
+                             s_name = strat.get("name", "")
+                             if s_name:
+                                 existing_scores[svc][s_name] = {
+                                     "score": score,
+                                     "timestamp": current_time
+                                 }
+                         
+                         save_json_safe(scores_path, existing_scores)
+                         log_func("[Score-Saver-Direct] Success.")
+                     except Exception as e:
+                         log_func(f"[Score-Saver-Direct] Error: {e}")
+
+                     sort_and_distribute_results(all_strategy_results, score_cache=active_scores_runtime)
 
                 if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Фаза завершена. Сохранение состояния...")
                 # === НОВОЕ: Пропускаем сохранение флагов если они уже были установлены (продолжение после перезапуска) ===
@@ -5179,6 +5853,7 @@ try:
                     if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Состояние сохранено.")
                 else:
                     if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Пропуск сохранения флагов (уже установлены).")
+                
                 # --- Загрузка кандидатов из general.json ---
                 
                 if not is_service_active or is_closing:
@@ -5187,17 +5862,21 @@ try:
                     break
 
                 # --- PHASE 3: EVOLUTION (3 STAGES) ---
+
+                
+                # FIX: Explicit Pruning BEFORE Evolution
                 
                 # FIX: Explicit Pruning BEFORE Evolution
                 # Ensure we strictly respect the limits (60 for General, 12 for others) before starting Evolution.
                 # This clears out any "overflow" from previous runs or merges.
                 if not is_closing and is_service_active:
+
                      try:
                          log_func("[Check] Принудительная очистка слабых стратегий перед Эволюцией...")
                          services_to_prune = ["general", "youtube", "discord", "whatsapp", "telegram"]
                          
                          for svc_p in services_to_prune:
-                             lim = 60 if svc_p == "general" else 12
+                             lim = 36 if svc_p == "general" else 12  # FIX: Reduced from 60
                              p_path = os.path.join(base_dir, "strat", f"{svc_p}.json")
                              
                              if os.path.exists(p_path):
@@ -5263,7 +5942,8 @@ try:
                     
                     # Если все этапы уже завершены, пропускаем блок эволюции
                     # If all stages already completed, skip evolution block
-                    if start_stage >= len(stages):
+                    # FIX: Also skip if completed=True (evolution_stage was reset to 0 on completion)
+                    if start_stage >= len(stages) or state.get("completed", False):
                         if IS_DEBUG_MODE: log_func(f"[StrategyChecker-Debug] Все этапы эволюции завершены, пропуск блока.")
                     else:
                         if start_stage > 0:
@@ -5276,6 +5956,8 @@ try:
                                 if IS_DEBUG_MODE: log_func(f"[Check-Debug] Пропуск этапа {stage_idx} (Target: {start_stage})")
                                 continue
                             if not is_service_active or is_closing: break
+                            
+                            # DEBUG TRACE
 
                             
                             # Сохраняем текущий этап в начале
@@ -5285,137 +5967,129 @@ try:
                             # 1. Gather Strategies from Files (Freshly Sorted)
                             strategies_to_evolve = []
                             
+                            # === КОНСТАНТЫ ФИЛЬТРАЦИИ ===
+                            # Минимальный порог качества: 20% от общего количества доменов
+                            THRESHOLD_PERCENT = 0.20
+                            
+                            # Динамический подсчет доменов из list/*.txt файлов
+                            def count_domains_in_file(filename):
+                                """Считает количество непустых строк в файле"""
+                                try:
+                                    path = os.path.join(base_dir, "list", filename)
+                                    if os.path.exists(path):
+                                        with open(path, "r", encoding="utf-8") as f:
+                                            return len([line for line in f if line.strip() and not line.strip().startswith("#")])
+                                except:
+                                    pass
+                                return 0
+            
+                            DOMAIN_COUNTS = {
+                                "general": count_domains_in_file("rkn.txt") or 100,  # fallback to 100
+                                "youtube": count_domains_in_file("youtube.txt") or 16,
+                                "discord": count_domains_in_file("discord.txt") or 23,
+                                "whatsapp": count_domains_in_file("whatsapp.txt") or 3,
+                                "telegram": count_domains_in_file("telegram.txt") or 10
+                            }
+                            
+                            if True:  # Debug
+                                thresholds = {k: int(v * THRESHOLD_PERCENT) for k, v in DOMAIN_COUNTS.items()}
+                                # log_func(f"[Evo-Init] Пороги качества (20%): {thresholds}")
+                            
                             try:
-                                # === LOGIC SPLIT: --evo режим vs обычный режим ===
+                                # === VALIDATION: --evo требует результаты Checker ===
+                                if IS_EVO_MODE and not state.get("checks_completed", False):
+                                    log_func("======================================================")
+                                    log_func("[Evo-Error] Режим --evo требует результаты Checker!")
+                                    log_func("[Evo-Error] Запустите Nova БЕЗ флага --evo для получения")
+                                    log_func("[Evo-Error] результатов из Checker.")
+                                    log_func("======================================================")
+                                    is_scanning = False
+                                    break
                                 
-                                if IS_EVO_MODE:
-                                    # === РЕЖИМ --evo: Мутации текущих стратегий ===
-                                    # Этап 1: 60%, Этап 2: 40%, Этап 3: 20% (от лимита, округление вверх)
-                                    evo_pct = stages[stage_idx] if stage_idx < len(stages) else 0.2
+                                # === UNIFIED LOGIC: Одна логика для всех режимов ===
+                                # Этап 1: 60%, Этап 2: 40%, Этап 3: 20% (от лимита)
+                                percentage = stages[stage_idx] if stage_idx < len(stages) else 0.2
+                                
+                                # Загружаем strategies.json для доступа к Current
+                                d = load_json_robust(strat_path, {})
+                                if not isinstance(d, dict): d = {}
+                                
+                                # === ЗАГРУЗКА SCORES ИЗ temp/strategy_scores.json ===
+                                strategy_scores = {}  # {(service, name): score}
+                                try:
+                                    scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                                    # log_func(f"[Evo-Scores-Debug] Проверка файла: {scores_path}")
+                                    # log_func(f"[Evo-Scores-Debug] Файл существует: {os.path.exists(scores_path)}")
                                     
-                                    log_func(f"[Evo] Режим --evo: Этап {stage_idx+1} ({int(evo_pct*100)}%)")
-                                    
-                                    d = load_json_robust(strat_path, {})
-                                    if not isinstance(d, dict): d = {}
-                                    
-                                    # 1. General: берём hard_1-12 из strategies.json
-                                    # Limit for General is technically 60, but we operate on Active Hard ones primarily here.
-                                    # User requirement: "60% from their limit".
-                                    # Check general.json for candidates if we want to follow the rule strictly?
-                                    # User mentioned "youtube.json checked all... so on evo checked 60%".
-                                    # For General, let's keep current logic of Hard strategies but maybe filter count?
-                                    # No, existing logic takes ALL 12 hard strategies. 12 is 20% of 60. So perfectly fits all stages.
-                                    
-                                    for i in range(12):
-                                        k = f"hard_{i+1}"
-                                        if k in d:
-                                            strategies_to_evolve.append(({
-                                                "name": k, 
-                                                "args": d[k]
-                                            }, "general"))
-                                    
-                                    # + текущая general стратегия
-                                    if "general" in d and isinstance(d["general"], list):
-                                        strategies_to_evolve.append(({
-                                            "name": "Current General",
-                                            "args": d["general"]
-                                        }, "general"))
-                                    
-                                    # === FIX: Include general.json candidates (60% of limit 60) ===
-                                    gen_limit = 60
-                                    gen_count = int(gen_limit * evo_pct + 0.999)
-                                    
-                                    gen_pool_path = os.path.join(base_dir, "strat", "general.json")
-                                    if os.path.exists(gen_pool_path):
-                                        g_data = load_json_robust(gen_pool_path, {})
-                                        g_list = []
-                                        if isinstance(g_data, dict) and "strategies" in g_data:
-                                            g_list = g_data["strategies"]
-                                        elif isinstance(g_data, list):
-                                            g_list = g_data
+                                    if os.path.exists(scores_path):
+                                        scores_data = load_json_robust(scores_path, {})
+                                        # log_func(f"[Evo-Scores-Debug] Загружено из файла: {type(scores_data)}, keys: {list(scores_data.keys()) if isinstance(scores_data, dict) else 'N/A'}")
                                         
-                                        # Avoid duplicates (hard_1..12 are likely in here too, but args comparison handles it later)
-                                        # We just take Top N from the sorted file
-                                        for s in g_list[:gen_count]:
-                                             if isinstance(s, dict) and "args" in s:
-                                                 strategies_to_evolve.append((s, "general"))
-                                    
-                                    # 2. YouTube: текущая + из youtube.json (Top N%)
-                                    if "youtube" in d and isinstance(d["youtube"], list):
-                                        strategies_to_evolve.append(({
-                                            "name": "Current youtube",
-                                            "args": d["youtube"]
-                                        }, "youtube"))
-                                    
-                                    yt_limit = 12
-                                    yt_count = int(yt_limit * evo_pct + 0.999)
-                                    
-                                    yt_path = os.path.join(base_dir, "strat", "youtube.json")
-                                    if os.path.exists(yt_path):
-                                        yt_data = load_json_robust(yt_path, {})
-                                        yt_list = []
-                                        if isinstance(yt_data, dict) and "strategies" in yt_data:
-                                            yt_list = yt_data["strategies"]
-                                        elif isinstance(yt_data, list):
-                                            yt_list = yt_data
-                                        # Sort just in case to get TOP
-                                        # (Assuming file is generally sorted, but verification doesn't hurt if we have cache)
-                                        # Simple truncation for now as per previous logic, usually sorted by Last Check
-                                        for s in yt_list[:yt_count]:
-                                            if isinstance(s, dict) and "args" in s:
-                                                strategies_to_evolve.append((s, "youtube"))
-                                    
-                                    # 3. Discord: текущая + из discord.json (Top N%)
-                                    if "discord" in d and isinstance(d["discord"], list):
-                                        strategies_to_evolve.append(({
-                                            "name": "Current discord", 
-                                            "args": d["discord"]
-                                        }, "discord"))
-                                    
-                                    dc_limit = 12
-                                    dc_count = int(dc_limit * evo_pct + 0.999)
-                                    
-                                    dc_path = os.path.join(base_dir, "strat", "discord.json")
-                                    if os.path.exists(dc_path):
-                                        dc_data = load_json_robust(dc_path, {})
-                                        dc_list = []
-                                        if isinstance(dc_data, dict) and "strategies" in dc_data:
-                                            dc_list = dc_data["strategies"]
-                                        elif isinstance(dc_data, list):
-                                            dc_list = dc_data
-                                        for s in dc_list[:dc_count]:
-                                            if isinstance(s, dict) and "args" in s:
-                                                strategies_to_evolve.append((s, "discord"))
-                                    
-                                else:
-                                    # === ОБЫЧНЫЙ РЕЖИМ: 60% → 40% → 20% из проверенных файлов ===
-                                    
-                                    # 1. General: ТОЛЬКО из general.json (не hard_x)
-                                    gen_path = os.path.join(base_dir, "strat", "general.json")
-                                    if os.path.exists(gen_path):
-                                        gen_data = load_json_robust(gen_path, {})
-                                        gen_list = []
-                                        if isinstance(gen_data, dict) and "strategies" in gen_data:
-                                            gen_list = gen_data["strategies"]
-                                        elif isinstance(gen_data, list):
-                                            gen_list = gen_data
+                                        for svc_name, strategies in scores_data.items():
+                                            for strat_name, info in strategies.items():
+                                                if isinstance(info, dict) and "score" in info:
+                                                     strategy_scores[(svc_name, strat_name)] = info["score"]
+                                        # if True: log_func(f"[Evo-Scores] Загружено {len(strategy_scores)} результатов из strategy_scores.json")
                                         
-                                        # Сортируем по score из кэша если есть
-                                        scored_gen = []
-                                        for s in gen_list:
-                                            if isinstance(s, dict) and "args" in s:
-                                                name = s.get("name", "")
-                                                cached_score = active_scores_runtime.get(("general", name), 0)
-                                                scored_gen.append((cached_score, s))
-                                        
-                                        scored_gen.sort(key=lambda x: x[0], reverse=True)
-                                        
-                                        max_general = 60
-                                        count = int(max_general * percentage)
-                                        if count < 1: count = 1
-                                        
-                                        for _, s in scored_gen[:count]:
-                                            strategies_to_evolve.append((s, "general"))
+                                        # Debug: Show what was loaded per service
+                                        # Debug: Show what was loaded per service
+                                        # if True:
+                                        #    for svc_debug in ["general", "youtube", "discord", "whatsapp"]:
+                                        #        pass
+                                    else:
+                                        log_func(f"[Evo-Scores-Warning] Файл {scores_path} не найден! Scores не загружены.")
+                                except Exception as e:
+                                    log_func(f"[Evo-Scores] Ошибка загрузки scores: {e}")
+                                
+                                
+                                # 1. General: Текущая + из general.json
+                                if "general" in d and isinstance(d["general"], list):
+                                     strategies_to_evolve.append(({
+                                         "name": "Current General",
+                                         "args": d["general"]
+                                     }, "general"))
+                                     
+                                gen_path = os.path.join(base_dir, "strat", "general.json")
+                                if os.path.exists(gen_path):
+                                    gen_data = load_json_robust(gen_path, {})
+                                    gen_list = []
+                                    if isinstance(gen_data, dict) and "strategies" in gen_data:
+                                        gen_list = gen_data["strategies"]
+                                    elif isinstance(gen_data, list):
+                                        gen_list = gen_data
+                                    
+                                    # FIX: Файл уже отсортирован после Checker (TOP->WORST). Берем TOP N.
+                                    # Фильтруем по last_score (минимум 20/100 для General)
+                                    max_general = 36
+                                    count = int(max_general * percentage)
+                                    if count < 1: count = 1
+                                    
+                                    # FIX: Фильтруем по score из strategy_scores.json
+                                    min_score_general = int(DOMAIN_COUNTS["general"] * THRESHOLD_PERCENT)
+                                    filtered_general = 0  # Debug counter
+                                    for s in gen_list:
+                                        if isinstance(s, dict) and "args" in s:
+                                            name = s.get("name", "")
+                                            score = strategy_scores.get(("general", name), 0)
+                                            
+                                            # Debug: Log filtering decisions
+                                            if score == 0 and name:
+                                                if filtered_general < 3: pass
+
+                                                filtered_general += 1
+                                            elif score < min_score_general:
+                                                if filtered_general < 3: pass
+
+                                                filtered_general += 1
+                                            else:
+                                                # Passed filter
+                                                strategies_to_evolve.append((s, "general"))
+                                                if len([x for x in strategies_to_evolve if x[1] == "general"]) >= count:
+                                                    break
+                                    
+                                    if filtered_general > 0 and False: # Silence
+                                        taken = len([x for x in strategies_to_evolve if x[1] == "general"])
+
                                     
                                     # 2. YouTube: из youtube.json
                                     max_special = 12
@@ -5423,6 +6097,13 @@ try:
                                     if special_count < 1: special_count = 1
                                     
                                     for svc in ["youtube", "discord"]:
+                                        # FIX: Inject Current Strategy first
+                                        if svc in d and isinstance(d[svc], list):
+                                             strategies_to_evolve.append(({
+                                                 "name": f"Current {svc}",
+                                                 "args": d[svc]
+                                             }, svc))
+                                        
                                         sp = os.path.join(base_dir, "strat", f"{svc}.json")
                                         if os.path.exists(sp):
                                             s_spec_data = load_json_robust(sp, {})
@@ -5433,37 +6114,117 @@ try:
                                             elif isinstance(s_spec_data, list):
                                                 s_spec_list = s_spec_data
                                             
-                                            # Сортируем по score
-                                            scored_spec = []
+                                            # FIX: Файл уже отсортирован после Checker. Берем TOP N.
+                                            # Фильтруем по score из strategy_scores.json
+                                            min_score = int(DOMAIN_COUNTS.get(svc, 10) * THRESHOLD_PERCENT)
+                                            
+                                            # Unique filter с фильтрацией по score
+                                            unique_spec = []
+                                            seen_args = set()
+                                            filtered_count = 0  # Debug counter
                                             for s in s_spec_list:
                                                 if isinstance(s, dict) and "args" in s:
                                                     name = s.get("name", "")
-                                                    cached_score = active_scores_runtime.get((svc, name), 0)
-                                                    scored_spec.append((cached_score, s))
+                                                    score = strategy_scores.get((svc, name), 0)
+                                                    
+                                                    # Debug: Log filtering decisions
+                                                    if score == 0 and name:
+                                                        if filtered_count < 3: pass # Limit spam
+
+                                                        filtered_count += 1
+                                                    
+                                                    if score < min_score:
+                                                        if score > 0 and filtered_count < 3:
+                                                            pass
+
+                                                        filtered_count += 1
+                                                        continue  # Пропускаем слабые
+                                                    
+                                                    a = s.get("args", "")
+                                                    if a:
+                                                        a_key = str(a)
+                                                        if a_key not in seen_args:
+                                                            seen_args.add(a_key)
+                                                            unique_spec.append(s)
+                                                            
+                                                    if len(unique_spec) >= special_count:
+                                                        break
                                             
-                                            scored_spec.sort(key=lambda x: x[0], reverse=True)
-                                            
-                                            # Unique filter
-                                            unique_spec = []
-                                            seen_args = set()
-                                            for _, s in scored_spec:
-                                                a = s.get("args", "")
-                                                if a:
-                                                    a_key = str(a)
-                                                    if a_key not in seen_args:
-                                                        seen_args.add(a_key)
-                                                        unique_spec.append(s)
+                                            if filtered_count > 0:
+                                                pass
+
                                             
                                             for s in unique_spec[:special_count]:
                                                 strategies_to_evolve.append((s, svc))
+                                            
+                                            # \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430 \u0444\u0438\u043b\u044c\u0442\u0440\u0430\u0446\u0438\u0438
+                                            filtered_out = len(s_spec_list) - len(unique_spec)
+                                            if filtered_out > 0:
+                                                pass
+
                                 
                             except Exception as e:
                                 log_func(f"[StrategyChecker-Debug] Ошибка подготовки эволюции: {e}")
                                 pass
 
-
-
-                            # 2. Mutate
+                            # 2. Mutate (дозаполнение перенесено ниже)
+                            # === ДОЗАПОЛНЕНИЕ: Гарантируем минимальное количество стратегий ===
+                            # Вынесено ПОСЛЕ обоих блоков (EVO и Normal) чтобы работало всегда
+                            try:
+                                # Загружаем strategies.json для доступа к Current
+                                d_fill = load_json_robust(strat_path, {})
+                                if not isinstance(d_fill, dict): d_fill = {}
+                                
+                                # Загружаем learning_data для мутаций
+                                learning_data_prefill = load_learning_data()
+                                
+                                # Определяем целевые количества для текущего этапа
+                                targets = {
+                                    "general": int(36 * percentage),  # FIX: Снижено с 60 до 36
+                                    "youtube": int(12 * percentage),
+                                    "discord": int(12 * percentage)
+                                }
+                                
+                                # Подсчитываем текущее количество для каждого сервиса
+                                current_counts = {}
+                                for _, svc in strategies_to_evolve:
+                                    current_counts[svc] = current_counts.get(svc, 0) + 1
+                                
+                                # if True: log_func(f"[Evo-Fill] Текущие: {current_counts}. Целевые: {targets}")
+                                
+                                # Дозаполняем
+                                for svc, target in targets.items():
+                                    current = current_counts.get(svc, 0)
+                                    deficit = target - current
+                                    
+                                    if deficit > 0 and svc in d_fill and isinstance(d_fill[svc], list):
+                                        # Генерируем мутации Current стратегии
+                                        current_args = d_fill[svc]
+                                        # log_func(f"[Evo-Fill] {svc}: {current}/{target}. Генерирую {deficit} мутаций Current.")
+                                        
+                                        for i in range(deficit):
+                                            mutations = mutate_strategy(current_args, bin_files, count=1, learning_data=learning_data_prefill)
+                                            if mutations:
+                                                m_args = mutations[0]
+                                                # Generate unique name
+                                                h_obj = hashlib.md5(str(m_args).encode())
+                                                h_str = h_obj.hexdigest()[:3].upper()
+                                                # FIX: Standard naming without 'Fill_' prefix
+                                                # Use service name + hash, similar to other mutations
+                                                new_name = f"{svc}_M{h_str}" 
+                                                strategies_to_evolve.append(({"name": new_name, "args": m_args}, svc))
+                            except Exception as e:
+                                log_func(f"[Evo-Fill] Ошибка дозаполнения: {e}")
+                                pass
+                            
+                            # Итоговая статистика
+                            final_counts = {}
+                            for _, svc in strategies_to_evolve:
+                                final_counts[svc] = final_counts.get(svc, 0) + 1
+                            # log_func(f"[Evo] Собрано стратегий: {final_counts}")
+                            log_func(f"[Evo] Подготовка к эволюции... собрано {len(strategies_to_evolve)} стратегий.")
+                            
+                            # if True: log_func(f"[Trace] Gathering done (after fill). Strategies found: {len(strategies_to_evolve)}")
                             evo_tasks = []
                             learning_data = load_learning_data()  # Загружаем статистику один раз
                             
@@ -5474,7 +6235,11 @@ try:
                             
                             for strat, svc in strategies_to_evolve:
                                 # Skip blocked services
-                                if svc in blocked_services: continue
+                                if svc in blocked_services:
+                                     # FIX: Allow blocked services ONE chance in Evo if it's the first stage?
+                                     # Or just log it.
+
+                                     continue
                                 
                                 # Select domains
                                 target_doms = domains_for_general
@@ -5484,7 +6249,9 @@ try:
                                     t_doms = []
                                     if os.path.exists(l_path):
                                          try:
-                                             with open(l_path, "r") as f: t_doms = [l.strip() for l in f if l.strip()]
+                                             # FIX: Filter comments
+                                             with open(l_path, "r") as f: 
+                                                 t_doms = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
                                          except: pass
                                     if t_doms: target_doms = t_doms
                                 
@@ -5506,10 +6273,12 @@ try:
 
                             log_func(f"{prefix} Сгенерировано {len(evo_tasks)} задач.")
 
-                            if not evo_tasks: 
-                                log_func(f"{prefix} Нет задач для выполнения.")
-                                continue
+                            if True: pass # Force log
 
+
+                            if not strategies_to_evolve:
+                                if IS_DEBUG_MODE or True: log_func(f"[Evo-{stage_idx+1}] Нет стратегий для эволюции. Пропуск этапа.")
+                                continue # Continue to next stage instead of breaking!
                             
                             # === Evolution Stage Message ===
                             stage_msg = f"[Evo] Эволюция стратегий. Этап {stage_idx+1}."
@@ -5582,13 +6351,18 @@ try:
                                             if update_needed and state['created']:
                                                 gray_count = state['checked'] + state['active'] - state['score']
                                                 bar = get_progress_bar(state['score'], gray_count, total, width=20)
-                                                msg = f"{pfx} {s_name} ({s_svc}) {bar} {state['score']}/{state['checked']}"
+                                                
+                                                # FIX: Checkmark inside tracker to guarantee visibility
+                                                suffix = ""
+                                                if state['checked'] == total: suffix = " ✓"
+                                                
+                                                msg = f"{pfx} {s_name} ({s_svc}) {bar} {state['score']}/{state['checked']}{suffix}"
                                                 progress_manager.update_line(lid, msg, is_final=False)
                                         return tracker
 
                                     tracker_func = make_evo_tracker(line_id, strat['name'], svc, len(doms))
                                     
-                                    fut = executor.submit(check_strat_threaded, strat["args"], doms, progress_tracker=tracker_func, run_id=current_run_id)
+                                    fut = executor.submit(check_strat_threaded, strat["args"], doms, progress_tracker=tracker_func, run_id=SERVICE_RUN_ID)
                                     active_evo[fut] = (t, line_id)
                                 
                                 if not active_evo: break
@@ -5614,7 +6388,9 @@ try:
                                             continue
                                         
                                         # CACHE SCORE
-                                        cache_score(svc_t, strat_t['name'], sc)
+                                        # CACHE SCORE (Inlined)
+                                        if svc_t not in active_scores_runtime: active_scores_runtime[svc_t] = {}
+                                        active_scores_runtime[svc_t][strat_t['name']] = sc
                                         
                                         # === UPDATE LEARNING STATS ===
                                         try:
@@ -5630,30 +6406,41 @@ try:
                                             )
                                         except: pass
                                         
+                                        # Add result to list
                                         evo_results.append((sc, strat_t, svc_t))
+                                        
+                                        # UI Update
                                         total_cnt = len(doms_t)
                                         gray_count = total_cnt - sc
                                         bar = get_progress_bar(sc, gray_count, total_cnt, width=20)
                                         final_msg = f"{prefix} {strat_t['name']} ({svc_t}) {bar} {sc}/{total_cnt} ✓"
                                         progress_manager.update_line(line_id, final_msg, is_final=True)
                                         
+                                        # Check if this beats the CURRENT BEST (not just any previous result)
                                         bl = service_baselines.get(svc_t, 0)
                                         if sc > bl:
                                              log_func(f"{prefix} >>> Улучшение для {svc_t}: {sc} (было {bl}) -> {strat_t['name']}")
                                              service_baselines[svc_t] = sc
-                                             better_found = True # Keep for logic outside (maybe redundant now)
+                                             better_found = True
                                              
-                                             # IMMEDIATE HOT SWAP FOR EVO
-                                             update_active_config_immediate(svc_t, strat_t["args"], f"{prefix} Применена лучшая стратегия {strat_t['name']}")
-                                    except: pass
+                                             # HOT SWAP: Only apply if this is REALLY better than current winws strategy
+                                             # Load current strategy from strategies.json to compare
+                                             try:
+                                                 strat_main_path = os.path.join(base_dir, "strat", "strategies.json")
+                                                 current_config = load_json_robust(strat_main_path, {})
+                                                 current_args = current_config.get(svc_t if svc_t != "general" else "general", [])
+                                                 
+                                                 # Only trigger Hot Swap if args are actually different
+                                                 if strat_t["args"] != current_args:
+                                                     update_active_config_immediate(svc_t, strat_t["args"], f"{prefix} Применена лучшая стратегия {strat_t['name']}")
+                                             except Exception as hs_err:
+                                                 if IS_DEBUG_MODE: log_func(f"[Evo-HotSwap] Error: {hs_err}")
+                                        
+                                    except Exception as e:
+                                        log_func(f"[Evo-Error] Loop Error: {e}")
 
                             # Cancel futures and log stop message
-                            if not is_service_active or is_closing:
-                                for f in active_evo.keys():
-                                    f.cancel()
-                                stop_msg = f"{prefix} Эволюция стратегий остановлена пользователем. Прогресс сохранён."
-                                progress_manager.log_message(stop_msg)
-
+                            
                             # 4. Sort Phase (Save results even if stopping - preservation of knowledge)
                             if evo_results:
                                  sort_and_distribute_results(evo_results, score_cache=active_scores_runtime)
@@ -5669,32 +6456,82 @@ try:
                             if not is_service_active or is_closing:
                                 break
                             
-                            # 5. Instant Restart (Hot Swap)
-                            if better_found and is_service_active and not is_closing:
-                                log_func(f"[Check] Эволюция нашла улучшения (Hot Swap).")
-                                if root: root.after(0, perform_hot_restart_backend)
+                            
 
-                    if is_service_active and not is_closing:
+                            # 5. End of stage log (Hot Swap already called inside loop if needed)
+                            if better_found and is_service_active and not is_closing:
+                                log_func(f"[Check] Эволюция нашла улучшения на этапе {stage_idx + 1}.")
+
+
+                    # --- FINAL COMPLETION CHECK ---
+                    # Logic moved OUTSIDE the "stages" loop but inside "if is_service_active"
+                    # Check if we are truly done (either skipped all because finished, or finished just now)
+                    
+                    # Reload stage to be sure
+                    current_stage_check = state.get("evolution_stage", 0)
+                    
+                    if is_service_active and not is_closing and current_stage_check >= len(stages):
                         # FINISH
                         log_func("[Check] Подбор полностью завершен.")
                         
                         # Sync keys to match reading logic
                         state["last_check_time"] = time.time()
                         state["last_full_check_time"] = time.time() 
-                        state["completed"] = True # FIX: Mark full cycle as completed to prevent immediate restart
-                        state["evolution_stage"] = 0  # Сбрасываем этап эволюции для следующего цикла
+                        state["completed"] = True
+                        state["evolution_stage"] = 0
+                        state["last_checked_ip"] = current_ip  # NEW: Save IP for restart detection
                         save_state()
                         
-                        # CRITICAL FIX: Stop the outer "wile is_scanning" loop
-                        is_scanning = False
+                        # Update check timestamp for DomainCleaner cooldown
+                        last_strategy_check_time = time.time()
+                        
+                        # === FINAL PRUNING: Enforce strict limits after Evolution ===
+                        try:
+                            log_func("[Check] Финальная очистка стратегий...")
+                            for svc_final in ["general", "youtube", "discord", "whatsapp", "telegram"]:
+                                lim_final = 36 if svc_final == "general" else 12
+                                p_final = os.path.join(base_dir, "strat", f"{svc_final}.json")
+                                
+                                if os.path.exists(p_final):
+                                    data_final = load_json_robust(p_final, {})
+                                    list_final = []
+                                    if isinstance(data_final, dict) and "strategies" in data_final:
+                                        list_final = data_final["strategies"]
+                                    elif isinstance(data_final, list):
+                                        list_final = data_final
+                                    
+                                    if len(list_final) > lim_final:
+                                        # Sort by score from runtime cache
+                                        scored_final = []
+                                        for s_f in list_final:
+                                            s_n = s_f.get("name", "")
+                                            sc_f = active_scores_runtime.get((svc_final, s_n), 0)
+                                            scored_final.append((sc_f, s_f))
+                                        
+                                        scored_final.sort(key=lambda x: x[0], reverse=True)
+                                        kept_final = [x[1] for x in scored_final[:lim_final]]
+                                        
+                                        save_json_safe(p_final, {"version": "1.0", "strategies": kept_final})
+                                        log_func(f"[Pruner-Final] {svc_final}: {len(kept_final)} (было {len(list_final)})")
+                        except Exception as prune_err:
+                            log_func(f"[Pruner-Final] Ошибка: {prune_err}")
+                        
+                        # CRITICAL FIX: Stop the outer "while is_scanning" loop
+                        # This 'break' leaves the ThreadPoolExecutor context
+                        # We also need to flag the outer variable
+                        is_scanning = False 
+                        all_tasks = [] # Ensure no re-entry from outer loop check?
                         break
 
 
                 # End of block
-                is_scanning = False
+                # FIX: Do NOT reset is_scanning here - Evolution phase may not be started yet!
+                # is_scanning = False  # REMOVED: Too early, Evolution still needs this flag
                 
                 # FIX: Clear progress on successful full completion
                 # But only if we actually did something?
+                if task_queue or active_futures:
+                    log_func("[Check-Debug] Removed progress file (finished round one).")
                 # For now, let's keep the progress file - it serves as "Temporary knowledge" 
                 # that expires in 4 hours. No explicit delete needed, handled by timestamp check.
                 
@@ -5704,10 +6541,14 @@ try:
                 # If urgent checks appear, they wake via matcher_wakeup_event or queue in next loop start
                 time.sleep(30)
 
-            except Exception as e:
-                # FIX: Silent exit on deliberate stop
+            except BaseException as e:
+                try:
+                     import traceback
+                     with open(os.path.join(get_base_dir(), "temp", "debug_worker.log"), "a", encoding="utf-8") as f:
+                         f.write(f"{time.strftime('%H:%M:%S')} CRASH: {e}\n{traceback.format_exc()}\n")
+                except: pass
+                
                 if "aborted_by_service" in str(e) or "Остановка сервиса" in str(e) or not is_service_active:
-                     # Already logged above, just pass
                      pass
                 else:
                      log_func(f"[Check] Ошибка рабочего цикла: {e}")
@@ -6084,6 +6925,82 @@ try:
         except: pass
         return added_new
 
+    def cleanup_redundant_domains_worker(log_func):
+        """
+        Фоновая задача: удаляет домены из general.txt, если они уже есть в специфических списках.
+        Запускается один раз при старте. Если были изменения -> Hot Restart.
+        """
+        time.sleep(10) # Даем системе прогрузиться
+        
+        try:
+            base_dir = get_base_dir()
+            general_path = os.path.join(base_dir, "list", "general.txt")
+            
+            if not os.path.exists(general_path): return
+            
+            # 1. Загружаем general
+            general_domains = set()
+            with open(general_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                
+            header = None
+            if lines and lines[0].strip().startswith("# version"):
+                header = lines[0]
+                
+            for line in lines:
+                d = line.split('#')[0].strip().lower()
+                if d and not line.strip().startswith("#"): general_domains.add(d)
+                
+            if not general_domains: return
+            
+            # 2. Собираем все "специальные" домены (из всех остальных списков)
+            special_domains = set()
+            
+            # Стратегии, определенные в файлах
+            strat_files = [f for f in os.listdir(os.path.join(base_dir, "list")) if f.endswith(".txt") and f != "general.txt" and not f.startswith("exclude")]
+            
+            for fname in strat_files:
+                fpath = os.path.join(base_dir, "list", fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            d = line.split('#')[0].strip().lower()
+                            if d: special_domains.add(d)
+                except: pass
+                
+            # 3. Ищем пересечения
+            duplicates = general_domains.intersection(special_domains)
+            
+            if duplicates:
+                log_func(f"[Cleanup] Найдено {len(duplicates)} дубликатов в general.txt (есть в других стратегиях). Удаляем...")
+                
+                # 4. Удаляем из general
+                new_general_content = []
+                # Сохраняем генеральный список без дубликатов, с сортировкой
+                final_domains = sorted(list(general_domains - duplicates))
+                
+                # FIX: Ensure we write back the CORRECT version header to avoid re-update loop
+                new_general_content = [f"# version: {CURRENT_VERSION}\n"]
+                
+                for d in final_domains:
+                     new_general_content.append(f"{d}\n")
+                     
+                with general_list_lock:
+                    with open(general_path, "w", encoding="utf-8") as f:
+                        f.writelines(new_general_content)
+                        
+                log_func(f"[Cleanup] general.txt очищен. Требуется перезапуск ядра.")
+                
+                # 5. Hot Restart для применения изменений
+                if root: root.after(1000, perform_hot_restart)
+            
+            else:
+                # log_func("[Cleanup] Дубликатов в general.txt не найдено.")
+                pass
+                
+        except Exception as e:
+            log_func(f"[Cleanup] Ошибка при очистке дубликатов: {e}")
+
     # ================= НОВЫЕ ФУНКЦИИ (Hard Checker & Robust Check) =================
 
     # Состояние для отслеживания замедленных доменов
@@ -6151,7 +7068,7 @@ try:
             # Используем DNSManager для разрешения домена.
             # check_cache=False заставляет выполнить свежую проверку, но результат все равно обновит кэш.
             # Используем burst_limiter, так как это активная проверка, а не фоновая очистка.
-            ip, status = dns_manager.resolve(domain, dns_manager.burst_limiter, check_cache=False)
+            ip, status = dns_manager.resolve(domain, dns_manager.burst_limiter, check_cache=True)
             if ip is None:
                 return "no_dns", f"dns_manager_{status}"
 
@@ -6800,10 +7717,20 @@ try:
         try:
             for url in services:
                 try:
-                    return session.get(url, timeout=10).text.strip()
+                    return session.get(url, timeout=5).text.strip()
                 except: continue
         finally:
             session.close()
+            
+        # Fallback: Standard request (if isolated failed)
+        try:
+            # Try one more time with standard requests (no source port binding)
+            for url in services:
+                 try:
+                     return requests.get(url, timeout=5).text.strip()
+                 except: continue
+        except: pass
+        
         return None
 
     def _resolve_worker(domain):
@@ -7014,8 +7941,13 @@ try:
         """Возвращает HOT домены (посещённые) отсортированные по приоритету."""
         global visited_domains_stats
         with visited_domains_lock:
+            # Filter out metadata like "version" which are not dicts
+            valid_items = [
+                x for x in visited_domains_stats.items() 
+                if isinstance(x[1], dict) and "priority" in x[1] and "last_visit" in x[1]
+            ]
             sorted_domains = sorted(
-                visited_domains_stats.items(),
+                valid_items,
                 key=lambda x: (-x[1]["priority"], -x[1]["last_visit"])
             )
             return [d[0] for d in sorted_domains[:max_count]]
@@ -8128,9 +9060,31 @@ try:
             strat_keys.remove("warp")
             strat_keys.insert(0, "warp")
         
+        # === FIX: Load runtime state to filter blocked services ===
+        blocked_state = {}
+        try:
+             state_path = os.path.join(get_base_dir(), "temp", "checker_state.json")
+             if os.path.exists(state_path):
+                 with open(state_path, "r", encoding="utf-8") as f:
+                     blocked_state = json.load(f)
+        except: pass
+
         num_specific_strats_added = 0
         for strat_name in strat_keys:
             if strat_name.startswith("_"): continue
+            
+            # Check blockage
+            # Logic: If checked=True AND score<=0 -> Service is dead, disable strategy in Main WinWS
+            # This logic automatically resets on IP change because 'blocked_state' is reset/cleared by Checker
+            is_blocked = False
+            if blocked_state.get(f"{strat_name}_checked", False):
+                 s_score = blocked_state.get(f"{strat_name}_score", 0)
+                 if s_score <= 0:
+                      is_blocked = True
+            
+            if is_blocked:
+                 if not silent: print(f"[Init] Пропуск стратегии {strat_name} (сервис заблокирован)")
+                 continue
 
             list_file_path = os.path.join(get_base_dir(), "list", f"{strat_name}.txt")
             list_file_rel = os.path.join("list", f"{strat_name}.txt")
@@ -8195,7 +9149,14 @@ try:
 
         gen_list_exists = os.path.exists(target_gen_list) and os.path.getsize(target_gen_list) > 0
         
-        if gen_list_exists or os.path.exists(paths['ip_general']):
+        # FIX: Check if General is blocked
+        is_gen_blocked = False
+        if blocked_state.get("general_checked", False) and blocked_state.get("general_score", 0) <= 0:
+             is_gen_blocked = True
+        
+        if is_gen_blocked:
+             if not silent: print("[Init] Пропуск General стратегии (сервис заблокирован)")
+        elif gen_list_exists or os.path.exists(paths['ip_general']):
             if num_specific_strats_added > 0:
                 args.append("--new")
             
@@ -8681,12 +9642,23 @@ try:
         # Выходим (фоновый поток завершится сам)
         os._exit(0)
 
+    # === HOT SWAP COOLDOWN ===
+    _hot_swap_last_call = [0]  # Mutable container for closure
+    _hot_swap_cooldown = 5  # Seconds between restarts
+    
     def perform_hot_restart_backend():
         """
         Мгновенный перезапуск только ядра WinWS (Backend) для применения новых стратегий.
         Не останавливает GUI и потоки проверок.
         """
         global process, is_service_active
+        
+        # Debouncing: Prevent rapid restarts that overload WinDivert driver (Code 177 fix)
+        now = time.time()
+        if now - _hot_swap_last_call[0] < _hot_swap_cooldown:
+            if IS_DEBUG_MODE: print("[HotSwap] Пропуск (cooldown)")
+            return
+        _hot_swap_last_call[0] = now
         
         # log_print("[HotSwap] Применение новых параметров (WinWS Reset)...")
         # Optimized log to avoid clutter, maybe just print to console or debug log?
@@ -8708,7 +9680,7 @@ try:
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
 
-        time.sleep(0.2) # Small breath
+        time.sleep(0.5) # Increased breath for WinDivert to release resources
         
         # 2. Restart via start_nova_service (Global context)
         # Flag restart to prevent old thread from reporting Crash
@@ -8823,6 +9795,7 @@ try:
         threading.Thread(target=batch_exclude_worker, args=(log_print,), daemon=True).start()
         threading.Thread(target=check_and_update_worker, args=(log_print,), daemon=True).start()
         threading.Thread(target=domain_cleaner_worker, args=(log_print,), daemon=True).start()
+        threading.Thread(target=cleanup_redundant_domains_worker, args=(log_print,), daemon=True).start()
 
     def create_round_rect_img(width, height, radius, color, alpha=255):
         """Генерирует изображение закругленного прямоугольника с поддержкой Alpha-канала"""
