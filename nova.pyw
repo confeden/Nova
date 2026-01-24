@@ -138,7 +138,7 @@ try:
     WINWS_FILENAME = "winws.exe"
     # === AUTO-UPDATE CONFIG ===
     UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
-    CURRENT_VERSION = "1.1"
+    CURRENT_VERSION = "1.4"
     
     # Debug Flag: Check args OR existence of "debug" file
     # Centralized argument parsing for consistency
@@ -210,18 +210,27 @@ try:
                 if not is_frozen_exe:
                     if not os.path.exists(gen_path):
                         pass # Do nothing
+                    elif not target_lines:
+                         # FIX: Read failed or file empty? Don't overwrite blindly
+                         logs.append("[Init] general.txt read failed or empty. Skipping header update to prevent data loss.")
                     elif not has_version:
                         # Append header
                         target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                        with open(gen_path, "w", encoding="utf-8") as f:
-                            f.writelines(target_lines)
-                        g_action = "Header Added (Script)"
+                        try:
+                            with open(gen_path, "w", encoding="utf-8") as f:
+                                f.writelines(target_lines)
+                            g_action = "Header Added (Script)"
+                        except Exception as e:
+                            logs.append(f"[Init] Failed to write general.txt: {e}")
                     elif current_ver_in_file != CURRENT_VERSION:
                         # Update header
                         target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                        with open(gen_path, "w", encoding="utf-8") as f:
-                            f.writelines(target_lines)
-                        g_action = "Header Updated (Script)"
+                        try:
+                            with open(gen_path, "w", encoding="utf-8") as f:
+                                f.writelines(target_lines)
+                            g_action = "Header Updated (Script)"
+                        except Exception as e:
+                            logs.append(f"[Init] Failed to write general.txt: {e}")
                 
                 # --- FROZEN EXE MODE ---
                 else:
@@ -240,10 +249,50 @@ try:
                              g_action = "Restored from Bundle (No Version)"
                     
                     elif current_ver_in_file != CURRENT_VERSION:
-                         # Version Mismatch -> Replace
+                         # Version Mismatch -> Smart Merge
                          if os.path.exists(internal_gen):
-                             shutil.copy2(internal_gen, gen_path)
-                             g_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
+                             try:
+                                 # 1. Read Bundle Domains
+                                 bundle_domains = set()
+                                 with open(internal_gen, "r", encoding="utf-8") as f:
+                                     for line in f:
+                                         clean = line.split('#')[0].strip()
+                                         if clean and not line.strip().startswith("#"): bundle_domains.add(clean)
+
+                                 # 2. Read User Domains
+                                 user_domains = set()
+                                 if os.path.exists(gen_path):
+                                     with open(gen_path, "r", encoding="utf-8") as f:
+                                         for line in f:
+                                             clean = line.split('#')[0].strip()
+                                             if clean and not line.strip().startswith("#"): user_domains.add(clean)
+                                 
+                                 # 3. Merge
+                                 merged = sorted(list(user_domains.union(bundle_domains)))
+                                 new_count = len(merged) - len(user_domains)
+                                 
+                                 # 4. Safety Check: If merged is empty but bundle has content, restore entirely
+                                 if not merged and bundle_domains:
+                                     shutil.copy2(internal_gen, gen_path)
+                                     g_action = f"Restored from Bundle (Merge resulted in empty, bundle had {len(bundle_domains)} domains)"
+                                 elif not merged:
+                                     # Both empty - just update header, don't touch content
+                                     logs.append(f"[Init] Warning: Both user and bundle general.txt are empty!")
+                                 else:
+                                     # 5. Write merged content
+                                     with open(gen_path, "w", encoding="utf-8") as f:
+                                         f.write(f"# version: {CURRENT_VERSION}\n")
+                                         for d in merged:
+                                             f.write(f"{d}\n")
+                                     g_action = f"Merged Update (v{current_ver_in_file}->v{CURRENT_VERSION}, +{new_count} new domains)"
+                             except Exception as e:
+                                 logs.append(f"[Init] Merge error: {e}")
+                                 # Fallback: try to restore from bundle entirely
+                                 try:
+                                     shutil.copy2(internal_gen, gen_path)
+                                     g_action = "Restored from Bundle (Merge Failed)"
+                                 except: pass
+
                 
                 if g_action:
                     logs.append(f"[Init] general.txt: {g_action}")
@@ -605,6 +654,19 @@ try:
                         continue
                     
                     if ver != CURRENT_VERSION:
+                        # === FORCE REPLACE: Критические файлы полностью заменяем при обновлении ===
+                        force_replace_files = ["strategies.json", "discord.json"]
+                        
+                        if fname in force_replace_files:
+                            try:
+                                bundled_file = get_internal_path(os.path.join("strat", fname))
+                                if os.path.exists(bundled_file):
+                                    shutil.copy2(bundled_file, fpath)
+                                    logs.append(f"Заменён конфиг {fname} (v{ver} -> v{CURRENT_VERSION})")
+                                    continue  # Skip to next file
+                            except Exception as e:
+                                logs.append(f"Ошибка замены {fname}: {e}")
+                        
                         # Проверяем, требуется ли миграция формата
                         needs_format_migration = False
                         
@@ -865,28 +927,84 @@ try:
                         s = os.path.join(internal_source, item)
                         d = os.path.join(target_folder_path, item)
                         
-                        if item.lower() == WINWS_FILENAME.lower() or True: # FIX: Force check ALL bin files (Drivers, DLLs)
-                            # Update if size differs or missing
+                        is_winws = (item.lower() == WINWS_FILENAME.lower())
+                        
+                        if is_winws:
+                            # Hard Update for winws.exe (Size Check)
                             if os.path.exists(d):
                                 try:
                                     if os.path.getsize(s) != os.path.getsize(d):
                                         shutil.copy2(s, d)
                                         updated_bins += 1
                                 except: pass
-                            else:
-                                shutil.copy2(s, d) # Missing? Copy.
+                            else: shutil.copy2(s, d)
+                        else:
+                            # Soft Update for DLLs/Drivers (Only add missing)
+                            if not os.path.exists(d): shutil.copy2(s, d)
+                                
                     if updated_bins > 0: logs.append(f"Bin: обновлено {updated_bins} исполняемых файлов")
                  except: pass
+
             else:
-                # Для list, strat, ip: добавляем только отсутствующие файлы (дефолтные), старые не трогаем
+                # Для list, strat, ip: умное обновление
                 try:
                     for item in os.listdir(internal_source):
+                        s = os.path.join(internal_source, item)
                         d = os.path.join(target_folder_path, item)
+
+                        # 1. Если файла нет - просто копируем
                         if not os.path.exists(d):
-                            s = os.path.join(internal_source, item)
                             if os.path.isfile(s):
                                 shutil.copy2(s, d)
                                 logs.append(f"Добавлен новый файл конфигурации: {item}")
+                            continue
+                        
+                        # 2. Если файл есть - проверяем тип
+                        if item.endswith(".txt"):
+                            # Smart Merge TXT (Version Check)
+                            try:
+                                with open(s, "r", encoding="utf-8") as f: src_lines = f.readlines()
+                                with open(d, "r", encoding="utf-8") as f: dst_lines = f.readlines()
+                                
+                                src_ver = "0.0"
+                                if src_lines and "version:" in src_lines[0]: src_ver = src_lines[0].split(":")[1].strip()
+                                
+                                dst_ver = "0.0"
+                                if dst_lines and "version:" in dst_lines[0]: dst_ver = dst_lines[0].split(":")[1].strip()
+                                
+                                def vt(v): 
+                                    try: return tuple(map(int, v.split('.')))
+                                    except: return (0,)
+                                
+                                # Если текущая версия НИЖЕ (старее) внутренней
+                                if vt(dst_ver) < vt(src_ver):
+                                    merged = set()
+                                    for l in dst_lines: # Keep user edits? Strategy: Add missing from source
+                                        if l.strip() and not l.startswith("#"): merged.add(l.strip())
+                                    for l in src_lines: # Add new defaults
+                                        if l.strip() and not l.startswith("#"): merged.add(l.strip())
+                                    
+                                    with open(d, "w", encoding="utf-8") as f:
+                                        f.write(f"# version: {src_ver}\n")
+                                        for dom in sorted(list(merged)): f.write(f"{dom}\n")
+                                    logs.append(f"List: обновлен {item} (v{src_ver})")
+                            except: pass
+
+                        elif item.endswith(".json"):
+                            # Smart Merge JSON (Add missing keys)
+                            try:
+                                js_src = load_json_robust(s, {})
+                                js_dst = load_json_robust(d, {})
+                                changed = False
+                                for k, v in js_src.items():
+                                    if k not in js_dst:
+                                        js_dst[k] = v
+                                        changed = True
+                                if changed:
+                                    save_json_safe(d, js_dst)
+                                    logs.append(f"Strat: дополнен {item}")
+                            except: pass
+
                 except Exception as e:
                     pass
 
@@ -1034,11 +1152,156 @@ try:
             "exclude.txt": ""
         }
         res = {}
+        
+        # === EMBEDDED DEFAULTS (Updated 1.4) ===
+        DEFAULT_STRATEGIES = {
+            "youtube": [
+                "--filter-tcp=443", "--dpi-desync=multisplit", "--dpi-desync-repeats=4", "--dpi-desync-fooling=ts",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-ttl=11", "--dpi-desync-autottl=2:3-64", "--new", "--filter-udp=443",
+                "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ],
+            "discord": [
+                "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-repeats=6",
+                "--dpi-desync-fooling=ts", "--dpi-desync-fakedsplit-pattern=0x00",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new",
+                "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6"
+            ],
+            "warp": [
+                "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ],
+            "voice": [
+                "--filter-udp=596,597,598,599,1400,3478,5222,45395,32000-32100", "--dpi-desync=fake", "--dpi-desync-repeats=6"
+            ],
+            "_games": [
+                "--filter-tcp=443,25565", "--filter-udp=443,19132", "--dpi-desync=multisplit",
+                "--dpi-desync-split-pos=1,2,3,4,5,6,7", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=10"
+            ],
+            "cloudflare": [
+                "--filter-tcp=80,443", "--dpi-desync=fake,multisplit", "--dpi-desync-repeats=6",
+                "--dpi-desync-fooling=ts", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin"
+            ],
+            "telegram": [
+                "--filter-tcp=443,5222", "--dpi-desync=fake", "--dpi-desync-fooling=badsum", "--dpi-desync-repeats=10"
+            ],
+            "whatsapp": [
+                "--filter-tcp=80,443,4244,5223,5228,5242", "--dpi-desync=fake,hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts", "--new", "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ],
+            "general": [
+                "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts",
+                "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ],
+            "hard_1": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_2": [ "--filter-tcp=80,443", "--dpi-desync=fake", "--dpi-desync-fake-tls-mod=dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_3": [ "--filter-tcp=80,443", "--dpi-desync=fake", "--dpi-desync-repeats=2", "--dpi-desync-fooling=ts", "--dpi-desync-fake-tls=fake/tls_clienthello_4pda_to.bin", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-autottl=2:3-64", "--dpi-desync-split-seqovl=2", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_4": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_5": [ "--filter-tcp=80,443", "--dpi-desync=fake", "--dpi-desync-split-pos=1", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=2", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_6": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=www.google.com", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_7": [ "--filter-tcp=80,443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=2", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=6", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_8": [ "--filter-tcp=80,443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=1", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=2", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_9": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rndsni", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_10": [ "--filter-tcp=80,443", "--dpi-desync=multisplit", "--dpi-desync-repeats=5", "--dpi-desync-fooling=ts", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-split-seqovl=2", "--dpi-desync-autottl=2", "--dpi-desync-fake-tls=fake/tls_clienthello_4.bin", "--dpi-desync-ttl=11" ],
+            "hard_11": [ "--filter-tcp=80,443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=2", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=badseq,ts", "--dpi-desync-repeats=5", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--dpi-desync-ttl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "hard_12": [ "--filter-tcp=80,443", "--dpi-desync=multidisorder", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "version": CURRENT_VERSION
+        }
+        
+        DEFAULT_DISCORD = {
+            "version": CURRENT_VERSION,
+            "strategies": [
+                { "name": "discord_1", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-repeats=6", "--dpi-desync-fooling=ts", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_2", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fooling=ts", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_3", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-seqovl=681", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=8", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_4", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=652", "--dpi-desync-split-pos=2", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_5", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--dpi-desync-hostfakesplit-mod=host=www.google.com,altorder=1", "--dpi-desync-fooling=ts", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_6", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-repeats=6", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=1000", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_8", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=681", "--dpi-desync-split-pos=1", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync=fake-repeats=6" ] },
+                { "name": "discord_9", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=2,sniext+1", "--dpi-desync-split-seqovl=679", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_10", "args": [ "--filter-tcp=2053,2083,2087,2096,8443", "--dpi-desync=fake", "--dpi-desync-fake-tls-mod=none", "--dpi-desync-repeats=6", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=2", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_11", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=hostfakesplit", "--dpi-desync-repeats=4", "--dpi-desync-fooling=ts", "--dpi-desync-hostfakesplit-mod=host=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_12", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=2", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_13", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_14", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_15", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_16", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_17", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_18", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
+                { "name": "discord_19", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] }
+            ]
+        }
+        
         for name, content in files.items():
             path = os.path.join(base_dir, "list", name)
             if not os.path.exists(path) or (name == "general.txt" and os.path.getsize(path) == 0):
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
+            
+        # === FIX: Config Auto-Update Logic ===
+        def check_and_update_config(filename, default_data, validation_callback=None):
+            fpath = os.path.join(base_dir, "strat", filename)
+            should_update = False
+            
+            try:
+                if not os.path.exists(fpath):
+                    should_update = True
+                else:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        if not content:
+                            should_update = True
+                        else:
+                            try:
+                                d = json.loads(content)
+                                if isinstance(d, list):
+                                    should_update = True # Legacy format -> Update
+                                elif isinstance(d, dict):
+                                    # 1. Version Check
+                                    file_ver = d.get("version", "0.0")
+                                    if file_ver < CURRENT_VERSION:
+                                        should_update = True
+                                    # 2. Content Validation (if version matches but content is wrong)
+                                    elif validation_callback and not validation_callback(d):
+                                        should_update = True
+                                else:
+                                    should_update = True
+                            except json.JSONDecodeError:
+                                should_update = True
+            except Exception:
+                should_update = True
+                    
+            if should_update:
+                try:
+                    print(f"[Config] Updating {filename}...")
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                    
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        json.dump(default_data, f, indent=4, ensure_ascii=False)
+                    print(f"[Config] {filename} updated successfully.")
+                except Exception as e:
+                    print(f"Error updating {filename}: {e}")
+
+        # Validator for Discord: Must have sequential naming 'discord_1'
+        def discord_validator(data):
+            try:
+                # Check for at least one strategy named 'discord_1'
+                strats = data.get("strategies", [])
+                for s in strats:
+                    if s.get("name") == "discord_1":
+                        return True
+                return False
+            except: return False
+
+        check_and_update_config(STRATEGIES_FILENAME, DEFAULT_STRATEGIES)
+        check_and_update_config("discord.json", DEFAULT_DISCORD, validation_callback=discord_validator)
+
 
         # === НОВОЕ: Создаем необходимые temp файлы с версионированием ===
         temp_files = {
@@ -1062,7 +1325,9 @@ try:
             path = os.path.join(base_dir, "temp", name)
             
             # 1. Version Check & Cleanup (JSON only)
-            if os.path.exists(path) and name.endswith(".json") and name != "ip_history.json":
+            # FIX: Exclude persistent data files from aggressive wipe
+            protected_files = ["ip_history.json", "learning_data.json", "checker_state.json"]
+            if os.path.exists(path) and name.endswith(".json") and name not in protected_files:
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                          d = json.load(f)
@@ -1085,8 +1350,8 @@ try:
                     f.write(content)
             else:
                 # Восстановление поврежденных/пустых JSON файлов
-                if name.endswith(".json") and os.path.getsize(path) == 0:
-                    with open(path, "w", encoding="utf-8") as f: f.write(content)
+                # FIX: Don't check getsize == 0 blindly. Trust version check above.
+                pass
 
         res["list_exclude_auto"] = os.path.join(base_dir, "temp", "exclude_auto.txt")
         res["ip_exclude"] = os.path.join(base_dir, "ip", "exclude.txt")
@@ -1167,7 +1432,7 @@ try:
     def load_learning_data():
         """Загружает данные обучения из temp/learning_data.json"""
         default = {
-            "version": "1.0",
+            "version": CURRENT_VERSION, # Sync with App Version
             "last_updated": 0,
             "argument_stats": {},
             "combo_stats": {},
@@ -1183,53 +1448,81 @@ try:
         with _learning_data_lock:
             save_json_safe(LEARNING_DATA_PATH, data)
     
-    def update_learning_stats(args, score, max_score, service="general", bin_files_used=None):
+    def update_learning_stats(args, score, max_score, service="general", bin_files_used=None, logger=None):
         """Обновляет статистику обучения после проверки стратегии"""
-        try:
-            data = load_learning_data()
-            success_rate = score / max_score if max_score > 0 else 0
-            
-            # 1. Обновляем статистику аргументов
-            for arg in args:
-                if not isinstance(arg, str): continue
-                if arg == "--new": continue
+        # CRITICAL FIX: Use Lock for END-TO-END Read-Modify-Write cycle to prevent race conditions
+        with _learning_data_lock:
+            try:
+                # Load directly (load_json_robust doesn't lock)
+                default = {
+                    "version": CURRENT_VERSION, 
+                    "last_updated": 0,
+                    "argument_stats": {},
+                    "combo_stats": {},
+                    "bin_stats": {},
+                    "service_stats": {},
+                    "checked_hashes": {}
+                }
+                data = load_json_robust(LEARNING_DATA_PATH, default)
+
+                # FIX: Ensure defaults exist (migration for existing partial files)
+                for k, v in default.items():
+                    if k not in data:
+                        data[k] = v
+
+                success_rate = score / max_score if max_score > 0 else 0
                 
-                # Извлекаем базовый ключ (без значения для некоторых)
-                key = arg
-                if "=" in arg:
-                    base = arg.split("=")[0]
-                    # Для repeats и ttl сохраняем полное значение
-                    if "repeats" in base or "ttl" in base:
-                        key = arg
+                # 1. Обновляем статистику аргументов
+                for arg in args:
+                    if not isinstance(arg, str): continue
+                    if arg == "--new": continue
+                    
+                    # Извлекаем базовый ключ (без значения для некоторых)
+                    key = arg
+                    if "=" in arg:
+                        base = arg.split("=")[0]
+                        # Для repeats и ttl сохраняем полное значение
+                        if "repeats" in base or "ttl" in base:
+                            key = arg
+                        else:
+                            key = base
                     else:
-                        key = base
+                        key = arg
                 
-                if key not in data["argument_stats"]:
-                    data["argument_stats"][key] = {"uses": 0, "successes": 0, "total_score": 0}
+                    if key not in data["argument_stats"]:
+                        data["argument_stats"][key] = {"uses": 0, "successes": 0, "total_score": 0}
+                    
+                    data["argument_stats"][key]["uses"] += 1
+                    data["argument_stats"][key]["successes"] += score
+                    data["argument_stats"][key]["total_score"] += success_rate
+            
+                # 2. Обновляем статистику bin-файлов
+                if bin_files_used:
+                    for bf in bin_files_used:
+                        bn = os.path.basename(bf)
+                        if bn not in data["bin_stats"]:
+                            data["bin_stats"][bn] = {"uses": 0, "successes": 0, "total_score": 0}
+                        data["bin_stats"][bn]["uses"] += 1
+                        data["bin_stats"][bn]["successes"] += score
+                        data["bin_stats"][bn]["total_score"] += success_rate
                 
-                data["argument_stats"][key]["uses"] += 1
-                data["argument_stats"][key]["successes"] += score
-                data["argument_stats"][key]["total_score"] += success_rate
-            
-            # 2. Обновляем статистику bin-файлов
-            if bin_files_used:
-                for bf in bin_files_used:
-                    bn = os.path.basename(bf)
-                    if bn not in data["bin_stats"]:
-                        data["bin_stats"][bn] = {"uses": 0, "successes": 0, "total_score": 0}
-                    data["bin_stats"][bn]["uses"] += 1
-                    data["bin_stats"][bn]["successes"] += score
-                    data["bin_stats"][bn]["total_score"] += success_rate
-            
-            # 3. Обновляем статистику сервиса
-            if service not in data["service_stats"]:
-                data["service_stats"][service] = {"best_score": 0, "total_checks": 0}
-            data["service_stats"][service]["total_checks"] += 1
-            if score > data["service_stats"][service].get("best_score", 0):
-                data["service_stats"][service]["best_score"] = score
-            
-            save_learning_data(data)
-        except: pass
+                # 3. Обновляем статистику сервиса
+                if service not in data["service_stats"]:
+                    data["service_stats"][service] = {"best_score": 0, "total_checks": 0}
+                data["service_stats"][service]["total_checks"] += 1
+                if score > data["service_stats"][service].get("best_score", 0):
+                    data["service_stats"][service]["best_score"] = score
+                
+                # Save DIRECTLY to avoid deadlock with save_learning_data()
+                data["last_updated"] = time.time()
+                save_json_safe(LEARNING_DATA_PATH, data)
+                
+                # VISIBLE DEBUG LOG
+                # if logger: logger(f"[Learning] Saved stats. Keys: {len(data.get('argument_stats', {}))}")
+
+            except Exception as e:
+                if logger: logger(f"[Learning-Error] Update failed: {e}")
+                pass
     
     def get_argument_success_rate(arg_key, learning_data=None):
         """Возвращает коэффициент успешности аргумента (0-1)"""
@@ -3482,14 +3775,14 @@ try:
                 dead_domains_found = set()
                 total_checked = 0
 
-                log_func("[DomainCleaner] Запуск проверки доменов на доступность...")
+                if IS_DEBUG_MODE: log_func("[DomainCleaner] Запуск проверки доменов на доступность...")
 
                 for file_path in files_to_check:
                     if is_closing: break
                     
                     # CRITICAL: Stop if strategy checks started (Suspend)
                     if is_scanning:
-                        log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
+                        if IS_DEBUG_MODE: log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
                         while not is_closing and is_scanning: time.sleep(10)
                         # Resume loop (state preserved or reloaded below)
 
@@ -3507,12 +3800,15 @@ try:
                             if start_idx >= len(lines): start_idx = 0
                         
                         if start_idx > 0:
-                             log_func(f"[DomainCleaner] Возобновление проверки {fname} с позиции {start_idx}...")
+                             if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Возобновление проверки {fname} с позиции {start_idx}...")
 
                         lock = general_list_lock if "general" in fname else None
                         batch_dead = set()
                         lines_processed_count = 0 
                         deleted_in_session = 0 
+                        progress_path = os.path.join(base_dir, "temp", f"cleaner_{fname}.json")
+                        total_checked = 0
+                        dead_domains_found = set()
 
                         
                         def flush_batch_cleaner():
@@ -3533,7 +3829,7 @@ try:
                                             f.writelines(out)
                                             f.flush()
                                             os.fsync(f.fileno())
-                                        log_func(f"[DomainCleaner] Удалено {rem} несуществующих доменов из {os.path.basename(file_path)}.")
+                                        if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Удалено {rem} несуществующих доменов из {os.path.basename(file_path)}.")
                                     return rem
 
                                 if lock: 
@@ -3559,7 +3855,8 @@ try:
                                     try: save_json_safe(progress_state_file, saved_state)
                                     except: pass
                                     
-                                    log_func(f"[DomainCleaner] Пауза (активность стратегий)")
+                                    
+                                    if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Пауза (активность стратегий)")
                                     break
                             
                             line_s = line.strip()
@@ -3567,42 +3864,47 @@ try:
                             d_part = line_s.split('/')[0].split(':')[0].strip().lower()
                             if not d_part or '.' not in d_part: continue
 
+                            total_checked += 1
                             exists = dns_manager.validate_domain_exists(d_part, dns_manager.cleanup_limiter)
                             
                             if not exists:
                                 batch_dead.add(d_part)
-                                log_func(f"[DomainCleaner] {d_part} не существует")
+                                dead_domains_found.add(d_part)
+                                if IS_DEBUG_MODE: log_func(f"[DomainCleaner] {d_part} не существует")
                                 
                                 if len(batch_dead) >= 10:
                                     flush_batch_cleaner()
                             
                             if idx % 50 == 0:
                                 cur_idx = max(0, (idx+1) - deleted_in_session)
-                                save_json_safe(progress_path, {"idx": cur_idx})
+                                try: save_json_safe(progress_path, {"idx": cur_idx})
+                                except: pass
                         
                         flush_batch_cleaner()
                         
                         if not is_closing and (time.time() - last_strategy_check_time >= 600):
-                             if os.path.exists(progress_path): os.remove(progress_path)
-
-                    except Exception as e:
-                        pass
-
-                        # Clean progress
-                        if os.path.exists(progress_path): os.remove(progress_path)
+                             if os.path.exists(progress_path): 
+                                 try: os.remove(progress_path)
+                                 except: pass
 
                     except Exception as e:
                         # Silent error handling
                         pass
 
-                # Log summary only if domains were found
+                # Log summary
                 if dead_domains_found:
-                    log_func(f"[DomainCleaner] Проверка завершена: удалено {len(dead_domains_found)} доменов из {total_checked} проверенных")
+                    if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Проверка завершена: удалено {len(dead_domains_found)} доменов из {total_checked} проверенных")
+                else:
+                    if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Проверка завершена: проверено {total_checked} доменов, мёртвых не найдено")
                 
-                # Pause for 24 hours before next check
-                for _ in range(24 * 3600):
-                    if is_closing: break
-                    time.sleep(1)
+                # Pause for 24 hours ONLY after the last file check
+                if files_to_check and file_path == files_to_check[-1]:
+                    if IS_DEBUG_MODE: log_func("[DomainCleaner] Полный цикл завершен. Сон 24 часа.")
+                    for _ in range(86400):
+                        if is_closing: break
+                        time.sleep(1)
+                else:
+                    time.sleep(1) # Fast transition to next file
 
             except Exception as e:
                 # Silent error
@@ -3759,17 +4061,26 @@ try:
         was_active = False # State to detect service start/restart transitions
         log_func("[Trace] Advanced Strategy Checker STARTED")
 
+        # Capture Run ID to die if Service restarts
+        my_run_id = SERVICE_RUN_ID
+        
         while not is_closing:
+            # Zombie Killer
+            if SERVICE_RUN_ID != my_run_id:
+                if IS_DEBUG_MODE: log_func(f"[Check] Stopping zombie thread (RunID {my_run_id} != {SERVICE_RUN_ID})")
+                break
+                
             try:
                 # Re-enable trace with rate limit (1 log per 3 sec)
                 if not hasattr(advanced_strategy_checker_worker, "last_loop_log"):
                      advanced_strategy_checker_worker.last_loop_log = 0
                 
-                # import time
-                if time_sys.time() - advanced_strategy_checker_worker.last_loop_log > 3:
-                     # log_func(f"[Trace] Loop. VPN={is_vpn_active}, Svc={is_service_active}")
-                     advanced_strategy_checker_worker.last_loop_log = time_sys.time()
-
+                # HEARTBEAT: Log every 10 seconds to confirm liveness
+                current_loop_ts = time_sys.time()
+                if current_loop_ts - advanced_strategy_checker_worker.last_loop_log > 10:
+                     # Using print() as fallback if log_func is dead
+                     if IS_DEBUG_MODE: print(f"[Checker-Heartbeat] Loop Active. Service={is_service_active}")
+                     advanced_strategy_checker_worker.last_loop_log = current_loop_ts
 
                 if is_vpn_active:
                     # debug_file_log("VPN Active, sleep 5")
@@ -4377,6 +4688,15 @@ try:
                                 key = get_key_fn(opt) if get_key_fn else str(opt)
                                 w = get_success_weight(key)
                                 weights.append(max(0.1, w))  # Минимальный вес
+                            
+                            # LOG: Prove usage
+                            try:
+                                if IS_DEBUG_MODE:
+                                     # Log only occasionally to avoid spam, or always if specific flag?
+                                     # Let's log unique events or just simple confirmation
+                                     log_func(f"[Evo-Weight] Using stats for selection. Options: {len(options)}, MaxWeight: {max(weights):.2f}")
+                            except: pass
+
                             total = sum(weights)
                             if total > 0:
                                 r = random.random() * total
@@ -4629,13 +4949,28 @@ try:
                     "cloudflare_checked": False,
                     "whatsapp_checked": False,
                     "last_wave_count": 0,
-                    "evolution_stage": 0
+                    "evolution_stage": 0,
+                    "app_version": CURRENT_VERSION # FIX: Default to current version to prevent false reset on fresh start
                 }
 
                 state_lock = threading.Lock()
                 s_display = "" # Prevent UnboundLocalError
-                state.update(load_json_robust(state_path, {}))
+                skip_main_check = False # FIX: Prevent UnboundLocalError during resume logic checks
+                # FIX: Retry loading state to avoid race conditions or transient IO errors
+                for _ in range(5):
+                    loaded_s = load_json_robust(state_path, {})
+                    if loaded_s and loaded_s.get("app_version"):
+                        state.update(loaded_s)
+                        break
+                    time.sleep(0.1)
+                else:
+                    # Final attempt if loop failed
+                    state.update(load_json_robust(state_path, {}))
                 
+                # DEBUG: Print loaded state critical flags
+                if IS_DEBUG_MODE:
+                    log_func(f"[Check-Debug] Loaded State: Ver={state.get('app_version')} CurVer={CURRENT_VERSION} IP={state.get('last_checked_ip')} Comp={state.get('completed')} Evo={state.get('evolution_stage')}")
+
                 # last_standby_log_wrapper removed - using state instead
                 # FIX: Если версия изменилась или было обновление -> Сбрасываем флаг завершения
                 # чтобы гарантировать проверку стратегий на новой версии
@@ -4643,7 +4978,9 @@ try:
                     is_updated = ARGS_PARSED.get('updated', False)
                 except (NameError, AttributeError):
                     is_updated = '--updated' in sys.argv
+                
                 if state.get("app_version") != CURRENT_VERSION or is_updated:
+                    log_func(f"[Check] Версия изменилась или флаг updated (StateVer={state.get('app_version')}, CurVer={CURRENT_VERSION}, Upd={is_updated}). Сброс статуса проверки.")
                     state["completed"] = False
                     state["hard_checked"] = False
                     state["youtube_checked"] = False
@@ -4724,12 +5061,12 @@ try:
 
                 # FIX: Check if already completed for same IP - if so, skip full reset
                 # This prevents restart loops when IP hasn't changed but timeout triggered
-                loaded_completed = state.get("completed", False)
+                loaded_completed = state.get("completed", False) or state.get("checks_completed", False)
                 loaded_ip = state.get("last_checked_ip", None)  # May not exist in old states
                 same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
                 
 
-                if (needs_ip_recheck or is_timeout) and not same_ip_and_completed:
+                if (needs_ip_recheck or is_timeout):
                     need_check = True
                     # FIX: Correct message for default timestamp
                     if last_full_ts == 0:
@@ -4737,11 +5074,8 @@ try:
                     else:
                         reason = f"смена IP ({current_ip})" if needs_ip_recheck else f"плановая ревалидация ({int(days_passed)} дн.)"
                     
-                    log_func(f"Обнаружена {reason}. Запуск полной проверки стратегий")
+                    log_func(f"[Check] Обнаружена {reason}. Запуск полной проверки стратегий. (IP_Recheck={needs_ip_recheck}, Timeout={is_timeout}, LoadedIP={loaded_ip})")
                     
-                    # FIX: Removed preservation of blocked status to allow fresh re-check on IP change/Timeout
-                    # preserved_status was here
-
                     state = {
                         "wave": 1, "idx": 0, "current_wave_strategies": [],
                         "best_strategies": [], "bin_performance": {b: 0 for b in bin_files},
@@ -4754,44 +5088,19 @@ try:
                         "last_wave_count": 0,
                         "evolution_stage": 0,
                         "checks_completed": False,
-                        "last_checked_ip": current_ip,  # Save IP for next restart check
-                        "app_version": CURRENT_VERSION  # FIX: Preserve app_version to prevent version mismatch on restart
+                        "last_checked_ip": current_ip,
+                        "app_version": CURRENT_VERSION
                     }
-                    
-
-                    # Removed restoration loop
                     save_state()
                 
-                if not need_check:
-                    # DEBUG STATE
-                    if IS_DEBUG_MODE or True: # Force log for diagnosis
-                         s_cc = state.get("checks_completed", False)
-                         s_es = state.get("evolution_stage", 0)
-                         s_c = state.get("completed", False)
-                         # log_func(f"[State-Debug] checks_completed={s_cc}, evolution_stage={s_es}, completed={s_c}")
-                    
-                    # === НОВОЕ: Проверка необходимости продолжения эволюции ===
-                    # Если completed=False, но все основные проверки завершены -> нужно продолжить эволюцию
-                    all_checks_done = (
-                        state.get("hard_checked", False) and
-                        state.get("youtube_checked", False) and
-                        state.get("discord_checked", False) and
-                        state.get("cloudflare_checked", False) and
-                        state.get("whatsapp_checked", False)
-                    ) or state.get("evolution_stage", 0) > 0 or state.get("checks_completed", False)
-                    
+                elif not same_ip_and_completed:
+                    # FIX: RESUME LOGIC (IP same, but NOT completed)
+                    # We do NOT wipe state, just flag to continue
                     if not state.get("completed", False):
-                        if all_checks_done:
-                            # Основная проверка завершена, но эволюция не закончена
-                            if IS_DEBUG_MODE: log_func(f"[StrategyChecker-Debug] Продолжение эволюции (все проверки завершены, но completed=False)")
-                            if not state.get("checks_completed", False):
-                                state["checks_completed"] = True
-                                save_state()
-                            need_check = True
-                        else:
-                            # Основная проверка еще не завершена
-                            if IS_DEBUG_MODE: log_func(f"[StrategyChecker-Debug] Force check: completed=False")
-                            need_check = True
+                         # Just log the resume
+                         if not skip_main_check: # Don't log if we are already in Evo or finished checks
+                             log_func(f"[Check] Возобновление проверки (IP прежний: {current_ip}, Completed=False)")
+                         need_check = True
 
                 if not need_check:
                     # Robust spam protection: Log only once per hour
@@ -4807,7 +5116,11 @@ try:
                          diff = now_ts - last_log
                          log_func(f"[Check] Проверка не требуется (все стратегии актуальны). Ожидание смены IP или истечения срока давности (7 дней).")
                          
-                    time.sleep(5) 
+                    # Standby Mode: Responsive Sleep Loop
+                    # FIX: Check every 5 seconds instead of sleeping 24 hours
+                    for _ in range(12): # 1 minute wait
+                        if is_closing or not is_service_active: break
+                        time.sleep(5)
                     continue
 
                 # === STATE INITIALIZATION (Pre-Check) ===
@@ -5272,10 +5585,29 @@ try:
                     OUTAGE_WINDOW = 10   # Check last 10 results
                     OUTAGE_THRESHOLD = 0.8  # 80% failures = likely outage
 
-                    # Reset Baselines for this session strictly! 
-                    # We rely on "Current ..." strategies (checked first) to establish the baseline.
+                    # Reset Baselines for this session OR restore from state if resuming on same IP
                     # Previous session scores are irrelevant if network changed.
-                    service_baselines = {} 
+                    service_baselines = {}
+                    
+                    # FIX: Restore baselines from state if IP matches (resume after stop)
+                    try:
+                        saved_ip = state.get("last_checked_ip", "")
+                        if saved_ip == current_ip:
+                            # Restore saved scores as baselines
+                            service_baselines = {
+                                "general": state.get("general_score", 0),
+                                "youtube": state.get("youtube_score", 0),
+                                "discord": state.get("discord_score", 0),
+                                "whatsapp": state.get("whatsapp_score", 0),
+                                "telegram": state.get("telegram_score", 0),
+                            }
+                            # Filter out zeros
+                            service_baselines = {k: v for k, v in service_baselines.items() if v > 0}
+                            if service_baselines:
+                                log_func(f"[Check] Восстановлены результаты прошлой сессии: {service_baselines}")
+                    except Exception as e:
+                        if IS_DEBUG_MODE: log_func(f"[Check] Ошибка восстановления baselines: {e}")
+                    
                     active_scores_runtime = {}  # FIX: Cached scores for sorting phase 
                     perfect_services = set()
                    
@@ -5383,6 +5715,28 @@ try:
                                     
                                     # FIX: Сохраняем score для последующего использования в Evolution
                                     check_phase_scores[(svc, s_name)] = sc
+
+                                    # === [LEARNING] Update Stats for Check Phase ===
+                                    try:
+                                        bin_used = []
+                                        if "bin" in strat and strat["bin"]:
+                                            bin_used.append(strat["bin"])
+                                        
+                                        # FORCE LOG to prove we are here
+                                        if IS_DEBUG_MODE:
+                                            log_func(f"[DEBUG-Check] Saving stats for {strat['name']} (Score={sc})")
+
+                                        update_learning_stats(
+                                            strat["args"], 
+                                            sc, 
+                                            len(doms), 
+                                            service=svc, 
+                                            bin_files_used=bin_used,
+                                            logger=log_func
+                                        )
+                                    except Exception as e:
+                                        log_func(f"[Learning] Error updating stats: {e}")
+
                                     
                                     is_current = s_name.startswith("Current ") or s_name.startswith("Текущая ")
 
@@ -5544,7 +5898,8 @@ try:
 
                 # === FIX: Mark Checks Completed Immediately After Loop ===
                 # If we exited the loop normally (not aborted, service active), it means queue is empty (all checks done)
-                if not aborted_by_service and is_service_active:
+                # FIX: Must check 'not is_closing' to avoid marking as done if user just hit Stop
+                if not aborted_by_service and is_service_active and not is_closing:
                      if not state.get("checks_completed", False):
                          log_func("[Check] Основная проверка завершена. Фиксация состояния.")
                          state["checks_completed"] = True
@@ -6096,7 +6451,7 @@ try:
                                     special_count = int(max_special * percentage)
                                     if special_count < 1: special_count = 1
                                     
-                                    for svc in ["youtube", "discord"]:
+                                    for svc in ["youtube"]:
                                         # FIX: Inject Current Strategy first
                                         if svc in d and isinstance(d[svc], list):
                                              strategies_to_evolve.append(({
@@ -6181,8 +6536,7 @@ try:
                                 # Определяем целевые количества для текущего этапа
                                 targets = {
                                     "general": int(36 * percentage),  # FIX: Снижено с 60 до 36
-                                    "youtube": int(12 * percentage),
-                                    "discord": int(12 * percentage)
+                                    "youtube": int(12 * percentage)
                                 }
                                 
                                 # Подсчитываем текущее количество для каждого сервиса
@@ -6416,12 +6770,15 @@ try:
                                         final_msg = f"{prefix} {strat_t['name']} ({svc_t}) {bar} {sc}/{total_cnt} ✓"
                                         progress_manager.update_line(line_id, final_msg, is_final=True)
                                         
-                                        # Check if this beats the CURRENT BEST (not just any previous result)
                                         bl = service_baselines.get(svc_t, 0)
                                         if sc > bl:
                                              log_func(f"{prefix} >>> Улучшение для {svc_t}: {sc} (было {bl}) -> {strat_t['name']}")
                                              service_baselines[svc_t] = sc
                                              better_found = True
+                                             
+                                             # FIX: Persist score to state for resume after stop
+                                             state[f"{svc_t}_score"] = sc
+                                             save_state()
                                              
                                              # HOT SWAP: Only apply if this is REALLY better than current winws strategy
                                              # Load current strategy from strategies.json to compare
@@ -6480,6 +6837,7 @@ try:
                         state["completed"] = True
                         state["evolution_stage"] = 0
                         state["last_checked_ip"] = current_ip  # NEW: Save IP for restart detection
+                        state["app_version"] = CURRENT_VERSION # FIX: Ensure version persists
                         save_state()
                         
                         # Update check timestamp for DomainCleaner cooldown
@@ -6488,7 +6846,7 @@ try:
                         # === FINAL PRUNING: Enforce strict limits after Evolution ===
                         try:
                             log_func("[Check] Финальная очистка стратегий...")
-                            for svc_final in ["general", "youtube", "discord", "whatsapp", "telegram"]:
+                            for svc_final in ["general", "youtube", "whatsapp", "telegram"]:
                                 lim_final = 36 if svc_final == "general" else 12
                                 p_final = os.path.join(base_dir, "strat", f"{svc_final}.json")
                                 
@@ -7900,7 +8258,7 @@ try:
             scored.sort(key=lambda x: x[0], reverse=True)
             return scored[0][1]
 
-    strategy_learner = StrategyLearner()
+    # strategy_learner = StrategyLearner() # DISABLED: Legacy/Conflicting implementation
 
     def record_ip_change(new_ip, log_func=None):
         """Записывает смену IP адреса (кроме VPN) и возвращает True если переверификация нужна."""
@@ -8656,7 +9014,14 @@ try:
             log_func(f"[Update] CRITICAL: Ошибка импорта requests: {e}")
             return
 
+        # Capture Run ID to die if Service restarts
+        my_run_id = SERVICE_RUN_ID
+
         while not is_closing:
+            # Zombie Killer
+            if SERVICE_RUN_ID != my_run_id:
+                break
+            
             try:
                 # 1. Проверка версии
                 latest_version = None
@@ -8773,7 +9138,7 @@ try:
                     
                     # Остановка процессов
                     stop_nova_service(silent=True)
-                    time.sleep(3) # Даем время на закрытие файлов и процессов (увеличено до 3с)
+                    # time.sleep(3) # Removed artificial delay for seamless update
                     log_func("[Update] Службы остановлены. Замена файлов...")
                     
                     # Подмена файлов
@@ -8808,6 +9173,32 @@ try:
             for _ in range(86400):
                 if is_closing: return
                 time.sleep(1)
+    def start_services_threads(log_func=None):
+        """Helper to start all background threads (Global Context)"""
+        if log_func is None: log_func = print
+        
+        # Ensure path structure is ready
+        paths = ensure_structure()
+
+        threading.Thread(target=advanced_strategy_checker_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=payload_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=vpn_monitor_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=hard_strategy_matcher_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=boost_evolution_worker, args=(log_func,), daemon=True).start()
+        
+        threading.Thread(target=update_ip_cache_worker, args=(paths, log_func), daemon=True).start()
+        
+        for _ in range(2): 
+            threading.Thread(target=background_checker_worker, args=(log_func,), daemon=True).start()
+            
+        threading.Thread(target=periodic_exclude_checker_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=exclude_auto_monitor_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=boost_strategy_matcher_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=batch_exclude_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=check_and_update_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=domain_cleaner_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=cleanup_redundant_domains_worker, args=(log_func,), daemon=True).start()
+
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
         try:
@@ -9408,16 +9799,25 @@ try:
                 if not is_closing: print(f"\nCRASH: {e}\n")
 
         # Start the thread, but verify we are still active!
+        # Start the thread, but verify we are still active!
         if is_service_active and not is_closing:
              threading.Thread(target=run_process, daemon=True).start()
+             
+             # FIX: Restart background tasks using GLOBAL function
+             # We use a separate thread/delayed call to avoid blocking UI or race conditions
+             if not silent: # Only on manual start/restart
+                 log_print("[Service] Перезапуск фоновых процессов...")
+                 threading.Thread(target=start_services_threads, args=(log_print,), daemon=True).start()
 
     def stop_nova_service(silent=False, wait_for_cleanup=False, restart_mode=False):
         global is_service_active, process, is_closing, nova_service_status
         
         # === НЕМЕДЛЕННОЕ обновление состояния ===
+        # === НЕМЕДЛЕННОЕ обновление состояния ===
         if not restart_mode:
             is_service_active = False
-        # is_closing = True <-- FIX: Do not kill background workers on stop! Only on exit.
+            # FIX: Kill background workers on manual stop to prevent duplication on restart
+            is_closing = True
         
         if not silent: 
             print("Остановка...")
@@ -9600,10 +10000,9 @@ try:
                 if dns_manager:
                     dns_manager.save_cache()
                 save_visited_domains()
-                save_strategies_evolution()
                 save_ip_history()
                 save_exclude_auto_checked()
-                strategy_learner.save() # Сохраняем знания AI
+                # strategy_learner.save() # Сохраняем знания AI (DISABLED: Conflicts with main learning_data system)
             except Exception as e:
                 print(f"[AdaptiveSystem] Ошибка сохранения при выходе: {e}")
             
@@ -9774,28 +10173,9 @@ try:
 
         migrate_service_strategies_format(log_print)
         
-        log_print("Запуск фоновых процессов...")
-        # Отключаем старый генератор стратегий, чтобы избежать дублирования
-        # threading.Thread(target=strategy_builder_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=advanced_strategy_checker_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=payload_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=vpn_monitor_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=hard_strategy_matcher_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=boost_evolution_worker, args=(log_print,), daemon=True).start()
-        
-        paths = ensure_structure()
-        threading.Thread(target=update_ip_cache_worker, args=(paths, log_print), daemon=True).start()
-        
-        for _ in range(2): # Оптимизация: уменьшаем кол-во потоков чекера с 4 до 2 (снижение нагрузки на CPU/Сеть)
-            threading.Thread(target=background_checker_worker, args=(log_print,), daemon=True).start()
-            
-        threading.Thread(target=periodic_exclude_checker_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=exclude_auto_monitor_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=boost_strategy_matcher_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=batch_exclude_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=check_and_update_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=domain_cleaner_worker, args=(log_print,), daemon=True).start()
-        threading.Thread(target=cleanup_redundant_domains_worker, args=(log_print,), daemon=True).start()
+        # FIX: Thread starting is now handled exclusively by start_nova_service logic
+        # to prevent duplication on startup (since start_nova_service calls it too).
+        pass
 
     def create_round_rect_img(width, height, radius, color, alpha=255):
         """Генерирует изображение закругленного прямоугольника с поддержкой Alpha-канала"""
@@ -10085,6 +10465,8 @@ try:
                 if os.path.exists(t_dir):
                      for item in os.listdir(t_dir):
                          if item.lower() == "window_state.json": continue
+                         # FIX: Do not delete runtime folders if located in temp (Anti-Self-Destruct)
+                         if item.startswith("_MEI") or "nuitka" in item.lower(): continue
                          try:
                              p = os.path.join(t_dir, item)
                              if os.path.isfile(p): os.remove(p)
@@ -10214,18 +10596,11 @@ try:
         
         display_logs = [log for log in total_logs if any(k in log.lower() for k in important_keywords)]
 
-        if display_logs:
-             # Limit log size
-             if len(display_logs) > 20:
-                 display_logs_msg = display_logs[:20] + [f"... и еще {len(display_logs)-20} изменений"]
-             else:
-                 display_logs_msg = display_logs
-             
-             msg_txt = f"Версия {CURRENT_VERSION} установлена.\n\nОтчет об обновлении:\n" + "\n".join(display_logs_msg)
-             # FIX: Only show update report popup if running as compiled EXE (user request)
-             if is_compiled:
-                 try: ctypes.windll.user32.MessageBoxW(0, msg_txt, "Nova - Обновление", 0x40) # MB_ICONINFORMATION
-                 except: pass
+        # Update Report Popup removed by user request (Silent Mode)
+        if display_logs and IS_DEBUG_MODE:
+             # Only print to stdout in debug mode
+             print(f"[Init] Update Report ({len(display_logs)} items):")
+             for l in display_logs: print(f" - {l}")
 
         import struct # Импорт struct для работы с IP
         
