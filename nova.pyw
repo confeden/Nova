@@ -138,7 +138,7 @@ try:
     WINWS_FILENAME = "winws.exe"
     # === AUTO-UPDATE CONFIG ===
     UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
-    CURRENT_VERSION = "1.4"
+    CURRENT_VERSION = "1.5"
     
     # Debug Flag: Check args OR existence of "debug" file
     # Centralized argument parsing for consistency
@@ -461,13 +461,8 @@ try:
                 logs.append(f"[Init] Strat JSON check error: {e}")
 
             
-            # Write if needed
-            if should_rewrite:
-                try:
-                    with open(gen_path, "w", encoding="utf-8") as f:
-                        f.writelines(new_content_lines)
-                except Exception as e:
-                    print(f"[Init] Ошибка записи general.txt: {e}")
+            # Write if needed - REMOVED (Broken Legacy Code)
+            # if should_rewrite: ...
             
             # Cleanup old version file
             try:
@@ -1222,7 +1217,7 @@ try:
                 { "name": "discord_4", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=652", "--dpi-desync-split-pos=2", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
                 { "name": "discord_5", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--dpi-desync-hostfakesplit-mod=host=www.google.com,altorder=1", "--dpi-desync-fooling=ts", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
                 { "name": "discord_6", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-repeats=6", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=1000", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_8", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=681", "--dpi-desync-split-pos=1", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync=fake-repeats=6" ] },
+                { "name": "discord_8", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=681", "--dpi-desync-split-pos=1", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-fake-repeats=6" ] },
                 { "name": "discord_9", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=2,sniext+1", "--dpi-desync-split-seqovl=679", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
                 { "name": "discord_10", "args": [ "--filter-tcp=2053,2083,2087,2096,8443", "--dpi-desync=fake", "--dpi-desync-fake-tls-mod=none", "--dpi-desync-repeats=6", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=2", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
                 { "name": "discord_11", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=hostfakesplit", "--dpi-desync-repeats=4", "--dpi-desync-fooling=ts", "--dpi-desync-hostfakesplit-mod=host=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
@@ -1288,20 +1283,8 @@ try:
                 except Exception as e:
                     print(f"Error updating {filename}: {e}")
 
-        # Validator for Discord: Must have sequential naming 'discord_1'
-        def discord_validator(data):
-            try:
-                # Check for at least one strategy named 'discord_1'
-                strats = data.get("strategies", [])
-                for s in strats:
-                    if s.get("name") == "discord_1":
-                        return True
-                return False
-            except: return False
-
         check_and_update_config(STRATEGIES_FILENAME, DEFAULT_STRATEGIES)
-        check_and_update_config("discord.json", DEFAULT_DISCORD, validation_callback=discord_validator)
-
+        check_and_update_config("discord.json", DEFAULT_DISCORD)
 
         # === НОВОЕ: Создаем необходимые temp файлы с версионированием ===
         temp_files = {
@@ -1779,7 +1762,7 @@ try:
                         cached_ip = self.dns_cache[domain].get("ip")
                         return cached_ip, "cached_ok" if cached_ip else "cached_no_dns"
 
-            limiter.acquire()
+            if limiter: limiter.acquire()
             
             ip_address = None
             
@@ -3653,11 +3636,20 @@ try:
                     os.utime(IP_CACHE_FILE, None) # Обновляем дату изменения файла
         except: pass
 
-    def update_ip_cache_worker(paths, log_func):
-        while True:
-            if is_closing: break
+    def ip_exclude_updater(log_func):
+        """Фоновый процесс обновления IP-адресов для списка исключений."""
+        global last_full_update, is_closing
+        
+        # USER_REQUEST: Отключить резолвинг IP для списка исключений (Steam slowdown fix)
+        ENABLE_IP_EXCLUDE_RESOLVING = False
+        
+        while not is_closing:
             try:
-                need_update = False
+                if not ENABLE_IP_EXCLUDE_RESOLVING:
+                    # log_func("[IP Exclude] Резолвинг отключен.") # Optional spam prevention
+                    time.sleep(3600)
+                    continue
+
                 state_file = os.path.join(get_base_dir(), "temp", "ip_cache_state.json")
                 last_full_update = 0
                 
@@ -4170,6 +4162,65 @@ try:
                 
                 # === НОВОЕ: Фильтрация живых доменов для стабилизации оценки ===
 
+                # === НОВОЕ: IPCacheManager для оптимизации WinDivert фильтров ===
+                class IPCacheManager:
+                    def __init__(self, cache_file="test_ip_cache.json", ttl_hours=8):
+                        self.cache_path = os.path.join(get_base_dir(), "temp", cache_file)
+                        self.ttl_seconds = ttl_hours * 3600
+                        self.cache = {}
+                        self.lock = threading.Lock()
+                        self.load()
+
+                    def load(self):
+                        try:
+                            if os.path.exists(self.cache_path):
+                                self.cache = load_json_robust(self.cache_path, {})
+                        except: pass
+
+                    def save(self):
+                        try:
+                            save_json_safe(self.cache_path, self.cache)
+                        except: pass
+
+                    def ensure_ips(self, domains):
+                        """
+                        Возвращает словарь {domain: ip} для списка доменов.
+                        Если IP нет в кэше или он устарел - резолвит.
+                        """
+                        result = {}
+                        updates = False
+                        now = time.time()
+                        
+                        # Pre-fill from cache
+                        to_resolve = []
+                        with self.lock:
+                            for d in domains:
+                                entry = self.cache.get(d)
+                                if entry and (now - entry.get("ts", 0) < self.ttl_seconds) and entry.get("ip"):
+                                    result[d] = entry["ip"]
+                                else:
+                                    to_resolve.append(d)
+                        
+                        # Resolve missing
+                        if to_resolve:
+                            # log_func(f"[IPCache] Резолвинг {len(to_resolve)} доменов для фильтра...")
+                            for d in to_resolve:
+                                # Используем dns_manager быстрый resolve
+                                # Важно: resolve возвращает (ip, status)
+                                ip, _ = dns_manager.resolve(d, None, check_cache=True) 
+                                if ip:
+                                    result[d] = ip
+                                    with self.lock:
+                                        self.cache[d] = {"ip": ip, "ts": int(now)}
+                                    updates = True
+                        
+                        if updates:
+                            self.save()
+                            
+                        return result
+
+                ip_cache_manager = IPCacheManager()
+
                 # === НОВОЕ: Фильтрация живых доменов для стабилизации оценки ===
                 def filter_alive_domains(domain_list, max_count=100):
                     # 24h Check Cooldown
@@ -4344,7 +4395,6 @@ try:
                         # Изоляция трафика: ограничиваем захват только портами этого теста
                         # Это предотвращает перехват пакетов основного Warp/VPN соединения
                         p_end = port_start + port_count + 2
-                        isolation_filter = f"outbound and !loopback and ((tcp and tcp.SrcPort >= {port_start} and tcp.SrcPort <= {p_end}) or (udp and udp.SrcPort >= {port_start} and udp.SrcPort <= {p_end}))"
                         
                         # Очищаем стратегию от параметров драйвера и адаптируем фильтры
                         test_args = clean_args_for_check(strat_args)
@@ -4359,7 +4409,35 @@ try:
                                 if os.path.exists(os.path.join(bin_dir, fname)):
                                     test_args[i] = f"{k}={os.path.join(get_base_dir(), 'fake', fname)}"
                         
-                        # Определяем протоколы для захвата, чтобы не ловить лишнее (причина сбоев)
+                        # === FIX: Strict IP Filtering to prevent Twitch Lag ===
+                        # 1. Get IPs for target domains
+                        target_ips_map = ip_cache_manager.ensure_ips(target_domains)
+                        unique_ips = sorted(list(set(target_ips_map.values())))
+                        
+                        ip_filter_part = ""
+                        if unique_ips:
+                            # Construct IP filter: (ip.DstAddr == X or ip.DstAddr == Y)
+                            # WinDivert optimization: check IP first!
+                            ip_parts = [f"ip.DstAddr == {ip}" for ip in unique_ips]
+                            combined_ips = " or ".join(ip_parts)
+                            
+                            # Safety check for command line length (max ~32k total, reserve 2k for other args)
+                            if len(combined_ips) < 28000:
+                                ip_filter_part = f" and ({combined_ips})"
+                            else:
+                                # Fallback: filter only first N IPs that fit
+                                safe_ips = []
+                                current_len = 0
+                                for p in ip_parts:
+                                    if current_len + len(p) + 4 < 28000:
+                                        safe_ips.append(p)
+                                        current_len += len(p) + 4
+                                    else:
+                                        break
+                                if safe_ips:
+                                    ip_filter_part = f" and ({' or '.join(safe_ips)})"
+                        
+                        # Определяем протоколы для захвата
                         has_tcp = any("filter-tcp" in a for a in test_args)
                         has_udp = any("filter-udp" in a for a in test_args)
                         if not has_tcp and not has_udp: has_tcp = has_udp = True
@@ -4368,7 +4446,8 @@ try:
                         if has_tcp: proto_parts.append(f"(tcp and tcp.SrcPort >= {port_start} and tcp.SrcPort <= {p_end})")
                         if has_udp: proto_parts.append(f"(udp and udp.SrcPort >= {port_start} and udp.SrcPort <= {p_end})")
                         
-                        isolation_filter = f"outbound and !loopback and ({' or '.join(proto_parts)})"
+                        # FINAL STRICT FILTER (Outbound + IP + Ports)
+                        isolation_filter = f"outbound and !loopback{ip_filter_part} and ({' or '.join(proto_parts)})"
                         
                         exe_name = WINWS_FILENAME
                         test_exe_name = "winws_test.exe"
@@ -4621,6 +4700,29 @@ try:
                             return False
                         return True
                     
+                    def should_auto_scroll():
+                        try:
+                            # Получаем глобальные координаты мыши
+                            ptr_x, ptr_y = log_text_widget.winfo_pointerxy()
+                            # Получаем координаты виджета
+                            wid_x = log_text_widget.winfo_rootx()
+                            wid_y = log_text_widget.winfo_rooty()
+                            wid_w = log_text_widget.winfo_width()
+                            wid_h = log_text_widget.winfo_height()
+                            
+                            # Если мышь внутри виджета - НЕ скроллим
+                            if (wid_x <= ptr_x <= wid_x + wid_w) and (wid_y <= ptr_y <= wid_y + wid_h):
+                                return False
+                                
+                            # Проверяем позицию скролла (если пользователь открутил вверх)
+                            # yview()[1] возвращает позицию нижней границы видимой области (0.0 - 1.0)
+                            if log_text_widget.yview()[1] < 0.99:
+                                return False
+                                
+                            return True
+                        except:
+                            return True
+
                     def get_hash(arg_list):
                         return hashlib.md5(str(arg_list).encode()).hexdigest()
                     
@@ -5012,7 +5114,8 @@ try:
                     try:
                         with open(state_path, "w", encoding="utf-8") as f:
                             json.dump(state, f, indent=2)
-                    except: pass
+                    except Exception as e:
+                        if IS_DEBUG_MODE: log_func(f"[Check-Error] Failed to save state: {e}")
 
                 # --- Логика проверки IP и необходимости запуска ---
                 # Повторная проверка VPN непосредственно перед получением IP, чтобы избежать гонки состояний при запуске.
@@ -5030,11 +5133,6 @@ try:
                     time.sleep(60)
                     continue
 
-                # DEBUG: Print loaded state critical flags
-                if True:
-                    pass
-
-
                 # Еще одна проверка после получения IP, чтобы гарантировать, что это не IP от VPN
                 if is_vpn_active_func():
                     time.sleep(5)
@@ -5048,7 +5146,6 @@ try:
 
                 need_check = False
                 # === НОВОЕ: Записываем IP и проверяем нужна ли переверификация ===
-                # === НОВОЕ: Записываем IP и проверяем нужна ли переверификация (IP, Версия, Время) ===
                 needs_ip_recheck = record_ip_change(current_ip, log_func)
                 
                 # Check 7-day timeout
@@ -5062,21 +5159,27 @@ try:
                 # FIX: Check if already completed for same IP - if so, skip full reset
                 # This prevents restart loops when IP hasn't changed but timeout triggered
                 loaded_completed = state.get("completed", False) or state.get("checks_completed", False)
-                loaded_ip = state.get("last_checked_ip", None)  # May not exist in old states
+                loaded_ip = state.get("last_checked_ip", None)
                 same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
                 
+                # FIX: Smart Resume Logic
+                # Только если таймаут ИЛИ (IP требует перепроверки И он отличается от сохраненного)
+                # Это предотвращает сброс Evo стадий при ложных срабатываниях смены IP
+                should_full_reset = is_timeout or (needs_ip_recheck and loaded_ip != current_ip)
 
-                if (needs_ip_recheck or is_timeout):
+                if should_full_reset:
                     need_check = True
                     # FIX: Correct message for default timestamp
                     if last_full_ts == 0:
-                        reason = f"смена IP ({current_ip})" if needs_ip_recheck else "первая проверка стратегий"
+                        reason = f"смена IP ({current_ip})" if (needs_ip_recheck and loaded_ip != current_ip) else "первая проверка стратегий"
                     else:
-                        reason = f"смена IP ({current_ip})" if needs_ip_recheck else f"плановая ревалидация ({int(days_passed)} дн.)"
+                        reason = f"смена IP ({current_ip})" if (needs_ip_recheck and loaded_ip != current_ip) else f"плановая ревалидация ({int(days_passed)} дн.)"
                     
-                    log_func(f"[Check] Обнаружена {reason}. Запуск полной проверки стратегий. (IP_Recheck={needs_ip_recheck}, Timeout={is_timeout}, LoadedIP={loaded_ip})")
+                    log_func(f"[Check] Обнаружена {reason}. Запуск полной проверки стратегий. (IP_Recheck={needs_ip_recheck}, Timeout={is_timeout})")
                     
-                    state = {
+                    # FIX: Use clear+update to preserve dictionary reference for closures/nonlocals
+                    state.clear()
+                    state.update({
                         "wave": 1, "idx": 0, "current_wave_strategies": [],
                         "best_strategies": [], "bin_performance": {b: 0 for b in bin_files},
                         "general_score": -1, "completed": False,
@@ -5090,7 +5193,7 @@ try:
                         "checks_completed": False,
                         "last_checked_ip": current_ip,
                         "app_version": CURRENT_VERSION
-                    }
+                    })
                     save_state()
                 
                 elif not same_ip_and_completed:
@@ -5098,11 +5201,16 @@ try:
                     # We do NOT wipe state, just flag to continue
                     if not state.get("completed", False):
                          # Just log the resume
-                         if not skip_main_check: # Don't log if we are already in Evo or finished checks
+                         if not skip_main_check: 
                              log_func(f"[Check] Возобновление проверки (IP прежний: {current_ip}, Completed=False)")
+                             # FIX: Explicitly ensure we are NOT in completed state if we are resuming check
+                             state["checks_completed"] = False 
+                             save_state()
+
                          need_check = True
 
-                if not need_check:
+                # FIX: In Evo mode, we want to proceed even if IP didn't change (to run evolution on existing base)
+                if not need_check and not IS_EVO_MODE:
                     # Robust spam protection: Log only once per hour
                     # Use GLOBAL dict to bypass any local scope reset issues
                     tid = threading.get_ident()
@@ -5149,6 +5257,21 @@ try:
                 is_scanning = True # FIX: Ensure flag set here
                 last_strategy_check_time = time.time()  # Update check timestamp
                 check_phase_scores = {}  # FIX: Словарь для накопления scores {(service, name): score}
+                
+                # FIX: Restore scores from previous run to prevent "Score 0" replacement issue
+                try:
+                    s_path = os.path.join(get_base_dir(), "temp", "strategy_scores.json")
+                    if os.path.exists(s_path):
+                        saved_scores = load_json_robust(s_path, {})
+                        if saved_scores:
+                            for svc, items in saved_scores.items():
+                                if not isinstance(items, dict): continue
+                                for name, details in items.items():
+                                    if isinstance(details, dict) and "score" in details:
+                                         check_phase_scores[(svc, name)] = details["score"]
+                            log_func(f"[Init] Восстановлено {len(check_phase_scores)} результатов стратегий для сравнения.")
+                except Exception as e:
+                    if IS_DEBUG_MODE: log_func(f"[Init-Err] Failed to load scores: {e}")
 
                 def prepare_service_tasks(service_key, json_path, test_domains, state_key):
                     # FIX: Strict Block Check - if service is blocked runtime, do not generate tasks
@@ -5607,12 +5730,48 @@ try:
                                 log_func(f"[Check] Восстановлены результаты прошлой сессии: {service_baselines}")
                     except Exception as e:
                         if IS_DEBUG_MODE: log_func(f"[Check] Ошибка восстановления baselines: {e}")
+
+                    # FIX: Restore check_phase_scores from disk if resuming (to populate Evolution/Sorting later)
+                    if saved_ip == current_ip:
+                         try:
+                             scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                             if os.path.exists(scores_path):
+                                 saved_scores_data = load_json_robust(scores_path, {})
+                                 count_restored = 0
+                                 for svc_key, svc_data in saved_scores_data.items():
+                                     for s_name, s_info in svc_data.items():
+                                         if isinstance(s_info, dict) and "score" in s_info:
+                                              check_phase_scores[(svc_key, s_name)] = s_info["score"]
+                                              count_restored += 1
+                                 if count_restored > 0:
+                                      log_func(f"[Init] Восстановлено {count_restored} индивидуальных результатов тестов.")
+                         except Exception as ex:
+                               if IS_DEBUG_MODE: log_func(f"[Init] Ошибка восстановления scores: {ex}")
                     
                     active_scores_runtime = {}  # FIX: Cached scores for sorting phase 
+                    
+                    # FIX: Populate runtime scores from restored check_phase_scores (critical for Evo mode skip)
+                    if check_phase_scores:
+                        for (c_svc, c_name), c_score in check_phase_scores.items():
+                            if c_svc not in active_scores_runtime: active_scores_runtime[c_svc] = {}
+                            active_scores_runtime[c_svc][c_name] = c_score
+                            
+                            # Also ensure baseline is correct (state might be outdated)
+                            if c_score > service_baselines.get(c_svc, 0):
+                                service_baselines[c_svc] = c_score
+
+                    # DEBUG LOG: Verify Baselines
+                    if IS_DEBUG_MODE or IS_EVO_MODE:
+                        log_func(f"[Evo-Debug] Baselines after restore: {service_baselines}")
+                        if "youtube" in service_baselines:
+                            log_func(f"[Evo-Debug] Youtube Baseline: {service_baselines['youtube']}")
+                        else:
+                            log_func(f"[Evo-Debug] Youtube NOT in baselines! check_phase_scores sample: {list(check_phase_scores.keys())[:5] if check_phase_scores else 'Empty'}")
+
                     perfect_services = set()
                    
                     log_func(f"[Check] Проверка текущих стратегий ({len(task_queue)} шт.)")
-
+                    
                     # Manual Executor for all phases to enable non-blocking shutdown
                     executor = concurrent.futures.ThreadPoolExecutor(max_workers=STRATEGY_THREADS)
                     aborted_by_service = False
@@ -5859,6 +6018,25 @@ try:
                                             "completed": list(completed_tasks), 
                                             "timestamp": time.time(), "ip": current_ip 
                                          })
+                                         
+                                         # FIX: Also save scores incrementally to avoid total loss if interrupted
+                                         try:
+                                             scores_temp_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                                             partial_scores = {}
+                                             # Reconstruct full structure from flat dict
+                                             for (svc_k, name_k), val_s in check_phase_scores.items():
+                                                 if svc_k not in partial_scores: partial_scores[svc_k] = {}
+                                                 partial_scores[svc_k][name_k] = {"score": val_s, "timestamp": int(time.time())}
+                                             
+                                             # Merge with existing file to handle restarts
+                                             # (If run 1 saved A, B, and run 2 saves C, we want A, B, C)
+                                             existing_partials = load_json_robust(scores_temp_path, {})
+                                             for k_svc, v_dict in partial_scores.items():
+                                                 if k_svc not in existing_partials: existing_partials[k_svc] = {}
+                                                 existing_partials[k_svc].update(v_dict)
+                                                 
+                                             save_json_safe(scores_temp_path, existing_partials)
+                                         except: pass
 
                                 except Exception as e:
                                     log_func(f"[Check] Error processing result: {e}")
@@ -6199,13 +6377,23 @@ try:
                 if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Фаза завершена. Сохранение состояния...")
                 # === НОВОЕ: Пропускаем сохранение флагов если они уже были установлены (продолжение после перезапуска) ===
                 if not skip_main_check:
-                    state["cloudflare_checked"] = True
-                    state["youtube_checked"] = True
-                    state["discord_checked"] = True
-                    state["whatsapp_checked"] = True
-                    state["hard_checked"] = True
-                    save_state()
-                    if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Состояние сохранено.")
+                    # FIX: Only mark services as checked if they were actually fully processed/skipped due to completion
+                    # If we aborted or didn't finish, do not mark as checked!
+                    
+                    if not aborted_by_service and not is_closing:
+                        # Logic: If task_queue is empty, we finished everything we intended to check.
+                        # EXCEPT if we were interrupted before this block?
+                        # This block is reached if loop finished.
+                        
+                        # We can assume if we are here and not aborted, we finished the queue.
+                        state["cloudflare_checked"] = True
+                        state["youtube_checked"] = True
+                        state["discord_checked"] = True
+                        state["whatsapp_checked"] = True
+                        state["hard_checked"] = True
+                        state["checks_completed"] = True # Sync with flag
+                        save_state()
+                        if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Состояние сохранено (Все проверки завершены).")
                 else:
                     if IS_DEBUG_MODE: log_func("[StrategyChecker-Debug] Пропуск сохранения флагов (уже установлены).")
                 
@@ -6218,7 +6406,19 @@ try:
 
                 # --- PHASE 3: EVOLUTION (3 STAGES) ---
 
-                
+                # FIX: Fallback - ensure we have baselines even if Check Phase was skipped
+                if not active_scores_runtime and check_phase_scores:
+                    log_func(f"[Evo-PreCheck] Restoring {len(check_phase_scores)} scores for Evolution baseline...")
+                    for (c_svc, c_name), c_score in check_phase_scores.items():
+                        if c_svc not in active_scores_runtime: active_scores_runtime[c_svc] = {}
+                        active_scores_runtime[c_svc][c_name] = c_score
+                        
+                        # Populate baseline
+                        if c_score > service_baselines.get(c_svc, 0):
+                            service_baselines[c_svc] = c_score
+                    
+                    if IS_DEBUG_MODE: log_func(f"[Evo-Debug] Forced Baselines: {service_baselines}")
+
                 # FIX: Explicit Pruning BEFORE Evolution
                 
                 # FIX: Explicit Pruning BEFORE Evolution
@@ -6873,6 +7073,8 @@ try:
                                         log_func(f"[Pruner-Final] {svc_final}: {len(kept_final)} (было {len(list_final)})")
                         except Exception as prune_err:
                             log_func(f"[Pruner-Final] Ошибка: {prune_err}")
+                        
+                        log_func("[Check] Очистка завершена.")
                         
                         # CRITICAL FIX: Stop the outer "while is_scanning" loop
                         # This 'break' leaves the ThreadPoolExecutor context
@@ -9016,6 +9218,8 @@ try:
 
         # Capture Run ID to die if Service restarts
         my_run_id = SERVICE_RUN_ID
+        
+        first_run = True
 
         while not is_closing:
             # Zombie Killer
@@ -9044,23 +9248,26 @@ try:
                             expected_hash = expected_hash.split(":", 1)[1]
                     else:
                         # Сервер ответил ошибкой (404 и т.д.)
-                        log_func("[Update] Новая версия программы готовится (Status != 200)")
+                        if first_run: log_func("[Update] Новая версия программы готовится (Status != 200)")
                         
                 except Exception as e:
                     # Ошибка сети/парсинга -> считаем что обновления нет/готовится
                     # FIX: Show error for debug
-                    log_func(f"[Update] Ошибка получения данных: {e}") 
-                    log_func("[Update] Новая версия программы готовится")
-                    # Пауза 24 часа
-                    for _ in range(86400):
+                    if first_run:
+                        log_func(f"[Update] Ошибка получения данных: {e}") 
+                        log_func("[Update] Новая версия программы готовится")
+                    # Пауза 8 часов
+                    first_run = False
+                    for _ in range(28800):
                         if is_closing: return
                         time.sleep(1)
                     continue
 
                 if not latest_version or not download_url:
                      # JSON некорректен или нет URL
-                    log_func("[Update] Новая версия программы готовится")
-                    for _ in range(86400):
+                    if first_run: log_func("[Update] Новая версия программы готовится")
+                    first_run = False
+                    for _ in range(28800):
                         if is_closing: return
                         time.sleep(1)
                     continue
@@ -9070,7 +9277,8 @@ try:
                     # FIX: Check frozen status BEFORE downloading
                     if not is_frozen:
                          log_func(f"[Update] Найдено обновление: {latest_version}. (Скачивание пропущено: запуск из исходника)")
-                         for _ in range(86400):
+                         first_run = False
+                         for _ in range(28800):
                             if is_closing: return
                             time.sleep(1)
                          continue
@@ -9108,8 +9316,9 @@ try:
 
                     except Exception as e:
                         log_func(f"[Update] FAIL: Не удалось скачать файл обновления: {e}")
-                        # Пауза 24 часа
-                        for _ in range(86400):
+                        # Пауза 8 часов
+                        first_run = False
+                        for _ in range(28800):
                             if is_closing: return
                             time.sleep(1)
                         continue
@@ -9164,13 +9373,14 @@ try:
                         
                         log_func("Обновление программы невозможно автоматически. Перезапустите Nova для установки обновления вручную")
                 else:
-                    log_func("Версия программы актуальна")
+                    if first_run: log_func("Версия программы актуальна")
 
             except Exception as e:
                 log_func(f"[Update] Ошибка: {e}")
             
-            # Пауза 24 часа перед следующей проверкой
-            for _ in range(86400):
+            # Пауза 8 часов перед следующей проверкой
+            first_run = False
+            for _ in range(28800):
                 if is_closing: return
                 time.sleep(1)
     def start_services_threads(log_func=None):
