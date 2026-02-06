@@ -15,6 +15,10 @@ import shutil
 import subprocess
 import collections
 
+# === VERSION & CONFIG ===
+CURRENT_VERSION = "1.7"
+WINWS_FILENAME = "winws.exe"
+UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
 # === FIX: Force Hide Console (Safeguard) ===
 # Проверяем, запущено ли как скомпилированный EXE
@@ -81,14 +85,28 @@ def is_admin():
     except: return False
 
 if not is_admin():
+    # FIX: Check for infinite loop (relaunch flag)
+    if "--admin-relaunch" in sys.argv:
+        ctypes.windll.user32.MessageBoxW(0, "Не удалось получить права администратора автоматически.\n\nПожалуйста, нажмите правой кнопкой мыши на файл и выберите 'Запуск от имени администратора'.", "Nova - Ошибка прав", 0x10)
+        sys.exit(1)
+
     try:
         # Re-run the script with Admin rights
-        # For pythonw/python:
+        # Prepare args: Quote them to handle spaces, and add restart flag
+        new_args = [arg for arg in sys.argv[1:] if arg != "--admin-relaunch"]
+        new_args.append("--admin-relaunch")
+        
+        # Proper quoting for arguments
+        args_str = " ".join([f'"{a}"' for a in new_args])
+        
         result = 0
         if getattr(sys, 'frozen', False):
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1)
+            # Running as compiled EXE
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args_str, None, 1)
         else:
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{sys.argv[0]}" ' + " ".join(sys.argv[1:]), None, 1)
+            # Running as script
+            # sys.executable is python.exe, sys.argv[0] is script path
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{sys.argv[0]}" {args_str}', None, 1)
             
         # ShellExecuteW returns > 32 on success. If <= 32, it failed.
         if result <= 32:
@@ -97,14 +115,14 @@ if not is_admin():
             if result == 5: msg += " (Доступ запрещён)"
             elif result == 1223: msg += " (Отменено пользователем)"
             
-            ctypes.windll.user32.MessageBoxW(0, msg + "\nПожалуйста, запустите программу от имени Администратора.", "Ошибка запуска Nova", 0x10)
+            ctypes.windll.user32.MessageBoxW(0, msg + "\n\nПожалуйста, запустите программу от имени Администратора вручную.", "Ошибка запуска Nova", 0x10)
             sys.exit(1)
         
         # If success, the new process is starting. We can exit.
         sys.exit(0)
             
     except Exception as e:
-        ctypes.windll.user32.MessageBoxW(0, f"Не удалось получить права администратора: {e}\nПожалуйста, запустите программу от имени Администратора.", "Ошибка запуска Nova", 0x10)
+        ctypes.windll.user32.MessageBoxW(0, f"Не удалось инициировать запрос прав администратора: {e}\n\nПожалуйста, запустите программу от имени Администратора вручную.", "Ошибка запуска Nova", 0x10)
         sys.exit(1)
 
 # Обертка для отлова ошибок при запуске
@@ -134,12 +152,6 @@ try:
     # Global defer
     dns_manager = None
 
-    # Конфигурация (перенесено наверх для deploy_infrastructure)
-    WINWS_FILENAME = "winws.exe"
-    # === AUTO-UPDATE CONFIG ===
-    UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
-    CURRENT_VERSION = "1.5"
-    
     # Debug Flag: Check args OR existence of "debug" file
     # Centralized argument parsing for consistency
     def _check_debug_mode():
@@ -650,7 +662,7 @@ try:
                     
                     if ver != CURRENT_VERSION:
                         # === FORCE REPLACE: Критические файлы полностью заменяем при обновлении ===
-                        force_replace_files = ["strategies.json", "discord.json"]
+                        force_replace_files = ["discord.json"]
                         
                         if fname in force_replace_files:
                             try:
@@ -6128,7 +6140,8 @@ try:
 
                         # Save SORTED lists back to files
                         # Save SORTED lists back to files
-                        target_limit = 36 if svc == "general" else 12  # FIX: Reduced from 60
+                        if svc == "discord": target_limit = 99
+                        else: target_limit = 36 if svc == "general" else 12  # FIX: Reduced from 60
                         start_path = os.path.join(base_dir, "strat", f"{svc}.json")
                         
                         try:
@@ -6431,7 +6444,8 @@ try:
                          services_to_prune = ["general", "youtube", "discord", "whatsapp", "telegram"]
                          
                          for svc_p in services_to_prune:
-                             lim = 36 if svc_p == "general" else 12  # FIX: Reduced from 60
+                             if svc_p == "discord": lim = 99
+                             else: lim = 36 if svc_p == "general" else 12  # FIX: Reduced from 60
                              p_path = os.path.join(base_dir, "strat", f"{svc_p}.json")
                              
                              if os.path.exists(p_path):
@@ -9235,6 +9249,12 @@ try:
                 try:
                     session = requests.Session()
                     session.trust_env = False
+                    # FIX: Add browser-like headers to prevent throttling and improve stability
+                    session.headers.update({
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': '*/*',
+                        'Accept-Encoding': 'identity',  # Prevent unintended compression for already compressed binaries
+                    })
                     r = session.get(UPDATE_URL, timeout=10)
                     
                     if r.status_code == 200:
@@ -9303,7 +9323,8 @@ try:
                             last_log_time = 0
                             
                             with open(new_exe, 'wb') as f:
-                                for chunk in r.iter_content(chunk_size=8192):
+                                # FIX: Increased chunk_size from 8KB to 128KB for significantly better download performance
+                                for chunk in r.iter_content(chunk_size=131072):
                                     f.write(chunk)
                                     downloaded += len(chunk)
                                     
