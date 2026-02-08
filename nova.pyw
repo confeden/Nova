@@ -1814,6 +1814,8 @@ try:
                 bool: True если домен существует, False если получен NXDOMAIN
             """
             import socket
+            import struct
+            import random as rand
             
             domain = domain.lower().strip()
             if not domain:
@@ -1838,13 +1840,30 @@ try:
                         try:
                             # Create socket with specific source port
                             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                            sock.bind(('0.0.0.0', DNS_CHECK_PORT))
+
+                            # Try to bind to dedicated port, or pick a random one in the safe range (16451-16499)
+                            # to support parallel validation while bypassing winws
+                            bound = False
+                            try:
+                                sock.bind(('0.0.0.0', DNS_CHECK_PORT))
+                                bound = True
+                            except:
+                                for _ in range(10): # Try 10 random ports in the safe range
+                                    try:
+                                        alt_port = rand.randint(16451, 16499)
+                                        sock.bind(('0.0.0.0', alt_port))
+                                        bound = True
+                                        break
+                                    except: continue
+
+                            if not bound:
+                                # Fallback: let OS pick a port if safe range is exhausted
+                                try: sock.bind(('0.0.0.0', 0))
+                                except: pass
+
                             sock.settimeout(5.0)  # 5 second timeout
                             
                             # Manual DNS query (simplified A record query)
-                            import struct
-                            import random as rand
-                            
                             # Build DNS query packet
                             transaction_id = rand.randint(0, 65535)
                             flags = 0x0100  # Standard query
@@ -3845,42 +3864,62 @@ try:
                             except Exception as ex:
                                 log_func(f"[DomainCleaner] Ошибка сохранения: {ex}")
 
-                        for idx, line in enumerate(lines[start_idx:], start=start_idx):
-                            if is_closing: break
-                            
-                            if idx % 10 == 0:
+                        # Use ThreadPoolExecutor for parallel domain validation (Efficiency optimization)
+                        chunk_size = 30
+                        with ThreadPoolExecutor(max_workers=8) as executor:
+                            for i in range(start_idx, len(lines), chunk_size):
+                                if is_closing: break
+
+                                # Periodically check for cooldown and suspend
                                 t_diff = time.time() - last_strategy_check_time
                                 if t_diff < 600:
                                     flush_batch_cleaner()
-                                    
-                                    # Save Resume State
-                                    cur_idx = max(0, idx - deleted_in_session)
+                                    cur_idx = max(0, i - deleted_in_session)
                                     saved_state[fname] = {"idx": cur_idx, "timestamp": int(time.time())}
                                     try: save_json_safe(progress_state_file, saved_state)
                                     except: pass
-                                    
-                                    
                                     if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Пауза (активность стратегий)")
                                     break
-                            
-                            line_s = line.strip()
-                            if not line_s or line_s.startswith('#'): continue
-                            d_part = line_s.split('/')[0].split(':')[0].strip().lower()
-                            if not d_part or '.' not in d_part: continue
 
-                            total_checked += 1
-                            exists = dns_manager.validate_domain_exists(d_part, dns_manager.cleanup_limiter)
-                            
-                            if not exists:
-                                batch_dead.add(d_part)
-                                dead_domains_found.add(d_part)
-                                if IS_DEBUG_MODE: log_func(f"[DomainCleaner] {d_part} не существует")
+                                if is_scanning:
+                                    if IS_DEBUG_MODE: log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
+                                    while not is_closing and is_scanning: time.sleep(10)
+                                    if is_closing: break
+
+                                chunk = lines[i : i + chunk_size]
+                                domains_in_chunk = []
+                                for offset, line in enumerate(chunk):
+                                    line_s = line.strip()
+                                    if not line_s or line_s.startswith('#'): continue
+                                    d_part = line_s.split('/')[0].split(':')[0].strip().lower()
+                                    if not d_part or '.' not in d_part: continue
+                                    domains_in_chunk.append(d_part)
+
+                                if not domains_in_chunk:
+                                    continue
+
+                                # Map domains to validation tasks
+                                futures = {executor.submit(dns_manager.validate_domain_exists, d, dns_manager.cleanup_limiter): d for d in domains_in_chunk}
                                 
-                                if len(batch_dead) >= 10:
-                                    flush_batch_cleaner()
-                            
-                            if idx % 50 == 0:
-                                cur_idx = max(0, (idx+1) - deleted_in_session)
+                                for future in as_completed(futures):
+                                    if is_closing: break
+                                    d_part = futures[future]
+                                    try:
+                                        exists = future.result()
+                                        total_checked += 1
+                                        if not exists:
+                                            batch_dead.add(d_part)
+                                            dead_domains_found.add(d_part)
+                                            if IS_DEBUG_MODE: log_func(f"[DomainCleaner] {d_part} не существует")
+
+                                            if len(batch_dead) >= 10:
+                                                flush_batch_cleaner()
+                                    except Exception:
+                                        # Silent fail for individual DNS queries
+                                        pass
+
+                                # Progress tracking (every chunk)
+                                cur_idx = max(0, (i + len(chunk)) - deleted_in_session)
                                 try: save_json_safe(progress_path, {"idx": cur_idx})
                                 except: pass
                         
