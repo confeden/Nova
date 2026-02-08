@@ -96,8 +96,8 @@ if not is_admin():
         new_args = [arg for arg in sys.argv[1:] if arg != "--admin-relaunch"]
         new_args.append("--admin-relaunch")
         
-        # Proper quoting for arguments
-        args_str = " ".join([f'"{a}"' for a in new_args])
+        # Proper quoting for arguments using standard subprocess library
+        args_str = subprocess.list2cmdline(new_args)
         
         result = 0
         if getattr(sys, 'frozen', False):
@@ -106,7 +106,8 @@ if not is_admin():
         else:
             # Running as script
             # sys.executable is python.exe, sys.argv[0] is script path
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{sys.argv[0]}" {args_str}', None, 1)
+            script_path_quoted = subprocess.list2cmdline([sys.argv[0]])
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'{script_path_quoted} {args_str}', None, 1)
             
         # ShellExecuteW returns > 32 on success. If <= 32, it failed.
         if result <= 32:
@@ -148,6 +149,24 @@ try:
     from tkinter import font as tkfont
     import winreg
     import glob
+
+    # === CLEANUP OLD EXE (SELF-DELETION HANDLER) ===
+    # This replaces the vulnerable shell-based self-deletion.
+    # The new process receives the path of the old executable and deletes it after a delay.
+    if "--cleanup-old-exe" in sys.argv:
+        try:
+            _idx = sys.argv.index("--cleanup-old-exe")
+            _old_exe = sys.argv[_idx + 1]
+            def _deferred_delete(path):
+                time.sleep(3)
+                for _ in range(5):
+                    try:
+                        if os.path.exists(path): os.remove(path)
+                        break
+                    except: time.sleep(1)
+            threading.Thread(target=_deferred_delete, args=(_old_exe,), daemon=True).start()
+            del sys.argv[_idx:_idx+2]
+        except: pass
 
     # Global defer
     dns_manager = None
@@ -10775,12 +10794,9 @@ try:
                             
                             # 6. Launch new process
                             # Use abspath for cwd to be safe
-                            subprocess.Popen([target_exe] + sys.argv[1:], cwd=os.path.abspath(target_dir))
-                            
-                            # === SELF-DELETION ===
-                            # Запускаем фоновую команду: подождать 3 сек и удалить исходный файл
-                            kill_cmd = f'cmd /c ping 127.0.0.1 -n 3 > nul & del /F /Q "{current_exe}"'
-                            subprocess.Popen(kill_cmd, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                            # We pass --cleanup-old-exe to the new process to delete the old one.
+                            # This avoids the use of shell commands and prevents command injection.
+                            subprocess.Popen([target_exe, "--cleanup-old-exe", current_exe] + sys.argv[1:], cwd=os.path.abspath(target_dir))
                             
                             sys.exit()
                         except Exception as e:
