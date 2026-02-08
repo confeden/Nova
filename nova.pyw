@@ -41,7 +41,10 @@ if is_compiled and not is_debug_launch:
     try:
         sys.stdout = open(os.devnull, 'w')
         sys.stderr = open(os.devnull, 'w')
-    except: pass
+    except (OSError, AttributeError):
+        # Если перенаправление не удалось (например, в некоторых средах sys.stdout 
+        # может быть недоступен), игнорируем ошибку, чтобы не прерывать запуск.
+        pass
 
 # === FIX: Исправление загрузки DLL для Nuitka/Python 3.13 ===
 if getattr(sys, 'frozen', False):
@@ -96,8 +99,8 @@ if not is_admin():
         new_args = [arg for arg in sys.argv[1:] if arg != "--admin-relaunch"]
         new_args.append("--admin-relaunch")
         
-        # Proper quoting for arguments
-        args_str = " ".join([f'"{a}"' for a in new_args])
+        # Proper quoting for arguments using standard subprocess library
+        args_str = subprocess.list2cmdline(new_args)
         
         result = 0
         if getattr(sys, 'frozen', False):
@@ -106,7 +109,8 @@ if not is_admin():
         else:
             # Running as script
             # sys.executable is python.exe, sys.argv[0] is script path
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{sys.argv[0]}" {args_str}', None, 1)
+            script_path_quoted = subprocess.list2cmdline([sys.argv[0]])
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'{script_path_quoted} {args_str}', None, 1)
             
         # ShellExecuteW returns > 32 on success. If <= 32, it failed.
         if result <= 32:
@@ -142,12 +146,31 @@ try:
     import math
     from tkinter import scrolledtext
     import random
+    import requests  # FIX: Ensure requests is included in Nuitka build
     import hashlib
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from collections import deque
     from tkinter import font as tkfont
     import winreg
     import glob
+
+    # === CLEANUP OLD EXE (SELF-DELETION HANDLER) ===
+    # This replaces the vulnerable shell-based self-deletion.
+    # The new process receives the path of the old executable and deletes it after a delay.
+    if "--cleanup-old-exe" in sys.argv:
+        try:
+            _idx = sys.argv.index("--cleanup-old-exe")
+            _old_exe = sys.argv[_idx + 1]
+            def _deferred_delete(path):
+                time.sleep(3)
+                for _ in range(5):
+                    try:
+                        if os.path.exists(path): os.remove(path)
+                        break
+                    except: time.sleep(1)
+            threading.Thread(target=_deferred_delete, args=(_old_exe,), daemon=True).start()
+            del sys.argv[_idx:_idx+2]
+        except: pass
 
     # Global defer
     dns_manager = None
@@ -1422,48 +1445,55 @@ try:
 
     # === EVOLUTION LEARNING SYSTEM ===
     LEARNING_DATA_PATH = os.path.join(get_base_dir(), "temp", "learning_data.json")
-    _learning_data_lock = threading.Lock()
-    
+    _learning_data_lock = threading.RLock()
+    _learning_data_cache = None
+
     def load_learning_data():
-        """Загружает данные обучения из temp/learning_data.json"""
-        default = {
-            "version": CURRENT_VERSION, # Sync with App Version
-            "last_updated": 0,
-            "argument_stats": {},
-            "combo_stats": {},
-            "bin_stats": {},
-            "service_stats": {},
-            "checked_hashes": {}  # hash -> {timestamp, score} для отслеживания перепроверок
-        }
-        return load_json_robust(LEARNING_DATA_PATH, default)
-    
-    def save_learning_data(data):
-        """Сохраняет данные обучения"""
-        data["last_updated"] = time.time()
+        """Загружает данные обучения из temp/learning_data.json с использованием кэша"""
+        global _learning_data_cache
         with _learning_data_lock:
-            save_json_safe(LEARNING_DATA_PATH, data)
+            if _learning_data_cache is not None:
+                return _learning_data_cache
+
+            default = {
+                "version": CURRENT_VERSION, # Sync with App Version
+                "last_updated": 0,
+                "argument_stats": {},
+                "combo_stats": {},
+                "bin_stats": {},
+                "service_stats": {},
+                "checked_hashes": {}  # hash -> {timestamp, score} для отслеживания перепроверок
+            }
+            _learning_data_cache = load_json_robust(LEARNING_DATA_PATH, default)
+            
+            # Ensure defaults exist
+            for k, v in default.items():
+                if k not in _learning_data_cache:
+                    _learning_data_cache[k] = v
+            
+            return _learning_data_cache
+
+    def flush_learning_data():
+        """Сбрасывает кэш обучения на диск"""
+        global _learning_data_cache
+        with _learning_data_lock:
+            if _learning_data_cache:
+                _learning_data_cache["last_updated"] = time.time()
+                save_json_safe(LEARNING_DATA_PATH, _learning_data_cache)
+
+    def save_learning_data(data):
+        """Сохраняет данные обучения (обновляет кэш и сбрасывает на диск)"""
+        global _learning_data_cache
+        with _learning_data_lock:
+            _learning_data_cache = data
+        flush_learning_data()
     
     def update_learning_stats(args, score, max_score, service="general", bin_files_used=None, logger=None):
         """Обновляет статистику обучения после проверки стратегии"""
         # CRITICAL FIX: Use Lock for END-TO-END Read-Modify-Write cycle to prevent race conditions
         with _learning_data_lock:
             try:
-                # Load directly (load_json_robust doesn't lock)
-                default = {
-                    "version": CURRENT_VERSION, 
-                    "last_updated": 0,
-                    "argument_stats": {},
-                    "combo_stats": {},
-                    "bin_stats": {},
-                    "service_stats": {},
-                    "checked_hashes": {}
-                }
-                data = load_json_robust(LEARNING_DATA_PATH, default)
-
-                # FIX: Ensure defaults exist (migration for existing partial files)
-                for k, v in default.items():
-                    if k not in data:
-                        data[k] = v
+                data = load_learning_data()
 
                 success_rate = score / max_score if max_score > 0 else 0
                 
@@ -1508,13 +1538,9 @@ try:
                 if score > data["service_stats"][service].get("best_score", 0):
                     data["service_stats"][service]["best_score"] = score
                 
-                # Save DIRECTLY to avoid deadlock with save_learning_data()
+                # No save to disk here.
                 data["last_updated"] = time.time()
-                save_json_safe(LEARNING_DATA_PATH, data)
                 
-                # VISIBLE DEBUG LOG
-                # if logger: logger(f"[Learning] Saved stats. Keys: {len(data.get('argument_stats', {}))}")
-
             except Exception as e:
                 if logger: logger(f"[Learning-Error] Update failed: {e}")
                 pass
@@ -1814,6 +1840,8 @@ try:
                 bool: True если домен существует, False если получен NXDOMAIN
             """
             import socket
+            import struct
+            import random as rand
             
             domain = domain.lower().strip()
             if not domain:
@@ -1838,13 +1866,30 @@ try:
                         try:
                             # Create socket with specific source port
                             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                            sock.bind(('0.0.0.0', DNS_CHECK_PORT))
+                            
+                            # Try to bind to dedicated port, or pick a random one in the safe range (16451-16499)
+                            # to support parallel validation while bypassing winws
+                            bound = False
+                            try:
+                                sock.bind(('0.0.0.0', DNS_CHECK_PORT))
+                                bound = True
+                            except:
+                                for _ in range(10): # Try 10 random ports in the safe range
+                                    try:
+                                        alt_port = rand.randint(16451, 16499)
+                                        sock.bind(('0.0.0.0', alt_port))
+                                        bound = True
+                                        break
+                                    except: continue
+                            
+                            if not bound:
+                                # Fallback: let OS pick a port if safe range is exhausted
+                                try: sock.bind(('0.0.0.0', 0))
+                                except: pass
+
                             sock.settimeout(5.0)  # 5 second timeout
                             
                             # Manual DNS query (simplified A record query)
-                            import struct
-                            import random as rand
-                            
                             # Build DNS query packet
                             transaction_id = rand.randint(0, 65535)
                             flags = 0x0100  # Standard query
@@ -3845,42 +3890,62 @@ try:
                             except Exception as ex:
                                 log_func(f"[DomainCleaner] Ошибка сохранения: {ex}")
 
-                        for idx, line in enumerate(lines[start_idx:], start=start_idx):
-                            if is_closing: break
-                            
-                            if idx % 10 == 0:
+                        # Use ThreadPoolExecutor for parallel domain validation (Efficiency optimization)
+                        chunk_size = 30
+                        with ThreadPoolExecutor(max_workers=8) as executor:
+                            for i in range(start_idx, len(lines), chunk_size):
+                                if is_closing: break
+                                
+                                # Periodically check for cooldown and suspend
                                 t_diff = time.time() - last_strategy_check_time
                                 if t_diff < 600:
                                     flush_batch_cleaner()
-                                    
-                                    # Save Resume State
-                                    cur_idx = max(0, idx - deleted_in_session)
+                                    cur_idx = max(0, i - deleted_in_session)
                                     saved_state[fname] = {"idx": cur_idx, "timestamp": int(time.time())}
                                     try: save_json_safe(progress_state_file, saved_state)
                                     except: pass
-                                    
-                                    
                                     if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Пауза (активность стратегий)")
                                     break
-                            
-                            line_s = line.strip()
-                            if not line_s or line_s.startswith('#'): continue
-                            d_part = line_s.split('/')[0].split(':')[0].strip().lower()
-                            if not d_part or '.' not in d_part: continue
-
-                            total_checked += 1
-                            exists = dns_manager.validate_domain_exists(d_part, dns_manager.cleanup_limiter)
-                            
-                            if not exists:
-                                batch_dead.add(d_part)
-                                dead_domains_found.add(d_part)
-                                if IS_DEBUG_MODE: log_func(f"[DomainCleaner] {d_part} не существует")
                                 
-                                if len(batch_dead) >= 10:
-                                    flush_batch_cleaner()
-                            
-                            if idx % 50 == 0:
-                                cur_idx = max(0, (idx+1) - deleted_in_session)
+                                if is_scanning:
+                                    if IS_DEBUG_MODE: log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
+                                    while not is_closing and is_scanning: time.sleep(10)
+                                    if is_closing: break
+
+                                chunk = lines[i : i + chunk_size]
+                                domains_in_chunk = []
+                                for offset, line in enumerate(chunk):
+                                    line_s = line.strip()
+                                    if not line_s or line_s.startswith('#'): continue
+                                    d_part = line_s.split('/')[0].split(':')[0].strip().lower()
+                                    if not d_part or '.' not in d_part: continue
+                                    domains_in_chunk.append(d_part)
+
+                                if not domains_in_chunk:
+                                    continue
+
+                                # Map domains to validation tasks
+                                futures = {executor.submit(dns_manager.validate_domain_exists, d, dns_manager.cleanup_limiter): d for d in domains_in_chunk}
+                                
+                                for future in as_completed(futures):
+                                    if is_closing: break
+                                    d_part = futures[future]
+                                    try:
+                                        exists = future.result()
+                                        total_checked += 1
+                                        if not exists:
+                                            batch_dead.add(d_part)
+                                            dead_domains_found.add(d_part)
+                                            if IS_DEBUG_MODE: log_func(f"[DomainCleaner] {d_part} не существует")
+                                            
+                                            if len(batch_dead) >= 10:
+                                                flush_batch_cleaner()
+                                    except Exception:
+                                        # Silent fail for individual DNS queries
+                                        pass
+                                
+                                # Progress tracking (every chunk)
+                                cur_idx = max(0, (i + len(chunk)) - deleted_in_session)
                                 try: save_json_safe(progress_path, {"idx": cur_idx})
                                 except: pass
                         
@@ -8625,23 +8690,44 @@ try:
                 for strat_args in test_pool:
                     if is_closing: break
                     
-                    # Запуск теста (аналог check_strat)
-                    # ... (упрощенно: запускаем winws с фильтром на порт и проверяем домен)
-                    # Для простоты используем check_domain_robust после запуска winws
-                    # Но нам нужен порт и изоляция.
-                    # В рамках этого worker'а сложно сделать полную изоляцию без дублирования кода.
-                    # Поэтому мы будем использовать audit_ports_queue и запускать winws на короткое время.
-                    
-                    # TODO: Реализовать полноценный тест с изоляцией, как в чекере.
-                    # Пока пропустим сложную реализацию и сделаем паузу.
-                    pass
+                    # Запуск полноценного теста с изоляцией
+                    test_port = None
+                    try:
+                        # Используем свободный порт из очереди аудита
+                        test_port = audit_ports_queue.get(timeout=5)
+                        if test_boost_strategy_isolated(strat_args, test_domain, test_port, base_dir, log_func):
+                            best_strat = strat_args
+                            log_func(f"[BoostEvo] Найдена работающая стратегия для {test_domain}: {' '.join(strat_args)}")
+                            break
+                    except queue.Empty:
+                        log_func("[BoostEvo] Нет свободных портов для тестирования")
+                        break
+                    except Exception as e:
+                        if IS_DEBUG_MODE: log_func(f"[BoostEvo] Ошибка при тесте стратегии: {e}")
+                    finally:
+                        if test_port:
+                            audit_ports_queue.put(test_port)
                 
-                # Примечание: Полная реализация требует переноса check_strat в глобальную область или дублирования.
-                # В текущей архитектуре лучше оставить это на hard_strategy_matcher, который уже перебирает hard стратегии.
-                # Но требование - отдельный фоновый процесс.
-                
-                # ВМЕСТО ЭТОГО: Мы будем обновлять boost.json успешными стратегиями из hard_strategy_matcher
-                # Если hard_strategy_matcher находит "легкую" стратегию, он может сохранить её в boost.json
+                # Сохраняем найденную стратегию, если она действительно новая
+                if best_strat and best_strat not in saved_candidates:
+                    try:
+                        # Загружаем текущие стратегии из boost.json
+                        data = {}
+                        if os.path.exists(boost_cand_path):
+                            data = load_json_robust(boost_cand_path, {})
+                        
+                        # Ищем свободный слот или перезаписываем boost_12 (как в matcher)
+                        slot = "boost_12"
+                        for i in range(1, 13):
+                            if f"boost_{i}" not in data:
+                                slot = f"boost_{i}"
+                                break
+                        
+                        data[slot] = best_strat
+                        save_json_safe(boost_cand_path, data)
+                        log_func(f"[BoostEvo] Новая эффективная стратегия сохранена в слот {slot}")
+                    except Exception as e:
+                        log_func(f"[BoostEvo] Ошибка при сохранении стратегии: {e}")
                 
                 time.sleep(300)
 
@@ -8718,6 +8804,7 @@ try:
             time.sleep(1.5)
             
             status, _ = detect_throttled_load(domain, port)
+            return status == "ok"
             
         except Exception:
             return False
@@ -9295,7 +9382,7 @@ try:
                 if compare_versions(latest_version, CURRENT_VERSION):
                     
                     # FIX: Check frozen status BEFORE downloading
-                    if not is_frozen:
+                    if not is_frozen and not sys.argv[0].lower().endswith(".exe"):
                          log_func(f"[Update] Найдено обновление: {latest_version}. (Скачивание пропущено: запуск из исходника)")
                          first_run = False
                          for _ in range(28800):
@@ -9404,6 +9491,12 @@ try:
             for _ in range(28800):
                 if is_closing: return
                 time.sleep(1)
+    def learning_data_flush_worker():
+        """Периодически сбрасывает кэш обучения на диск."""
+        while not is_closing:
+            time.sleep(60)
+            flush_learning_data()
+
     def start_services_threads(log_func=None):
         """Helper to start all background threads (Global Context)"""
         if log_func is None: log_func = print
@@ -9411,6 +9504,7 @@ try:
         # Ensure path structure is ready
         paths = ensure_structure()
 
+        threading.Thread(target=learning_data_flush_worker, daemon=True).start()
         threading.Thread(target=advanced_strategy_checker_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=payload_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=vpn_monitor_worker, args=(log_func,), daemon=True).start()
@@ -10233,6 +10327,7 @@ try:
                 save_visited_domains()
                 save_ip_history()
                 save_exclude_auto_checked()
+                flush_learning_data()
                 # strategy_learner.save() # Сохраняем знания AI (DISABLED: Conflicts with main learning_data system)
             except Exception as e:
                 print(f"[AdaptiveSystem] Ошибка сохранения при выходе: {e}")
@@ -10775,12 +10870,9 @@ try:
                             
                             # 6. Launch new process
                             # Use abspath for cwd to be safe
-                            subprocess.Popen([target_exe] + sys.argv[1:], cwd=os.path.abspath(target_dir))
-                            
-                            # === SELF-DELETION ===
-                            # Запускаем фоновую команду: подождать 3 сек и удалить исходный файл
-                            kill_cmd = f'cmd /c ping 127.0.0.1 -n 3 > nul & del /F /Q "{current_exe}"'
-                            subprocess.Popen(kill_cmd, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                            # We pass --cleanup-old-exe to the new process to delete the old one.
+                            # This avoids the use of shell commands and prevents command injection.
+                            subprocess.Popen([target_exe, "--cleanup-old-exe", current_exe] + sys.argv[1:], cwd=os.path.abspath(target_dir))
                             
                             sys.exit()
                         except Exception as e:
