@@ -1422,48 +1422,55 @@ try:
 
     # === EVOLUTION LEARNING SYSTEM ===
     LEARNING_DATA_PATH = os.path.join(get_base_dir(), "temp", "learning_data.json")
-    _learning_data_lock = threading.Lock()
-    
+    _learning_data_lock = threading.RLock()
+    _learning_data_cache = None
+
     def load_learning_data():
-        """Загружает данные обучения из temp/learning_data.json"""
-        default = {
-            "version": CURRENT_VERSION, # Sync with App Version
-            "last_updated": 0,
-            "argument_stats": {},
-            "combo_stats": {},
-            "bin_stats": {},
-            "service_stats": {},
-            "checked_hashes": {}  # hash -> {timestamp, score} для отслеживания перепроверок
-        }
-        return load_json_robust(LEARNING_DATA_PATH, default)
-    
-    def save_learning_data(data):
-        """Сохраняет данные обучения"""
-        data["last_updated"] = time.time()
+        """Загружает данные обучения из temp/learning_data.json с использованием кэша"""
+        global _learning_data_cache
         with _learning_data_lock:
-            save_json_safe(LEARNING_DATA_PATH, data)
+            if _learning_data_cache is not None:
+                return _learning_data_cache
+
+            default = {
+                "version": CURRENT_VERSION, # Sync with App Version
+                "last_updated": 0,
+                "argument_stats": {},
+                "combo_stats": {},
+                "bin_stats": {},
+                "service_stats": {},
+                "checked_hashes": {}  # hash -> {timestamp, score} для отслеживания перепроверок
+            }
+            _learning_data_cache = load_json_robust(LEARNING_DATA_PATH, default)
+
+            # Ensure defaults exist
+            for k, v in default.items():
+                if k not in _learning_data_cache:
+                    _learning_data_cache[k] = v
+
+            return _learning_data_cache
+
+    def flush_learning_data():
+        """Сбрасывает кэш обучения на диск"""
+        global _learning_data_cache
+        with _learning_data_lock:
+            if _learning_data_cache:
+                _learning_data_cache["last_updated"] = time.time()
+                save_json_safe(LEARNING_DATA_PATH, _learning_data_cache)
+
+    def save_learning_data(data):
+        """Сохраняет данные обучения (обновляет кэш и сбрасывает на диск)"""
+        global _learning_data_cache
+        with _learning_data_lock:
+            _learning_data_cache = data
+        flush_learning_data()
     
     def update_learning_stats(args, score, max_score, service="general", bin_files_used=None, logger=None):
         """Обновляет статистику обучения после проверки стратегии"""
         # CRITICAL FIX: Use Lock for END-TO-END Read-Modify-Write cycle to prevent race conditions
         with _learning_data_lock:
             try:
-                # Load directly (load_json_robust doesn't lock)
-                default = {
-                    "version": CURRENT_VERSION, 
-                    "last_updated": 0,
-                    "argument_stats": {},
-                    "combo_stats": {},
-                    "bin_stats": {},
-                    "service_stats": {},
-                    "checked_hashes": {}
-                }
-                data = load_json_robust(LEARNING_DATA_PATH, default)
-
-                # FIX: Ensure defaults exist (migration for existing partial files)
-                for k, v in default.items():
-                    if k not in data:
-                        data[k] = v
+                data = load_learning_data()
 
                 success_rate = score / max_score if max_score > 0 else 0
                 
@@ -1508,13 +1515,9 @@ try:
                 if score > data["service_stats"][service].get("best_score", 0):
                     data["service_stats"][service]["best_score"] = score
                 
-                # Save DIRECTLY to avoid deadlock with save_learning_data()
+                # No save to disk here.
                 data["last_updated"] = time.time()
-                save_json_safe(LEARNING_DATA_PATH, data)
                 
-                # VISIBLE DEBUG LOG
-                # if logger: logger(f"[Learning] Saved stats. Keys: {len(data.get('argument_stats', {}))}")
-
             except Exception as e:
                 if logger: logger(f"[Learning-Error] Update failed: {e}")
                 pass
@@ -9404,6 +9407,12 @@ try:
             for _ in range(28800):
                 if is_closing: return
                 time.sleep(1)
+    def learning_data_flush_worker():
+        """Периодически сбрасывает кэш обучения на диск."""
+        while not is_closing:
+            time.sleep(60)
+            flush_learning_data()
+
     def start_services_threads(log_func=None):
         """Helper to start all background threads (Global Context)"""
         if log_func is None: log_func = print
@@ -9411,6 +9420,7 @@ try:
         # Ensure path structure is ready
         paths = ensure_structure()
 
+        threading.Thread(target=learning_data_flush_worker, daemon=True).start()
         threading.Thread(target=advanced_strategy_checker_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=payload_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=vpn_monitor_worker, args=(log_func,), daemon=True).start()
@@ -10233,6 +10243,7 @@ try:
                 save_visited_domains()
                 save_ip_history()
                 save_exclude_auto_checked()
+                flush_learning_data()
                 # strategy_learner.save() # Сохраняем знания AI (DISABLED: Conflicts with main learning_data system)
             except Exception as e:
                 print(f"[AdaptiveSystem] Ошибка сохранения при выходе: {e}")
