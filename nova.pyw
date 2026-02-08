@@ -102,15 +102,21 @@ if not is_admin():
         # Proper quoting for arguments using standard subprocess library
         args_str = subprocess.list2cmdline(new_args)
         
+        # FIX: Explicitly pass Current Working Directory (CWD) to elevated process
+        # This prevents issues where the new process starts in System32 (default for Admin shell)
+        cwd = os.getcwd()
+        
         result = 0
         if getattr(sys, 'frozen', False):
             # Running as compiled EXE
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args_str, None, 1)
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args_str, cwd, 1)
         else:
             # Running as script
             # sys.executable is python.exe, sys.argv[0] is script path
-            script_path_quoted = subprocess.list2cmdline([sys.argv[0]])
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'{script_path_quoted} {args_str}', None, 1)
+            # FIX: Use absolute path for script to handle CWD changes during elevation
+            script_abs = os.path.abspath(sys.argv[0])
+            script_path_quoted = subprocess.list2cmdline([script_abs])
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'{script_path_quoted} {args_str}', cwd, 1)
             
         # ShellExecuteW returns > 32 on success. If <= 32, it failed.
         if result <= 32:
@@ -10928,7 +10934,8 @@ try:
         import struct # Импорт struct для работы с IP
         
         try:
-            old_exe_chk = sys.argv[0] + ".old" # Используем sys.argv[0] для надежности
+            # FIX: Use absolute path to ensure we find the correct file
+            old_exe_chk = os.path.abspath(sys.argv[0]) + ".old" 
             if os.path.exists(old_exe_chk):
                  # Пытаемся удалить старый exe.
                  for _ in range(3):
