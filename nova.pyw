@@ -8625,23 +8625,44 @@ try:
                 for strat_args in test_pool:
                     if is_closing: break
                     
-                    # Запуск теста (аналог check_strat)
-                    # ... (упрощенно: запускаем winws с фильтром на порт и проверяем домен)
-                    # Для простоты используем check_domain_robust после запуска winws
-                    # Но нам нужен порт и изоляция.
-                    # В рамках этого worker'а сложно сделать полную изоляцию без дублирования кода.
-                    # Поэтому мы будем использовать audit_ports_queue и запускать winws на короткое время.
-                    
-                    # TODO: Реализовать полноценный тест с изоляцией, как в чекере.
-                    # Пока пропустим сложную реализацию и сделаем паузу.
-                    pass
+                    # Запуск полноценного теста с изоляцией
+                    test_port = None
+                    try:
+                        # Используем свободный порт из очереди аудита
+                        test_port = audit_ports_queue.get(timeout=5)
+                        if test_boost_strategy_isolated(strat_args, test_domain, test_port, base_dir, log_func):
+                            best_strat = strat_args
+                            log_func(f"[BoostEvo] Найдена работающая стратегия для {test_domain}: {' '.join(strat_args)}")
+                            break
+                    except queue.Empty:
+                        log_func("[BoostEvo] Нет свободных портов для тестирования")
+                        break
+                    except Exception as e:
+                        if IS_DEBUG_MODE: log_func(f"[BoostEvo] Ошибка при тесте стратегии: {e}")
+                    finally:
+                        if test_port:
+                            audit_ports_queue.put(test_port)
                 
-                # Примечание: Полная реализация требует переноса check_strat в глобальную область или дублирования.
-                # В текущей архитектуре лучше оставить это на hard_strategy_matcher, который уже перебирает hard стратегии.
-                # Но требование - отдельный фоновый процесс.
-                
-                # ВМЕСТО ЭТОГО: Мы будем обновлять boost.json успешными стратегиями из hard_strategy_matcher
-                # Если hard_strategy_matcher находит "легкую" стратегию, он может сохранить её в boost.json
+                # Сохраняем найденную стратегию, если она действительно новая
+                if best_strat and best_strat not in saved_candidates:
+                    try:
+                        # Загружаем текущие стратегии из boost.json
+                        data = {}
+                        if os.path.exists(boost_cand_path):
+                            data = load_json_robust(boost_cand_path, {})
+
+                        # Ищем свободный слот или перезаписываем boost_12 (как в matcher)
+                        slot = "boost_12"
+                        for i in range(1, 13):
+                            if f"boost_{i}" not in data:
+                                slot = f"boost_{i}"
+                                break
+
+                        data[slot] = best_strat
+                        save_json_safe(boost_cand_path, data)
+                        log_func(f"[BoostEvo] Новая эффективная стратегия сохранена в слот {slot}")
+                    except Exception as e:
+                        log_func(f"[BoostEvo] Ошибка при сохранении стратегии: {e}")
                 
                 time.sleep(300)
 
@@ -8718,6 +8739,7 @@ try:
             time.sleep(1.5)
             
             status, _ = detect_throttled_load(domain, port)
+            return status == "ok"
             
         except Exception:
             return False
