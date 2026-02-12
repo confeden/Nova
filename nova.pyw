@@ -14,9 +14,27 @@ import ctypes
 import shutil
 import subprocess
 import collections
+from datetime import datetime
+# IMPORTS
+try:
+    import winreg # Added for Autostart feature
+    import pystray # Added for Tray feature
+    from PIL import Image # Added for Tray feature
+    TRAY_SUPPORT = True
+except ImportError as e:
+    TRAY_SUPPORT = False
+    # Optional: Warn user but continue
+    # ctypes.windll.user32.MessageBoxW(0, f"Функция трея отключена. Ошибка: {e}", "Nova Warning", 0x30)
+
+# TRACE UTILS
+def safe_trace(msg):
+    try: print(msg)
+    except: pass
+
+safe_trace("=== NOVA SCRIPT STARTED ===")
 
 # === VERSION & CONFIG ===
-CURRENT_VERSION = "1.7"
+CURRENT_VERSION = "1.9"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
@@ -46,7 +64,7 @@ if is_compiled and not is_debug_launch:
         # может быть недоступен), игнорируем ошибку, чтобы не прерывать запуск.
         pass
 
-# === FIX: Исправление загрузки DLL для Nuitka/Python 3.13 ===
+# === FIX: Исправление загрузки DLL для Nuitka/Python 3.13+ ===
 if getattr(sys, 'frozen', False):
     base_path = os.path.dirname(os.path.abspath(__file__))
     # Добавляем корень и папку DLLs в PATH, чтобы _tkinter.pyd нашел tcl86t.dll
@@ -467,10 +485,10 @@ try:
                                          shutil.copy2(internal_path, target_path)
                                          j_action = "Restored from Bundle (No Version)"
                                  elif cur_ver != CURRENT_VERSION:
-                                      # Old Version -> Update Version ONLY (Preserve user strategies)
-                                      current_data["version"] = CURRENT_VERSION
-                                      save_json_safe(target_path, current_data)
-                                      j_action = f"Version Updated ({cur_ver}->{CURRENT_VERSION})"
+                                      # Version Mismatch -> Force Replace from Bundle (User Request: No Backup)
+                                      if os.path.exists(internal_path):
+                                         shutil.copy2(internal_path, target_path)
+                                         j_action = f"Restored from Bundle (Version Mismatch {cur_ver}->{CURRENT_VERSION})"
                                       
                          # === STANDARD JSON (youtube.json, etc.) ===
                          else:
@@ -887,7 +905,8 @@ try:
             except: pass
 
         # 2. Список папок (img исключена, она остается внутри)
-        folders_to_deploy = ["bin", "fake", "list", "strat", "ip"] # img removed per request
+        # FIX: Removed 'bin' because it is downloaded at runtime
+        folders_to_deploy = ["fake", "list", "strat", "ip"] # img removed per request
         
         for folder in folders_to_deploy:
             target_folder_path = os.path.join(base_dir, folder)
@@ -997,7 +1016,6 @@ try:
                         
                         # 2. Если файл есть - проверяем тип
                         if item.endswith(".txt"):
-                            # Smart Merge TXT (Version Check)
                             try:
                                 with open(s, "r", encoding="utf-8") as f: src_lines = f.readlines()
                                 with open(d, "r", encoding="utf-8") as f: dst_lines = f.readlines()
@@ -1012,40 +1030,105 @@ try:
                                     try: return tuple(map(int, v.split('.')))
                                     except: return (0,)
                                 
-                                # Если текущая версия НИЖЕ (старее) внутренней
-                                if vt(dst_ver) < vt(src_ver):
-                                    merged = set()
-                                    for l in dst_lines: # Keep user edits? Strategy: Add missing from source
-                                        if l.strip() and not l.startswith("#"): merged.add(l.strip())
-                                    for l in src_lines: # Add new defaults
-                                        if l.strip() and not l.startswith("#"): merged.add(l.strip())
+                                # Logic for general.txt
+                                if item == "general.txt":
+                                    # Policy: Version < 1.9 -> Hard Reset
+                                    if vt(dst_ver) < vt("1.9"):
+                                        shutil.copy2(s, d)
+                                        logs.append(f"List: Полный сброс {item} (v{dst_ver} -> v{src_ver})")
+                                    else:
+                                        # Policy: Version >= 1.9 -> Merge
+                                        merged = set()
+                                        for l in dst_lines: 
+                                            if l.strip() and not l.startswith("#"): merged.add(l.strip())
+                                        for l in src_lines:
+                                            if l.strip() and not l.startswith("#"): merged.add(l.strip())
+                                        
+                                        with open(d, "w", encoding="utf-8") as f:
+                                            f.write(f"# version: {src_ver}\n")
+                                            for dom in sorted(list(merged)): f.write(f"{dom}\n")
+                                        logs.append(f"List: Обновлен {item} (Merge v{dst_ver} -> v{src_ver})")
+
+                                # Logic for cloudflare.txt
+                                elif item == "cloudflare.txt":
+                                    # Policy: If internal version is newer -> Replace
+                                    # If no version in file (dst_ver=0.0) -> Replace
+                                    if vt(dst_ver) < vt(src_ver):
+                                        # Force Replace but ensure header matches source
+                                        with open(d, "w", encoding="utf-8") as f:
+                                            # If source has no header, add it? Assuming source has header.
+                                            # If source is raw list, we should prepend header.
+                                            if "version:" not in src_lines[0]:
+                                                f.write(f"# version: {src_ver}\n")
+                                                f.writelines(src_lines)
+                                            else:
+                                                f.writelines(src_lines)
+                                        logs.append(f"List: Полный сброс {item} (v{dst_ver} -> v{src_ver})")
+                                
+                                else:
+                                    # Default behavior for other txt files (e.g. broken ones)
+                                    pass
                                     
-                                    with open(d, "w", encoding="utf-8") as f:
-                                        f.write(f"# version: {src_ver}\n")
-                                        for dom in sorted(list(merged)): f.write(f"{dom}\n")
-                                    logs.append(f"List: обновлен {item} (v{src_ver})")
                             except: pass
 
                         elif item.endswith(".json"):
-                            # Smart Merge JSON (Add missing keys)
-                            try:
-                                js_src = load_json_robust(s, {})
-                                js_dst = load_json_robust(d, {})
-                                changed = False
-                                for k, v in js_src.items():
-                                    if k not in js_dst:
-                                        js_dst[k] = v
-                                        changed = True
-                                if changed:
-                                    save_json_safe(d, js_dst)
-                                    logs.append(f"Strat: дополнен {item}")
-                            except: pass
+                            # Strategies.json Smart Update
+                            if item == "strategies.json":
+                                try:
+                                    js_src = load_json_robust(s, {})
+                                    js_dst = load_json_robust(d, {})
+                                    
+                                    src_ver = js_src.get("version", "0.0")
+                                    dst_ver = js_dst.get("version", "0.0")
+                                    
+                                    # Helper to compare versions
+                                    def vt(v): 
+                                        try: return tuple(map(int, v.split('.')))
+                                        except: return (0,)
+
+                                    # Policy: Version < 1.8 -> Hard Reset (Structure changed)
+                                    if vt(dst_ver) < vt("1.8"):
+                                        shutil.copy2(s, d)
+                                        logs.append(f"Strat: Полный сброс {item} (v{dst_ver} -> v{src_ver})")
+                                    else:
+                                        # Policy: Version >= 1.8 -> Soft Update (Merge keys + Update Version)
+                                        changed = False
+                                        
+                                        # 1. Update Version
+                                        if dst_ver != src_ver:
+                                            js_dst["version"] = src_ver
+                                            changed = True
+                                            
+                                        # 2. Add missing top-level keys (new services)
+                                        for k, v in js_src.items():
+                                            if k not in js_dst:
+                                                js_dst[k] = v
+                                                changed = True
+                                                
+                                        if changed:
+                                            save_json_safe(d, js_dst)
+                                            logs.append(f"Strat: Обновлен {item} (v{dst_ver} -> v{src_ver})")
+                                except: pass
+                            else:
+                                # Other JSONs (Legacy behavior - fill missing keys)
+                                try:
+                                    js_src = load_json_robust(s, {})
+                                    js_dst = load_json_robust(d, {})
+                                    changed = False
+                                    for k, v in js_src.items():
+                                        if k not in js_dst:
+                                            js_dst[k] = v
+                                            changed = True
+                                    if changed:
+                                        save_json_safe(d, js_dst)
+                                        logs.append(f"Strat: дополнен {item}")
+                                except: pass
 
                 except Exception as e:
                     pass
 
-        # FIX: Проверка успешности развертывания критических файлов
-        if not os.path.exists(winws_path):
+        # FIX: Проверка успешности развертывания критических файлов (DISABLED: Downloaded later)
+        if False and not os.path.exists(winws_path):
             debug_info = f"Target: {winws_path}\nInternal Source: {get_internal_path('bin')}\nBase Dir: {base_dir}\nArgv[0]: {sys.argv[0]}"
             try: ctypes.windll.user32.MessageBoxW(0, f"Critical Error: winws.exe not found after setup.\n\n{debug_info}", "Nova Setup Failed", 0x10)
             except: pass
@@ -1116,6 +1199,7 @@ try:
     CONFIG_FILENAME = "window_config.json"
     STRATEGIES_FILENAME = "strategies.json"
     HARD_LIST_FILENAME = "hard.txt"
+    BLOCKED_LIST_FILENAME = "list/ru.txt"
     VISITED_DOMAINS_FILE = "temp/visited_domains_stats.json"
     STRATEGIES_EVOLUTION_FILE = "temp/strategies_evolution.json"
     IP_HISTORY_FILE = "temp/ip_history.json"
@@ -1123,6 +1207,646 @@ try:
 
     # === NEW: Service Run ID for zombie thread suppression ===
     SERVICE_RUN_ID = 0
+
+
+    # ================= WARP & PROXY MANAGER =================
+    # Alternative Cloudflare WARP ports
+    # Port 443 FIRST: works with QUIC bypass (user confirmed official WARP client works on 443)
+    # Port 2408 is default but often blocked
+    WARP_PORTS = [443, 500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 
+                  908, 928, 934, 939, 942, 943, 945, 946, 955, 968, 
+                  987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 
+                  1387, 1843, 2371, 2506, 3138, 3476, 3581, 3854, 4177, 
+                  4198, 4233, 5279, 5956]
+    
+    class WarpManager:
+        """WARP Manager using official warp-cli with MASQUE protocol.
+        Supports portable service installation if WARP is not installed system-wide.
+        """
+        
+        SERVICE_NAME = "CloudflareWARP"
+        
+        def __init__(self, log_func=None):
+            self.log_func = log_func or print
+            self.bin_dir = os.path.join(get_base_dir(), "bin")
+            self.warp_cli_path = os.path.join(self.bin_dir, "warp-cli.exe")
+            self.warp_svc_path = os.path.join(self.bin_dir, "warp-svc.exe")
+            self.port = 1370
+            self.is_connected = False
+            self.service_installed_by_us = False  # Track if we installed the service
+        
+        def is_service_installed(self):
+            """Check if CloudflareWARP service is installed."""
+            try:
+                result = subprocess.run(
+                    ["sc", "query", self.SERVICE_NAME],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                return result.returncode == 0
+            except:
+                return False
+        
+        def is_service_running(self):
+            """Check if CloudflareWARP service is running."""
+            try:
+                result = subprocess.run(
+                    ["sc", "query", self.SERVICE_NAME],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                return "RUNNING" in result.stdout
+            except:
+                return False
+        
+        def install_service(self):
+            """Install CloudflareWARP service from bin folder (requires admin)."""
+            if not os.path.exists(self.warp_svc_path):
+                self.log_func("[RU] warp-svc.exe не найден!")
+                return False
+            
+            try:
+                self.log_func("[RU] Установка службы CloudflareWARP...")
+                # Create service pointing to our warp-svc.exe
+                result = subprocess.run(
+                    ["sc", "create", self.SERVICE_NAME, 
+                     "binPath=", self.warp_svc_path,
+                     "start=", "demand",  # Manual start
+                     "DisplayName=", "Cloudflare WARP (Nova)"],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                
+                if result.returncode == 0 or "EXISTS" in result.stdout.upper():
+                    self.service_installed_by_us = True
+                    self.log_func("[RU] Служба установлена.")
+                    return True
+                else:
+                    self.log_func(f"[RU] Ошибка установки службы: {result.stderr}")
+                    return False
+            except Exception as e:
+                self.log_func(f"[RU] Ошибка установки службы: {e}")
+                return False
+        
+        def start_service(self):
+            """Start the CloudflareWARP service."""
+            try:
+                self.log_func("[RU] Запуск службы...")
+                result = subprocess.run(
+                    ["sc", "start", self.SERVICE_NAME],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                # Wait for service to start
+                import time
+                for _ in range(10):
+                    if self.is_service_running():
+                        self.log_func("[RU] Служба запущена. Ожидание готовности daemon...")
+                        # Wait until warp-cli can communicate with daemon
+                        for _ in range(30):  # Max 15 seconds
+                            status = self.get_status()
+                            if status and "Unable" not in status and "Unknown" not in status:
+                                self.log_func("[RU] Daemon готов.")
+                                return True
+                            time.sleep(0.5)
+                        return True  # Proceed anyway after timeout
+                    time.sleep(0.5)
+                return self.is_service_running()
+            except Exception as e:
+                self.log_func(f"[RU] Ошибка запуска службы: {e}")
+                return False
+        
+        def stop_service(self):
+            """Stop the CloudflareWARP service."""
+            try:
+                subprocess.run(
+                    ["sc", "stop", self.SERVICE_NAME],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            except:
+                pass
+        
+        def uninstall_service(self):
+            """Uninstall the CloudflareWARP service (only if we installed it)."""
+            if not self.service_installed_by_us:
+                return
+            
+            try:
+                self.log_func("[RU] Удаление временной службы...")
+                self.stop_service()
+                import time
+                time.sleep(1)
+                subprocess.run(
+                    ["sc", "delete", self.SERVICE_NAME],
+                    capture_output=True, text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                self.log_func("[RU] Служба удалена.")
+            except Exception as e:
+                self.log_func(f"[RU] Ошибка удаления службы: {e}")
+        
+        def ensure_service(self):
+            """Ensure CloudflareWARP service is installed and running."""
+            # 1. Fast path: Check execution status directly
+            if self.is_service_running():
+                if IS_DEBUG_MODE: self.log_func("[RU] Служба уже запущена.")
+                return True
+            
+            # 2. Check if installed
+            if not self.is_service_installed():
+                if not self.install_service():
+                    return False
+            
+            # 3. Start if needed
+            return self.start_service()
+        
+        def run_warp_cli(self, *args, timeout=30):
+            """Run warp-cli command and return result."""
+            if not os.path.exists(self.warp_cli_path):
+                return None
+                
+            try:
+                cmd = [self.warp_cli_path] + list(args)
+                
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    startupinfo=startupinfo
+                )
+                return result
+            except subprocess.TimeoutExpired:
+                if IS_DEBUG_MODE: self.log_func(f"[RU] Команда таймаут: {' '.join(args)}")
+                return None
+            except Exception as e:
+                self.log_func(f"[RU] Ошибка команды: {e}")
+                return None
+        
+        def get_status(self):
+            """Get current WARP connection status."""
+            result = self.run_warp_cli("status")
+            if result and result.returncode == 0:
+                return result.stdout.strip()
+            return "Unknown"
+        
+        def ensure_masque(self):
+            """Ensure MASQUE protocol is enabled."""
+            result = self.run_warp_cli("settings", "list")
+            if result and result.returncode == 0:
+                if "MASQUE" not in result.stdout:
+                    if IS_DEBUG_MODE: self.log_func("[RU] Переключение на протокол MASQUE...")
+                    self.run_warp_cli("tunnel", "protocol", "set", "masque")
+        
+        def set_proxy_port(self, port):
+            """Set WARP proxy port."""
+            result = self.run_warp_cli("proxy", "port", str(port))
+            if result and result.returncode == 0:
+                self.port = port
+                if IS_DEBUG_MODE: self.log_func(f"[RU] Порт прокси: {port}")
+                return True
+            return False
+        
+        def set_proxy_mode(self):
+            """Set WARP to proxy mode."""
+            result = self.run_warp_cli("mode", "proxy")
+            if result and result.returncode == 0:
+                if IS_DEBUG_MODE: self.log_func("[RU] Режим прокси активирован.")
+                return True
+            return False
+        
+        def start(self):
+            """Connect to WARP using MASQUE protocol."""
+            # Ensure service is running
+            if not self.ensure_service():
+                self.log_func("[RU] Не удалось запустить службу!")
+                return
+            
+            # FIX: Robust Registration Check Loop
+            status = "Unknown"
+            import time
+            
+            # Wait for daemon to be responsive
+            for _ in range(10):
+                status = self.get_status()
+                if status and "Unable to connect" not in status:
+                    break
+                time.sleep(0.5)
+
+            # Check if registration is needed
+            if "Registration Missing" in status:
+                self.log_func("[RU] Регистрация устройства...")
+                
+                # Retry loop for registration
+                reg_success = False
+                last_error = ""
+                for _ in range(3):
+                    result = self.run_warp_cli("registration", "new")
+                    if result and result.returncode == 0:
+                        self.log_func("[RU] Устройство зарегистрировано.")
+                        reg_success = True
+                        break
+                    else:
+                        # Capture error for logging
+                        if result:
+                            err_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
+                            last_error = err_msg or "Unknown error"
+                            
+                            # Auto-fix: Old registration exists
+                            if "Old registration is still around" in last_error:
+                                if IS_DEBUG_MODE: self.log_func("[RU] Обнаружена старая регистрация. Удаление...")
+                                self.run_warp_cli("registration", "delete")
+                                time.sleep(1.0)
+                                continue # Retry immediately
+                                
+                            if IS_DEBUG_MODE: self.log_func(f"[RU] Попытка регистрации неудачна: {last_error}")
+                    time.sleep(1.0)
+                
+                if not reg_success:
+                    self.log_func(f"[RU] Ошибка регистрации: {last_error}")
+                    return
+                
+                # Refresh status after registration
+                status = self.get_status()
+            
+            # Check if already connected
+            if "Connected" in status:
+                if IS_DEBUG_MODE: self.log_func("[RU] Уже подключено.")
+                self.is_connected = True
+                return
+            
+            # Configure WARP
+            self.ensure_masque()
+            self.set_proxy_port(self.port)
+            self.set_proxy_mode()
+            
+            # Connect
+            if IS_DEBUG_MODE: self.log_func("[RU] Подключение через MASQUE (HTTP/3)...")
+            result = self.run_warp_cli("connect")
+            
+            if result and result.returncode == 0:
+                if IS_DEBUG_MODE: self.log_func("[RU] Подключено успешно!")
+                self.is_connected = True
+            else:
+                error_msg = result.stderr if result else "Unknown error"
+                self.log_func(f"[RU] Ошибка подключения: {error_msg}")
+        
+        def stop(self):
+            """Disconnect from WARP and stop service (keep installed for next session)."""
+            self.log_func("[RU] Отключение...")
+            self.run_warp_cli("disconnect")
+            self.is_connected = False
+            
+            # Stop service but keep it installed (preserves registration data)
+            self.stop_service()
+
+
+    class PacManager:
+        def __init__(self, log_func=None):
+            self.log_func = log_func or print
+            self.pac_file = os.path.join(get_base_dir(), "temp", "nova.pac")
+            self.server_port = 1369
+            self.server_thread = None
+            self.httpd = None
+            self.warp_port = 1370
+            self.registry_backup = {}
+
+        def _load_domain_list(self, filepath):
+            """Load domains from a text file."""
+            domains = set()
+            if os.path.exists(filepath):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        d = line.split('#')[0].strip().lower()
+                        if d: domains.add(d)
+            return domains
+
+        def _load_ip_list(self, filepath):
+            """Load IPs/CIDR from file and return list of [ip, mask/prefix, version] for PAC."""
+            import ipaddress
+            res = []
+            if os.path.exists(filepath):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.split('#')[0].strip()
+                        if not line: continue
+                        try:
+                            # If just IP, default to /32 or /128
+                            if '/' not in line: 
+                                if ':' in line: line += '/128'
+                                else: line += '/32'
+                                
+                            net = ipaddress.ip_network(line, strict=False)
+                            
+                            if net.version == 4:
+                                # IPv4: [IP, Mask, 4] for isInNet
+                                res.append( [str(net.network_address), str(net.netmask), 4] )
+                            elif net.version == 6:
+                                # IPv6: [IP, PrefixLen, 6] for isInNetEx
+                                res.append( [str(net.network_address), str(net.prefixlen), 6] )
+                        except: pass
+            return res
+
+        def generate_pac(self):
+            """Generates PAC file based on ru.txt/eu.txt domains AND ip/ru.txt IPs."""
+            try:
+                base = get_base_dir()
+                ru_domains = self._load_domain_list(os.path.join(base, "list", "ru.txt"))
+                eu_domains = self._load_domain_list(os.path.join(base, "list", "eu.txt"))
+                # NEW: Load Discord domains for WARP routing
+                discord_domains = self._load_domain_list(os.path.join(base, "list", "discord.txt"))
+                
+                # Load IP ranges
+                ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
+                
+                # NEW: Load Discord IPs and merge with RU IPs (both go to WARP)
+                discord_ips = self._load_ip_list(os.path.join(base, "ip", "discord.txt"))
+                ru_ips.extend(discord_ips)
+                
+                # Format for JS
+                import json
+                ru_ips_js = json.dumps(ru_ips)
+
+                ru_js = "{" + ",".join(f'"{d}":1' for d in ru_domains) + "}"
+                eu_js = "{" + ",".join(f'"{d}":1' for d in eu_domains) + "}"
+                discord_js = "{" + ",".join(f'"{d}":1' for d in discord_domains) + "}"
+                
+                # Dual routing:
+                # ru.txt domains OR ip/ru.txt IPs -> WARP SOCKS5 (port 1370)
+                # eu.txt domains -> Opera Proxy HTTP (port 1371)
+                pac_content = f"""
+function FindProxyForURL(url, host) {{
+    var ru = {ru_js};
+    var eu = {eu_js};
+    var discord = {discord_js};
+    var ru_ips = {ru_ips_js};
+    
+    // Check if host is IP address (v4 or v6)
+    // Simple regex for v4, v6 is complex so we assume if not domain
+    var isIpV4 = /^\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}$/.test(host);
+    var isIpV6 = (host.indexOf(':') > -1);
+    
+    if (isIpV4 || isIpV6) {{
+        for (var i = 0; i < ru_ips.length; i++) {{
+            var entry = ru_ips[i];
+            var ver = entry[2];
+            
+            if (ver === 4 && isIpV4) {{
+                // IPv4: isInNet(host, ip, mask)
+                if (isInNet(host, entry[0], entry[1])) {{
+                    return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+                }}
+            }} else if (ver === 6 && isIpV6) {{
+                // IPv6: isInNetEx(host, "IP/Prefix") - Windows/Chrome extension
+                if (typeof isInNetEx === 'function') {{
+                    if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
+                        return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+                    }}
+                }}
+            }}
+        }}
+    }}
+    
+    function matchDomain(list, h) {{
+        if (list[h]) return true;
+        var pos = h.indexOf('.');
+        while (pos > -1) {{
+            var suffix = h.substring(pos + 1);
+            if (list[suffix]) return true;
+            pos = h.indexOf('.', pos + 1);
+        }}
+        return false;
+    }}
+    
+    if (matchDomain(ru, host)) return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+    if (matchDomain(discord, host)) return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+    if (matchDomain(eu, host)) return "PROXY 127.0.0.1:1371; DIRECT";
+    
+    return "DIRECT";
+}}
+"""
+                with open(self.pac_file, "w", encoding="utf-8") as f:
+                    f.write(pac_content)
+            except Exception as e:
+                self.log_func(f"[PAC] Ошибка генерации: {e}")
+
+        def start_server(self):
+            """Starts a simple HTTP server to serve the PAC file."""
+            if self.server_thread and self.server_thread.is_alive():
+                return
+
+            bind_event = threading.Event()
+            bind_error = [None]  # mutable container for error
+
+            def run():
+                from http.server import SimpleHTTPRequestHandler
+                import socketserver
+
+                class PacHandler(SimpleHTTPRequestHandler):
+                    def do_GET(self_handler):
+                        if self_handler.path.startswith("/nova.pac"):
+                            if os.path.exists(self.pac_file):
+                                self_handler.send_response(200)
+                                self_handler.send_header('Content-type', 'application/x-ns-proxy-autoconfig')
+                                self_handler.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                                self_handler.send_header('Pragma', 'no-cache')
+                                self_handler.send_header('Expires', '0')
+                                self_handler.end_headers()
+                                with open(self.pac_file, 'rb') as f:
+                                    self_handler.wfile.write(f.read())
+                            else:
+                                self_handler.send_error(404)
+                        else:
+                            self_handler.send_error(404)
+                    def log_message(self, format, *args): pass # Silence logs
+
+                try:
+                    socketserver.TCPServer.allow_reuse_address = True
+                    self.httpd = socketserver.TCPServer(("127.0.0.1", self.server_port), PacHandler)
+                    bind_event.set()  # Signal successful binding
+                    self.httpd.serve_forever()
+                except Exception as e:
+                    bind_error[0] = e
+                    bind_event.set()  # Signal failure too
+
+            self.generate_pac() # Initial gen
+            self.server_thread = threading.Thread(target=run, daemon=True)
+            self.server_thread.start()
+            bind_event.wait(timeout=5)  # Wait for binding result
+            
+            if bind_error[0]:
+                self.log_func(f"[PAC] Ошибка запуска сервера на порту {self.server_port}: {bind_error[0]}")
+            else:
+                if IS_DEBUG_MODE: self.log_func(f"[PAC] Сервер запущен на порту {self.server_port}")
+
+        def set_system_proxy(self):
+            """Configures Windows to use the PAC file."""
+            try:
+                # Backup current settings
+                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+                    self.registry_backup['AutoConfigURL'] = winreg.QueryValueEx(key, 'AutoConfigURL')[0]
+                except: pass
+                try:
+                    # If ProxyEnable was 1, we should remember that? 
+                    # Actually, if we use AutoConfig, ProxyEnable is usually ignored or works with it.
+                    # Safe bet: Just set AutoConfigURL.
+                    pass 
+                except: pass
+                
+                # Set new settings
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE)
+                pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac"
+                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                
+                # Notify system
+                # InternetSetOption needed to flush cache, but python wrapper implies ctypes.
+                # Simple registry change might require a browser restart or refresh.
+                # To make it instant, we call InternetSetOption.
+                self.refresh_system_options()
+                
+                if IS_DEBUG_MODE: self.log_func("[System] Системный прокси настроен на Nova PAC.")
+            except Exception as e:
+                self.log_func(f"[System] Ошибка настройки прокси: {e}")
+
+        def restore_system_proxy(self):
+            """Restores original settings - forcibly clears Nova proxy settings."""
+            try:
+                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE | winreg.KEY_READ)
+                
+                # Check current AutoConfigURL - only clear if it's Nova's PAC
+                try:
+                    current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+                    if "nova.pac" in current_pac or "127.0.0.1:1371" in current_pac:
+                        # It's Nova's PAC - delete it
+                        try:
+                            winreg.DeleteValue(key, "AutoConfigURL")
+                            self.log_func("[System] AutoConfigURL удалён.")
+                        except WindowsError as e:
+                            self.log_func(f"[System] Ошибка удаления AutoConfigURL: {e}")
+                except FileNotFoundError:
+                    # AutoConfigURL doesn't exist - that's fine
+                    pass
+                except Exception as e:
+                    self.log_func(f"[System] Ошибка чтения AutoConfigURL: {e}")
+                
+                # Also clear ProxyServer if it's pointing to Nova
+                try:
+                    current_proxy = winreg.QueryValueEx(key, "ProxyServer")[0]
+                    if "127.0.0.1:1370" in current_proxy:
+                        winreg.DeleteValue(key, "ProxyServer")
+                        self.log_func("[System] ProxyServer удалён.")
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    pass  # ProxyServer might not exist
+                
+                winreg.CloseKey(key)
+                self.refresh_system_options()
+                self.log_func("[System] Настройки прокси восстановлены.")
+            except Exception as e:
+                self.log_func(f"[System] Ошибка восстановления прокси: {e}")
+
+        def refresh_system_options(self):
+            try:
+                import winreg
+                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE)
+                pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
+                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                winreg.CloseKey(key)
+                
+                INTERNET_OPTION_SETTINGS_CHANGED = 39
+                INTERNET_OPTION_REFRESH = 37
+                ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+                ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
+            except: pass
+
+
+    class OperaProxyManager:
+        """Manages opera-proxy process for HTTP proxy."""
+        
+        def __init__(self, log_func=None, port=1371, country="EU"):
+            self.log_func = log_func or print
+            self.port = port
+            self.country = country
+            self.process = None
+            self.exe_path = os.path.join(get_base_dir(), "bin", "opera-proxy.windows-amd64.exe")
+        
+        def start(self):
+            """Start opera-proxy process."""
+            if self.process and self.process.poll() is None:
+                if IS_DEBUG_MODE: self.log_func("[EU] Уже запущен.")
+                return
+            
+            if not os.path.exists(self.exe_path):
+                self.log_func("[EU] Файл не найден!")
+                return
+            
+            # FIX: Force kill any orphan processes to free the port (bind error 10048)
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", "opera-proxy.windows-amd64.exe"], 
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+            except: pass
+            
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+                cmd = [
+                    self.exe_path,
+                    "-bind-address", f"127.0.0.1:{self.port}",
+                    "-country", self.country
+                ]
+                
+                # FIX: Redirect output to file for debugging
+                log_dir = os.path.join(get_base_dir(), "temp")
+                if not os.path.exists(log_dir): os.makedirs(log_dir)
+                self.log_file = os.path.join(log_dir, "opera.log")
+                
+                # Open file for writing (subprocess will inherit handle)
+                self.f_log = open(self.log_file, "w")
+                
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=self.f_log,
+                    stderr=subprocess.STDOUT,
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                if IS_DEBUG_MODE: self.log_func(f"[EU] Запущен на порту {self.port} (регион: {self.country})")
+                self.log_func("[EU] Daemon готов.")
+            except Exception as e:
+                self.log_func(f"[EU] Ошибка запуска: {e}")
+        
+        def stop(self):
+            """Stop opera-proxy process."""
+            if self.process:
+                try:
+                    self.process.terminate()
+                    self.process.wait(timeout=5)
+                except:
+                    try: self.process.kill()
+                    except: pass
+                self.process = None
+                if IS_DEBUG_MODE: self.log_func("[EU] Остановлен.")
+
+
+    # Global Managers
+    warp_manager = None
+    pac_manager = None
+    opera_proxy_manager = None
+
+
+
 
     # Функции модуля nova_boot
     def install_requirements_visually():
@@ -1281,6 +2005,7 @@ try:
             
         # === FIX: Config Auto-Update Logic ===
         def check_and_update_config(filename, default_data, validation_callback=None):
+            # safe_trace(f"[Config] Checking {filename}") # Verbose trace
             fpath = os.path.join(base_dir, "strat", filename)
             should_update = False
             
@@ -1377,6 +2102,8 @@ try:
                 # FIX: Don't check getsize == 0 blindly. Trust version check above.
                 pass
 
+                pass
+        
         res["list_exclude_auto"] = os.path.join(base_dir, "temp", "exclude_auto.txt")
         res["ip_exclude"] = os.path.join(base_dir, "ip", "exclude.txt")
         if not os.path.exists(res["ip_exclude"]):
@@ -2205,7 +2932,6 @@ try:
         record = b'\x16\x03\x01' + record_len + handshake_msg
         
         return record
-
     def sanitize_filename(domain):
         return domain.replace(".", "_")
 
@@ -2223,47 +2949,9 @@ try:
                 # Just sleep to keep thread alive but idle (or valid logic if needed later)
                 time.sleep(3600)
                 
-                """
-                if not os.path.exists(exclude_file):
-                    time.sleep(60)
-                    continue
-                    
-                with open(exclude_file, "r", encoding="utf-8") as f:
-                    domains = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-                
-                created_count = 0
-                skipped_count = 0
-                
-                for domain in domains:
-                    if is_closing: break
-                    
-                    safe_name = sanitize_filename(domain)
-                    tls_filename = f"tls_clienthello_{safe_name}.bin"
-                    tls_path = os.path.join(bin_dir, tls_filename)
-                    
-                    need_tls = False
-                    if not os.path.exists(tls_path):
-                        need_tls = True
-                    # FIX: Removed weekly regeneration (user request)
-                    # else:
-                    #    if (time.time() - os.path.getmtime(tls_path)) > 604800:
-                    #        need_tls = True
-                    
-                    if need_tls:
-                        try:
-                            data = create_tls_client_hello(domain)
-                            with open(tls_path, "wb") as f:
-                                f.write(data)
-                            log_callback(f"[PayloadGen] Создан TLS фейк: {tls_filename}")
-                            created_count += 1
-                            time.sleep(0.1)
-                        except: pass
-                    else:
-                        skipped_count += 1
-                
-                if created_count > 0:
-                    log_callback(f"[PayloadGen] Создано {created_count} новых TLS-фейков.")
-                """
+                # FIX: Disabled scanning of exclude.txt (User Request: reduce load + unnecessary fakes)
+                # Just sleep to keep thread alive but idle (or valid logic if needed later)
+                time.sleep(3600)
                 
             except Exception as e:
                 # log_callback(f"[PayloadGen ERROR] Критическая ошибка: {e}")
@@ -2465,6 +3153,70 @@ try:
         except Exception as e:
             # print(f"Align error: {e}")
             pass
+
+    def get_autostart_cmd():
+        """Проверяет наличие записи автозапуска в реестре"""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+            try:
+                cmd, _ = winreg.QueryValueEx(key, "NovaApplication")
+                winreg.CloseKey(key)
+                return cmd
+            except FileNotFoundError:
+                winreg.CloseKey(key)
+                return None
+        except Exception:
+            return None
+
+    def toggle_startup(log_func=None):
+        """Переключает состояние автозапуска"""
+        try:
+            start_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            
+            # Determine correct path logic (similar to NetMonitor)
+            if getattr(sys, 'frozen', False):
+                # Compiled .exe
+                exe_path = sys.executable
+                # Add quotes to handle spaces in path
+                cmd_to_add = f'"{exe_path}" --minimized' 
+            else:
+                # Script .pyw
+                exe_path = sys.executable
+                script_path = os.path.abspath(__file__)
+                cmd_to_add = f'"{exe_path}" "{script_path}" --minimized'
+
+            # Check existing
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_READ)
+                try:
+                    winreg.QueryValueEx(key, "NovaApplication")
+                    exists = True
+                except FileNotFoundError:
+                    exists = False
+                winreg.CloseKey(key)
+            except: exists = False
+
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_SET_VALUE)
+            
+            if exists:
+                try:
+                    winreg.DeleteValue(key, "NovaApplication")
+                    if log_func: log_func("[Autostart] Автозапуск отключен")
+                    else: print("[Autostart] Disabled")
+                except Exception as e:
+                    if log_func: log_func(f"[Autostart] Ошибка отключения: {e}")
+            else:
+                try:
+                    winreg.SetValueEx(key, "NovaApplication", 0, winreg.REG_SZ, cmd_to_add)
+                    if log_func: log_func(f"[Autostart] Автозапуск включен")
+                    else: print("[Autostart] Enabled")
+                except Exception as e:
+                    if log_func: log_func(f"[Autostart] Ошибка включения: {e}")
+            
+            winreg.CloseKey(key)
+        except Exception as e:
+            if log_func: log_func(f"[Autostart] Ошибка доступа к реестру: {e}")
+            else: print(f"[Autostart] Registry Error: {e}")
 
     def ensure_log_window_created():
         global log_window, log_text_widget, cached_log_size
@@ -2752,6 +3504,26 @@ try:
         context_menu.add_command(label="Копировать", command=copy_selection)
         context_menu.add_command(label="Выделить все", command=select_all)
         context_menu.add_separator()
+
+        # === Autostart Option ===
+        # Use a dynamic variable to track state
+        autostart_var = tk.BooleanVar()
+        
+        def update_autostart_menu():
+            """Updates the checkbutton state before showing menu"""
+            is_auto = get_autostart_cmd() is not None
+            autostart_var.set(is_auto)
+
+        # Use postcommand to update state when menu opens
+        context_menu.configure(postcommand=update_autostart_menu)
+        
+        def toggle_autostart_wrapper():
+            toggle_startup(log_print)
+            # visual update happens next time menu opens due to postcommand
+
+        context_menu.add_checkbutton(label="Автозапуск", variable=autostart_var, command=toggle_autostart_wrapper)
+        context_menu.add_separator()
+
         
         def restart_nova():
             """Перезапускает Nova: корректная остановка -> перезапуск"""
@@ -3191,6 +3963,8 @@ try:
     BACKGROUND_SEM = threading.Semaphore(32)
     audit_running_event = threading.Event()
     
+    # ================= MIGRATED UTILS =================
+
     class RateLimiter:
         def __init__(self, limit_per_sec):
             self.limit = float(limit_per_sec)
@@ -3217,7 +3991,88 @@ try:
 
     BACKGROUND_RATE_LIMITER = RateLimiter(32)
         
-    # ================= IP UTILS =================
+    # ================= TRAY LOGIC =================
+    TRAY_ICON = None
+    
+    def on_tray_open(icon, item):
+        try:
+            root.deiconify()
+            root.state('normal')
+            root.lift()
+            root.attributes('-topmost', True)
+            root.after(50, lambda: root.attributes('-topmost', False))
+            icon.stop()
+        except: pass
+
+    def on_tray_quit(icon, item):
+        try:
+            icon.stop()
+            # on_closing() # Avoid direct circular call or early call
+            # Just signal app to close?
+            # Better: use root.event_generate("WM_DELETE_WINDOW")?
+            # Or assume on_closing handles it.
+            # actually we called on_closing() in original code, but we must ensure it is defined.
+            # If on_tray_quit is called, on_closing MUST be defined by then (runtime).
+            root.quit() 
+            os._exit(0)
+        except: pass
+
+    def init_tray_icon():
+        global TRAY_ICON
+        try:
+            image_path = get_internal_path(os.path.join("img", "icon.ico"))
+            # Fallback if specific icon not found, try bin or use default
+            if not os.path.exists(image_path):
+                 image_path = get_internal_path("icon.ico")
+            
+            if os.path.exists(image_path):
+                image = Image.open(image_path)
+            else:
+                # Create simple colored rectangle if no icon
+                image = Image.new('RGB', (64, 64), color = (73, 109, 137))
+
+            menu = (pystray.MenuItem('Открыть', on_tray_open, default=True), pystray.MenuItem('Выход', on_tray_quit))
+            TRAY_ICON = pystray.Icon("name", image, "Nova", menu)
+            TRAY_ICON.run()
+        except Exception as e:
+            safe_trace(f"Tray Error: {e}")
+            # Restore window if tray fails
+            root.after(0, lambda: root.deiconify())
+
+    def minimize_to_tray(event=None):
+        # Only minimize if state is 'iconic' (minimized) and we are not already shutting down
+        if root.state() == 'iconic':
+            try:
+                if TRAY_SUPPORT:
+                   root.withdraw() # Hide window
+                   threading.Thread(target=init_tray_icon, daemon=True).start()
+                else:
+                   pass # Standard minimize behavior (do nothing special)
+            except: pass
+
+    # Bind minimize event
+    # <Unmap> is triggered when window is minimized OR hidden. We need to distinguish.
+    # checking root.state() inside the event handler is the key.
+    # root.bind("<Unmap>", lambda e: minimize_to_tray(e) if root.state() == 'iconic' else None)
+
+
+    # Clean up tray on exit
+    def cleanup_tray():
+        global TRAY_ICON
+        if TRAY_ICON:
+            try: TRAY_ICON.stop()
+            except: pass
+
+    # Hook into existing on_closing to ensure tray is removed
+    # original_on_closing = on_closing
+    # def new_on_closing():
+    #     cleanup_tray()
+    #     original_on_closing()
+    
+    # root.protocol("WM_DELETE_WINDOW", new_on_closing)
+
+    # ================= GUI UTILS =================
+
     
     def ip_in_network(ip, net):
         try:
@@ -3569,6 +4424,8 @@ try:
                         log_func(f"[Check] Защищенный домен {domain} сбоит [{diag}]. В экстренный подбор.")
                     else:
                         log_func(f"[Warning] {domain} заблокирован/замедлен [{diag}]. Запуск экстренного подбора...")
+                        # Сразу сохраняем в hard.txt для надежности
+                        add_to_hard_list_safe(domain)
                     
                     # Отправляем домен на экстренный анализ, который сам добавит его в hard.txt если нужно
                     urgent_analysis_queue.put(domain)
@@ -4177,10 +5034,14 @@ try:
                     test_exe_name = "winws_test.exe"
                     exe_path = os.path.join(get_base_dir(), "bin", exe_name)
                     test_exe_path = os.path.join(get_base_dir(), "bin", test_exe_name)
-                    if os.path.exists(exe_path):
+                    
+                    # FIX: Don't overwrite if exists to avoid race conditions
+                    if os.path.exists(exe_path) and not os.path.exists(test_exe_path):
                         shutil.copy2(exe_path, test_exe_path)
                 except Exception as e:
-                    log_func(f"[Check] Ошибка подготовки ядра: {e}")
+                    # Ignore benign errors if file is busy
+                    # log_func(f"[Check] Ошибка подготовки ядра: {e}")
+                    pass
                 
                 # === CRITICAL HEALTH CHECK ===
                 # Check if main winws.exe is still running. If not, restart immediately.
@@ -5229,7 +6090,33 @@ try:
 
                 need_check = False
                 # === НОВОЕ: Записываем IP и проверяем нужна ли переверификация ===
-                needs_ip_recheck = record_ip_change(current_ip, log_func)
+                # FIX: Debounce IP changes to prevent constant restarts on unstable connections
+                # We trust record_ip_change but verify the "need_recheck" flag carefully
+                
+                try:
+                    needs_ip_recheck = record_ip_change(current_ip, log_func)
+                except NameError:
+                    # Generic fallback if function missing (shouldn't happen but safety first)
+                    needs_ip_recheck = False
+                    if state.get("last_checked_ip") != current_ip:
+                         needs_ip_recheck = True
+
+                # FIX: Chech loaded_ip and completion status BEFORE using them in debounce logic
+                loaded_completed = state.get("completed", False) or state.get("checks_completed", False)
+                loaded_ip = state.get("last_checked_ip", None)
+                same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
+
+                # Extra Debounce: If IP just changed, wait a bit and re-verify before nuking state
+                if needs_ip_recheck and loaded_ip != current_ip:
+                     if IS_DEBUG_MODE: log_func(f"[Check] IP changed ({loaded_ip} -> {current_ip}). Debouncing...")
+                     time.sleep(10)
+                     try:
+                         check_ip = get_public_ip_isolated()
+                         if check_ip != current_ip:
+                             log_func(f"[Check] IP change was transient ({current_ip} -> {check_ip}). Ignoring.")
+                             needs_ip_recheck = False
+                             current_ip = check_ip # Adopt the latest one but don't reset
+                     except: pass
                 
                 # Check 7-day timeout
                 last_full_ts = state.get("last_full_check_time", 0)
@@ -5238,12 +6125,6 @@ try:
                      days_passed = (time.time() - last_full_ts) / 86400
                 
                 is_timeout = days_passed > 7
-
-                # FIX: Check if already completed for same IP - if so, skip full reset
-                # This prevents restart loops when IP hasn't changed but timeout triggered
-                loaded_completed = state.get("completed", False) or state.get("checks_completed", False)
-                loaded_ip = state.get("last_checked_ip", None)
-                same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
                 
                 # FIX: Smart Resume Logic
                 # Только если таймаут ИЛИ (IP требует перепроверки И он отличается от сохраненного)
@@ -5293,7 +6174,10 @@ try:
                          need_check = True
 
                 # FIX: In Evo mode, we want to proceed even if IP didn't change (to run evolution on existing base)
-                if not need_check and not IS_EVO_MODE:
+                # Also check if Evolution stage > 0 (dynamic evolution in progress)
+                # FIX: Check 'completed' (Total) instead of 'evolution_stage' (Partial).
+                # If checks_completed=True but completed=False, we MUST proceed to Evolution.
+                if not need_check and not IS_EVO_MODE and state.get("completed", False):
                     # Robust spam protection: Log only once per hour
                     # Use GLOBAL dict to bypass any local scope reset issues
                     tid = threading.get_ident()
@@ -5382,10 +6266,22 @@ try:
                     try:
                         with open(strat_path, "r", encoding="utf-8") as f:
                             main_data = json.load(f)
+                            
+                            # FIX: If service is not in strategies.json, consider it disabled/inactive
+                            if service_key not in main_data:
+                                return []
+                            
                             if service_key in main_data:
+                                args = main_data[service_key]
+                                # FIX: Respect DISABLED/OFF status (including null/false)
+                                if args is None or (isinstance(args, bool) and not args) or \
+                                   (isinstance(args, str) and args.strip().upper() in ["DISABLED", "OFF", "FALSE", "NONE"]):
+                                     blocked_services.add(service_key)
+                                     return []
+                                     
                                 # Mark as "Current" for UI clarity, but it might duplicate a file strategy.
                                 # StrategyChecker will check it.
-                                service_strategies.append({"name": f"Current {service_key}", "args": main_data[service_key]})
+                                service_strategies.append({"name": f"Current {service_key}", "args": args})
                     except: pass
 
                     # 2. Load File Strategies
@@ -5473,17 +6369,22 @@ try:
 
                     # --- 2. Discord Strategy Check ---
                     discord_list_path = os.path.join(base_dir, "list", "discord.txt")
-                    ds_domains = read_domains_from_file(discord_list_path)
-                    if not ds_domains:
-                        ds_domains = ["discord.com", "gateway.discord.gg", "cdn.discordapp.com", "discordapp.com"]
-                    all_tasks.extend(prepare_service_tasks("discord", discord_strat_path, ds_domains, "discord_checked"))
+                    dc_domains = read_domains_from_file(discord_list_path)
+                    if not dc_domains:
+                        dc_domains = ["discord.com", "gateway.discord.gg", "cdn.discordapp.com"]
+                    all_tasks.extend(prepare_service_tasks("discord", discord_strat_path, dc_domains, "discord_checked"))
+                    # discord_list_path = os.path.join(base_dir, "list", "discord.txt")
+                    # ds_domains = read_domains_from_file(discord_list_path)
+                    # if not ds_domains:
+                    #     ds_domains = ["discord.com", "gateway.discord.gg", "cdn.discordapp.com", "discordapp.com"]
+                    # all_tasks.extend(prepare_service_tasks("discord", discord_strat_path, ds_domains, "discord_checked"))
                     
                     # --- 3. WhatsApp Strategy Check ---
-                    whatsapp_list_path = os.path.join(base_dir, "list", "whatsapp.txt")
-                    wa_domains = read_domains_from_file(whatsapp_list_path)
-                    if not wa_domains:
-                        wa_domains = ["whatsapp.com", "whatsapp.net"]
-                    all_tasks.extend(prepare_service_tasks("whatsapp", whatsapp_strat_path, wa_domains, "whatsapp_checked"))
+                    # whatsapp_list_path = os.path.join(base_dir, "list", "whatsapp.txt")
+                    # wa_domains = read_domains_from_file(whatsapp_list_path)
+                    # if not wa_domains:
+                    #     wa_domains = ["whatsapp.com", "whatsapp.net"]
+                    # all_tasks.extend(prepare_service_tasks("whatsapp", whatsapp_strat_path, wa_domains, "whatsapp_checked"))
                 
                 # --- General / Hard Strategy Check ---
                 # === НОВОЕ: Правильный выбор доменов для General (всегда 100 доменов) ===
@@ -6512,7 +7413,7 @@ try:
 
                      try:
                          log_func("[Check] Принудительная очистка слабых стратегий перед Эволюцией...")
-                         services_to_prune = ["general", "youtube", "discord", "whatsapp", "telegram"]
+                         services_to_prune = ["general", "youtube", "discord"] # Removed whatsapp, telegram
                          
                          for svc_p in services_to_prune:
                              if svc_p == "discord": lim = 99
@@ -7131,7 +8032,7 @@ try:
                         # === FINAL PRUNING: Enforce strict limits after Evolution ===
                         try:
                             log_func("[Check] Финальная очистка стратегий...")
-                            for svc_final in ["general", "youtube", "whatsapp", "telegram"]:
+                            for svc_final in ["general", "youtube"]: # Removed whatsapp, telegram
                                 lim_final = 36 if svc_final == "general" else 12
                                 p_final = os.path.join(base_dir, "strat", f"{svc_final}.json")
                                 
@@ -7473,25 +8374,7 @@ try:
         with throttled_registry_lock:
             return domain in throttled_domains_registry
 
-    def add_to_hard_list_safe(domain):
-        """Безопасно добавляет домен в temp/hard.txt для подбора стратегии."""
-        with hard_list_lock:
-            try:
-                base_dir = get_base_dir()
-                hard_path = os.path.join(base_dir, "temp", "hard.txt")
-                
-                with open(hard_path, "a+", encoding="utf-8") as f:
-                    f.seek(0)
-                    content = f.read()
-                    domain_lower = domain.lower()
-                    
-                    # Проверяем что домена нет в списке
-                    if domain_lower not in content.lower():
-                        if content and not content.endswith("\n"):
-                            f.write("\n")
-                        f.write(f"{domain_lower}\n")
-            except Exception as e:
-                pass
+
 
     def add_domain_to_hard_strategy(domain, hard_name, log_func=None):
         """Добавляет домен в определенную hard_X стратегию."""
@@ -7905,33 +8788,96 @@ try:
         return False # Если после всех попыток не было успеха
 
     def add_to_hard_list_safe(domain):
-        hard_path = os.path.join(get_base_dir(), "temp", "hard.txt")
+        """Безопасно добавляет домен в temp/hard.txt для подбора стратегии."""
         try:
-            lines = []
-            if os.path.exists(hard_path):
-                with open(hard_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
+            hard_path = os.path.join(get_base_dir(), "temp", "hard.txt")
+            lock = globals().get('hard_list_lock', threading.Lock())
             
-            new_lines = []
-            found = False
-            timestamp = time.strftime("%d.%m.%Y в %H:%M")
-            new_entry = f"{domain} # Не удалось разблокировать (Auto-Detect {timestamp})\n"
-            
-            for line in lines:
-                parts = line.strip().split('#')[0].strip()
-                if parts == domain:
-                    new_lines.append(new_entry)
-                    found = True
-                else:
-                    new_lines.append(line)
-            
-            if not found:
-                new_lines.append(new_entry)
+            with lock:
+                lines = []
+                if os.path.exists(hard_path):
+                    with open(hard_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
                 
-            with open(hard_path, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
+                new_lines = []
+                found = False
+                timestamp = time.strftime("%d.%m.%Y в %H:%M")
+                new_entry = f"{domain} # Не удалось разблокировать (Auto-Detect {timestamp})\n"
+                domain_lower = domain.lower().strip()
+                
+                for line in lines:
+                    parts = line.strip().split('#')[0].strip().lower()
+                    if parts == domain_lower:
+                        new_lines.append(new_entry)
+                        found = True
+                    else:
+                        new_lines.append(line)
+                
+                if not found:
+                    new_lines.append(new_entry)
+                    
+                with open(hard_path, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+
         except Exception as e:
             print(f"Error updating hard.txt: {e}")
+
+    def remove_from_hard_list_safe(domain):
+        """Безопасно удаляет домен из temp/hard.txt."""
+        try:
+            hard_path = os.path.join(get_base_dir(), "temp", "hard.txt")
+            if not os.path.exists(hard_path): return
+
+            # Используем блокировку если она доступна, иначе просто читаем/пишем (риск гонки, но лучше чем ничего)
+            # В этом контексте hard_list_lock должен быть доступен
+            lock = globals().get('hard_list_lock', threading.Lock()) 
+            
+            with lock:
+                with open(hard_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                
+                new_lines = []
+                domain_lower = domain.lower().strip()
+                
+                for line in lines:
+                    if line.strip().split('#')[0].strip().lower() != domain_lower:
+                        new_lines.append(line)
+                
+                with open(hard_path, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+                    
+        except Exception as e:
+            print(f"Error removing from hard.txt: {e}")
+
+    def add_to_blocked_list_safe(domain):
+        """Безопасно добавляет домен в list/ru.txt (кладбище)."""
+        try:
+            base_dir = get_base_dir()
+            blocked_path = os.path.join(base_dir, BLOCKED_LIST_FILENAME)
+            
+            # Создаем директорию list если нет (хотя должна быть)
+            os.makedirs(os.path.dirname(blocked_path), exist_ok=True)
+            
+            # Используем отдельный лок для blocked списка или общий hard_list_lock
+            lock = globals().get('hard_list_lock', threading.Lock())
+            
+            with lock:
+                # Читаем существующие чтобы не дублировать
+                existing = set()
+                if os.path.exists(blocked_path):
+                     with open(blocked_path, "r", encoding="utf-8") as f:
+                        for l in f:
+                            existing.add(l.strip().split('#')[0].strip().lower())
+                
+                domain_lower = domain.lower().strip()
+                if domain_lower in existing: return
+
+                with open(blocked_path, "a", encoding="utf-8") as f:
+                    ts = time.strftime('%d.%m.%Y')
+                    f.write(f"{domain_lower} # Blocked (No Strategy Found) {ts}\n")
+                    
+        except Exception as e:
+            print(f"Error updating ru.txt: {e}")
 
     def load_exclude_auto_checked():
         global exclude_auto_checked_domains
@@ -8355,14 +9301,25 @@ try:
                     num_pools=connections, maxsize=maxsize,
                     block=block, source_address=('0.0.0.0', self._source_port), socket_options=options, **pool_kwargs)
 
-        services = ['https://api.ipify.org', 'https://ifconfig.me', 'https://icanhazip.com']
+        services = ['https://api.ipify.org', 'https://ifconfig.me', 'https://icanhazip.com', 'https://ipinfo.io/ip']
         local_port = random.randint(16000, 16009)
         session = requests.Session()
+        session.trust_env = False # FIX: Ignore system proxy to get real ISP IP
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
         session.mount('https://', SourcePortAdapter(local_port))
+        
+        def is_valid_ip(text):
+            if not text or len(text) > 45 or '<' in text or '>' in text or 'html' in text.lower():
+                return False
+            return True
+
         try:
             for url in services:
                 try:
-                    return session.get(url, timeout=5).text.strip()
+                    ip = session.get(url, timeout=5).text.strip()
+                    if is_valid_ip(ip): return ip
                 except: continue
         finally:
             session.close()
@@ -8372,7 +9329,9 @@ try:
             # Try one more time with standard requests (no source port binding)
             for url in services:
                  try:
-                     return requests.get(url, timeout=5).text.strip()
+                     # FIX: Explicitly disable proxies for fallback
+                     ip = requests.get(url, headers=session.headers, timeout=5, proxies={"http": None, "https": None}).text.strip()
+                     if is_valid_ip(ip): return ip
                  except: continue
         except: pass
         
@@ -8545,7 +9504,7 @@ try:
             scored.sort(key=lambda x: x[0], reverse=True)
             return scored[0][1]
 
-    # strategy_learner = StrategyLearner() # DISABLED: Legacy/Conflicting implementation
+
 
     def record_ip_change(new_ip, log_func=None):
         """Записывает смену IP адреса (кроме VPN) и возвращает True если переверификация нужна."""
@@ -9039,6 +9998,7 @@ try:
                         if status == "ok":
                             log_func(f"[HardMatcher] {domain} разблокирован (General). Добавляем в general.txt")
                             smart_update_general([domain])
+                            remove_from_hard_list_safe(domain)
                             continue
                         
                         found_strategy = None
@@ -9054,6 +10014,7 @@ try:
                                     log_func(f"[HardMatcher] Найден Boost: {b_name}")
                                     mark_boost_strategy_for_domain(domain, b_name)
                                     add_domain_to_hard_strategy(domain, b_name, log_func)
+                                    remove_from_hard_list_safe(domain)
                                     found_strategy = b_name
                                     break
                         
@@ -9066,14 +10027,16 @@ try:
                                     if test_boost_strategy_isolated(strategies[h_name], domain, 16016, base_dir, log_func):
                                         log_func(f"[HardMatcher] Найдена Hard стратегия: {h_name}")
                                         add_domain_to_hard_strategy(domain, h_name, log_func)
+                                        remove_from_hard_list_safe(domain)
                                         found_strategy = h_name
                                         break
                         
                         if found_strategy:
                             if root: root.after(0, perform_hot_restart)
                         else:
-                            log_func(f"[HardMatcher] Быстрый подбор не удался для {domain}. В очередь глубокого анализа.")
-                            add_to_hard_list_safe(domain)
+                            log_func(f"[HardMatcher] Быстрый подбор не удался для {domain}. Переносим в BLOCKED.")
+                            add_to_blocked_list_safe(domain)
+                            remove_from_hard_list_safe(domain)
                             if is_throttled:
                                 t_type = classify_throttle_type(diag)
                                 mark_domain_as_throttled_registry(domain, t_type)
@@ -9302,6 +10265,259 @@ try:
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
 
+    def pac_updater_worker(log_func):
+        """
+        Monitors list/*.txt and ip/*.txt for changes.
+        - Updates PAC file.
+        - Optimizes general.txt (removes VPN domains).
+        - Triggers Hot Reload for WinWS if strategies/lists change.
+        """
+        base = get_base_dir()
+        
+        # Files to monitor
+        # PAC relevant
+        monitor_vpn = [
+            os.path.join(base, "list", "ru.txt"),
+            os.path.join(base, "list", "eu.txt"),
+            os.path.join(base, "ip", "ru.txt"),
+            os.path.join(base, "ip", "eu.txt")
+        ]
+        
+        # General list (for Hot Reload)
+        file_general = os.path.join(base, "list", "general.txt")
+        
+        all_monitor_files = monitor_vpn + [file_general]
+        
+        def get_file_stats(p):
+            """Returns hash for robust change detection"""
+            try:
+                if os.path.exists(p):
+                    with open(p, "rb") as f:
+                        content = f.read()
+                        return hashlib.md5(content).hexdigest()
+            except: pass
+            return ""
+
+        # Helper: Optimize General List (Remove VPN domains)
+        def optimize_general_list():
+            """Removes domains from general.txt that are already in VPN lists (ru.txt, eu.txt)"""
+            try:
+                if not os.path.exists(file_general): return False
+                
+                # 1. Load VPN domains
+                vpn_domains = set()
+                for f_path in [os.path.join(base, "list", "ru.txt"), os.path.join(base, "list", "eu.txt")]:
+                    if os.path.exists(f_path):
+                        with open(f_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line and not line.startswith("#"):
+                                    vpn_domains.add(line.lower())
+                
+                # 2. Process General
+                lines = []
+                with open(file_general, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                
+                new_lines = []
+                cleaned_count = 0
+                
+                for line in lines:
+                    stripped = line.strip().lower()
+                    if not stripped or line.startswith("#"):
+                        new_lines.append(line)
+                        continue
+                        
+                    if stripped in vpn_domains:
+                        cleaned_count += 1
+                        continue # Skip (Remove)
+                    
+                    new_lines.append(line)
+                
+                if cleaned_count > 0:
+                    with open(file_general, "w", encoding="utf-8") as f:
+                        f.writelines(new_lines)
+                    log_func(f"[List] Оптимизация: удалено {cleaned_count} доменов из general.txt (есть в VPN)")
+                    return True # File changed
+                    
+            except Exception as e:
+                safe_trace(f"[Optimizer] Error: {e}")
+            return False
+        
+        # Init state
+        file_hashes = {f: get_file_stats(f) for f in all_monitor_files}
+        
+        # Capture current run ID
+        my_run_id = SERVICE_RUN_ID
+        
+        log_func("[PAC] Мониторинг списков запущен (Hot Reload активен)")
+        
+        while not is_closing:
+            if SERVICE_RUN_ID != my_run_id: break
+            
+            time.sleep(2)
+            try:
+                vpn_changed = False
+                general_changed = False
+                
+                # Check VPN files
+                for f_path in monitor_vpn:
+                    current_hash = get_file_stats(f_path)
+                    if current_hash != file_hashes[f_path]:
+                        file_hashes[f_path] = current_hash
+                        vpn_changed = True
+
+                # Check General file
+                gen_hash = get_file_stats(file_general)
+                if gen_hash != file_hashes[file_general]:
+                    file_hashes[file_general] = gen_hash
+                    general_changed = True
+                
+                # Logic Flow
+                if vpn_changed:
+                    # 1. Update PAC
+                    if pac_manager:
+                        pac_manager.generate_pac()
+                        pac_manager.refresh_system_options()
+                        log_func("[PAC] Списки VPN обновлены.")
+                    
+                    # 2. Optimize General (might trigger general_changed next loop, or now)
+                    if optimize_general_list():
+                        # If optimization changed the file, update hash immediately to avoid double trigger
+                        file_hashes[file_general] = get_file_stats(file_general)
+                        general_changed = True # Cascading change
+                        
+                if general_changed:
+                    # Trigger Hot Restart
+                    log_func("[Auto] Изменен general.txt -> Перезапуск ядра...")
+                    perform_hot_restart_backend()
+                    
+                    # Also update PAC if general is used there (usually not, but good practice if logic changes)
+                    # currently PAC only uses ru/eu/sip, so general doesn't affect PAC directly usually. 
+                    # But if we add general to PAC later, do it here.
+                        
+            except Exception as e:
+                safe_trace(f"[PAC Worker] Error: {e}")
+                time.sleep(5)
+
+    def update_ip_cache_worker(paths, log_func):
+        """Checks external IP. If changed, clears domain check cache."""
+        import requests
+        
+        # Wait a bit for network to stabilize
+        time.sleep(2)
+        
+        try:
+            current_ip = None
+            try:
+                # Use a reliable IP echo service with timeout
+                r = requests.get("https://api.ipify.org", timeout=5)
+                if r.status_code == 200:
+                    current_ip = r.text.strip()
+            except: pass
+            
+            if not current_ip:
+                 safe_trace("[IP Worker] Failed to get external IP")
+                 return
+
+            ip_cache_file = os.path.join(get_base_dir(), "temp", "ip_last.txt")
+            last_ip = ""
+            if os.path.exists(ip_cache_file):
+                with open(ip_cache_file, "r") as f:
+                    last_ip = f.read().strip()
+                    
+            # Helper for privacy
+            def mask_ip(ip_str):
+                try:
+                    parts = ip_str.split('.')
+                    if len(parts) == 4:
+                        return f"***.***.{parts[2]}.{parts[3]}"
+                    return "***"
+                except: return "***"
+
+            if current_ip == last_ip:
+                log_func(f"[Init] IP не изменился ({mask_ip(current_ip)}). Повторная проверка доменов не требуется.")
+            else:
+                log_func(f"[Init] IP изменился ({mask_ip(last_ip)} -> {mask_ip(current_ip)}). Сброс кэша проверок.")
+                try:
+                    with check_cache_lock:
+                        check_cache.clear()
+                        save_json_safe(CHECK_CACHE_FILE, check_cache)
+                except: pass
+                
+                try:
+                    with open(ip_cache_file, "w") as f:
+                        f.write(current_ip)
+                except: pass
+                    
+        except Exception as e:
+            safe_trace(f"[IP Worker] Error: {e}")
+
+    def proxy_watchdog_worker(log_func):
+        """Monitors WARP and Opera Proxy, restarts if crashed."""
+        my_run_id = SERVICE_RUN_ID
+        retry_timestamps = []  # Track retry times
+        MAX_RETRIES = 6
+        RETRY_WINDOW = 60  # seconds
+        RETRY_PAUSE = 3
+        CHECK_INTERVAL = 15
+        
+        # Initial delay to let everything start
+        time.sleep(30)
+        
+        while not is_closing:
+            if SERVICE_RUN_ID != my_run_id: break
+            time.sleep(CHECK_INTERVAL)
+            
+            try:
+                now = time.time()
+                # Clean old timestamps
+                retry_timestamps[:] = [t for t in retry_timestamps if now - t < RETRY_WINDOW]
+                
+                if len(retry_timestamps) >= MAX_RETRIES:
+                    continue  # Rate limit reached, skip
+                
+                # Check WARP
+                if warp_manager:
+                    status = warp_manager.get_status()
+                    if status and "Disconnected" in status:
+                        log_func("[RU] Обнаружено отключение. Переподключение...")
+                        retry_timestamps.append(now)
+                        time.sleep(RETRY_PAUSE)
+                        warp_manager.run_warp_cli("connect")
+                        time.sleep(5)
+                        new_status = warp_manager.get_status()
+                        if new_status and "Connected" in new_status:
+                            log_func("[RU] Соединение восстановлено.")
+                        else:
+                            log_func(f"[RU] Не удалось восстановить: {new_status}")
+                
+                # Check Opera Proxy
+                if opera_proxy_manager and opera_proxy_manager.process:
+                    if opera_proxy_manager.process.poll() is not None:
+                        exit_code = opera_proxy_manager.process.returncode
+                        log_func(f"[EU] Процесс завершился (код: {exit_code}). Перезапуск...")
+                        
+                        # Read log for details
+                        try:
+                            if hasattr(opera_proxy_manager, 'log_file') and os.path.exists(opera_proxy_manager.log_file):
+                                with open(opera_proxy_manager.log_file, "r") as f:
+                                    lines = f.readlines()
+                                    if lines:
+                                        log_func(f"[EU] Лог падения:")
+                                        for l in lines[-5:]: # Last 5 lines
+                                            log_func(f" > {l.strip()}")
+                        except: pass
+                        
+                        retry_timestamps.append(now)
+                        time.sleep(RETRY_PAUSE)
+                        opera_proxy_manager.start()
+                        if opera_proxy_manager.process and opera_proxy_manager.process.poll() is None:
+                            log_func("[EU] Процесс восстановлен.")
+                        else:
+                            log_func("[EU] Не удалось перезапустить!")
+            except: pass
+
     def check_and_update_worker(log_func):
         """Фоновая проверка обновлений."""
         # Обновление работает только в скомпилированном виде (.exe)
@@ -9378,25 +10594,30 @@ try:
 
                 if not latest_version or not download_url:
                      # JSON некорректен или нет URL
-                    if first_run: log_func("[Update] Новая версия программы готовится")
+                    if first_run: log_func("[Update] Новая версия программы готовится (No Data)")
                     first_run = False
                     for _ in range(28800):
                         if is_closing: return
                         time.sleep(1)
                     continue
 
-                if compare_versions(latest_version, CURRENT_VERSION):
+                # Debug version comparison
+                should_update = compare_versions(latest_version, CURRENT_VERSION)
+                if first_run and IS_DEBUG_MODE:
+                    log_func(f"[Update-Debug] Server: {latest_version}, Local: {CURRENT_VERSION}, Update: {should_update}, Frozen: {is_frozen}")
+
+                if should_update:
                     
                     # FIX: Check frozen status BEFORE downloading
                     if not is_frozen and not sys.argv[0].lower().endswith(".exe"):
-                         log_func(f"[Update] Найдено обновление: {latest_version}. (Скачивание пропущено: запуск из исходника)")
+                         if first_run: log_func(f"[Update] Найдено обновление: {latest_version}. (Скачивание пропущено: запуск из исходника)")
                          first_run = False
                          for _ in range(28800):
                             if is_closing: return
                             time.sleep(1)
                          continue
 
-                    log_func(f"[Update] Происходит обновление программы. Ожидайте.")
+                    log_func(f"[Update] Происходит обновление программы до v{latest_version}. Ожидайте.")
                     
                     # 2. Скачивание
                     # FIX: In Nuitka OneFile, sys.executable is the temp python.exe
@@ -9503,35 +10724,448 @@ try:
             time.sleep(60)
             flush_learning_data()
 
+    # ================= DEPENDENCY DOWNLOADER =================
+    def download_dependencies(log_func, status_callback=None):
+        """Downloads required binaries if missing."""
+        # Allow download in script mode too (for debugging/first run)
+        # if not getattr(sys, 'frozen', False): return
+
+        base = get_base_dir()
+        bin_dir = os.path.join(base, "bin")
+        temp_dir = os.path.join(base, "temp")
+        if not os.path.exists(bin_dir):
+            os.makedirs(bin_dir)
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+
+        # Base URL (Direct GitHub with browser headers - User Request)
+        BASE_URL = "https://github.com/confeden/nova_updates/raw/main/bin/"
+        
+        # Files to check/download
+        files = [
+            "winws.exe",
+            "WinDivert.dll",
+            "WinDivert64.sys",
+            "cygwin1.dll",
+            "warp-cli.exe",
+            "warp-svc.exe",
+            "opera-proxy.windows-amd64.exe",
+            "aws_lc_fips_0_13_7_crypto.dll",
+            "aws_lc_fips_0_13_7_rust_wrapper.dll",
+            "warp_ipc.dll",
+            "wintun.dll"
+        ]
+
+        missing_files = []
+        for f in files:
+            path = os.path.join(bin_dir, f)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                missing_files.append(f)
+        
+        if not missing_files:
+            return True
+
+        # FIX: Force cleanup processes before attempting to update files (WinError 32 fix)
+        try:
+            log_func("[Init] Остановка процессов перед обновлением компонентов...")
+            subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["taskkill", "/F", "/IM", "warp-cli.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["taskkill", "/F", "/IM", "opera-proxy.windows-amd64.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            # Force stop driver service
+            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            time.sleep(1.0) # Wait for release
+        except: pass
+
+        # ZIP Strategy (User Request: Single connection, faster)
+        ZIP_URL = "https://github.com/confeden/nova_updates/archive/refs/heads/main.zip"
+        zip_path = os.path.join(temp_dir, "update_temp.zip")
+        
+        if status_callback: status_callback("ЗАГРУЗКА АРХИВА . . .")
+        log_func(f"[Init] Обнаружено отсутствие {len(missing_files)} компонентов. Скачивание ZIP-архива...")
+        
+        import requests
+        from requests.adapters import HTTPAdapter
+        import zipfile
+        import shutil
+
+        # Optimize connection
+        session = requests.Session()
+        retries = HTTPAdapter(max_retries=3, pool_connections=1, pool_maxsize=1)
+        session.mount('https://', retries)
+        
+        # PowerShell Masking
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.22621; en-US) PowerShell/7.4.0",
+        })
+
+        download_success = False
+
+        # --- METHOD 1: System Curl (HTTP/2, Faster) ---
+        if not download_success:
+            curl_path = shutil.which("curl")
+            if curl_path:
+                log_func(f"[Download] Использование System Curl (HTTP/2) для скорости...")
+                try:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    
+                    process = subprocess.Popen(
+                        [curl_path, "-L", "-o", zip_path, ZIP_URL],
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        startupinfo=startupinfo,
+                        encoding='utf-8',
+                        errors='replace'
+                    )
+                    
+                    import re
+                    last_percent = -1
+                    
+                    # FIX: Read line-by-line for smoother animation
+                    while True:
+                        line = process.stderr.readline()
+                        if not line and process.poll() is not None:
+                            break
+                            
+                        if line:
+                            # Curl format: "100 123M  100 123M    0     0  12.5M      0  0:00:09  0:00:09 --:--:-- 14.2M"
+                            # Regex to find the FIRST percentage (Total or Received)
+                            matches = re.findall(r'(\d{1,3})%', line)
+                            if not matches: 
+                                # Fallback: look for generic numbers that might be percentage (start of line or after spaces)
+                                matches = re.findall(r'\s(\d{1,3})\s', line)
+                                
+                            if matches:
+                                try:
+                                    pct = int(matches[0]) # Use first match
+                                    if pct != last_percent and 0 <= pct <= 100:
+                                        last_percent = pct
+                                        if status_callback:
+                                            # Use thread-safe GUI update if callback provided
+                                            status_callback(f"ЗАГРУЗКА ZIP (CURL) {pct}% . . .")
+                                except: pass
+                                
+                    if process.returncode == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+                         log_func("[Download] Curl успешно скачал файл.")
+                         download_success = True
+                    else:
+                        log_func(f"[Download] Curl завершился с кодом {process.returncode}")
+                except Exception as e:
+                    log_func(f"[Download] Curl Error: {e}. Пробуем следующий метод...")
+
+        # --- METHOD 2: PowerShell (Native Windows) ---
+        if not download_success and shutil.which("powershell"):
+            log_func("[Download] Использование PowerShell (Invoke-WebRequest)...")
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+                # Use Invoke-WebRequest
+                ps_cmd = f"Invoke-WebRequest -Uri '{ZIP_URL}' -OutFile '{zip_path}' -UseBasicParsing"
+                
+                if status_callback: status_callback("ЗАГРУЗКА ZIP (POWERSHELL) . . .")
+                
+                process = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    startupinfo=startupinfo
+                )
+                stdout, stderr = process.communicate()
+                
+                if process.returncode == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+                    log_func("[Download] PowerShell успешно скачал файл.")
+                    download_success = True
+                else:
+                    log_func(f"[Download] PowerShell Error: {stderr.decode('utf-8', errors='ignore')}")
+            except Exception as e:
+                 log_func(f"[Download] PowerShell Exception: {e}")
+
+        # --- METHOD 3: CertUtil (Native Windows Legacy) ---
+        if not download_success and shutil.which("certutil"):
+            log_func("[Download] Использование CertUtil...")
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+                if status_callback: status_callback("ЗАГРУЗКА ZIP (CERTUTIL) . . .")
+                
+                # -urlcache -split -f "url" "file"
+                process = subprocess.Popen(
+                    ["certutil", "-urlcache", "-split", "-f", ZIP_URL, zip_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    startupinfo=startupinfo
+                )
+                stdout, stderr = process.communicate()
+                
+                if process.returncode == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
+                    log_func("[Download] CertUtil успешно скачал файл.")
+                    download_success = True
+                else:
+                    log_func(f"[Download] CertUtil Error.")
+            except Exception as e:
+                 log_func(f"[Download] CertUtil Exception: {e}")
+
+        # --- METHOD 4: Python Requests (Fallback) ---
+        if not download_success:
+                # FALLBACK: Requests
+                log_func("[Download] Использование Requests (HTTP/1.1)...")
+                with session.get(ZIP_URL, stream=True, timeout=(10, 300)) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+                    ESTIMATED_SIZE = 30 * 1024 * 1024
+                    downloaded = 0
+                    
+                    with open(zip_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024*1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if status_callback:
+                                    if total_size > 0:
+                                         percent = int((downloaded / total_size) * 100)
+                                    else:
+                                         percent = int((downloaded / ESTIMATED_SIZE) * 100)
+                                         if percent > 99: percent = 99
+                                    
+                                    status_callback(f"ЗАГРУЗКА ZIP {percent}% . . .")
+                
+                download_success = True # If no exception raised
+
+        if not download_success:
+             raise Exception("Все методы загрузки не удались.")
+            
+        try:
+            log_func("[Init] Архивы загружен. Распаковка...")
+            if status_callback: status_callback("РАСПАКОВКА . . .")
+
+            # Extract BIN folder
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # GitHub zip structure: nova_updates-main/bin/file.exe
+                # We need to find the prefix
+                root_folder = zip_ref.namelist()[0].split('/')[0] # usually repo-branch
+                
+                for member in zip_ref.namelist():
+                    if member.startswith(f"{root_folder}/bin/") and not member.endswith("/"):
+                        filename = os.path.basename(member)
+                        if not filename: continue
+                        
+                        # Extract to temp first to avoid AV locks/partial writes in bin
+                        temp_extract_path = os.path.join(temp_dir, filename)
+                        
+                        source = zip_ref.open(member)
+                        target = open(temp_extract_path, "wb")
+                        with source, target:
+                            shutil.copyfileobj(source, target)
+                            
+                        # Move to bin
+                        final_path = os.path.join(bin_dir, filename)
+                        if os.path.exists(final_path):
+                            try: os.remove(final_path)
+                            except: pass
+                        
+                        try:
+                            # Retry loop for moving files (robust against antivirus/driver locks)
+                            moved = False
+                            for attempt in range(3):
+                                try:
+                                    shutil.move(temp_extract_path, final_path)
+                                    moved = True
+                                    break
+                                except Exception as move_err:
+                                    if attempt < 2: 
+                                        time.sleep(1.0)
+                                        # Emergency kill again
+                                        subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                                    else:
+                                        raise move_err
+                            
+                            if not moved: raise Exception("Move failed after retries")
+
+                        except Exception as e:
+                            log_func(f"[Init] Ошибка перемещения {filename}: {e}")
+                            
+            log_func("[Init] Распаковка завершена.")
+            
+            # Verify missing files again
+            still_missing = []
+            for f in missing_files:
+                 if not os.path.exists(os.path.join(bin_dir, f)) or os.path.getsize(os.path.join(bin_dir, f)) == 0:
+                     still_missing.append(f)
+            
+            if still_missing:
+                log_func(f"[Init] Ошибка: Не удалось извлечь {len(still_missing)} файлов из архива!")
+                if os.path.exists(zip_path): 
+                    try: os.remove(zip_path) 
+                    except: pass
+                return False
+                
+            if os.path.exists(zip_path): 
+                try: os.remove(zip_path) 
+                except: pass
+                
+            log_func("[Init] Все компоненты успешно загружены.")
+            
+            # Create winws_test.exe for process isolation
+            try:
+                w_src = os.path.join(bin_dir, "winws.exe")
+                w_dst = os.path.join(bin_dir, "winws_test.exe")
+                if os.path.exists(w_src):
+                    # FIX: Only copy if missing to avoid locking active test process
+                    if not os.path.exists(w_dst):
+                        shutil.copy2(w_src, w_dst)
+            except: pass
+            
+            return True
+        except Exception as e:
+            log_func(f"[Init] Ошибка распаковки: {e}")
+            if os.path.exists(zip_path): 
+                try: os.remove(zip_path) 
+                except: pass
+            return False
+
+
+
+
+    SERVICES_RUNNING = False
+
     def start_services_threads(log_func=None):
         """Helper to start all background threads (Global Context)"""
+        global SERVICES_RUNNING
         if log_func is None: log_func = print
         
-        # Ensure path structure is ready
-        paths = ensure_structure()
+        # FIX: Prevent duplicate service threads during hot restarts
+        if SERVICES_RUNNING:
+            safe_trace("[Services] Threads already running. Skipping start_services_threads.")
+            return
 
+        SERVICES_RUNNING = True
+        
+        # Ensure path structure is ready
+        try:
+            paths = ensure_structure()
+            safe_trace("[Services] Structure ensured. Checking dependencies...")
+        except Exception as e:
+            safe_trace(f"[Services] Structure ERROR: {e}")
+            return
+            
+        # Download dependencies before starting threads
+        try:
+             download_dependencies(log_func)
+        except Exception as e:
+             log_func(f"[Init] Ошибка проверки зависимостей: {e}")
+
+        safe_trace("[Services] Threads launching...")
+
+        # === PRIORITY SERVICES ===
+        # PAC & Watchdog first to ensure connectivity and updates work immediately
+        threading.Thread(target=pac_updater_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=proxy_watchdog_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=update_ip_cache_worker, args=(paths, log_func), daemon=True).start()
+        threading.Thread(target=check_and_update_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=learning_data_flush_worker, daemon=True).start()
+
+        # === CORE CHECKERS ===
+        for _ in range(2): 
+            threading.Thread(target=background_checker_worker, args=(log_func,), daemon=True).start()
+
+        threading.Thread(target=periodic_exclude_checker_worker, args=(log_func,), daemon=True).start()
+        threading.Thread(target=exclude_auto_monitor_worker, args=(log_func,), daemon=True).start()
+        
+        # === HEAVY / LOWER PRIORITY ===
         threading.Thread(target=advanced_strategy_checker_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=payload_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=vpn_monitor_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=hard_strategy_matcher_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=boost_evolution_worker, args=(log_func,), daemon=True).start()
-        
-        threading.Thread(target=update_ip_cache_worker, args=(paths, log_func), daemon=True).start()
-        
-        for _ in range(2): 
-            threading.Thread(target=background_checker_worker, args=(log_func,), daemon=True).start()
-            
-        threading.Thread(target=periodic_exclude_checker_worker, args=(log_func,), daemon=True).start()
-        threading.Thread(target=exclude_auto_monitor_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=boost_strategy_matcher_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=batch_exclude_worker, args=(log_func,), daemon=True).start()
-        threading.Thread(target=check_and_update_worker, args=(log_func,), daemon=True).start()
+        
         threading.Thread(target=domain_cleaner_worker, args=(log_func,), daemon=True).start()
         threading.Thread(target=cleanup_redundant_domains_worker, args=(log_func,), daemon=True).start()
 
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
+        global warp_manager, pac_manager, opera_proxy_manager, SERVICE_RUN_ID, state_lock
+
+        # Increment run ID
+        try:
+            with state_lock:
+                SERVICE_RUN_ID += 1
+        except: pass
+
+        # FIX: Check & Download dependencies FIRST (Synchronous)
+        # This prevents race conditions where services try to start before binaries exist
+        try:
+             logger = globals().get('log_print', safe_trace)
+             
+             def update_loading_status_sync(msg):
+                 try:
+                     if 'status_label' in globals() and 'root' in globals() and root:
+                         root.after(0, lambda: status_label.config(text=msg))
+                 except: pass
+
+             if not download_dependencies(logger, status_callback=update_loading_status_sync):
+                 msg = "Не удалось загрузить необходимые компоненты!\nПроверьте интернет и повторите попытку."
+                 safe_trace(f"[Init] {msg}")
+                 if not silent:
+                     root.after(0, lambda: messagebox.showerror("Ошибка", msg))
+                 return
+             
+             # Restore status
+             update_loading_status_sync("ЗАПУСК . . .")
+        except Exception as e:
+             safe_trace(f"[Init] Dependency download error: {e}")
+
+        # === WARP & PAC INIT (ASYNC) ===
+        def warp_startup_task():
+            try:
+                def safe_log(msg):
+                    try: 
+                        if 'log_print' in globals(): log_print(msg)
+                        else: print(msg)
+                    except: pass
+                
+                # WAIT for WinWS Service to be ACTIVE
+                # This is critical if we need WinWS to unblock Warp connection
+                max_wait = 30
+                started = False
+                for _ in range(max_wait):
+                    if is_service_active:
+                        started = True
+                        break
+                    time.sleep(1)
+                
+                if not started:
+                    safe_log("[RU] Warning: WinWS service did not start in time. Trying Warp anyway...")
+
+                # Extra delay to let WinWS fully initialize divert
+                time.sleep(2)
+
+                global warp_manager, pac_manager, opera_proxy_manager
+                if not warp_manager: warp_manager = WarpManager(log_func=safe_log)
+                if not pac_manager: pac_manager = PacManager(log_func=safe_log)
+                
+                # Start WARP (might take time if config missing)
+                # FIX: Run in background so app starts immediately
+                warp_manager.start()
+                
+                # Start Opera Proxy
+                if not opera_proxy_manager: opera_proxy_manager = OperaProxyManager(log_func=safe_log)
+                opera_proxy_manager.start()
+                
+                # Start PAC server and set system proxy
+                pac_manager.start_server()
+                pac_manager.set_system_proxy()
+                
+            except Exception as e:
+                 print(f"WARP Init Error: {e}")
+
+        threading.Thread(target=warp_startup_task, daemon=True).start()
+
         try:
             _start_nova_service_logic(silent, restart_mode)
         except Exception as e:
@@ -9594,12 +11228,18 @@ try:
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
         global is_service_active, process, is_closing
         
+        
+        # TRACE LOGGING
+
         # Сбрасываем флаг завершения при перезапуске, чтобы фоновые проверки возобновились
         is_closing = False
+        safe_trace(f"[_start_nova_service_logic] Called. Silent={silent}, Restart={restart_mode}")
         
         if not is_admin(): 
             root.after(0, lambda: messagebox.showerror("Ошибка", "Нужны права Администратора!"))
             return
+        
+
         
         exe_path = os.path.join(get_base_dir(), "bin", WINWS_FILENAME)
         if not os.path.exists(exe_path): 
@@ -9886,9 +11526,11 @@ try:
             general_common_args = []
             general_common_args.extend(exclusions)
             if gen_list_exists:
-                general_common_args.append(f"--hostlist={target_gen_list}")
+                 general_common_args.append(f"--hostlist={target_gen_list}")
+            
+            # Add ipset if exists
             if os.path.exists(paths['ip_general']) and os.path.getsize(paths['ip_general']) > 0:
-                general_common_args.append(f"--ipset={paths['ip_general']}")
+                 general_common_args.append(f"--ipset={paths['ip_general']}")
 
             args.extend(general_common_args)
             
@@ -9955,8 +11597,12 @@ try:
         def run_process():
             global process, is_closing, is_service_active, nova_service_status, is_restarting
             
+            
+            safe_trace(f"[run_process] Thread started. Active={is_service_active}")
+            
             # PREVENT RESTART if stopped (unless explicitly restarting)
             if not is_service_active and not is_closing and not is_restarting:
+                safe_trace("[run_process] Aborting: inactive/closing.")
                 return
 
             # --- Smart Startup Retry Loop ---
@@ -10136,19 +11782,26 @@ try:
              
              # FIX: Restart background tasks using GLOBAL function
              # We use a separate thread/delayed call to avoid blocking UI or race conditions
-             if not silent: # Only on manual start/restart
-                 log_print("[Service] Перезапуск фоновых процессов...")
-                 threading.Thread(target=start_services_threads, args=(log_print,), daemon=True).start()
+             # FIX: Restart background tasks using GLOBAL function
+             # We use a separate thread/delayed call to avoid blocking UI or race conditions
+             log_print("[Service] Запуск фоновых процессов...")
+             # FIX: Use GLOBAL log_print to bypass local 'silent' check for background threads
+             # This ensures logs appear in GUI even if started silently
+             global_logger = globals().get('log_print', print)
+             
+             safe_trace("[run_process] Launching start_services_threads...")
+             
+             threading.Thread(target=start_services_threads, args=(global_logger,), daemon=True).start()
 
     def stop_nova_service(silent=False, wait_for_cleanup=False, restart_mode=False):
-        global is_service_active, process, is_closing, nova_service_status
+        global is_service_active, process, is_closing, nova_service_status, SERVICES_RUNNING
         
-        # === НЕМЕДЛЕННОЕ обновление состояния ===
         # === НЕМЕДЛЕННОЕ обновление состояния ===
         if not restart_mode:
             is_service_active = False
             # FIX: Kill background workers on manual stop to prevent duplication on restart
             is_closing = True
+            SERVICES_RUNNING = False
         
         if not silent: 
             print("Остановка...")
@@ -10161,6 +11814,16 @@ try:
         if root and not restart_mode:
             root.after(0, lambda: btn_toggle.config(text="ЗАПУСТИТЬ"))
             root.after(0, lambda: status_label.config(text="ОСТАНОВЛЕНО", fg=COLOR_TEXT_FAIL))
+        
+        # === КРИТИЧНО: Восстанавливаем системный прокси при остановке ===
+        # Иначе браузер не сможет подключиться к сайтам после остановки Nova
+        if not restart_mode:
+            try:
+                if pac_manager: pac_manager.restore_system_proxy()
+                if opera_proxy_manager: opera_proxy_manager.stop()
+                if warp_manager: warp_manager.stop()
+            except Exception as e:
+                print(f"[Cleanup] Ошибка восстановления прокси: {e}")
         
         # === Асинхронное завершение процессов (в отдельном потоке, без блокировки UI) ===
         def cleanup_processes():
@@ -10232,6 +11895,9 @@ try:
         # FIX: Wait for cleanup to prevent race condition (killing new process)
         stop_nova_service(silent=True, restart_mode=True, wait_for_cleanup=True)
         
+        # FIX: Delay to release file handles
+        time.sleep(1.0)
+        
         # Start main process again
         start_nova_service(silent=True, restart_mode=True)
         
@@ -10297,8 +11963,17 @@ try:
     def on_closing():
         global is_closing, process
         
+        # Ensure tray icon is removed
+        try: cleanup_tray()
+        except: pass
+
+        
         # Stop everything synchronously first
         try:
+             # Restore Proxy first!
+             if pac_manager: pac_manager.restore_system_proxy()
+             if warp_manager: warp_manager.stop()
+             
              stop_nova_service(silent=True, wait_for_cleanup=True)
         except: pass
         
@@ -10781,6 +12456,7 @@ try:
 
     # ================= STARTUP =================
     if __name__ == "__main__":
+        safe_trace("[Main] Entry point reached.")
         # === ARGUMENT PARSING: Order-independent, but execution in correct sequence ===
         # Parse all arguments first
         ARGS_PARSED = {
@@ -10859,15 +12535,24 @@ try:
                             os.makedirs(target_dir, exist_ok=True)
                             
                             # 2. Define Paths
-                            current_exe = os.path.abspath(sys.executable)
-                            target_exe = os.path.abspath(os.path.join(target_dir, exe_name))
+                            # FIX: Use argv[0] to get the REAL executable path in Nuitka OneFile mode
+                            # sys.executable points to the temp python.exe in the extraction folder
+                            # Explicitly force "Nova.exe" as target name to prevent renaming to "python.exe"
+                            current_exe = os.path.abspath(sys.argv[0]) if is_compiled else os.path.abspath(sys.executable)
+                            target_exe = os.path.abspath(os.path.join(target_dir, "Nova.exe"))
                             
                             # 3. Validation
                             if not os.path.exists(current_exe):
                                 raise FileNotFoundError(f"Source file not found: {current_exe}")
                                 
                             # 4. Copy File
-                            shutil.copy2(current_exe, target_exe)
+                            # Retry loop for stability
+                            for _ in range(3):
+                                try:
+                                    shutil.copy2(current_exe, target_exe)
+                                    break
+                                except:
+                                    time.sleep(0.5)
                             
                             # 5. Flush & Verify
                             time.sleep(0.5) # Give file system a moment
@@ -10984,6 +12669,7 @@ try:
                     log_window.lift()
             except: pass
 
+
         def do_move(event):
             # Calculate new main positions
             x = root.winfo_x() + (event.x - root._drag_start_x)
@@ -11042,6 +12728,37 @@ try:
         
         btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, fg="#777777", bg_color="#E0E0E0")
 
+        # === Autostart Context Menu (Main Window) ===
+        main_context_menu = tk.Menu(root, tearoff=0)
+        
+        main_autostart_var = tk.BooleanVar()
+        def update_main_menu_state():
+            is_auto = get_autostart_cmd() is not None
+            main_autostart_var.set(is_auto)
+            
+        main_context_menu.configure(postcommand=update_main_menu_state)
+        
+        def toggle_autostart_main():
+            # Use global log_print if available, else print
+            logger = globals().get('log_print', print)
+            toggle_startup(logger)
+            
+        # Renamed to "Автозапуск" per request
+        main_context_menu.add_checkbutton(label="Автозапуск", variable=main_autostart_var, command=toggle_autostart_main)
+        
+        def show_main_context_menu(event):
+            try: 
+                # Use tk_popup for correct behavior (close on click outside)
+                main_context_menu.tk_popup(event.x_root, event.y_root)
+            except: pass
+            
+        # Bind to Main Window and Canvas
+        root.bind("<Button-3>", show_main_context_menu)
+        main_canvas.bind("<Button-3>", show_main_context_menu)
+        try: status_label.bind("<Button-3>", show_main_context_menu)
+        except: pass
+
+
         root.update()
         ensure_log_window_created()
         
@@ -11071,6 +12788,10 @@ try:
         root.after(1000, lambda: launch_background_tasks())
         
         check_scan_status_loop() 
+        
+        # FIX: Bind minimize event here, where root is defined
+        root.bind("<Unmap>", lambda e: minimize_to_tray(e) if root.state() == 'iconic' else None)
+        
         root.protocol("WM_DELETE_WINDOW", on_closing)
         root.mainloop()
 
