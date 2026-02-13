@@ -15,6 +15,74 @@ import shutil
 import subprocess
 import collections
 from datetime import datetime
+
+# === AUTO-INSTALL REQUIREMENTS ===
+def install_requirements_visually():
+    if getattr(sys, 'frozen', False): return
+    
+    # Check for required packages
+    required = {
+        "requests": "requests", 
+        "urllib3": "urllib3", 
+        "Pillow": "PIL",
+        "pystray": "pystray"
+    }
+    
+    missing = []
+    for package, module in required.items():
+        try: __import__(module)
+        except ImportError: missing.append(package)
+    
+    if not missing: return
+
+    # Try to use Tkinter for GUI feedback
+    try:
+        import tkinter as tk
+        has_tk = True
+    except ImportError:
+        has_tk = False
+        
+    root = None
+    if has_tk:
+        try:
+            root = tk.Tk()
+            root.overrideredirect(True)
+            root.configure(bg="#2b2b2b")
+            w, h = 400, 100
+            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+            root.geometry(f"{w}x{h}+{int((sw-w)/2)}+{int((sh-h)/2)}")
+            lbl = tk.Label(root, text="Настройка окружения...\nУстановка зависимостей, подождите.", 
+                           fg="white", bg="#2b2b2b", font=("Arial", 10))
+            lbl.pack(expand=True)
+            root.update()
+        except:
+            if root: root.destroy()
+            root = None
+
+    try:
+        for lib in missing:
+            # Install package
+            cmd = [sys.executable, "-m", "pip", "install", lib, "--quiet", "--disable-pip-version-check"]
+            # Use CREATE_NO_WINDOW (0x08000000)
+            subprocess.check_call(cmd, creationflags=0x08000000)
+            
+            # Verify import
+            __import__(required[lib])
+            
+    except Exception as e:
+        if has_tk:
+            # Try to show error
+            try: ctypes.windll.user32.MessageBoxW(0, f"Ошибка установки библиотек: {e}", "Nova Error", 0x10)
+            except: pass
+        # Fallback: exit if critical deps missing
+        sys.exit(1)
+    finally:
+        if root: 
+            try: root.destroy()
+            except: pass
+
+install_requirements_visually()
+
 # IMPORTS
 try:
     import winreg # Added for Autostart feature
@@ -31,12 +99,12 @@ def safe_trace(msg):
     try: print(msg)
     except: pass
 
-safe_trace("=== NOVA SCRIPT STARTED ===")
-
 # === VERSION & CONFIG ===
-CURRENT_VERSION = "1.9"
+CURRENT_VERSION = "1.10"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
+
+safe_trace("=== NOVA SCRIPT STARTED ===")
 
 # === FIX: Force Hide Console (Safeguard) ===
 # Проверяем, запущено ли как скомпилированный EXE
@@ -186,10 +254,13 @@ try:
             _idx = sys.argv.index("--cleanup-old-exe")
             _old_exe = sys.argv[_idx + 1]
             def _deferred_delete(path):
+                global OLD_VERSION_CLEANED
                 time.sleep(3)
                 for _ in range(5):
                     try:
-                        if os.path.exists(path): os.remove(path)
+                        if os.path.exists(path): 
+                            os.remove(path)
+                            OLD_VERSION_CLEANED = True
                         break
                     except: time.sleep(1)
             threading.Thread(target=_deferred_delete, args=(_old_exe,), daemon=True).start()
@@ -308,49 +379,10 @@ try:
                              g_action = "Restored from Bundle (No Version)"
                     
                     elif current_ver_in_file != CURRENT_VERSION:
-                         # Version Mismatch -> Smart Merge
+                         # Version Mismatch -> Force Replace from Bundle (User Request)
                          if os.path.exists(internal_gen):
-                             try:
-                                 # 1. Read Bundle Domains
-                                 bundle_domains = set()
-                                 with open(internal_gen, "r", encoding="utf-8") as f:
-                                     for line in f:
-                                         clean = line.split('#')[0].strip()
-                                         if clean and not line.strip().startswith("#"): bundle_domains.add(clean)
-
-                                 # 2. Read User Domains
-                                 user_domains = set()
-                                 if os.path.exists(gen_path):
-                                     with open(gen_path, "r", encoding="utf-8") as f:
-                                         for line in f:
-                                             clean = line.split('#')[0].strip()
-                                             if clean and not line.strip().startswith("#"): user_domains.add(clean)
-                                 
-                                 # 3. Merge
-                                 merged = sorted(list(user_domains.union(bundle_domains)))
-                                 new_count = len(merged) - len(user_domains)
-                                 
-                                 # 4. Safety Check: If merged is empty but bundle has content, restore entirely
-                                 if not merged and bundle_domains:
-                                     shutil.copy2(internal_gen, gen_path)
-                                     g_action = f"Restored from Bundle (Merge resulted in empty, bundle had {len(bundle_domains)} domains)"
-                                 elif not merged:
-                                     # Both empty - just update header, don't touch content
-                                     logs.append(f"[Init] Warning: Both user and bundle general.txt are empty!")
-                                 else:
-                                     # 5. Write merged content
-                                     with open(gen_path, "w", encoding="utf-8") as f:
-                                         f.write(f"# version: {CURRENT_VERSION}\n")
-                                         for d in merged:
-                                             f.write(f"{d}\n")
-                                     g_action = f"Merged Update (v{current_ver_in_file}->v{CURRENT_VERSION}, +{new_count} new domains)"
-                             except Exception as e:
-                                 logs.append(f"[Init] Merge error: {e}")
-                                 # Fallback: try to restore from bundle entirely
-                                 try:
-                                     shutil.copy2(internal_gen, gen_path)
-                                     g_action = "Restored from Bundle (Merge Failed)"
-                                 except: pass
+                             shutil.copy2(internal_gen, gen_path)
+                             g_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
 
                 
                 if g_action:
@@ -425,6 +457,174 @@ try:
 
             except Exception as e:
                 logs.append(f"[Init] Ошибка проверки версии discord.txt: {e}")
+
+            # === 1.5.5 EU List Version Management (Smart Merge) ===
+            try:
+                eu_path = os.path.join(base_dir, "list", "eu.txt")
+                is_frozen_exe = getattr(sys, 'frozen', False)
+                
+                # Check existing file
+                target_lines = []
+                has_version = False
+                current_ver_in_file = None
+                
+                if os.path.exists(eu_path):
+                    try:
+                        with open(eu_path, "r", encoding="utf-8") as f:
+                            target_lines = f.readlines()
+                        if target_lines and target_lines[0].strip().startswith("# version:"):
+                            has_version = True
+                            try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
+                            except: pass
+                    except: pass
+                
+                eu_action = ""
+                
+                # --- SCRIPT MODE (.pyw) ---
+                if not is_frozen_exe:
+                    if not os.path.exists(eu_path): pass
+                    elif not has_version:
+                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                        with open(eu_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
+                        eu_action = "Header Added (Script)"
+                    elif current_ver_in_file != CURRENT_VERSION:
+                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
+                        with open(eu_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
+                        eu_action = "Header Updated (Script)"
+                
+                # --- FROZEN EXE MODE ---
+                else:
+                    internal_eu = get_internal_path(os.path.join("list", "eu.txt"))
+                    
+                    if not os.path.exists(eu_path):
+                        if os.path.exists(internal_eu):
+                            shutil.copy2(internal_eu, eu_path)
+                            eu_action = "Restored from Bundle (Missing)"
+                    
+                    elif not has_version:
+                        if os.path.exists(internal_eu):
+                            shutil.copy2(internal_eu, eu_path)
+                            eu_action = "Restored from Bundle (No Version)"
+                    
+                    elif current_ver_in_file != CURRENT_VERSION:
+                         # Version Mismatch -> Smart Merge
+                         if os.path.exists(internal_eu):
+                             try:
+                                 # 1. Read Bundle Domains
+                                 bundle_domains = set()
+                                 with open(internal_eu, "r", encoding="utf-8") as f:
+                                     for line in f:
+                                         clean = line.split('#')[0].strip()
+                                         if clean and not line.strip().startswith("#"): bundle_domains.add(clean)
+
+                                 # 2. Read User Domains
+                                 user_domains = set()
+                                 with open(eu_path, "r", encoding="utf-8") as f:
+                                     for line in f:
+                                         clean = line.split('#')[0].strip()
+                                         if clean and not line.strip().startswith("#"): user_domains.add(clean)
+                                 
+                                 # 3. Merge
+                                 merged = sorted(list(user_domains.union(bundle_domains)))
+                                 new_count = len(merged) - len(user_domains)
+                                 
+                                 # 4. Write merged content
+                                 with open(eu_path, "w", encoding="utf-8") as f:
+                                     f.write(f"# version: {CURRENT_VERSION}\n")
+                                     for d in merged: f.write(f"{d}\n")
+                                 eu_action = f"Merged Update (v{current_ver_in_file}->v{CURRENT_VERSION}, +{new_count} new domains)"
+                             except:
+                                 shutil.copy2(internal_eu, eu_path)
+                                 eu_action = "Restored from Bundle (Merge Failed)"
+
+                if eu_action:
+                    logs.append(f"[Init] eu.txt: {eu_action}")
+            except Exception as e:
+                logs.append(f"[Init] Ошибка проверки версии eu.txt: {e}")
+
+            # === 1.5.6 RU List Version Management (Smart Merge) ===
+            try:
+                ru_path = os.path.join(base_dir, "list", "ru.txt")
+                is_frozen_exe = getattr(sys, 'frozen', False)
+                
+                # Check existing file
+                target_lines = []
+                has_version = False
+                current_ver_in_file = None
+                
+                if os.path.exists(ru_path):
+                    try:
+                        with open(ru_path, "r", encoding="utf-8") as f:
+                            target_lines = f.readlines()
+                        if target_lines and target_lines[0].strip().startswith("# version:"):
+                            has_version = True
+                            try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
+                            except: pass
+                    except: pass
+                
+                ru_action = ""
+                
+                # --- SCRIPT MODE (.pyw) ---
+                if not is_frozen_exe:
+                    if not os.path.exists(ru_path): pass
+                    elif not has_version:
+                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                        with open(ru_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
+                        ru_action = "Header Added (Script)"
+                    elif current_ver_in_file != CURRENT_VERSION:
+                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
+                        with open(ru_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
+                        ru_action = "Header Updated (Script)"
+                
+                # --- FROZEN EXE MODE ---
+                else:
+                    internal_ru = get_internal_path(os.path.join("list", "ru.txt"))
+                    
+                    if not os.path.exists(ru_path):
+                        if os.path.exists(internal_ru):
+                            shutil.copy2(internal_ru, ru_path)
+                            ru_action = "Restored from Bundle (Missing)"
+                    
+                    elif not has_version:
+                        if os.path.exists(internal_ru):
+                            shutil.copy2(internal_ru, ru_path)
+                            ru_action = "Restored from Bundle (No Version)"
+                    
+                    elif current_ver_in_file != CURRENT_VERSION:
+                         # Version Mismatch -> Smart Merge
+                         if os.path.exists(internal_ru):
+                             try:
+                                 # 1. Read Bundle Domains
+                                 bundle_domains = set()
+                                 with open(internal_ru, "r", encoding="utf-8") as f:
+                                     for line in f:
+                                         clean = line.split('#')[0].strip()
+                                         if clean and not line.strip().startswith("#"): bundle_domains.add(clean)
+
+                                 # 2. Read User Domains
+                                 user_domains = set()
+                                 with open(ru_path, "r", encoding="utf-8") as f:
+                                     for line in f:
+                                         clean = line.split('#')[0].strip()
+                                         if clean and not line.strip().startswith("#"): user_domains.add(clean)
+                                 
+                                 # 3. Merge
+                                 merged = sorted(list(user_domains.union(bundle_domains)))
+                                 new_count = len(merged) - len(user_domains)
+                                 
+                                 # 4. Write merged content
+                                 with open(ru_path, "w", encoding="utf-8") as f:
+                                     f.write(f"# version: {CURRENT_VERSION}\n")
+                                     for d in merged: f.write(f"{d}\n")
+                                 ru_action = f"Merged Update (v{current_ver_in_file}->v{CURRENT_VERSION}, +{new_count} new domains)"
+                             except:
+                                 shutil.copy2(internal_ru, ru_path)
+                                 ru_action = "Restored from Bundle (Merge Failed)"
+
+                if ru_action:
+                    logs.append(f"[Init] ru.txt: {ru_action}")
+            except Exception as e:
+                logs.append(f"[Init] Ошибка проверки версии ru.txt: {e}")
 
             # === 1.6 Standardized Strat JSON Versioning ===
             try:
@@ -1297,18 +1497,18 @@ try:
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
-                # Wait for service to start
+            # Wait for service to start
                 import time
                 for _ in range(10):
                     if self.is_service_running():
-                        self.log_func("[RU] Служба запущена. Ожидание готовности daemon...")
+                        self.log_func("[RU] Служба запущена. Ожидание отклика...")
                         # Wait until warp-cli can communicate with daemon
-                        for _ in range(30):  # Max 15 seconds
+                        for _ in range(150):  # Max 15 seconds (0.1s * 150)
                             status = self.get_status()
                             if status and "Unable" not in status and "Unknown" not in status:
-                                self.log_func("[RU] Daemon готов.")
+                                self.log_func("[RU] Служба WARP активна.")
                                 return True
-                            time.sleep(0.5)
+                            time.sleep(0.1)
                         return True  # Proceed anyway after timeout
                     time.sleep(0.5)
                 return self.is_service_running()
@@ -1408,16 +1608,22 @@ try:
             result = self.run_warp_cli("proxy", "port", str(port))
             if result and result.returncode == 0:
                 self.port = port
-                if IS_DEBUG_MODE: self.log_func(f"[RU] Порт прокси: {port}")
+                self.log_func(f"[RU] Настройки порта ({port}) отправлены.")
                 return True
+            else:
+                err = result.stderr.strip() if result else "Unknown error"
+                self.log_func(f"[RU] ОШИБКА установки порта прокси {port}: {err}")
             return False
         
         def set_proxy_mode(self):
             """Set WARP to proxy mode."""
             result = self.run_warp_cli("mode", "proxy")
             if result and result.returncode == 0:
-                if IS_DEBUG_MODE: self.log_func("[RU] Режим прокси активирован.")
+                self.log_func("[RU] Команда режима прокси отправлена.")
                 return True
+            else:
+                err = result.stderr.strip() if result else "Unknown error"
+                self.log_func(f"[RU] ОШИБКА активации режима прокси: {err}")
             return False
         
         def start(self):
@@ -1454,12 +1660,16 @@ try:
                     else:
                         # Capture error for logging
                         if result:
-                            err_msg = result.stderr.strip() if result.stderr else result.stdout.strip()
-                            last_error = err_msg or "Unknown error"
+                            # FIX: Combine stdout and stderr to ensure we catch the error message
+                            out = result.stdout.strip() if result.stdout else ""
+                            err = result.stderr.strip() if result.stderr else ""
+                            last_error = f"{err} {out}".strip() or "Unknown error"
                             
                             # Auto-fix: Old registration exists
-                            if "Old registration is still around" in last_error:
-                                if IS_DEBUG_MODE: self.log_func("[RU] Обнаружена старая регистрация. Удаление...")
+                            if "Old registration" in last_error or "registration delete" in last_error:
+                                self.log_func("[RU] Обнаружена старая регистрация. Удаление...")
+                                
+                                # FIX: Just delete and retry, don't kill the service
                                 self.run_warp_cli("registration", "delete")
                                 time.sleep(1.0)
                                 continue # Retry immediately
@@ -1474,27 +1684,56 @@ try:
                 # Refresh status after registration
                 status = self.get_status()
             
+            # Configure WARP (Always ensure configuration)
+            self.ensure_masque()
+            self.set_proxy_port(self.port)
+            self.set_proxy_mode()
+
             # Check if already connected
             if "Connected" in status:
                 if IS_DEBUG_MODE: self.log_func("[RU] Уже подключено.")
                 self.is_connected = True
                 return
             
-            # Configure WARP
-            self.ensure_masque()
-            self.set_proxy_port(self.port)
-            self.set_proxy_mode()
-            
             # Connect
             if IS_DEBUG_MODE: self.log_func("[RU] Подключение через MASQUE (HTTP/3)...")
             result = self.run_warp_cli("connect")
             
             if result and result.returncode == 0:
-                if IS_DEBUG_MODE: self.log_func("[RU] Подключено успешно!")
+                if IS_DEBUG_MODE: self.log_func("[RU] Команда подключения отправлена. Ожидание установки соединения...")
+                self.wait_for_connection(timeout=20)
                 self.is_connected = True
             else:
                 error_msg = result.stderr if result else "Unknown error"
                 self.log_func(f"[RU] Ошибка подключения: {error_msg}")
+
+        def check_port(self, port):
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            return result == 0
+
+        def wait_for_connection(self, timeout=20):
+             import time
+             start_time = time.time()
+             while time.time() - start_time < timeout:
+                 # Check status
+                 status = self.get_status()
+                 if "Connected" in status:
+                     # Check port
+                     if self.check_port(self.port):
+                         self.log_func(f"[RU] Успешное подключение! Прокси доступен на порту {self.port}")
+                         return True
+                     else:
+                         if IS_DEBUG_MODE: self.log_func(f"[RU] Статус Connected, но порт {self.port} пока закрыт...")
+                 else:
+                     if IS_DEBUG_MODE: self.log_func(f"[RU] Статус: {status}...")
+                 time.sleep(1)
+             
+             self.log_func(f"[RU] [Warning] WARP не перешел в рабочий режим за {timeout} сек. Статус: {self.get_status()}. Порт {self.port} закрыт.")
+             return False
         
         def stop(self):
             """Disconnect from WARP and stop service (keep installed for next session)."""
@@ -1770,6 +2009,96 @@ function FindProxyForURL(url, host) {{
             except: pass
 
 
+    class SingBoxManager:
+        """Manages sing-box process for SOCKS5 UDP support."""
+        
+        def __init__(self, log_func=None):
+            self.log_func = log_func or print
+            self.bin_dir = os.path.join(get_base_dir(), "bin")
+            self.exe_path = os.path.join(self.bin_dir, "sing-box.exe")
+            self.config_path = os.path.join(self.bin_dir, "sing-box-config.json")
+            self.process = None
+            self.port = 1372
+
+        def start(self):
+            if not os.path.exists(self.exe_path):
+                if IS_DEBUG_MODE: self.log_func("[SingBox] Executable not found.")
+                return
+            
+            if not os.path.exists(self.config_path):
+                if IS_DEBUG_MODE: self.log_func("[SingBox] Config not found (run keygen first).")
+                return
+
+            # Kill existing
+            try:
+                subprocess.run(["taskkill", "/f", "/im", "sing-box.exe"], 
+                             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            except: pass
+
+            try:
+                # Start sing-box run -c config.json
+                # We need to hide window
+                cmd = [self.exe_path, "run", "-c", self.config_path]
+                
+                # Fix for Sing-Box 1.12+ Legacy DNS error
+                env = os.environ.copy()
+                env["ENABLE_DEPRECATED_LEGACY_DNS_SERVERS"] = "true"
+                env["ENABLE_DEPRECATED_WIREGUARD_OUTBOUND"] = "true"
+                env["ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER"] = "true"
+                
+                # Log to file for debugging
+                log_dir = os.path.join(get_base_dir(), "temp")
+                if not os.path.exists(log_dir): os.makedirs(log_dir)
+                self.log_file = os.path.join(log_dir, "singbox.log")
+                self.f_log = open(self.log_file, "w", encoding='utf-8')
+
+                self.process = subprocess.Popen(
+                    cmd,
+                    cwd=self.bin_dir,
+                    stdout=self.f_log,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    env=env, # Pass updated env
+                    text=True,
+                    encoding='utf-8', errors='replace'
+                )
+                self.log_func(f"[SingBox] Запущен на порту {self.port} (UDP Enabled)")
+                
+                # Non-blocking check for immediate failure
+                try:
+                    exit_code = self.process.wait(timeout=0.5)
+                    if exit_code is not None:
+                        if IS_DEBUG_MODE: self.log_func(f"[SingBox] Ошибка запуска (код {exit_code}). Лог: {self.log_file}")
+                except subprocess.TimeoutExpired:
+                    pass # Running ok
+                    
+            except Exception as e:
+                self.log_func(f"[SingBox] Exception: {e}")
+
+        def stop(self):
+            if self.process:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=1)
+                except:
+                    self.process.kill()
+                self.process = None
+            
+            # Close log file if open
+            if hasattr(self, 'f_log') and self.f_log:
+                try:
+                    self.f_log.close()
+                    self.f_log = None
+                except: pass
+            
+            # Ensure cleanup
+            try:
+                subprocess.run(["taskkill", "/f", "/im", "sing-box.exe"], 
+                             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            except: pass
+
+
     class OperaProxyManager:
         """Manages opera-proxy process for HTTP proxy."""
         
@@ -1823,7 +2152,7 @@ function FindProxyForURL(url, host) {{
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
                 if IS_DEBUG_MODE: self.log_func(f"[EU] Запущен на порту {self.port} (регион: {self.country})")
-                self.log_func("[EU] Daemon готов.")
+                self.log_func("[EU] 1371 готов.")
             except Exception as e:
                 self.log_func(f"[EU] Ошибка запуска: {e}")
         
@@ -1848,51 +2177,7 @@ function FindProxyForURL(url, host) {{
 
 
 
-    # Функции модуля nova_boot
-    def install_requirements_visually():
-        # Если запущено в скомпилированном виде (Nuitka), библиотеки уже внутри.
-        # Ничего устанавливать не нужно.
-        if getattr(sys, 'frozen', False):
-            return
 
-        # Mapping: pip package name -> python module name
-        required = {
-            "requests": "requests", 
-            "urllib3": "urllib3", 
-            "Pillow": "PIL"
-        }
-        missing = []
-        for package, module in required.items():
-            try:
-                __import__(module)
-            except ImportError:
-                missing.append(package)
-        
-        if not missing: return 
-
-        install_root = tk.Tk()
-        install_root.overrideredirect(True) 
-        install_root.configure(bg="#2b2b2b")
-        w, h = 400, 100
-        sw, sh = install_root.winfo_screenwidth(), install_root.winfo_screenheight()
-        install_root.geometry(f"{w}x{h}+{int((sw-w)/2)}+{int((sh-h)/2)}")
-        
-        lbl = tk.Label(install_root, text="Выполняется первоначальная настройка...\nУстановка компонентов, подождите.", 
-                       fg="white", bg="#2b2b2b", font=("Verdana", 10))
-        lbl.pack(expand=True)
-        install_root.update() 
-
-        try:
-            for lib in missing:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", lib, "--quiet", "--disable-pip-version-check"], creationflags=subprocess.CREATE_NO_WINDOW)
-                __import__(required[lib])
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось установить библиотеки: {e}")
-            sys.exit(1)
-        finally:
-            install_root.destroy()
-
-    install_requirements_visually()
 
 
 
@@ -2385,16 +2670,38 @@ function FindProxyForURL(url, host) {{
 
     def check_single_instance():
         kernel32 = ctypes.windll.kernel32
-        app_mutex = kernel32.CreateMutexW(None, False, "Nova_Unique_Mutex_Lock")
-        if kernel32.GetLastError() == 183:
-            try:
-                temp_root = tk.Tk()
-                temp_root.withdraw()
-                messagebox.showerror("Ошибка", "Программа уже запущена!")
-                temp_root.destroy()
-            except: pass
-            sys.exit()
-        return app_mutex
+        # FIX: Retry loop for auto-update restart race condition
+        # Old process might take a moment to release the mutex
+        for i in range(10): 
+            app_mutex = kernel32.CreateMutexW(None, False, "Nova_Unique_Mutex_Lock")
+            last_err = kernel32.GetLastError()
+            
+            if last_err == 183: # ERROR_ALREADY_EXISTS
+                # Mutex exists, maybe old process is still closing?
+                # Close the handle we just grabbed to avoid leaking/keeping it alive
+                kernel32.CloseHandle(app_mutex)
+                time.sleep(0.3)
+                continue
+            
+            # Success!
+            return app_mutex
+
+        # If we got here, Mutex is still held after 3 seconds
+        try:
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            # Make sure window is top level to be seen
+            temp_root.attributes("-topmost", True)
+            
+            # Check if we were restarted (auto-update)
+            msg = "Программа уже запущена!"
+            if "--updated" in sys.argv:
+                msg += "\n(Ошибка обновления: предыдущая версия не закрылась)"
+                
+            messagebox.showerror("Ошибка запуска", msg)
+            temp_root.destroy()
+        except: pass
+        sys.exit()
 
     class POINT(ctypes.Structure): _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
     def is_monitor_available(x, y):
@@ -5046,7 +5353,16 @@ function FindProxyForURL(url, host) {{
                 # === CRITICAL HEALTH CHECK ===
                 # Check if main winws.exe is still running. If not, restart immediately.
                 if process and process.poll() is not None and is_service_active:
-                     log_func(f"[Check] КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ: Основной процесс winws.exe упал (код {process.poll()}). Перезапуск...")
+                     exit_code = process.poll()
+                     log_func(f"[Check] КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ: Основной процесс winws.exe упал (код {exit_code}). Перезапуск...")
+                     
+                     # FIX: Auto-repair driver if service is disabled (Code 34 / 0x422) or missing (Code 177)
+                     if exit_code == 34 or exit_code == 177:
+                         log_func(f"[Check] Обнаружена проблема с драйвером (Code {exit_code}). Запуск восстановления...")
+                         try: repair_windivert_driver(log_func)
+                         except: pass
+                         time.sleep(2.0) # Give driver time to settle
+
                      is_service_active = False # Flag as down
                      perform_restart_sequence()
                      continue
@@ -5441,7 +5757,20 @@ function FindProxyForURL(url, host) {{
                             # Логируем только если это не штатная остановка
                             if proc.returncode != 0:
                                 log_func(f"[Check] WinWS упал (код {proc.returncode}). Порт: {port_start}. Попытка {attempt+1}/2")
-                                if stderr_out: log_func(f"[Check] Ошибка WinWS: {stderr_out.strip()}")
+                                
+                                err_msg = stderr_out.strip() if stderr_out else ""
+                                if err_msg: log_func(f"[Check] Ошибка WinWS: {err_msg}")
+                                
+                                # FIX: Auto-repair driver if service is disabled (Code 34 / 0x422) or missing (Code 177)
+                                if proc.returncode in (34, 177) or \
+                                   ("service cannot be started" in err_msg and "disabled" in err_msg) or \
+                                   ("device which does not exist" in err_msg):
+                                    log_func(f"[Check] Обнаружена проблема с драйвером (Code {proc.returncode}). Запуск восстановления...")
+                                    try: repair_windivert_driver(log_func)
+                                    except: pass
+                                    time.sleep(1.0)
+                                    continue # Retry immediately
+                                
                                 if attempt == 1:
                                     log_func(f"[Check] Стратегия вызывает сбой процесса. Пропускаем.")
                                     return 0 # Возвращаем 0 (blocked), чтобы не ломать воркер возвратом None
@@ -10128,6 +10457,60 @@ function FindProxyForURL(url, host) {{
                          udp_ports.add(f"udp.DstPort == {part}")
         return tcp_ports, udp_ports
 
+    def repair_windivert_driver(log_func=None):
+        """
+        Attempts to repair broken WinDivert driver installation.
+        Fixes:
+        - Code 177 (Driver locked)
+        - Code 577 (Signature verification)
+        - "Service cannot be started... disabled" (0x422)
+        """
+        try:
+            if log_func: log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
+        except: pass
+        
+        # 1. Force Enable Service (Fix for "Service Disabled" 0x422 error)
+        # Some optimizers disable "windivert" service. We must re-enable it.
+        try:
+            # "start= demand" (Note the space!)
+            subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        except: pass
+
+        # 2. Stop and Delete Service (Force Reinstall)
+        # If enabling didn't work, we nuke it so winws can re-register it.
+        try:
+            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        except: pass
+        
+        # 3. Add delay for SCM to clean up registry
+        time.sleep(2.0)
+        
+        # 4. Restore driver files from backup if available (or assume they are present in bin)
+        # Note: In Nuitka OneFile, sys._MEIPASS contains the original files. 
+        # But deployed bin/ is what matters. deploy_infrastructure should have handled this.
+        # We can try to force-copy if frozen.
+        if getattr(sys, 'frozen', False):
+             try:
+                 base_dir = get_base_dir()
+                 internal = get_internal_path("bin")
+                 if os.path.exists(internal):
+                     for f in os.listdir(internal):
+                         if f.endswith(".sys") or f.endswith(".dll"):
+                             src = os.path.join(internal, f)
+                             dst = os.path.join(base_dir, "bin", f)
+                             try: shutil.copy2(src, dst)
+                             except: pass
+                     if log_func: log_func("[Repair] Файлы драйвера обновлены из ресурсов.")
+             except Exception as e:
+                 try:
+                     if log_func: log_func(f"[Repair] Ошибка копирования файлов: {e}")
+                 except: pass
+
+        try:
+            if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
+        except: pass
+
     def start_nova_service(silent=False, restart_mode=False):
         threading.Thread(target=_start_nova_service_impl, args=(silent, restart_mode), daemon=True).start()
 
@@ -10522,6 +10905,11 @@ function FindProxyForURL(url, host) {{
         """Фоновая проверка обновлений."""
         # Обновление работает только в скомпилированном виде (.exe)
         # FIX: Debug log to verify start
+        
+        if "--no-update" in sys.argv:
+            log_func("[Update] Автообновление отключено пользователем (--no-update).")
+            return
+
         log_func("[Update] Запуск потока обновлений...") 
         
         # FIX: Robust frozen check for Nuitka onefile
@@ -10692,11 +11080,49 @@ function FindProxyForURL(url, host) {{
                         os.rename(current_exe, old_exe)
                         os.rename(new_exe, current_exe)
                         
-                        log_func("[Update] Файлы заменены. Перезапуск...")
-                        # Перезапуск
-                        clean_argv = [a for a in sys.argv[1:] if a != "--updated"]
-                        # Use close_fds=True to ensure no handles from the old process (like the lock on .old) are inherited
-                        subprocess.Popen([current_exe, "--updated"] + clean_argv, creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True)
+                        # FIX: Using VBScript for reliable DELAYED restart without console windows
+                        # This allows the main process to exit completely before the new one starts
+                        
+                        vbs_script = os.path.join(os.path.dirname(current_exe), "restart_helper.vbs")
+                        
+                        # Arguments for the new process
+                        # escaping quotes for VBScript can be tricky, so we keep it simple
+                        updated_args_str = " ".join([f'"{a}"' for a in sys.argv[1:] if a != "--updated"])
+                        if updated_args_str: updated_args_str = " " + updated_args_str
+                        
+                        # VBScript content
+                        # WScript.Sleep 3000 (3 seconds)
+                        # Shell.Run path, 1 (SW_SHOWNORMAL), False (Don't wait)
+                        # We pass --updated and --cleanup-old-exe
+                        
+                        vbs_content = f'''
+                        WScript.Sleep 3000
+                        Set objShell = CreateObject("WScript.Shell")
+                        strCmd = """{current_exe}"" --updated --cleanup-old-exe ""{old_exe}""{updated_args_str}"
+                        objShell.Run strCmd, 1, False
+                        Set objFSO = CreateObject("Scripting.FileSystemObject")
+                        ' Self-delete the script after a short delay (best effort)
+                        ' objFSO.DeleteFile WScript.ScriptFullName
+                        '''
+                        
+                        try:
+                            with open(vbs_script, "w", encoding="utf-8") as f:
+                                f.write(vbs_content)
+                                
+                            # Execute VBScript detached
+                            ctypes.windll.shell32.ShellExecuteW(
+                                None, 
+                                "open", 
+                                "wscript.exe", 
+                                f'"{vbs_script}"', 
+                                None, 
+                                0 # SW_HIDE (for wscript, but the app it launches will be normal)
+                            )
+                        except Exception as e:
+                            log_func(f"[Update] VBScript launch failed: {e}. Fallback to direct.")
+                             # Last resort fallback
+                            subprocess.Popen([current_exe, "--updated", "--cleanup-old-exe", old_exe] + [a for a in sys.argv[1:] if a != "--updated"])
+                        
                         os._exit(0)
                         
                     except Exception as e:
@@ -11044,6 +11470,15 @@ function FindProxyForURL(url, host) {{
 
         SERVICES_RUNNING = True
         
+        # FIX: Force reset WinDivert service configuration to fix "Service disabled" errors (WinError 34)
+        # This happens if the service was left in a bad state or disabled by previous runs
+        try:
+            subprocess.run(["sc", "config", "windivert", "start=", "demand"], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["sc", "stop", "windivert"], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        except: pass
+        
         # Ensure path structure is ready
         try:
             paths = ensure_structure()
@@ -11089,7 +11524,7 @@ function FindProxyForURL(url, host) {{
 
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
-        global warp_manager, pac_manager, opera_proxy_manager, SERVICE_RUN_ID, state_lock
+        global warp_manager, pac_manager, opera_proxy_manager, sing_box_manager, SERVICE_RUN_ID, state_lock
 
         # Increment run ID
         try:
@@ -11145,13 +11580,18 @@ function FindProxyForURL(url, host) {{
                 # Extra delay to let WinWS fully initialize divert
                 time.sleep(2)
 
-                global warp_manager, pac_manager, opera_proxy_manager
+                global warp_manager, pac_manager, opera_proxy_manager, sing_box_manager
                 if not warp_manager: warp_manager = WarpManager(log_func=safe_log)
                 if not pac_manager: pac_manager = PacManager(log_func=safe_log)
+                if 'sing_box_manager' not in globals() or not sing_box_manager: 
+                    sing_box_manager = SingBoxManager(log_func=safe_log)
                 
                 # Start WARP (might take time if config missing)
                 # FIX: Run in background so app starts immediately
                 warp_manager.start()
+                
+                # Start Sing-Box (UDP Proxy)
+                sing_box_manager.start()
                 
                 # Start Opera Proxy
                 if not opera_proxy_manager: opera_proxy_manager = OperaProxyManager(log_func=safe_log)
@@ -11177,53 +11617,6 @@ function FindProxyForURL(url, host) {{
             try: stop_nova_service(silent=True)
             except: pass
 
-    def repair_windivert_driver(log_func=None):
-        """
-        Attempts to repair broken WinDivert driver installation.
-        Fixes:
-        - Code 177 (Driver locked)
-        - Code 577 (Signature verification)
-        - "Service cannot be started... disabled" (0x422)
-        """
-        if log_func: log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
-        
-        # 1. Force Enable Service (Fix for "Service Disabled" 0x422 error)
-        # Some optimizers disable "windivert" service. We must re-enable it.
-        try:
-            # "start= demand" (Note the space!)
-            subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-        except: pass
-
-        # 2. Stop and Delete Service (Force Reinstall)
-        # If enabling didn't work, we nuke it so winws can re-register it.
-        try:
-            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-        except: pass
-        
-        # 3. Add delay for SCM to clean up registry
-        time.sleep(2.0)
-        
-        # 4. Restore driver files from backup if available (or assume they are present in bin)
-        # Note: In Nuitka OneFile, sys._MEIPASS contains the original files. 
-        # But deployed bin/ is what matters. deploy_infrastructure should have handled this.
-        # We can try to force-copy if frozen.
-        if getattr(sys, 'frozen', False):
-             try:
-                 base_dir = get_base_dir()
-                 internal = get_internal_path("bin")
-                 if os.path.exists(internal):
-                     for f in os.listdir(internal):
-                         if f.endswith(".sys") or f.endswith(".dll"):
-                             src = os.path.join(internal, f)
-                             dst = os.path.join(base_dir, "bin", f)
-                             try: shutil.copy2(src, dst)
-                             except: pass
-                     if log_func: log_func("[Repair] Файлы драйвера обновлены из ресурсов.")
-             except Exception as e:
-                 if log_func: log_func(f"[Repair] Ошибка копирования файлов: {e}")
-
-        if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
 
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
         global is_service_active, process, is_closing
@@ -11973,6 +12366,9 @@ function FindProxyForURL(url, host) {{
              # Restore Proxy first!
              if pac_manager: pac_manager.restore_system_proxy()
              if warp_manager: warp_manager.stop()
+             if 'sing_box_manager' in globals() and sing_box_manager:
+                  try: sing_box_manager.stop()
+                  except: pass
              
              stop_nova_service(silent=True, wait_for_cleanup=True)
         except: pass
@@ -12124,9 +12520,9 @@ function FindProxyForURL(url, host) {{
         try:
             if ARGS_PARSED.get('updated', False):
                 log_print("Установлена последняя версия Nova.")
-                # Сообщаем об очистке, если она была
+                # Сообщаем об очистке, если она была (DISABLED per user request)
                 if OLD_VERSION_CLEANED:
-                     log_print("Следы прежней версии программы удалены")
+                     if IS_DEBUG_MODE: log_print("Следы прежней версии программы удалены")
             
             if ARGS_PARSED.get('fresh', False):
                 log_print("Запуск с флагом --fresh: Временные файлы и состояние стратегий сброшены.")
@@ -12697,8 +13093,20 @@ function FindProxyForURL(url, host) {{
                     w, h = int(match.group(1)), int(match.group(2))
             except: pass
         else:
-            sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-            root.geometry(f"{w}x{h}+{int((sw/2)-(w/2))}+{int((sh/2)-(h/2))}")
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            x = int((sw/2) - (w/2))
+            y = int((sh/2) - (h/2))
+            root.geometry(f"{w}x{h}+{x}+{y}")
+            
+        # FIX: Force window to show if this is a restart/update
+        # This prevents the app from starting minimized or hidden
+        if "--updated" in sys.argv or "--restart" in sys.argv:
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+            root.update()
+            root.attributes("-topmost", False)
 
         main_canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=COLOR_BG)
         main_canvas.pack(fill="both", expand=True)
