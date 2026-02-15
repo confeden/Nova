@@ -1476,16 +1476,28 @@ try:
         Supports portable service installation if WARP is not installed system-wide.
         """
         
-        SERVICE_NAME = "CloudflareWARP"
-        
-        def decode_output(self, binary_data):
-            """Decodes Windows CMD output (CP866 usually) safely."""
-            if not binary_data: return ""
-            for enc in ['cp866', 'cp1251', 'utf-8']:
-                try:
-                    return binary_data.decode(enc).strip()
-                except: continue
-            return str(binary_data)
+        def nuke_warp_data(self):
+            """Physically deletes Warp registration data from ProgramData (Nuclear option)."""
+            try:
+                self.log_func("[RU] Глубокая очистка данных WARP...")
+                self.stop_service()
+                time.sleep(1)
+                
+                # Path where Cloudflare stores registration
+                program_data = os.environ.get('ProgramData', 'C:\\ProgramData')
+                warp_data_dir = os.path.join(program_data, 'Cloudflare')
+                
+                if os.path.exists(warp_data_dir):
+                    # We only delete files related to registration, keep the folder if possible
+                    # but deleting the whole folder is safer
+                    shutil.rmtree(warp_data_dir, ignore_errors=True)
+                
+                self.start_service()
+                time.sleep(1)
+                return True
+            except Exception as e:
+                self.log_func(f"[RU] Ошибка глубокой очистки: {e}")
+                return False
 
         def __init__(self, log_func=None):
             self.log_func = log_func or print
@@ -1689,21 +1701,28 @@ try:
                 cmd = [self.warp_cli_path] + list(args)
                 
                 # --- FAILOVER PROXY LOGIC ---
-                # If we are doing registration/account tasks, try to use Opera VPN (1371) as proxy
-                # because Warp itself isn't working yet.
+                # For registration/account tasks, use a proxy to bypass blocks.
+                # Priority: 1370 (Warp itself/existing) -> 1371 (Opera VPN)
                 env = os.environ.copy()
                 is_reg_cmd = any(x in args for x in ["registration", "account", "license"])
                 
                 if is_reg_cmd and not is_closing:
-                    # Wait up to 10s for Opera VPN (1371) to become available if needed
-                    for _ in range(10):
-                        if is_closing or self.is_port_open(1371): break
-                        time.sleep(1)
+                    proxy_to_use = None
+                    # 1. Try 1370 first (if it's already up)
+                    if self.is_port_open(1370):
+                        proxy_to_use = "http://127.0.0.1:1370"
+                    else:
+                        # 2. If 1370 is down, wait for 1371 (Opera)
+                        for _ in range(10):
+                            if is_closing or self.is_port_open(1371): break
+                            time.sleep(1)
+                        if self.is_port_open(1371):
+                            proxy_to_use = "http://127.0.0.1:1371"
                     
-                    if not is_closing and self.is_port_open(1371):
-                        env["HTTPS_PROXY"] = "http://127.0.0.1:1371"
-                        env["HTTP_PROXY"] = "http://127.0.0.1:1371"
-                        # if IS_DEBUG_MODE: self.log_func("[RU] Команда регистрации направлена через Opera VPN (1371)")
+                    if proxy_to_use and not is_closing:
+                        env["HTTPS_PROXY"] = proxy_to_use
+                        env["HTTP_PROXY"] = proxy_to_use
+                        # if IS_DEBUG_MODE: self.log_func(f"[RU] Регистрация через прокси {proxy_to_use}")
 
                 if is_closing: return None
 
@@ -1831,8 +1850,11 @@ try:
                             break
                         else:
                             if any(x in last_error.lower() for x in ["old registration", "registration delete", "already exists", "conflict"]):
-                                self.log_func(f"[RU] Очистка старой регистрации...")
-                                self.run_warp_cli("registration", "delete")
+                                if attempt == 1: # On second fail, try nuclear option
+                                    self.nuke_warp_data()
+                                else:
+                                    self.log_func(f"[RU] Очистка старой регистрации...")
+                                    self.run_warp_cli("registration", "delete")
                                 time.sleep(1.5)
                                 continue 
                         time.sleep(1.5)
