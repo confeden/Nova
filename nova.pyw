@@ -1787,14 +1787,18 @@ try:
                 
                 # --- SYNC WITH WINWS ---
                 max_wait_winws = 15
+                winws_active = False
                 for _ in range(max_wait_winws * 2): # 0.5s intervals
                     if is_closing or SERVICE_RUN_ID != my_run_id: return
                     if (is_service_active and process and process.poll() is None) or is_restarting:
+                        winws_active = True
                         break
                     time.sleep(0.5)
                 
                 if SERVICE_RUN_ID != my_run_id: return
-                time.sleep(1.0)
+                
+                # Basic safety wait for driver
+                if winws_active: time.sleep(1.0)
 
                 # Wait for daemon to be responsive
                 status = "Unknown"
@@ -1813,9 +1817,7 @@ try:
                 # Check if registration is needed
                 if "Registration Missing" in status:
                     self.log_func("[RU] Регистрация устройства...")
-                    
                     reg_success = False
-                    last_error = ""
                     for attempt in range(3):
                         if is_closing or SERVICE_RUN_ID != my_run_id: return
                         result = self.run_warp_cli("registration", "new")
@@ -1842,7 +1844,6 @@ try:
                 
                 # --- CONFIGURATION ---
                 if SERVICE_RUN_ID != my_run_id: return
-                if IS_DEBUG_MODE: self.log_func("[RU] Настройка параметров...")
                 self.ensure_masque()
                 self.set_proxy_port(self.port)
                 self.set_proxy_mode()
@@ -1853,22 +1854,38 @@ try:
                         self.log_func(f"[RU] {self.port} готов")
                         self.is_connected = True
                     else:
-                        if IS_DEBUG_MODE: self.log_func("[RU] Ожидание проброса порта...")
-                        self.wait_for_connection(timeout=20)
+                        self.wait_for_connection(timeout=10)
                         self.is_connected = True
                     return
                 
-                # Connect
+                # --- CONNECT ---
+                # FINAL CHECK: Ensure winws.exe is alive before trying to connect
+                # because the bypass depends on it.
+                if not (is_service_active and process and process.poll() is None):
+                    if IS_DEBUG_MODE: self.log_func("[RU] Предупреждение: Ядро не активно перед подключением.")
+
                 if SERVICE_RUN_ID != my_run_id: return
                 self.log_func("[RU] Подключение...")
                 result = self.run_warp_cli("connect")
                 
                 if result and result.returncode == 0:
-                    self.wait_for_connection(timeout=25)
-                    self.is_connected = True
+                    if not self.wait_for_connection(timeout=10):
+                        # FAILED to connect with default settings within 10s
+                        status_fail = self.get_status()
+                        if "happy eyeballs" in status_fail.lower() or "Unable" in status_fail or "Connecting" in status_fail:
+                            self.log_func("[RU] Ошибка Happy Eyeballs или Таймаут. Переключение на IPv4...")
+                            self.run_warp_cli("tunnel", "ip-version", "set", "4")
+                            self.run_warp_cli("connect") 
+                            if self.wait_for_connection(timeout=10):
+                                self.is_connected = True
+                                return
+                    else:
+                        self.is_connected = True
+                        return
                 else:
                     error_msg = (result.stderr if result else "Unknown error") or "Unknown"
                     self.log_func(f"[RU] Ошибка подключения: {error_msg}")
+
             finally:
                 self._is_starting_now = False
 
@@ -10778,6 +10795,8 @@ function FindProxyForURL(url, host) {{
         
         # 1. Stop and Delete Service (Full reset)
         try:
+            # Force enable first in case it was disabled (Fix for Code 34)
+            subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
         except: pass
