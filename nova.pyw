@@ -1476,6 +1476,17 @@ try:
         Supports portable service installation if WARP is not installed system-wide.
         """
         
+        SERVICE_NAME = "CloudflareWARP"
+        
+        def decode_output(self, binary_data):
+            """Decodes Windows CMD output (CP866 usually) safely."""
+            if not binary_data: return ""
+            for enc in ['cp866', 'cp1251', 'utf-8']:
+                try:
+                    return binary_data.decode(enc).strip()
+                except: continue
+            return str(binary_data)
+
         def nuke_warp_data(self):
             """Physically deletes Warp registration data from ProgramData (Nuclear option)."""
             try:
