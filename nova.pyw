@@ -1772,92 +1772,105 @@ try:
         
         def start(self):
             """Connect to WARP using MASQUE protocol."""
-            # Ensure service is running
-            if not self.ensure_service():
-                self.log_func("[RU] Не удалось запустить службу!")
+            # Prevent multiple concurrent starts
+            if hasattr(self, '_is_starting_now') and self._is_starting_now:
                 return
             
-            # --- SYNC WITH WINWS ---
-            max_wait_winws = 15
-            winws_ready = False
+            self._is_starting_now = True
+            my_run_id = SERVICE_RUN_ID
             
-            for _ in range(max_wait_winws * 2): # 0.5s intervals
-                if (is_service_active and process and process.poll() is None) or is_restarting:
-                    winws_ready = True
-                    break
-                time.sleep(0.5)
-            
-            if winws_ready:
+            try:
+                # Ensure service is running
+                if not self.ensure_service():
+                    self.log_func("[RU] Не удалось запустить службу!")
+                    return
+                
+                # --- SYNC WITH WINWS ---
+                max_wait_winws = 15
+                for _ in range(max_wait_winws * 2): # 0.5s intervals
+                    if is_closing or SERVICE_RUN_ID != my_run_id: return
+                    if (is_service_active and process and process.poll() is None) or is_restarting:
+                        break
+                    time.sleep(0.5)
+                
+                if SERVICE_RUN_ID != my_run_id: return
                 time.sleep(1.0)
 
-            # Wait for daemon to be responsive
-            status = "Unknown"
-            for i in range(20): # Up to 10s
-                status = self.get_status()
-                if status and "Unable to connect" not in status and "Unknown" not in status:
-                    break
-                time.sleep(0.5)
-
-            if "Unable to connect" in status or "Unknown" in status:
-                self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
-                return
-
-            # Check if registration is needed
-            if "Registration Missing" in status:
-                self.log_func("[RU] Регистрация устройства...")
-                
-                reg_success = False
-                last_error = ""
-                for attempt in range(3):
-                    result = self.run_warp_cli("registration", "new")
-                    out = result.stdout.strip() if (result and result.stdout) else ""
-                    err = result.stderr.strip() if (result and result.stderr) else ""
-                    last_error = f"{err} {out}".strip() or "Unknown error"
-
-                    if result and result.returncode == 0:
-                        self.log_func("[RU] Устройство зарегистрировано.")
-                        reg_success = True
+                # Wait for daemon to be responsive
+                status = "Unknown"
+                for i in range(20): # Up to 10s
+                    if is_closing or SERVICE_RUN_ID != my_run_id: return
+                    status = self.get_status()
+                    if status and "Unable to connect" not in status and "Unknown" not in status:
                         break
-                    else:
-                        if any(x in last_error.lower() for x in ["old registration", "registration delete", "already exists", "conflict"]):
-                            self.log_func(f"[RU] Очистка старой регистрации...")
-                            self.run_warp_cli("registration", "delete")
-                            time.sleep(1.5)
-                            continue 
-                    time.sleep(1.5)
-                
-                if not reg_success:
-                    self.log_func(f"[RU] Ошибка регистрации: {last_error}")
-                    return
-                status = self.get_status()
-            
-            # --- CONFIGURATION ---
-            if IS_DEBUG_MODE: self.log_func("[RU] Настройка параметров...")
-            self.ensure_masque()
-            self.set_proxy_port(self.port)
-            self.set_proxy_mode()
+                    time.sleep(0.5)
 
-            # Check if already connected
-            if "Connected" in status:
-                if self.check_port(self.port):
-                    self.log_func(f"[RU] {self.port} готов")
+                if SERVICE_RUN_ID != my_run_id: return
+                if "Unable to connect" in status or "Unknown" in status:
+                    self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
+                    return
+
+                # Check if registration is needed
+                if "Registration Missing" in status:
+                    self.log_func("[RU] Регистрация устройства...")
+                    
+                    reg_success = False
+                    last_error = ""
+                    for attempt in range(3):
+                        if is_closing or SERVICE_RUN_ID != my_run_id: return
+                        result = self.run_warp_cli("registration", "new")
+                        out = result.stdout.strip() if (result and result.stdout) else ""
+                        err = result.stderr.strip() if (result and result.stderr) else ""
+                        last_error = f"{err} {out}".strip() or "Unknown error"
+
+                        if result and result.returncode == 0:
+                            self.log_func("[RU] Устройство зарегистрировано.")
+                            reg_success = True
+                            break
+                        else:
+                            if any(x in last_error.lower() for x in ["old registration", "registration delete", "already exists", "conflict"]):
+                                self.log_func(f"[RU] Очистка старой регистрации...")
+                                self.run_warp_cli("registration", "delete")
+                                time.sleep(1.5)
+                                continue 
+                        time.sleep(1.5)
+                    
+                    if not reg_success:
+                        self.log_func(f"[RU] Ошибка регистрации: {last_error}")
+                        return
+                    status = self.get_status()
+                
+                # --- CONFIGURATION ---
+                if SERVICE_RUN_ID != my_run_id: return
+                if IS_DEBUG_MODE: self.log_func("[RU] Настройка параметров...")
+                self.ensure_masque()
+                self.set_proxy_port(self.port)
+                self.set_proxy_mode()
+
+                # Check if already connected
+                if "Connected" in status:
+                    if self.check_port(self.port):
+                        self.log_func(f"[RU] {self.port} готов")
+                        self.is_connected = True
+                    else:
+                        if IS_DEBUG_MODE: self.log_func("[RU] Ожидание проброса порта...")
+                        self.wait_for_connection(timeout=20)
+                        self.is_connected = True
+                    return
+                
+                # Connect
+                if SERVICE_RUN_ID != my_run_id: return
+                self.log_func("[RU] Подключение...")
+                result = self.run_warp_cli("connect")
+                
+                if result and result.returncode == 0:
+                    self.wait_for_connection(timeout=25)
                     self.is_connected = True
                 else:
-                    if IS_DEBUG_MODE: self.log_func("[RU] Ожидание проброса порта...")
-                    self.wait_for_connection(timeout=20)
-                    self.is_connected = True
-                return
-            
-            # Connect
-            self.log_func("[RU] Подключение...")
-            result = self.run_warp_cli("connect")
-            
-            if result and result.returncode == 0:
-                self.wait_for_connection(timeout=25)
-                self.is_connected = True
-            else:
-                error_msg = (result.stderr if result else "Unknown error") or "Unknown"
-                self.log_func(f"[RU] Ошибка подключения: {error_msg}")
+                    error_msg = (result.stderr if result else "Unknown error") or "Unknown"
+                    self.log_func(f"[RU] Ошибка подключения: {error_msg}")
+            finally:
+                self._is_starting_now = False
 
         def check_port(self, port):
             import socket
