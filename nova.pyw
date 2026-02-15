@@ -1529,13 +1529,13 @@ try:
             
             try:
                 self.log_func("[RU] Установка службы CloudflareWARP...")
-                # IMPORTANT: sc.exe requires a space AFTER the '=' sign (e.g. binPath= "path")
-                # and the path must be quoted if it contains spaces.
+                # Split parameters into separate arguments to ensure space handling is perfect
+                quoted_path = f'"{self.warp_svc_path}"'
                 cmd = [
                     "sc", "create", self.SERVICE_NAME, 
-                    f"binPath= \"{self.warp_svc_path}\"",
-                    "start= demand",
-                    "DisplayName= Cloudflare WARP (Nova)"
+                    "binPath=", quoted_path,
+                    "start=", "demand",
+                    "DisplayName=", "Cloudflare WARP (Nova)"
                 ]
                 
                 result = subprocess.run(
@@ -1546,9 +1546,9 @@ try:
                 
                 stdout = self.decode_output(result.stdout)
                 if result.returncode == 0 or "EXISTS" in stdout.upper():
-                    # If it exists, we MUST update the path to the current one in case Nova was moved
+                    # Update path anyway
                     subprocess.run(
-                        ["sc", "config", self.SERVICE_NAME, f"binPath= \"{self.warp_svc_path}\""],
+                        ["sc", "config", self.SERVICE_NAME, "binPath=", quoted_path],
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
                     self.service_installed_by_us = True
@@ -1585,16 +1585,16 @@ try:
                 if result.returncode in (2, 87) or " 2:" in err_msg or " 87:" in err_msg:
                     if IS_DEBUG_MODE: self.log_func(f"[RU] Ошибка пути (Код {result.returncode}). Пересоздание службы...")
                     
-                    # Nuke and Rebuild is safer for Code 87 than just 'config'
+                    # Nuke and Rebuild
                     subprocess.run(["sc", "stop", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
                     subprocess.run(["sc", "delete", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
                     time.sleep(1)
                     
                     cmd = [
                         "sc", "create", self.SERVICE_NAME, 
-                        f"binPath= {quoted_path}",
-                        "start= demand",
-                        "DisplayName= Cloudflare WARP (Nova)"
+                        "binPath=", quoted_path,
+                        "start=", "demand",
+                        "DisplayName=", "Cloudflare WARP (Nova)"
                     ]
                     subprocess.run(cmd, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
                     
