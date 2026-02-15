@@ -21,6 +21,37 @@ CURRENT_VERSION = "1.11"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
+# === PORTABLE PATH SAFEGUARD ===
+def apply_path_safeguard():
+    try:
+        # 1. Determine launch directory
+        if getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        
+        # 2. Fix CWD if started from System32 (admin bug)
+        cwd = os.getcwd().lower()
+        system32 = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'system32').lower()
+        if cwd == system32:
+            os.chdir(exe_dir)
+
+        # 3. Create local temp directory for full portability
+        local_temp = os.path.join(exe_dir, "temp")
+        if not os.path.exists(local_temp):
+            os.makedirs(local_temp, exist_ok=True)
+        
+        # 4. OVERRIDE System Temp variables for this process and its children
+        # This forces Nuitka, Python tempfile, and subprocesses to use OUR folder
+        os.environ['TEMP'] = local_temp
+        os.environ['TMP'] = local_temp
+        os.environ['NUITKA_PACKAGE_HOME'] = os.path.join(local_temp, "nuitka_runtime")
+        
+    except Exception as e:
+        print(f"Path Safeguard Error: {e}")
+
+apply_path_safeguard()
+
 # === AUTO-INSTALL REQUIREMENTS ===
 def install_requirements_visually():
     if getattr(sys, 'frozen', False): return
@@ -1447,6 +1478,15 @@ try:
         
         SERVICE_NAME = "CloudflareWARP"
         
+        def decode_output(self, binary_data):
+            """Decodes Windows CMD output (CP866 usually) safely."""
+            if not binary_data: return ""
+            for enc in ['cp866', 'cp1251', 'utf-8']:
+                try:
+                    return binary_data.decode(enc).strip()
+                except: continue
+            return str(binary_data)
+
         def __init__(self, log_func=None):
             self.log_func = log_func or print
             self.bin_dir = os.path.join(get_base_dir(), "bin")
@@ -1461,7 +1501,7 @@ try:
             try:
                 result = subprocess.run(
                     ["sc", "query", self.SERVICE_NAME],
-                    capture_output=True, text=True,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
                 return result.returncode == 0
@@ -1473,10 +1513,11 @@ try:
             try:
                 result = subprocess.run(
                     ["sc", "query", self.SERVICE_NAME],
-                    capture_output=True, text=True,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
-                return "RUNNING" in result.stdout
+                out = self.decode_output(result.stdout)
+                return "RUNNING" in out.upper()
             except:
                 return False
         
@@ -1488,25 +1529,35 @@ try:
             
             try:
                 self.log_func("[RU] Установка службы CloudflareWARP...")
-                # Create service pointing to our warp-svc.exe
+                # IMPORTANT: sc.exe requires a space AFTER the '=' sign (e.g. binPath= "path")
+                # and the path must be quoted if it contains spaces.
+                cmd = [
+                    "sc", "create", self.SERVICE_NAME, 
+                    f"binPath= \"{self.warp_svc_path}\"",
+                    "start= demand",
+                    "DisplayName= Cloudflare WARP (Nova)"
+                ]
+                
                 result = subprocess.run(
-                    ["sc", "create", self.SERVICE_NAME, 
-                     "binPath=", self.warp_svc_path,
-                     "start=", "demand",  # Manual start
-                     "DisplayName=", "Cloudflare WARP (Nova)"],
-                    capture_output=True, text=True,
+                    cmd,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
                 
-                if result.returncode == 0 or "EXISTS" in result.stdout.upper():
+                stdout = self.decode_output(result.stdout)
+                if result.returncode == 0 or "EXISTS" in stdout.upper():
+                    # If it exists, we MUST update the path to the current one in case Nova was moved
+                    subprocess.run(
+                        ["sc", "config", self.SERVICE_NAME, f"binPath= \"{self.warp_svc_path}\""],
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
                     self.service_installed_by_us = True
                     self.log_func("[RU] Служба установлена.")
                     return True
                 else:
-                    err_msg = result.stderr.strip() or result.stdout.strip()
+                    stderr = self.decode_output(result.stderr)
+                    err_msg = stderr or stdout
                     self.log_func(f"[RU] Ошибка установки службы (Код {result.returncode}): {err_msg}")
-                    if result.returncode == 5:
-                        self.log_func("[RU] СОВЕТ: Запустите приложение от имени администратора для установки службы.")
                     return False
             except Exception as e:
                 self.log_func(f"[RU] Исключение при установке службы: {e}")
@@ -1516,21 +1567,47 @@ try:
             """Start the CloudflareWARP service."""
             try:
                 self.log_func("[RU] Запуск службы...")
+                
+                # Pre-check path quoting: ensure path is properly wrapped for Windows
+                quoted_path = f'"{self.warp_svc_path}"'
+                
                 result = subprocess.run(
                     ["sc", "start", self.SERVICE_NAME],
-                    capture_output=True, text=True,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
                 
+                stdout = self.decode_output(result.stdout)
+                stderr = self.decode_output(result.stderr)
+                err_msg = stderr or stdout
+
+                # Error 2 (Not Found) or Error 87 (Invalid Parameter / Bad Path)
+                if result.returncode in (2, 87) or " 2:" in err_msg or " 87:" in err_msg:
+                    if IS_DEBUG_MODE: self.log_func(f"[RU] Ошибка пути (Код {result.returncode}). Пересоздание службы...")
+                    
+                    # Nuke and Rebuild is safer for Code 87 than just 'config'
+                    subprocess.run(["sc", "stop", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    subprocess.run(["sc", "delete", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    time.sleep(1)
+                    
+                    cmd = [
+                        "sc", "create", self.SERVICE_NAME, 
+                        f"binPath= {quoted_path}",
+                        "start= demand",
+                        "DisplayName= Cloudflare WARP (Nova)"
+                    ]
+                    subprocess.run(cmd, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    
+                    # Final try to start
+                    result = subprocess.run(["sc", "start", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    if result.returncode == 0: return True
+
                 if result.returncode != 0:
-                    err_msg = result.stderr.strip() or result.stdout.strip()
                     # Error 1056 means it's already running
                     if "1056" in err_msg or "already running" in err_msg.lower():
                          if IS_DEBUG_MODE: self.log_func("[RU] Служба уже была запущена.")
                     else:
                         self.log_func(f"[RU] Ошибка запуска службы (Код {result.returncode}): {err_msg}")
-                        if result.returncode == 5:
-                             self.log_func("[RU] СОВЕТ: Запустите приложение от имени администратора для запуска службы.")
                         return False
 
                 # Wait for service to start
@@ -1557,7 +1634,7 @@ try:
             try:
                 subprocess.run(
                     ["sc", "stop", self.SERVICE_NAME],
-                    capture_output=True, text=True,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
             except:
@@ -1605,7 +1682,7 @@ try:
 
         def run_warp_cli(self, *args, timeout=30):
             """Run warp-cli command and return result."""
-            if not os.path.exists(self.warp_cli_path):
+            if not os.path.exists(self.warp_cli_path) or is_closing:
                 return None
                 
             try:
@@ -1617,16 +1694,18 @@ try:
                 env = os.environ.copy()
                 is_reg_cmd = any(x in args for x in ["registration", "account", "license"])
                 
-                if is_reg_cmd:
+                if is_reg_cmd and not is_closing:
                     # Wait up to 10s for Opera VPN (1371) to become available if needed
                     for _ in range(10):
-                        if self.is_port_open(1371): break
+                        if is_closing or self.is_port_open(1371): break
                         time.sleep(1)
                     
-                    if self.is_port_open(1371):
+                    if not is_closing and self.is_port_open(1371):
                         env["HTTPS_PROXY"] = "http://127.0.0.1:1371"
                         env["HTTP_PROXY"] = "http://127.0.0.1:1371"
                         # if IS_DEBUG_MODE: self.log_func("[RU] Команда регистрации направлена через Opera VPN (1371)")
+
+                if is_closing: return None
 
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -1634,18 +1713,23 @@ try:
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
-                    text=True,
                     timeout=timeout,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                     startupinfo=startupinfo,
                     env=env
                 )
+                
+                # Manual decode to fix encoding issues on localized Windows
+                if result:
+                    result.stdout = self.decode_output(result.stdout)
+                    result.stderr = self.decode_output(result.stderr)
+
                 return result
             except subprocess.TimeoutExpired:
-                if IS_DEBUG_MODE: self.log_func(f"[RU] Команда таймаут: {' '.join(args)}")
+                if IS_DEBUG_MODE and not is_closing: self.log_func(f"[RU] Команда таймаут: {' '.join(args)}")
                 return None
             except Exception as e:
-                self.log_func(f"[RU] Ошибка команды: {e}")
+                if not is_closing: self.log_func(f"[RU] Ошибка команды: {e}")
                 return None
         
         def get_status(self):
@@ -1806,6 +1890,11 @@ try:
         
         def stop(self):
             """Disconnect from WARP and stop service (keep installed for next session)."""
+            if is_closing:
+                # Nuclear option for shutdown: just kill service, don't try to disconnect via CLI
+                self.stop_service()
+                return
+
             self.log_func("[RU] Отключение...")
             self.run_warp_cli("disconnect")
             self.is_connected = False
@@ -3245,7 +3334,7 @@ function FindProxyForURL(url, host) {{
 
         if line.startswith("!!! [AUTO]"): return "normal"
         if "[StrategyBuilder]" in line: return "info"
-        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]"]): 
+        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]", "[Repair]", "Code 177"]): 
             return "info"
         
         # Специальное выделение проблем для [RU], [EU], [SingBox]
@@ -9790,7 +9879,7 @@ function FindProxyForURL(url, host) {{
 
         if line.startswith("!!! [AUTO]"): return "normal"
         if "[StrategyBuilder]" in line: return "info"
-        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]"]): 
+        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]", "[Repair]", "Code 177"]): 
             return "info"
         
         # Специальное выделение проблем для [RU], [EU], [SingBox]
@@ -10668,56 +10757,63 @@ function FindProxyForURL(url, host) {{
     def repair_windivert_driver(log_func=None):
         """
         Attempts to repair broken WinDivert driver installation.
-        Fixes:
-        - Code 177 (Driver locked)
-        - Code 577 (Signature verification)
-        - "Service cannot be started... disabled" (0x422)
+        Fixes Code 177, 577, and 0x422 (Disabled).
         """
         try:
             if log_func: log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
         except: pass
         
-        # 1. Force Enable Service (Fix for "Service Disabled" 0x422 error)
-        # Some optimizers disable "windivert" service. We must re-enable it.
-        try:
-            # "start= demand" (Note the space!)
-            subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-        except: pass
-
-        # 2. Stop and Delete Service (Force Reinstall)
-        # If enabling didn't work, we nuke it so winws can re-register it.
+        # 1. Stop and Delete Service (Full reset)
         try:
             subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
         except: pass
         
-        # 3. Add delay for SCM to clean up registry
-        time.sleep(2.0)
-        
-        # 4. Restore driver files from backup if available (or assume they are present in bin)
-        # Note: In Nuitka OneFile, sys._MEIPASS contains the original files. 
-        # But deployed bin/ is what matters. deploy_infrastructure should have handled this.
-        # We can try to force-copy if frozen.
-        if getattr(sys, 'frozen', False):
-             try:
-                 base_dir = get_base_dir()
-                 internal = get_internal_path("bin")
-                 if os.path.exists(internal):
-                     for f in os.listdir(internal):
-                         if f.endswith(".sys") or f.endswith(".dll"):
-                             src = os.path.join(internal, f)
-                             dst = os.path.join(base_dir, "bin", f)
-                             try: shutil.copy2(src, dst)
-                             except: pass
-                     if log_func: log_func("[Repair] Файлы драйвера обновлены из ресурсов.")
-             except Exception as e:
-                 try:
-                     if log_func: log_func(f"[Repair] Ошибка копирования файлов: {e}")
-                 except: pass
-
+        # 2. Kill any WinWS remnants that might be holding the driver
         try:
-            if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
+            subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
+
+        # 3. Clean system remnants (Drivers often stuck in system32/drivers)
+        try:
+            sys_driver = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'drivers', 'WinDivert64.sys')
+            if os.path.exists(sys_driver):
+                # Try to delete, might fail if in use
+                subprocess.run(["del", "/F", "/Q", sys_driver], shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        except: pass
+
+        # 4. Restore driver files from internal resources
+        try:
+            base_dir = get_base_dir()
+            bin_path = os.path.join(base_dir, "bin")
+            
+            # Check if we have files in bin
+            required_files = ["WinDivert.dll", "WinDivert64.sys"]
+            missing = [f for f in required_files if not os.path.exists(os.path.join(bin_path, f))]
+            
+            if missing and getattr(sys, 'frozen', False):
+                internal = get_internal_path("bin")
+                for f in required_files:
+                    src = os.path.join(internal, f)
+                    dst = os.path.join(bin_path, f)
+                    if os.path.exists(src):
+                        try: shutil.copy2(src, dst)
+                        except: pass
+                if log_func: log_func("[Repair] Файлы драйвера восстановлены из ресурсов.")
+        except Exception as e:
+            if log_func: log_func(f"[Repair] Ошибка при восстановлении файлов: {e}")
+
+        # 5. Diagnostic: Check if files are actually there now
+        try:
+            if os.path.exists(os.path.join(get_base_dir(), "bin", "WinDivert64.sys")):
+                if log_func: log_func("[Repair] Проверка: WinDivert64.sys на месте.")
+            else:
+                if log_func: log_func("[Repair] КРИТИЧНО: Файл WinDivert64.sys отсутствует после ремонта!")
+        except: pass
+
+        time.sleep(1.5)
+        if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
 
     def start_nova_service(silent=False, restart_mode=False):
         threading.Thread(target=_start_nova_service_impl, args=(silent, restart_mode), daemon=True).start()
@@ -12360,7 +12456,7 @@ function FindProxyForURL(url, host) {{
                          # Update UI Status
                          if not silent and root:
                              root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
-                             root.after(0, lambda: btn_toggle.set_text("ОСТАНОВИТЬ"))
+                             root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
                          
                          # === ASYNC START: Strategy Checker ===
                          # Launching checker system ONLY after main core is confirmed stable
@@ -12537,7 +12633,9 @@ function FindProxyForURL(url, host) {{
             try: smart_update_general()
             except: pass
             
-            if not silent: print("Готово.\n")
+            if not silent: 
+                log_print("[Service] Все процессы завершены.")
+                print("Готово.\n")
         
         if wait_for_cleanup:
              # Run synchronously for exit
