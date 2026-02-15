@@ -96,22 +96,33 @@ def install_requirements_visually():
             root = None
 
     try:
+        # Use python.exe instead of pythonw.exe for pip if possible (more reliable)
+        pip_python = sys.executable.lower().replace("pythonw.exe", "python.exe")
+        if not os.path.exists(pip_python): pip_python = sys.executable
+
         for lib in missing:
             # Install package
-            cmd = [sys.executable, "-m", "pip", "install", lib, "--quiet", "--disable-pip-version-check"]
+            cmd = [pip_python, "-m", "pip", "install", lib, "--quiet", "--disable-pip-version-check"]
             # Use CREATE_NO_WINDOW (0x08000000)
-            subprocess.check_call(cmd, creationflags=0x08000000)
-            
-            # Verify import
-            __import__(required[lib])
+            try:
+                subprocess.check_call(cmd, creationflags=0x08000000)
+                # Verify import
+                __import__(required[lib])
+            except:
+                # If non-critical (Pillow/pystray), just continue
+                if lib in ["Pillow", "pystray"]: continue
+                raise # Re-raise if critical (requests)
             
     except Exception as e:
         if has_tk:
             # Try to show error
-            try: ctypes.windll.user32.MessageBoxW(0, f"Ошибка установки библиотек: {e}", "Nova Error", 0x10)
+            try: ctypes.windll.user32.MessageBoxW(0, f"Ошибка установки библиотек: {e}\nПопробуйте установить их вручную: pip install requests urllib3 Pillow pystray", "Nova Error", 0x10)
             except: pass
-        # Fallback: exit if critical deps missing
-        sys.exit(1)
+        # Fallback: only exit if critical deps (requests) are still missing
+        try:
+            import requests
+        except ImportError:
+            sys.exit(1)
     finally:
         if root: 
             try: root.destroy()
@@ -10829,7 +10840,17 @@ function FindProxyForURL(url, host) {{
         # 1. Stop and Delete Service (Full reset)
         try:
             # Force enable first in case it was disabled (Fix for Code 34)
+            # Use 'sc config' with correct syntax
             subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            # Direct Registry Fix for Code 34 (Nuclear option)
+            try:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\WinDivert", 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3) # 3 = Manual (Demand)
+                winreg.CloseKey(key)
+            except: pass
+
             subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
         except: pass
@@ -12487,6 +12508,13 @@ function FindProxyForURL(url, host) {{
                                 if not silent: log_print(f"[Error] Сбой драйвера (Код 177). Попытка лечения #{attempt+1}...")
                                 repair_windivert_driver(log_print if not silent else None)
                                 # Increase delay for driver to settle
+                                time.sleep(1.0)
+                                continue
+
+                            # FIX: Handling for Code 34 (Service Disabled)
+                            if exit_code == 34:
+                                if not silent: log_print(f"[Error] Драйвер отключен (Код 34). Включение...")
+                                repair_windivert_driver(log_print if not silent else None)
                                 time.sleep(1.0)
                                 continue
 
