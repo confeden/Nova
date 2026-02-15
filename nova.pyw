@@ -16,6 +16,11 @@ import subprocess
 import collections
 from datetime import datetime
 
+# === VERSION & CONFIG ===
+CURRENT_VERSION = "1.11"
+WINWS_FILENAME = "winws.exe"
+UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
+
 # === AUTO-INSTALL REQUIREMENTS ===
 def install_requirements_visually():
     if getattr(sys, 'frozen', False): return
@@ -98,11 +103,6 @@ except ImportError as e:
 def safe_trace(msg):
     try: print(msg)
     except: pass
-
-# === VERSION & CONFIG ===
-CURRENT_VERSION = "1.10"
-WINWS_FILENAME = "winws.exe"
-UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
 safe_trace("=== NOVA SCRIPT STARTED ===")
 
@@ -245,6 +245,27 @@ try:
     from tkinter import font as tkfont
     import winreg
     import glob
+
+    def mask_ip(ip_str):
+        """
+        Masks the first two octets of an IP address (e.g., 192.168.1.1 -> ***.***.1.1).
+        Returns "***" on error or invalid format.
+        """
+        try:
+            if not ip_str or not isinstance(ip_str, str): return "***"
+            parts = ip_str.split('.')
+            if len(parts) == 4:
+                return f"***.***.{parts[2]}.{parts[3]}"
+            return "***"
+        except: return "***"
+
+    def mask_ips_in_text(text):
+        """Masks all IPv4 addresses in a text string."""
+        if not text or not isinstance(text, str): return text
+        if '.' not in text: return text # Optimization
+        try:
+            return re.sub(r'\b\d{1,3}\.\d{1,3}\.(\d{1,3}\.\d{1,3})\b', r'***.***.\1', text)
+        except: return text
 
     # === CLEANUP OLD EXE (SELF-DELETION HANDLER) ===
     # This replaces the vulnerable shell-based self-deletion.
@@ -1482,10 +1503,13 @@ try:
                     self.log_func("[RU] Служба установлена.")
                     return True
                 else:
-                    self.log_func(f"[RU] Ошибка установки службы: {result.stderr}")
+                    err_msg = result.stderr.strip() or result.stdout.strip()
+                    self.log_func(f"[RU] Ошибка установки службы (Код {result.returncode}): {err_msg}")
+                    if result.returncode == 5:
+                        self.log_func("[RU] СОВЕТ: Запустите приложение от имени администратора для установки службы.")
                     return False
             except Exception as e:
-                self.log_func(f"[RU] Ошибка установки службы: {e}")
+                self.log_func(f"[RU] Исключение при установке службы: {e}")
                 return False
         
         def start_service(self):
@@ -1497,20 +1521,32 @@ try:
                     capture_output=True, text=True,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
-            # Wait for service to start
+                
+                if result.returncode != 0:
+                    err_msg = result.stderr.strip() or result.stdout.strip()
+                    # Error 1056 means it's already running
+                    if "1056" in err_msg or "already running" in err_msg.lower():
+                         if IS_DEBUG_MODE: self.log_func("[RU] Служба уже была запущена.")
+                    else:
+                        self.log_func(f"[RU] Ошибка запуска службы (Код {result.returncode}): {err_msg}")
+                        if result.returncode == 5:
+                             self.log_func("[RU] СОВЕТ: Запустите приложение от имени администратора для запуска службы.")
+                        return False
+
+                # Wait for service to start
                 import time
-                for _ in range(10):
+                for i in range(10):
                     if self.is_service_running():
-                        self.log_func("[RU] Служба запущена. Ожидание отклика...")
-                        # Wait until warp-cli can communicate with daemon
-                        for _ in range(150):  # Max 15 seconds (0.1s * 150)
+                        # Wait until warp-cli can communicate with daemon (Optimized for speed)
+                        for j in range(20):  # Max 10 seconds (0.5s * 20)
                             status = self.get_status()
+                            # If we get ANY valid response (even registration info), service is alive
                             if status and "Unable" not in status and "Unknown" not in status:
-                                self.log_func("[RU] Служба WARP активна.")
                                 return True
-                            time.sleep(0.1)
-                        return True  # Proceed anyway after timeout
-                    time.sleep(0.5)
+                            # Use 0.5s interval to reduce CPU load
+                            time.sleep(0.5)
+                        return True
+                    time.sleep(0.2)
                 return self.is_service_running()
             except Exception as e:
                 self.log_func(f"[RU] Ошибка запуска службы: {e}")
@@ -1561,6 +1597,12 @@ try:
             # 3. Start if needed
             return self.start_service()
         
+        def is_port_open(self, port):
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                return s.connect_ex(('127.0.0.1', port)) == 0
+
         def run_warp_cli(self, *args, timeout=30):
             """Run warp-cli command and return result."""
             if not os.path.exists(self.warp_cli_path):
@@ -1569,6 +1611,23 @@ try:
             try:
                 cmd = [self.warp_cli_path] + list(args)
                 
+                # --- FAILOVER PROXY LOGIC ---
+                # If we are doing registration/account tasks, try to use Opera VPN (1371) as proxy
+                # because Warp itself isn't working yet.
+                env = os.environ.copy()
+                is_reg_cmd = any(x in args for x in ["registration", "account", "license"])
+                
+                if is_reg_cmd:
+                    # Wait up to 10s for Opera VPN (1371) to become available if needed
+                    for _ in range(10):
+                        if self.is_port_open(1371): break
+                        time.sleep(1)
+                    
+                    if self.is_port_open(1371):
+                        env["HTTPS_PROXY"] = "http://127.0.0.1:1371"
+                        env["HTTP_PROXY"] = "http://127.0.0.1:1371"
+                        # if IS_DEBUG_MODE: self.log_func("[RU] Команда регистрации направлена через Opera VPN (1371)")
+
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
@@ -1578,7 +1637,8 @@ try:
                     text=True,
                     timeout=timeout,
                     creationflags=subprocess.CREATE_NO_WINDOW,
-                    startupinfo=startupinfo
+                    startupinfo=startupinfo,
+                    env=env
                 )
                 return result
             except subprocess.TimeoutExpired:
@@ -1633,78 +1693,86 @@ try:
                 self.log_func("[RU] Не удалось запустить службу!")
                 return
             
-            # FIX: Robust Registration Check Loop
-            status = "Unknown"
-            import time
+            # --- SYNC WITH WINWS ---
+            max_wait_winws = 15
+            winws_ready = False
             
-            # Wait for daemon to be responsive
-            for _ in range(10):
-                status = self.get_status()
-                if status and "Unable to connect" not in status:
+            for _ in range(max_wait_winws * 2): # 0.5s intervals
+                if (is_service_active and process and process.poll() is None) or is_restarting:
+                    winws_ready = True
                     break
                 time.sleep(0.5)
+            
+            if winws_ready:
+                time.sleep(1.0)
+
+            # Wait for daemon to be responsive
+            status = "Unknown"
+            for i in range(20): # Up to 10s
+                status = self.get_status()
+                if status and "Unable to connect" not in status and "Unknown" not in status:
+                    break
+                time.sleep(0.5)
+
+            if "Unable to connect" in status or "Unknown" in status:
+                self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
+                return
 
             # Check if registration is needed
             if "Registration Missing" in status:
                 self.log_func("[RU] Регистрация устройства...")
                 
-                # Retry loop for registration
                 reg_success = False
                 last_error = ""
-                for _ in range(3):
+                for attempt in range(3):
                     result = self.run_warp_cli("registration", "new")
+                    out = result.stdout.strip() if (result and result.stdout) else ""
+                    err = result.stderr.strip() if (result and result.stderr) else ""
+                    last_error = f"{err} {out}".strip() or "Unknown error"
+
                     if result and result.returncode == 0:
                         self.log_func("[RU] Устройство зарегистрировано.")
                         reg_success = True
                         break
                     else:
-                        # Capture error for logging
-                        if result:
-                            # FIX: Combine stdout and stderr to ensure we catch the error message
-                            out = result.stdout.strip() if result.stdout else ""
-                            err = result.stderr.strip() if result.stderr else ""
-                            last_error = f"{err} {out}".strip() or "Unknown error"
-                            
-                            # Auto-fix: Old registration exists
-                            if "Old registration" in last_error or "registration delete" in last_error:
-                                self.log_func("[RU] Обнаружена старая регистрация. Удаление...")
-                                
-                                # FIX: Just delete and retry, don't kill the service
-                                self.run_warp_cli("registration", "delete")
-                                time.sleep(1.0)
-                                continue # Retry immediately
-                                
-                            if IS_DEBUG_MODE: self.log_func(f"[RU] Попытка регистрации неудачна: {last_error}")
-                    time.sleep(1.0)
+                        if any(x in last_error.lower() for x in ["old registration", "registration delete", "already exists", "conflict"]):
+                            self.log_func(f"[RU] Очистка старой регистрации...")
+                            self.run_warp_cli("registration", "delete")
+                            time.sleep(1.5)
+                            continue 
+                    time.sleep(1.5)
                 
                 if not reg_success:
                     self.log_func(f"[RU] Ошибка регистрации: {last_error}")
                     return
-                
-                # Refresh status after registration
                 status = self.get_status()
             
-            # Configure WARP (Always ensure configuration)
+            # --- CONFIGURATION ---
+            if IS_DEBUG_MODE: self.log_func("[RU] Настройка параметров...")
             self.ensure_masque()
             self.set_proxy_port(self.port)
             self.set_proxy_mode()
 
             # Check if already connected
             if "Connected" in status:
-                if IS_DEBUG_MODE: self.log_func("[RU] Уже подключено.")
-                self.is_connected = True
+                if self.check_port(self.port):
+                    self.log_func(f"[RU] {self.port} готов")
+                    self.is_connected = True
+                else:
+                    if IS_DEBUG_MODE: self.log_func("[RU] Ожидание проброса порта...")
+                    self.wait_for_connection(timeout=20)
+                    self.is_connected = True
                 return
             
             # Connect
-            if IS_DEBUG_MODE: self.log_func("[RU] Подключение через MASQUE (HTTP/3)...")
+            self.log_func("[RU] Подключение...")
             result = self.run_warp_cli("connect")
             
             if result and result.returncode == 0:
-                if IS_DEBUG_MODE: self.log_func("[RU] Команда подключения отправлена. Ожидание установки соединения...")
-                self.wait_for_connection(timeout=20)
+                self.wait_for_connection(timeout=25)
                 self.is_connected = True
             else:
-                error_msg = result.stderr if result else "Unknown error"
+                error_msg = (result.stderr if result else "Unknown error") or "Unknown"
                 self.log_func(f"[RU] Ошибка подключения: {error_msg}")
 
         def check_port(self, port):
@@ -1724,7 +1792,8 @@ try:
                  if "Connected" in status:
                      # Check port
                      if self.check_port(self.port):
-                         self.log_func(f"[RU] Успешное подключение! Прокси доступен на порту {self.port}")
+                         self.log_func(f"[RU] {self.port} готов")
+                         self.is_connected = True
                          return True
                      else:
                          if IS_DEBUG_MODE: self.log_func(f"[RU] Статус Connected, но порт {self.port} пока закрыт...")
@@ -1791,33 +1860,40 @@ try:
                         except: pass
             return res
 
+        def is_port_open(self, port):
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                return s.connect_ex(('127.0.0.1', port)) == 0
+
         def generate_pac(self):
-            """Generates PAC file based on ru.txt/eu.txt domains AND ip/ru.txt IPs."""
+            """Generates PAC file with smart failover logic."""
             try:
                 base = get_base_dir()
                 ru_domains = self._load_domain_list(os.path.join(base, "list", "ru.txt"))
                 eu_domains = self._load_domain_list(os.path.join(base, "list", "eu.txt"))
-                # NEW: Load Discord domains for WARP routing
                 discord_domains = self._load_domain_list(os.path.join(base, "list", "discord.txt"))
-                
-                # Load IP ranges
                 ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
-                
-                # NEW: Load Discord IPs and merge with RU IPs (both go to WARP)
                 discord_ips = self._load_ip_list(os.path.join(base, "ip", "discord.txt"))
                 ru_ips.extend(discord_ips)
                 
-                # Format for JS
+                # Check Warp status for optimized routing
+                warp_active = self.is_port_open(self.warp_port)
+                
+                # Routing strings
+                # If Warp is active, try it first, then failover to Opera.
+                # If Warp is down, go straight to Opera to avoid browser timeouts.
+                if warp_active:
+                    ru_route = f"SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT"
+                else:
+                    ru_route = "PROXY 127.0.0.1:1371; DIRECT"
+                
                 import json
                 ru_ips_js = json.dumps(ru_ips)
-
                 ru_js = "{" + ",".join(f'"{d}":1' for d in ru_domains) + "}"
                 eu_js = "{" + ",".join(f'"{d}":1' for d in eu_domains) + "}"
                 discord_js = "{" + ",".join(f'"{d}":1' for d in discord_domains) + "}"
                 
-                # Dual routing:
-                # ru.txt domains OR ip/ru.txt IPs -> WARP SOCKS5 (port 1370)
-                # eu.txt domains -> Opera Proxy HTTP (port 1371)
                 pac_content = f"""
 function FindProxyForURL(url, host) {{
     var ru = {ru_js};
@@ -1825,8 +1901,6 @@ function FindProxyForURL(url, host) {{
     var discord = {discord_js};
     var ru_ips = {ru_ips_js};
     
-    // Check if host is IP address (v4 or v6)
-    // Simple regex for v4, v6 is complex so we assume if not domain
     var isIpV4 = /^\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}$/.test(host);
     var isIpV6 = (host.indexOf(':') > -1);
     
@@ -1834,17 +1908,14 @@ function FindProxyForURL(url, host) {{
         for (var i = 0; i < ru_ips.length; i++) {{
             var entry = ru_ips[i];
             var ver = entry[2];
-            
             if (ver === 4 && isIpV4) {{
-                // IPv4: isInNet(host, ip, mask)
                 if (isInNet(host, entry[0], entry[1])) {{
-                    return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+                    return "{ru_route}";
                 }}
             }} else if (ver === 6 && isIpV6) {{
-                // IPv6: isInNetEx(host, "IP/Prefix") - Windows/Chrome extension
                 if (typeof isInNetEx === 'function') {{
                     if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
-                        return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+                        return "{ru_route}";
                     }}
                 }}
             }}
@@ -1862,8 +1933,8 @@ function FindProxyForURL(url, host) {{
         return false;
     }}
     
-    if (matchDomain(ru, host)) return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
-    if (matchDomain(discord, host)) return "SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371; DIRECT";
+    if (matchDomain(ru, host)) return "{ru_route}";
+    if (matchDomain(discord, host)) return "{ru_route}";
     if (matchDomain(eu, host)) return "PROXY 127.0.0.1:1371; DIRECT";
     
     return "DIRECT";
@@ -1871,6 +1942,8 @@ function FindProxyForURL(url, host) {{
 """
                 with open(self.pac_file, "w", encoding="utf-8") as f:
                     f.write(pac_content)
+            except Exception as e:
+                self.log_func(f"[PAC] Ошибка генерации: {e}")
             except Exception as e:
                 self.log_func(f"[PAC] Ошибка генерации: {e}")
 
@@ -2022,11 +2095,10 @@ function FindProxyForURL(url, host) {{
 
         def start(self):
             if not os.path.exists(self.exe_path):
-                if IS_DEBUG_MODE: self.log_func("[SingBox] Executable not found.")
                 return
             
             if not os.path.exists(self.config_path):
-                if IS_DEBUG_MODE: self.log_func("[SingBox] Config not found (run keygen first).")
+                self.log_func(f"[SingBox] Config not found at: {self.config_path} (run keygen first).")
                 return
 
             # Kill existing
@@ -2063,9 +2135,23 @@ function FindProxyForURL(url, host) {{
                     text=True,
                     encoding='utf-8', errors='replace'
                 )
-                self.log_func(f"[SingBox] Запущен на порту {self.port} (UDP Enabled)")
                 
-                # Non-blocking check for immediate failure
+                # FIX: Wait for port 1372 to actually open before reporting ready
+                def wait_for_singbox_ready():
+                    import socket
+                    start_t = time.time()
+                    while time.time() - start_t < 10: # Max 10s wait
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.settimeout(0.5)
+                            if s.connect_ex(('127.0.0.1', self.port)) == 0:
+                                self.log_func(f"[SingBox] {self.port} готов")
+                                return
+                        time.sleep(0.5)
+                    if IS_DEBUG_MODE: self.log_func("[SingBox] Предупреждение: Порт 1372 не открылся вовремя.")
+
+                threading.Thread(target=wait_for_singbox_ready, daemon=True).start()
+                
+            except Exception as e:
                 try:
                     exit_code = self.process.wait(timeout=0.5)
                     if exit_code is not None:
@@ -2151,8 +2237,23 @@ function FindProxyForURL(url, host) {{
                     startupinfo=startupinfo,
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
-                if IS_DEBUG_MODE: self.log_func(f"[EU] Запущен на порту {self.port} (регион: {self.country})")
-                self.log_func("[EU] 1371 готов.")
+                
+                # FIX: Wait for port 1371 to actually open before reporting ready
+                def wait_for_opera_ready():
+                    import socket
+                    start_t = time.time()
+                    while time.time() - start_t < 15: # Max 15s wait
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.settimeout(0.5)
+                            if s.connect_ex(('127.0.0.1', self.port)) == 0:
+                                if IS_DEBUG_MODE: self.log_func(f"[EU] Запущен на порту {self.port} (регион: {self.country})")
+                                self.log_func(f"[EU] {self.port} готов")
+                                return
+                        time.sleep(0.5)
+                    if IS_DEBUG_MODE: self.log_func("[EU] Предупреждение: Порт 1371 не открылся вовремя.")
+
+                threading.Thread(target=wait_for_opera_ready, daemon=True).start()
+                
             except Exception as e:
                 self.log_func(f"[EU] Ошибка запуска: {e}")
         
@@ -2213,7 +2314,9 @@ function FindProxyForURL(url, host) {{
                 "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6"
             ],
             "warp": [
-                "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6",
+                "--filter-udp=443",
+                "--dpi-desync=fake,disorder2",
+                "--dpi-desync-repeats=6",
                 "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
             ],
             "voice": [
@@ -2723,39 +2826,6 @@ function FindProxyForURL(url, host) {{
                     continue
         return False
 
-    def is_vpn_active_func():
-        """Проверяет наличие активных VPN/Туннельных интерфейсов (PowerShell)."""
-        try:
-            # Используем PowerShell
-            cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -ExpandProperty InterfaceDescription"]
-            
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            output = subprocess.check_output(cmd, startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW, stderr=subprocess.DEVNULL, timeout=3).decode('utf-8', errors='ignore').lower()
-            
-            # Uncomment to debug what Nova sees:
-            # log_print(f"[VPN Debug] Adapters: {output.strip()}")
-
-            # 1. Keywords that trigger VPN detection
-            keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "hamachi", "amnezia", "warp", "cloudflare"]
-            
-            # 2. Exclusions (Whitelist) - Adapters containing these will be IGNORED
-            exclusions = ["radmin"] 
-
-            for line in output.splitlines():
-                line_lower = line.lower()
-                
-                # Check exclusions FIRST
-                if any(ex in line_lower for ex in exclusions):
-                     continue
-
-                # Check match
-                if any(k in line_lower for k in keywords):
-                    # log_print(f"[VPN Debug] Found VPN: {line}")
-                    return True
-            return False
-        except: return False
-
     # ================= МОДУЛЬ: NOVA_LOGIC =================
 
     # === Потокобезопасный ограничитель скорости ===
@@ -3175,9 +3245,14 @@ function FindProxyForURL(url, host) {{
 
         if line.startswith("!!! [AUTO]"): return "normal"
         if "[StrategyBuilder]" in line: return "info"
-        if "[Check]" in line: return "info"
-        if "[ExcludeCheck]" in line: return "info"
+        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]"]): 
+            return "info"
         
+        # Специальное выделение проблем для [RU], [EU], [SingBox]
+        if any(cat in line for cat in ["[RU]", "[EU]", "[SingBox]"]):
+            if any(x in text_lower for x in ["ошибка", "error", "fail", "не удается", "не найден", "не удалось", "exception", "warning", "warn", "остановка", "падение"]):
+                return "error"
+
         if any(x in text_lower for x in ["err:", "error", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено"]):
             return "error"
         
@@ -3187,7 +3262,10 @@ function FindProxyForURL(url, host) {{
         if "ok (" in text_lower:
             return "normal"
         
-        if any(x in text_lower for x in ["пропуск", "удаление", "отмена", "инфо", "успешно", "ядро активно"]):
+        if any(x in text_lower for x in ["успешное подключение", "успешно инициализирован", "ядро активно"]):
+            return "normal"
+        
+        if any(x in text_lower for x in ["пропуск", "удаление", "отмена", "инфо", "успешно"]):
             return "info"
             
         return "normal"
@@ -3480,49 +3558,59 @@ function FindProxyForURL(url, host) {{
         try:
             start_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
             
-            # Determine correct path logic (similar to NetMonitor)
+            # Определяем пути
+            base_dir = get_base_dir()
+            potential_exe = os.path.join(base_dir, "Nova.exe")
+            if not os.path.exists(potential_exe):
+                potential_exe = os.path.join(base_dir, "nova.exe")
+            
             if getattr(sys, 'frozen', False):
-                # Compiled .exe
-                exe_path = sys.executable
-                # Add quotes to handle spaces in path
-                cmd_to_add = f'"{exe_path}" --minimized' 
+                # Скомпилированная версия (EXE)
+                exe_path = os.path.abspath(sys.executable)
+                cmd_to_add = f'"{exe_path}" --minimized'
+            elif os.path.exists(potential_exe):
+                # Мы в режиме скрипта, но рядом есть Nova.exe - используем его для автозапуска
+                cmd_to_add = f'"{os.path.abspath(potential_exe)}" --minimized'
             else:
-                # Script .pyw
-                exe_path = sys.executable
+                # Режим скрипта .pyw
+                exe_path = os.path.abspath(sys.executable)
                 script_path = os.path.abspath(__file__)
                 cmd_to_add = f'"{exe_path}" "{script_path}" --minimized'
 
-            # Check existing
+            # Проверяем текущее наличие
+            exists = False
             try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_READ)
                 try:
-                    winreg.QueryValueEx(key, "NovaApplication")
+                    current_cmd, _ = winreg.QueryValueEx(key, "NovaApplication")
                     exists = True
                 except FileNotFoundError:
                     exists = False
                 winreg.CloseKey(key)
-            except: exists = False
+            except: 
+                exists = False
 
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_SET_VALUE)
+            # Открываем для записи
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_WRITE)
             
             if exists:
                 try:
                     winreg.DeleteValue(key, "NovaApplication")
-                    if log_func: log_func("[Autostart] Автозапуск отключен")
+                    if log_func: log_func("[Autostart] Автозапуск отключен (запись удалена)")
                     else: print("[Autostart] Disabled")
                 except Exception as e:
-                    if log_func: log_func(f"[Autostart] Ошибка отключения: {e}")
+                    if log_func: log_func(f"[Autostart] Ошибка при удалении: {e}")
             else:
                 try:
                     winreg.SetValueEx(key, "NovaApplication", 0, winreg.REG_SZ, cmd_to_add)
-                    if log_func: log_func(f"[Autostart] Автозапуск включен")
-                    else: print("[Autostart] Enabled")
+                    if log_func: log_func(f"[Autostart] Автозапуск включен: {cmd_to_add}")
+                    else: print(f"[Autostart] Enabled: {cmd_to_add}")
                 except Exception as e:
-                    if log_func: log_func(f"[Autostart] Ошибка включения: {e}")
+                    if log_func: log_func(f"[Autostart] Ошибка при записи: {e}")
             
             winreg.CloseKey(key)
         except Exception as e:
-            if log_func: log_func(f"[Autostart] Ошибка доступа к реестру: {e}")
+            if log_func: log_func(f"[Autostart] Ошибка реестра: {e}")
             else: print(f"[Autostart] Registry Error: {e}")
 
     def ensure_log_window_created():
@@ -3813,22 +3901,17 @@ function FindProxyForURL(url, host) {{
         context_menu.add_separator()
 
         # === Autostart Option ===
-        # Use a dynamic variable to track state
-        autostart_var = tk.BooleanVar()
-        
-        def update_autostart_menu():
-            """Updates the checkbutton state before showing menu"""
-            is_auto = get_autostart_cmd() is not None
-            autostart_var.set(is_auto)
-
-        # Use postcommand to update state when menu opens
-        context_menu.configure(postcommand=update_autostart_menu)
-        
+        autostart_log_var = tk.BooleanVar()
         def toggle_autostart_wrapper():
-            toggle_startup(log_print)
-            # visual update happens next time menu opens due to postcommand
+            # Use separate thread to ensure UI is not blocked
+            threading.Thread(target=toggle_startup, args=(log_print,), daemon=True).start()
 
-        context_menu.add_checkbutton(label="Автозапуск", variable=autostart_var, command=toggle_autostart_wrapper)
+        def update_autostart_label():
+            is_auto = get_autostart_cmd() is not None
+            autostart_log_var.set(is_auto)
+
+        context_menu.add_checkbutton(label="Автозапуск Nova", variable=autostart_log_var, command=toggle_autostart_wrapper)
+        context_menu.configure(postcommand=update_autostart_label)
         context_menu.add_separator()
 
         
@@ -3883,7 +3966,7 @@ function FindProxyForURL(url, host) {{
         context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
 
         log_text_widget.tag_bind("clickable_cmd", "<Button-1>", copy_command)
-        log_text_widget.bind("<Button-3>", lambda e: context_menu.post(e.x_root, e.y_root))
+        log_text_widget.bind("<Button-3>", lambda e: (context_menu.post(e.x_root, e.y_root), "break")[1])
         log_text_widget.bind("<Key>", handle_key_press)
         
         log_text_widget.bind_all("<Control-c>", copy_selection)
@@ -3960,6 +4043,7 @@ function FindProxyForURL(url, host) {{
 
     def _safe_log_insert(string):
         global early_log_buffer
+        string = mask_ips_in_text(string)
         lw_exists = log_window and tk.Toplevel.winfo_exists(log_window)
         
         if lw_exists:
@@ -3970,12 +4054,7 @@ function FindProxyForURL(url, host) {{
                 if int(log_text_widget.index('end-1c').split('.')[0]) > LOG_MAX_LINES:
                     log_text_widget.delete('1.0', '101.0')
                 
-                tag = "normal"
-                if "[Check]" in string: tag = "info"
-                if "[ExcludeCheck]" in string: tag = "info"
-                if "FAIL" in string: tag = "fail"
-                if "[Warning]" in string: tag = "warning"
-                if "OK" in string: tag = "normal"
+                tag = get_line_tag(string)
                 
                 ts = time.strftime("%H:%M:%S")
                 log_text_widget.insert(tk.END, f"{ts} {string.strip()}\n", tag)
@@ -3998,6 +4077,7 @@ function FindProxyForURL(url, host) {{
                 pass # Root not created yet
 
         def _safe_write(self, string):
+            string = mask_ips_in_text(string)
             if should_ignore(string): return
             
             # === TIMESTAMP ADDED ===
@@ -4030,6 +4110,7 @@ function FindProxyForURL(url, host) {{
 
         def _safe_create(self, line_id, initial_text):
             try:
+                initial_text = mask_ips_in_text(initial_text)
                 with self.lock:
                     log_text_widget.configure(state=tk.NORMAL)
                     # Ensure newline if needed
@@ -4060,6 +4141,7 @@ function FindProxyForURL(url, host) {{
 
         def _safe_update(self, line_id, text, is_final):
             try:
+                text = mask_ips_in_text(text)
                 with self.lock:
                     if line_id not in self.active_lines: return
                     mark_name = self.active_lines[line_id]
@@ -4162,28 +4244,45 @@ function FindProxyForURL(url, host) {{
     # ================= VPN ДЕТЕКТОР =================
     
     def is_vpn_active_func():
-        """Проверяет наличие активного VPN (Cloudflare, WireGuard, TUN/TAP)."""
+        """Проверяет наличие активных VPN/Туннельных интерфейсов (PowerShell)."""
         try:
-            # Проверка через PowerShell (надежный способ для Windows)
-            # Ищем адаптеры по ключевым словам: Cloudflare, WireGuard, OpenVPN, tun, tap
-            cmd = ['powershell', '-NoProfile', '-Command', 'Get-NetAdapter | Where-Object { ($_.InterfaceDescription -match "Cloudflare|WireGuard|OpenVPN|tun|tap" -or $_.Name -match "Cloudflare|WireGuard|OpenVPN|tun|tap") -and ($_.Status -eq "Up") }']
+            # Используем PowerShell для получения всех активных адаптеров
+            # Мы проверяем как Name, так и InterfaceDescription
+            cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object Name, InterfaceDescription | ConvertTo-Json"]
             
-            # Используем subprocess с подавлением окна
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW)
             try:
-                out, _ = proc.communicate(timeout=2)
-                # Если вывод есть - значит адаптер найден
-                if out and out.strip():
-                    return True
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                output = subprocess.check_output(cmd, startupinfo=startupinfo, creationflags=subprocess.CREATE_NO_WINDOW, stderr=subprocess.DEVNULL, timeout=5).decode('utf-8', errors='ignore')
+                if not output.strip(): return False
                 
+                adapters = json.loads(output)
+                if isinstance(adapters, dict): adapters = [adapters] # Handle single adapter case
+            except:
+                return False
+
+            # Расширенный список ключевых слов для обнаружения VPN
+            keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "hamachi", "amnezia", "warp", "cloudflare", "privado", "mullvad", "nord", "proton"]
+            
+            # Исключения (белый список)
+            exclusions = ["radmin"] 
+
+            for adapter in adapters:
+                name = str(adapter.get("Name", "")).lower()
+                desc = str(adapter.get("InterfaceDescription", "")).lower()
+                combined = name + " " + desc
+                
+                # Пропускаем, если адаптер в белом списке
+                if any(ex in combined for ex in exclusions):
+                     continue
+
+                # Если найдено совпадение с ключевым словом
+                if any(k in combined for k in keywords):
+                    # log_print(f"[VPN Debug] Найдено совпадение: {combined}")
+                    return True
             return False
-        except:
-            return False
+        except: return False
 
     def vpn_monitor_worker(log_func):
         """Monitors for VPN connections and pauses/resumes the service."""
@@ -4197,11 +4296,12 @@ function FindProxyForURL(url, host) {{
                 vpn_is_currently_active = is_vpn_active_func()
 
                 if vpn_is_currently_active and not is_vpn_active:
-                    log_func("[VPN Detector] Обнаружен активный VPN (Cloudflare WARP). Работа приостановлена.")
+                    log_func("[VPN Detector] Обнаружен активный VPN. Работа приостановлена.")
                     is_vpn_active = True
                     was_service_active_before_vpn = is_service_active
                     
                     if is_service_active: 
+                        # silent=True, чтобы не спамить в лог об остановке, так как мы выше уже написали причину
                         stop_nova_service(silent=True)
                     
                     if root: 
@@ -4213,14 +4313,13 @@ function FindProxyForURL(url, host) {{
                     
                     def restore_ui():
                         btn_toggle.config(state=tk.NORMAL)
-                        # Если сервис не был активен до VPN, сбрасываем статус на нейтральный
                         if not was_service_active_before_vpn:
                             status_label.config(text="ГОТОВ К ЗАПУСКУ", fg="#cccccc")
-                        # Если был активен - он сам станет "Running" после запуска
 
                     if root: root.after(0, restore_ui)
                     
                     if was_service_active_before_vpn: 
+                        log_func("[VPN Detector] Автозапуск Nova...")
                         start_nova_service()
             except Exception as e: 
                 log_func(f"[VPN Detector] Ошибка в цикле мониторинга: {e}")
@@ -5558,7 +5657,9 @@ function FindProxyForURL(url, host) {{
                         test_args.append(f'--wf-raw={isolation_filter}')
                         
                         exe_path = os.path.join(get_base_dir(), "bin", WINWS_FILENAME)
-                        proc = subprocess.Popen([exe_path] + test_args, cwd=get_base_dir(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                        # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
+                        proc = subprocess.Popen([exe_path] + test_args, cwd=get_base_dir(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                                               creationflags=subprocess.CREATE_NO_WINDOW | 0x00004000)
                         time.sleep(3)
                         
                         failed = []
@@ -5732,7 +5833,10 @@ function FindProxyForURL(url, host) {{
                         
                         # Попытка запуска с ретраем для надежности (исправляет падения с кодом 1)
                         for attempt in range(2):
-                            proc = subprocess.Popen(final_args, cwd=get_base_dir(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW)
+                            # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
+                            proc = subprocess.Popen(final_args, cwd=get_base_dir(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, 
+                                                   text=True, encoding='utf-8', errors='replace', 
+                                                   creationflags=subprocess.CREATE_NO_WINDOW | 0x00004000)
                             
                             time.sleep(2.0)
                             if proc.poll() is None:
@@ -5956,9 +6060,19 @@ function FindProxyForURL(url, host) {{
                         return sum(1 for a in arg_list if ".bin" in a)
                     
                     def validate_mutation(new_args):
-                        """Проверяет ограничения мутации"""
+                        """Проверяет ограничения мутации и очищает от мусора."""
+                        # FIX: Remove any None or non-string elements (extra safety)
+                        if any(not isinstance(a, str) for a in new_args if a is not None):
+                            return False
+                        
+                        clean_args = []
                         for a in new_args:
-                            if not isinstance(a, str): continue
+                            if not a: continue
+                            # FIX: Prevent malformed arguments like ^! or random binary garbage
+                            # winws can fail on specific special characters if not escaped
+                            if "^!" in a or "\x00" in a or "\\x" in a:
+                                return False
+                                
                             # Запрет wssize
                             if "--wssize" in a or "--wsize" in a:
                                 return False
@@ -5968,6 +6082,8 @@ function FindProxyForURL(url, host) {{
                                     v = int(a.split("=")[1])
                                     if v > 11: return False
                                 except: pass
+                            clean_args.append(a)
+                            
                         # Не более 2 bin файлов
                         if count_bin_files(new_args) > 2:
                             return False
@@ -6344,7 +6460,7 @@ function FindProxyForURL(url, host) {{
                 
                 # DEBUG: Print loaded state critical flags
                 if IS_DEBUG_MODE:
-                    log_func(f"[Check-Debug] Loaded State: Ver={state.get('app_version')} CurVer={CURRENT_VERSION} IP={state.get('last_checked_ip')} Comp={state.get('completed')} Evo={state.get('evolution_stage')}")
+                    log_func(f"[Check-Debug] Loaded State: Ver={state.get('app_version')} CurVer={CURRENT_VERSION} IP={mask_ip(state.get('last_checked_ip'))} Comp={state.get('completed')} Evo={state.get('evolution_stage')}")
 
                 # last_standby_log_wrapper removed - using state instead
                 # FIX: Если версия изменилась или было обновление -> Сбрасываем флаг завершения
@@ -6437,12 +6553,12 @@ function FindProxyForURL(url, host) {{
 
                 # Extra Debounce: If IP just changed, wait a bit and re-verify before nuking state
                 if needs_ip_recheck and loaded_ip != current_ip:
-                     if IS_DEBUG_MODE: log_func(f"[Check] IP changed ({loaded_ip} -> {current_ip}). Debouncing...")
+                     if IS_DEBUG_MODE: log_func(f"[Check] IP changed ({mask_ip(loaded_ip)} -> {mask_ip(current_ip)}). Debouncing...")
                      time.sleep(10)
                      try:
                          check_ip = get_public_ip_isolated()
                          if check_ip != current_ip:
-                             log_func(f"[Check] IP change was transient ({current_ip} -> {check_ip}). Ignoring.")
+                             log_func(f"[Check] IP change was transient ({mask_ip(current_ip)} -> {mask_ip(check_ip)}). Ignoring.")
                              needs_ip_recheck = False
                              current_ip = check_ip # Adopt the latest one but don't reset
                      except: pass
@@ -6464,9 +6580,9 @@ function FindProxyForURL(url, host) {{
                     need_check = True
                     # FIX: Correct message for default timestamp
                     if last_full_ts == 0:
-                        reason = f"смена IP ({current_ip})" if (needs_ip_recheck and loaded_ip != current_ip) else "первая проверка стратегий"
+                        reason = f"смена IP ({mask_ip(current_ip)})" if (needs_ip_recheck and loaded_ip != current_ip) else "первая проверка стратегий"
                     else:
-                        reason = f"смена IP ({current_ip})" if (needs_ip_recheck and loaded_ip != current_ip) else f"плановая ревалидация ({int(days_passed)} дн.)"
+                        reason = f"смена IP ({mask_ip(current_ip)})" if (needs_ip_recheck and loaded_ip != current_ip) else f"плановая ревалидация ({int(days_passed)} дн.)"
                     
                     log_func(f"[Check] Обнаружена {reason}. Запуск полной проверки стратегий. (IP_Recheck={needs_ip_recheck}, Timeout={is_timeout})")
                     
@@ -6495,7 +6611,7 @@ function FindProxyForURL(url, host) {{
                     if not state.get("completed", False):
                          # Just log the resume
                          if not skip_main_check: 
-                             log_func(f"[Check] Возобновление проверки (IP прежний: {current_ip}, Completed=False)")
+                             log_func(f"[Check] Возобновление проверки (IP прежний: {mask_ip(current_ip)}, Completed=False)")
                              # FIX: Explicitly ensure we are NOT in completed state if we are resuming check
                              state["checks_completed"] = False 
                              save_state()
@@ -6532,7 +6648,8 @@ function FindProxyForURL(url, host) {{
                 blocked_services = set()
                 consecutive_zeros = {}
                 proven_working_services = set()
-                service_baselines = {} 
+                service_baselines = {}
+                service_totals = {}
                 active_scores_runtime = {}
                 perfect_services = set()
                 
@@ -6552,7 +6669,7 @@ function FindProxyForURL(url, host) {{
                 all_tasks = [] # (service_key, strategy_entry, domains, json_path)
                 is_scanning = True # FIX: Ensure flag set here
                 last_strategy_check_time = time.time()  # Update check timestamp
-                check_phase_scores = {}  # FIX: Словарь для накопления scores {(service, name): score}
+                check_phase_scores = {}  # FIX: Словарь для накопления {(service, name): (score, total)}
                 
                 # FIX: Restore scores from previous run to prevent "Score 0" replacement issue
                 try:
@@ -6560,11 +6677,12 @@ function FindProxyForURL(url, host) {{
                     if os.path.exists(s_path):
                         saved_scores = load_json_robust(s_path, {})
                         if saved_scores:
-                            for svc, items in saved_scores.items():
-                                if not isinstance(items, dict): continue
-                                for name, details in items.items():
+                            for svc, items_dict in saved_scores.items():
+                                if not isinstance(items_dict, dict): continue
+                                for name, details in items_dict.items():
                                     if isinstance(details, dict) and "score" in details:
-                                         check_phase_scores[(svc, name)] = details["score"]
+                                         # Restore as (score, total) tuple
+                                         check_phase_scores[(svc, name)] = (details["score"], details.get("total", 0))
                             log_func(f"[Init] Восстановлено {len(check_phase_scores)} результатов стратегий для сравнения.")
                 except Exception as e:
                     if IS_DEBUG_MODE: log_func(f"[Init-Err] Failed to load scores: {e}")
@@ -6985,7 +7103,7 @@ function FindProxyForURL(url, host) {{
                                 completed_tasks -= tasks_to_remove
                                 
                                 if completed_tasks:
-                                    log_func(f"[Init] Восстановлен прогресс для IP {current_ip}: {len(completed_tasks)} стратегий уже проверено.")
+                                    log_func(f"[Init] Восстановлен прогресс для IP {mask_ip(current_ip)}: {len(completed_tasks)} стратегий уже проверено.")
                             else:
                                 # IP changed or Too Old - ignore previous progress (start fresh)
                                 pass
@@ -7024,6 +7142,7 @@ function FindProxyForURL(url, host) {{
                     # Reset Baselines for this session OR restore from state if resuming on same IP
                     # Previous session scores are irrelevant if network changed.
                     service_baselines = {}
+                    service_totals = {}
                     
                     # FIX: Restore baselines from state if IP matches (resume after stop)
                     try:
@@ -7037,10 +7156,18 @@ function FindProxyForURL(url, host) {{
                                 "whatsapp": state.get("whatsapp_score", 0),
                                 "telegram": state.get("telegram_score", 0),
                             }
+                            # Restore totals to enable percentage comparison
+                            service_totals = {
+                                "general": state.get("general_total", 100),
+                                "youtube": state.get("youtube_total", 16),
+                                "discord": state.get("discord_total", 16),
+                                "whatsapp": state.get("whatsapp_total", 16),
+                                "telegram": state.get("telegram_total", 16),
+                            }
                             # Filter out zeros
                             service_baselines = {k: v for k, v in service_baselines.items() if v > 0}
                             if service_baselines:
-                                log_func(f"[Check] Восстановлены результаты прошлой сессии: {service_baselines}")
+                                log_func(f"[Check] Восстановлены результаты прошлой сессии: {service_baselines} (Totals: {service_totals})")
                     except Exception as e:
                         if IS_DEBUG_MODE: log_func(f"[Check] Ошибка восстановления baselines: {e}")
 
@@ -7054,7 +7181,7 @@ function FindProxyForURL(url, host) {{
                                  for svc_key, svc_data in saved_scores_data.items():
                                      for s_name, s_info in svc_data.items():
                                          if isinstance(s_info, dict) and "score" in s_info:
-                                              check_phase_scores[(svc_key, s_name)] = s_info["score"]
+                                              check_phase_scores[(svc_key, s_name)] = (s_info["score"], s_info.get("total", 0))
                                               count_restored += 1
                                  if count_restored > 0:
                                       log_func(f"[Init] Восстановлено {count_restored} индивидуальных результатов тестов.")
@@ -7065,13 +7192,23 @@ function FindProxyForURL(url, host) {{
                     
                     # FIX: Populate runtime scores from restored check_phase_scores (critical for Evo mode skip)
                     if check_phase_scores:
-                        for (c_svc, c_name), c_score in check_phase_scores.items():
+                        for (c_svc, c_name), c_val in check_phase_scores.items():
+                            c_score, c_total = c_val if isinstance(c_val, tuple) else (c_val, 0)
+                            
                             if c_svc not in active_scores_runtime: active_scores_runtime[c_svc] = {}
                             active_scores_runtime[c_svc][c_name] = c_score
                             
                             # Also ensure baseline is correct (state might be outdated)
-                            if c_score > service_baselines.get(c_svc, 0):
+                            # Use ratio-based comparison for robustness
+                            curr_b_score = service_baselines.get(c_svc, 0)
+                            curr_b_total = service_totals.get(c_svc, 0)
+                            
+                            b_ratio = curr_b_score / curr_b_total if curr_b_total > 0 else -1
+                            c_ratio = c_score / c_total if c_total > 0 else 0
+                            
+                            if c_ratio > b_ratio:
                                 service_baselines[c_svc] = c_score
+                                service_totals[c_svc] = c_total
 
                     # DEBUG LOG: Verify Baselines
                     if IS_DEBUG_MODE or IS_EVO_MODE:
@@ -7185,8 +7322,9 @@ function FindProxyForURL(url, host) {{
                                     
                                     s_name = strat["name"]
                                     
-                                    # FIX: Сохраняем score для последующего использования в Evolution
-                                    check_phase_scores[(svc, s_name)] = sc
+                                    # FIX: Сохраняем score и total для последующего использования в Evolution
+                                    check_phase_scores[(svc, s_name)] = (sc, len(doms))
+                                    all_strategy_results.append((sc, strat, svc, len(doms)))
 
                                     # === [LEARNING] Update Stats for Check Phase ===
                                     try:
@@ -7203,7 +7341,7 @@ function FindProxyForURL(url, host) {{
                                             sc, 
                                             len(doms), 
                                             service=svc, 
-                                            bin_files_used=bin_used,
+                                            bin_files_used=bin_used, 
                                             logger=log_func
                                         )
                                     except Exception as e:
@@ -7215,49 +7353,72 @@ function FindProxyForURL(url, host) {{
                                     # Обновляем базовый счетчик, если это текущая стратегия
                                     if is_current:
                                         service_baselines[svc] = sc
-                                        if svc == "general": state["general_score"] = sc
-                                        else: state[f"{svc}_score"] = sc
+                                        service_totals[svc] = len(doms)
+                                        
+                                        if svc == "general": 
+                                            state["general_score"] = sc
+                                            state["general_total"] = len(doms)
+                                        else: 
+                                            state[f"{svc}_score"] = sc
+                                            state[f"{svc}_total"] = len(doms)
                                         save_state()
                                         
                                         # CRITICAL: Проверяем pending_hotswap для этого сервиса
                                         # (стратегии, которые были проверены ДО Current)
-                                        for p_sc, p_strat, p_svc in pending_hotswap:
-                                            if p_svc == svc and p_sc > sc:
-                                                msg_t = f"   >>> Найдена более сильная стратегия для {svc} ({p_sc} > {sc}) [из очереди]"
-                                                if root: root.after(0, lambda m=msg_t: log_print(m))
+                                        for p_sc, p_strat, p_svc, p_total in pending_hotswap:
+                                            if p_svc == svc:
+                                                p_ratio = p_sc / p_total if p_total > 0 else 0
+                                                c_ratio = sc / len(doms) if len(doms) > 0 else 0
                                                 
-                                                service_baselines[svc] = p_sc
-                                                if svc == "general": state["general_score"] = p_sc
-                                                else: state[f"{svc}_score"] = p_sc
-                                                save_state()
-                                                
-                                                update_active_config_immediate(p_svc, p_strat["args"], "   Применена новая стратегия (Pending)")
-                                                break  # Применили лучшую - выходим
+                                                if p_ratio > c_ratio:
+                                                    msg_t = f"   >>> Найдена более сильная стратегия для {svc} ({p_sc}/{p_total} > {sc}/{len(doms)}) [из очереди]"
+                                                    if root: root.after(0, lambda m=msg_t: log_print(m))
+                                                    
+                                                    service_baselines[svc] = p_sc
+                                                    service_totals[svc] = p_total
+                                                    if svc == "general": 
+                                                        state["general_score"] = p_sc
+                                                        state["general_total"] = p_total
+                                                    else: 
+                                                        state[f"{svc}_score"] = p_sc
+                                                        state[f"{svc}_total"] = p_total
+                                                    save_state()
+                                                    
+                                                    update_active_config_immediate(p_svc, p_strat["args"], "   Применена новая стратегия (Pending)")
+                                                    break  # Применили лучшую - выходим
 
                                     # Логика замены (Hot Swap)
-                                    # Берем текущий базовый счет
-                                    bl = service_baselines.get(svc, -1)
+                                    # Берем текущий базовый счет и общее кол-во
+                                    bl_score = service_baselines.get(svc, -1)
+                                    bl_total = service_totals.get(svc, 0)
                                     
-                                    # CRITICAL FIX: Если baseline ещё не установлен для этого сервиса,
-                                    # значит "Current" стратегия ещё не была обработана (гонка в futures).
-                                    # Пропускаем Hot Swap - стратегия будет обработана в финальной сортировке.
-                                    # Но НЕ пропускаем Blockage Logic и Save Progress!
-                                    baseline_ready = (bl >= 0)
+                                    # Рассчитываем коэффициенты для сравнения (проценты успеха)
+                                    bl_ratio = bl_score / bl_total if bl_total > 0 else -1
+                                    curr_ratio = sc / len(doms) if len(doms) > 0 else 0
+                                    
+                                    # baseline_ready = (bl >= 0)
+                                    baseline_ready = (bl_ratio >= 0)
                                     
                                     # Если baseline не готов - откладываем Hot Swap проверку
                                     if not baseline_ready and not is_current:
-                                        pending_hotswap.append((sc, strat, svc))
+                                        pending_hotswap.append((sc, strat, svc, len(doms)))
 
 
-                                    if baseline_ready and not is_current and sc > bl:
+                                    if baseline_ready and not is_current and curr_ratio > bl_ratio:
                                          # Thread-safe логирование в GUI
-                                         msg_t = f"   >>> Найдена более сильная стратегия для {svc} ({sc} > {bl})"
+                                         msg_t = f"   >>> Найдена более сильная стратегия для {svc} ({sc}/{len(doms)} > {bl_score}/{bl_total})"
                                          if root: root.after(0, lambda m=msg_t: log_print(m))
                                          
                                          # Обновляем baseline сразу
                                          service_baselines[svc] = sc
-                                         if svc == "general": state["general_score"] = sc
-                                         else: state[f"{svc}_score"] = sc
+                                         service_totals[svc] = len(doms)
+                                         
+                                         if svc == "general": 
+                                             state["general_score"] = sc
+                                             state["general_total"] = len(doms)
+                                         else: 
+                                             state[f"{svc}_score"] = sc
+                                             state[f"{svc}_total"] = len(doms)
                                          save_state()
 
                                          update_active_config_immediate(svc, strat["args"], "   Применена новая стратегия")
@@ -7337,9 +7498,14 @@ function FindProxyForURL(url, host) {{
                                              scores_temp_path = os.path.join(base_dir, "temp", "strategy_scores.json")
                                              partial_scores = {}
                                              # Reconstruct full structure from flat dict
-                                             for (svc_k, name_k), val_s in check_phase_scores.items():
+                                             for (svc_k, name_k), val_pair in check_phase_scores.items():
+                                                 val_s, val_t = val_pair if isinstance(val_pair, tuple) else (val_pair, 0)
                                                  if svc_k not in partial_scores: partial_scores[svc_k] = {}
-                                                 partial_scores[svc_k][name_k] = {"score": val_s, "timestamp": int(time.time())}
+                                                 partial_scores[svc_k][name_k] = {
+                                                     "score": val_s, 
+                                                     "total": val_t,
+                                                     "timestamp": int(time.time())
+                                                 }
                                              
                                              # Merge with existing file to handle restarts
                                              # (If run 1 saved A, B, and run 2 saves C, we want A, B, C)
@@ -7402,11 +7568,13 @@ function FindProxyForURL(url, host) {{
                              scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
                              strategy_scores_data = {}
                              
-                             for (svc, name), score in check_phase_scores.items():
+                             for (svc, name), score_val in check_phase_scores.items():
+                                 score, total_count = score_val if isinstance(score_val, (list, tuple)) else (score_val, 0)
                                  if svc not in strategy_scores_data:
                                      strategy_scores_data[svc] = {}
                                  strategy_scores_data[svc][name] = {
                                      "score": score,
+                                     "total": total_count,
                                      "timestamp": int(time.time())
                                  }
                              
@@ -7417,32 +7585,47 @@ function FindProxyForURL(url, host) {{
                              log_func(f"[Score-Save] Ошибка: {e}")
 
                 def sort_and_distribute_results(results_list, score_cache=None, log_func=log_func):
-                    # Sort by Score DESC
-                    results_list.sort(key=lambda x: x[0], reverse=True)
+                    # Sort by Ratio DESC (Success Percentage)
+                    # We use a custom key to handle different domain counts
+                    def get_ratio(x):
+                        # x = (score, strat, svc, total) OR (score, strat, svc)
+                        sc = x[0]
+                        tot = x[3] if len(x) > 3 else 100 # Default to 100 if total missing
+                        return sc / tot if tot > 0 else 0
+
+                    results_list.sort(key=get_ratio, reverse=True)
                     
                     if score_cache is None: score_cache = {}
 
                     # Split by Service
                     grouped = {}
-                    for sc, strat, svc in results_list:
+                    for item in results_list:
+                        sc = item[0]
+                        st = item[1]
+                        svc = item[2]
+                        tot = item[3] if len(item) > 3 else 100
+                        
                         if svc not in grouped: grouped[svc] = []
-                        grouped[svc].append((sc, strat))
+                        grouped[svc].append((sc, st, tot))
                         
                     for svc, items in grouped.items():
-                        # Get current baseline for this service
-                        baseline = service_baselines.get(svc, -1)
+                        # Get current baseline for this service (score and total)
+                        bl_score = service_baselines.get(svc, -1)
+                        bl_total = service_totals.get(svc, 100)
+                        bl_ratio = bl_score / bl_total if bl_total > 0 else -1
                         
-                        top_strat = items[0] # (score, strat_obj)
-                        top_score = top_strat[0]
+                        top_item = items[0] # (score, strat_obj, total)
+                        top_score = top_item[0]
+                        top_total = top_item[2]
+                        top_ratio = top_score / top_total if top_total > 0 else 0
                         
                         # Only log if exciting improvement or Current
-                        if top_score > baseline:
-                             log_func(f"[Sorter] {svc}: Новая лучшая -> {top_strat[1].get('name', 'Unknown')} ({top_score})")
+                        if top_ratio > bl_ratio:
+                             log_func(f"[Sorter] {svc}: Новая лучшая -> {top_item[1].get('name', 'Unknown')} ({top_score}/{top_total})")
 
                         # Save SORTED lists back to files
-                        # Save SORTED lists back to files
                         if svc == "discord": target_limit = 99
-                        else: target_limit = 36 if svc == "general" else 12  # FIX: Reduced from 60
+                        else: target_limit = 200 if svc == "general" else 12  # FIX: Increased limit
                         start_path = os.path.join(base_dir, "strat", f"{svc}.json")
                         
                         try:
@@ -7458,7 +7641,7 @@ function FindProxyForURL(url, host) {{
                             # Checked = In 'items' (New Results) OR In 'score_cache' (Old results we know)
                             
                             checked_names_current = set()
-                            for sc, st in items:
+                            for sc, st, tot in items:
                                 raw_name = st.get('name', '')
                                 # Normalize (Strip "Current ", lowercase start)
                                 if raw_name.startswith('Current '):
@@ -7480,59 +7663,53 @@ function FindProxyForURL(url, host) {{
                                     # Found in Cache! Treat as Checked/Verified baseline.
                                     # Add to pool with Cached Score to complete in Tournament.
                                     cached_score = score_cache[svc][s_name]
-                                    cached_strategies_to_add.append({"score": cached_score, "strat": s})
+                                    # FIX: If it's a tuple (score, total) in cache, handle it.
+                                    # But score_cache (active_scores_runtime) usually only has raw score.
+                                    # We'll assume a default total for cached ones if missing.
+                                    c_s = cached_score[0] if isinstance(cached_score, (list, tuple)) else cached_score
+                                    cached_strategies_to_add.append({"score": c_s, "strat": s})
                                 else:
                                     unchecked_strategies.append(s)
                             
                             # 3. Create Pool of "Active Candidates"
                             # 'items' contains ALL results from this run. 
                             
-                            active_candidates = [] # list of dict(score, strat)
+                            active_candidates = [] # list of dict(score, strat, total)
                             
-                            for sc, st in items:
+                            for sc, st, tot in items:
                                 # FIX: Strip "Current " prefix before saving
                                 clean_strat = st.copy()
                                 name = clean_strat.get('name', '')
                                 if name.startswith('Current '):
-                                    # Remove prefix: "Current youtube" -> "youtube", "Current General_M38F" -> "General_M38F"
                                     clean_name = name[8:]  # len('Current ') = 8
-                                    # Normalize case: "General_M38F" -> "general_M38F"
                                     if clean_name and clean_name[0].isupper():
                                         clean_name = clean_name[0].lower() + clean_name[1:]
                                     clean_strat['name'] = clean_name
-                                active_candidates.append({"score": sc, "strat": clean_strat})
+                                active_candidates.append({"score": sc, "strat": clean_strat, "total": tot})
                             
                             # Add Cached (Old Verified)
-                            active_candidates.extend(cached_strategies_to_add)
+                            for c_item in cached_strategies_to_add:
+                                # We don't know the total for cached ones easily, assume 100 or use existing if any
+                                active_candidates.append({"score": c_item["score"], "strat": c_item["strat"], "total": 100})
                             
-                            # Sort Active Candidates by Score DESC
-                            active_candidates.sort(key=lambda x: x["score"], reverse=True)
+                            # Sort Active Candidates by Ratio DESC
+                            active_candidates.sort(key=lambda x: x["score"] / x["total"] if x.get("total", 0) > 0 else 0, reverse=True)
                             
                             # --- UPDATE strategies.json (Global Active Config) ---
                             # FIX: Update for ALL services if we found a better one (Top 1)
-                            # This ensures Hot Swap applies the new best strategy immediately.
-                            
                             if active_candidates:
                                 try:
                                     strat_main_path = os.path.join(base_dir, "strat", "strategies.json")
                                     main_data = load_json_robust(strat_main_path, {})
                                     
-                                    # We allow update even in Evo mode because 'active_candidates' includes 
-                                    # both New Mutants and Old Cached Parents (sorted by score).
-                                    # So active_candidates[0] is strictly the Best Known Strategy.
-                                    
-                                    best_strat = active_candidates[0]["strat"]
+                                    best_cand = active_candidates[0]
+                                    best_strat = best_cand["strat"]
                                     updated_active = False
                                     
                                     if svc == "general":
-                                        # 1. Update "Current General"
                                         if best_strat and "args" in best_strat:
-                                            # Optional: Check if different to avoid IO churn? 
-                                            # JSON save is cheap enough generally.
                                             main_data["general"] = best_strat["args"]
                                             updated_active = True
-                                            
-                                        # 2. Update "hard_1" ... "hard_12"
                                         for i in range(12):
                                             key = f"hard_{i+1}"
                                             if i < len(active_candidates):
@@ -7541,17 +7718,14 @@ function FindProxyForURL(url, host) {{
                                                     main_data[key] = s_cand["args"]
                                                     updated_active = True
                                     else:
-                                        # For specific services (youtube, discord, etc.)
-                                        # Update the key with service name
                                         if best_strat and "args" in best_strat:
                                             main_data[svc] = best_strat["args"]
                                             updated_active = True
                                     
                                     if updated_active:
                                         save_json_safe(strat_main_path, main_data)
-                                        # log_func(f"[Sorter] strategies.json обновлен для {svc} (Best: {best_strat.get('name')})")
-                                        
                                 except Exception as e:
+                                    log_func(f"[Sorter] strategies.json update error: {e}")
                                     log_func(f"[Sorter] Ошибка обновления strategies.json для {svc}: {e}")
                                     pass
 
@@ -7612,7 +7786,7 @@ function FindProxyForURL(url, host) {{
                             final_list = final_active + unchecked_strategies
                             
                             # Save
-                            new_data = {"version": "1.0", "strategies": final_list}
+                            new_data = {"version": CURRENT_VERSION, "strategies": final_list}
                             save_json_safe(start_path, new_data)
                             
                             # === СОХРАНЕНИЕ SCORES В temp/strategy_scores.json ===
@@ -7637,6 +7811,7 @@ function FindProxyForURL(url, host) {{
                                     if strat_name:
                                         existing_scores[svc][strat_name] = {
                                             "score": candidate["score"],
+                                            "total": candidate.get("total", 0),
                                             "timestamp": current_time
                                         }
                                         saved_count += 1
@@ -7672,7 +7847,11 @@ function FindProxyForURL(url, host) {{
                          import time
                          current_time = int(time.time())
                          
-                         for score, strat, svc in all_strategy_results:
+                         for item in all_strategy_results:
+                             score = item[0]
+                             strat = item[1]
+                             svc = item[2]
+                             
                              if svc not in existing_scores: existing_scores[svc] = {}
                              s_name = strat.get("name", "")
                              if s_name:
@@ -7723,13 +7902,22 @@ function FindProxyForURL(url, host) {{
                 # FIX: Fallback - ensure we have baselines even if Check Phase was skipped
                 if not active_scores_runtime and check_phase_scores:
                     log_func(f"[Evo-PreCheck] Restoring {len(check_phase_scores)} scores for Evolution baseline...")
-                    for (c_svc, c_name), c_score in check_phase_scores.items():
+                    for (c_svc, c_name), c_val in check_phase_scores.items():
+                        c_score, c_total = c_val if isinstance(c_val, (list, tuple)) else (c_val, 0)
+                        
                         if c_svc not in active_scores_runtime: active_scores_runtime[c_svc] = {}
                         active_scores_runtime[c_svc][c_name] = c_score
                         
-                        # Populate baseline
-                        if c_score > service_baselines.get(c_svc, 0):
+                        # Populate baseline using ratio comparison
+                        curr_b_score = service_baselines.get(c_svc, 0)
+                        curr_b_total = service_totals.get(c_svc, 0)
+                        
+                        b_ratio = curr_b_score / curr_b_total if curr_b_total > 0 else -1
+                        c_ratio = c_score / c_total if c_total > 0 else 0
+                        
+                        if c_ratio > b_ratio:
                             service_baselines[c_svc] = c_score
+                            service_totals[c_svc] = c_total
                     
                     if IS_DEBUG_MODE: log_func(f"[Evo-Debug] Forced Baselines: {service_baselines}")
 
@@ -7784,7 +7972,7 @@ function FindProxyForURL(url, host) {{
                                      kept_strategies = [x[1] for x in scored_prune[:lim]]
                                      
                                      # Save back
-                                     save_json_safe(p_path, {"version": "1.0", "strategies": kept_strategies})
+                                     save_json_safe(p_path, {"version": CURRENT_VERSION, "strategies": kept_strategies})
                                      log_func(f"[Pruner] {svc_p}: Оставлено {len(kept_strategies)} лучших стратегий (было {len(p_list)}).")
                                      
                      except Exception as e:
@@ -8276,7 +8464,7 @@ function FindProxyForURL(url, host) {{
                                         except: pass
                                         
                                         # Add result to list
-                                        evo_results.append((sc, strat_t, svc_t))
+                                        evo_results.append((sc, strat_t, svc_t, len(doms_t)))
                                         
                                         # UI Update
                                         total_cnt = len(doms_t)
@@ -8285,14 +8473,24 @@ function FindProxyForURL(url, host) {{
                                         final_msg = f"{prefix} {strat_t['name']} ({svc_t}) {bar} {sc}/{total_cnt} ✓"
                                         progress_manager.update_line(line_id, final_msg, is_final=True)
                                         
-                                        bl = service_baselines.get(svc_t, 0)
-                                        if sc > bl:
-                                             log_func(f"{prefix} >>> Улучшение для {svc_t}: {sc} (было {bl}) -> {strat_t['name']}")
+                                        bl_score = service_baselines.get(svc_t, 0)
+                                        bl_total = service_totals.get(svc_t, 1)
+                                        bl_ratio = bl_score / bl_total if bl_total > 0 else -1
+                                        curr_ratio = sc / total_cnt if total_cnt > 0 else 0
+                                        
+                                        if curr_ratio > bl_ratio:
+                                             log_func(f"{prefix} >>> Улучшение для {svc_t}: {sc}/{total_cnt} (было {bl_score}/{bl_total}) -> {strat_t['name']}")
                                              service_baselines[svc_t] = sc
+                                             service_totals[svc_t] = total_cnt
                                              better_found = True
                                              
                                              # FIX: Persist score to state for resume after stop
-                                             state[f"{svc_t}_score"] = sc
+                                             if svc_t == "general":
+                                                 state["general_score"] = sc
+                                                 state["general_total"] = total_cnt
+                                             else:
+                                                 state[f"{svc_t}_score"] = sc
+                                                 state[f"{svc_t}_total"] = total_cnt
                                              save_state()
                                              
                                              # HOT SWAP: Only apply if this is REALLY better than current winws strategy
@@ -8384,7 +8582,7 @@ function FindProxyForURL(url, host) {{
                                         scored_final.sort(key=lambda x: x[0], reverse=True)
                                         kept_final = [x[1] for x in scored_final[:lim_final]]
                                         
-                                        save_json_safe(p_final, {"version": "1.0", "strategies": kept_final})
+                                        save_json_safe(p_final, {"version": CURRENT_VERSION, "strategies": kept_final})
                                         log_func(f"[Pruner-Final] {svc_final}: {len(kept_final)} (было {len(list_final)})")
                         except Exception as prune_err:
                             log_func(f"[Pruner-Final] Ошибка: {prune_err}")
@@ -9592,9 +9790,14 @@ function FindProxyForURL(url, host) {{
 
         if line.startswith("!!! [AUTO]"): return "normal"
         if "[StrategyBuilder]" in line: return "info"
-        if "[Check]" in line: return "info"
-        if "[ExcludeCheck]" in line: return "info"
+        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]"]): 
+            return "info"
         
+        # Специальное выделение проблем для [RU], [EU], [SingBox]
+        if any(cat in line for cat in ["[RU]", "[EU]", "[SingBox]"]):
+            if any(x in text_lower for x in ["ошибка", "error", "fail", "не удается", "не найден", "не удалось", "exception", "warning", "warn", "остановка", "падение"]):
+                return "error"
+
         if any(x in text_lower for x in ["err:", "error", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено"]):
             return "error"
         
@@ -9604,7 +9807,10 @@ function FindProxyForURL(url, host) {{
         if "ok (" in text_lower:
             return "normal"
         
-        if any(x in text_lower for x in ["пропуск", "удаление", "отмена", "инфо", "успешно", "ядро активно"]):
+        if any(x in text_lower for x in ["успешное подключение", "успешно инициализирован", "ядро активно"]):
+            return "normal"
+        
+        if any(x in text_lower for x in ["пропуск", "удаление", "отмена", "инфо", "успешно"]):
             return "info"
             
         return "normal"
@@ -10094,7 +10300,9 @@ function FindProxyForURL(url, host) {{
             exe_path = os.path.join(base_dir, "bin", exe_name)
             final_args = [exe_path] + test_args + [f'--wf-raw={isolation_filter}']
             
-            proc = subprocess.Popen(final_args, cwd=base_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
+            proc = subprocess.Popen(final_args, cwd=base_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                                   creationflags=subprocess.CREATE_NO_WINDOW | 0x00004000)
             time.sleep(1.5)
             
             status, _ = detect_throttled_load(domain, port)
@@ -10681,21 +10889,97 @@ function FindProxyForURL(url, host) {{
             except: pass
             return ""
 
+        # Helper: Deduplicate List File
+        def deduplicate_list_file(f_path):
+            """Removes duplicates and empty lines while preserving # version header."""
+            try:
+                if not os.path.exists(f_path): return False
+                
+                with open(f_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                
+                header = ""
+                data = set()
+                original_content = "".join(lines)
+                
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped: continue
+                    if stripped.startswith("# version:"):
+                        header = stripped + "\n"
+                        continue
+                    if stripped.startswith("#"):
+                        # Keep other comments? Or discard? 
+                        # Usually user wants to keep comments, but de-duplicate data.
+                        # For simplicity, let's keep comments as unique entries if they are not headers.
+                        data.add(stripped)
+                        continue
+                    
+                    data.add(stripped.lower())
+                
+                # Sort data: comments first (but there's only one header usually), then domains
+                sorted_data = sorted(list(data))
+                new_content = header
+                for item in sorted_data:
+                    new_content += f"{item}\n"
+                
+                if new_content != original_content:
+                    with open(f_path, "w", encoding="utf-8") as f:
+                        f.write(new_content)
+                    return True
+            except Exception as e:
+                safe_trace(f"[Deduplicator] Error processing {os.path.basename(f_path)}: {e}")
+            return False
+
         # Helper: Optimize General List (Remove VPN domains)
         def optimize_general_list():
             """Removes domains from general.txt that are already in VPN lists (ru.txt, eu.txt)"""
             try:
                 if not os.path.exists(file_general): return False
                 
-                # 1. Load VPN domains
-                vpn_domains = set()
-                for f_path in [os.path.join(base, "list", "ru.txt"), os.path.join(base, "list", "eu.txt")]:
-                    if os.path.exists(f_path):
-                        with open(f_path, "r", encoding="utf-8") as f:
-                            for line in f:
-                                line = line.strip()
-                                if line and not line.startswith("#"):
-                                    vpn_domains.add(line.lower())
+                # 0. Cross-deduplicate ru.txt and eu.txt (Priority: eu.txt)
+                ru_path = os.path.join(base, "list", "ru.txt")
+                eu_path = os.path.join(base, "list", "eu.txt")
+                
+                eu_domains = set()
+                if os.path.exists(eu_path):
+                    with open(eu_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            d = line.split("#")[0].strip().lower()
+                            if d and not line.strip().startswith("#"):
+                                eu_domains.add(d)
+                
+                ru_changed = False
+                ru_domains_clean = set()
+                if os.path.exists(ru_path):
+                    with open(ru_path, "r", encoding="utf-8") as f:
+                        ru_lines = f.readlines()
+                    
+                    new_ru_lines = []
+                    for line in ru_lines:
+                        stripped = line.strip()
+                        if not stripped:
+                            new_ru_lines.append(line)
+                            continue
+                        if stripped.startswith("#"):
+                            new_ru_lines.append(line)
+                            continue
+                        
+                        d = stripped.split("#")[0].strip().lower()
+                        if d in eu_domains:
+                            ru_changed = True
+                            continue # Keep only in eu.txt
+                        
+                        new_ru_lines.append(line)
+                        ru_domains_clean.add(d)
+                    
+                    if ru_changed:
+                        with open(ru_path, "w", encoding="utf-8") as f:
+                            f.writelines(new_ru_lines)
+                        log_func("[List] Удалены дубликаты: домены из ru.txt теперь только в eu.txt")
+
+                # 1. Load combined VPN domains for general.txt optimization
+                vpn_domains = eu_domains.union(ru_domains_clean)
                 
                 # 2. Process General
                 lines = []
@@ -10717,17 +11001,22 @@ function FindProxyForURL(url, host) {{
                     
                     new_lines.append(line)
                 
-                if cleaned_count > 0:
-                    with open(file_general, "w", encoding="utf-8") as f:
-                        f.writelines(new_lines)
-                    log_func(f"[List] Оптимизация: удалено {cleaned_count} доменов из general.txt (есть в VPN)")
-                    return True # File changed
+                if cleaned_count > 0 or ru_changed:
+                    if cleaned_count > 0:
+                        with open(file_general, "w", encoding="utf-8") as f:
+                            f.writelines(new_lines)
+                        log_func(f"[List] Оптимизация: удалено {cleaned_count} доменов из general.txt (есть в VPN)")
+                    return True # File(s) changed
                     
             except Exception as e:
                 safe_trace(f"[Optimizer] Error: {e}")
             return False
         
         # Init state
+        # Initial cleanup: Deduplicate everything first
+        for f in monitor_vpn:
+            deduplicate_list_file(f)
+            
         file_hashes = {f: get_file_stats(f) for f in all_monitor_files}
         
         # Capture current run ID
@@ -10747,6 +11036,11 @@ function FindProxyForURL(url, host) {{
                 for f_path in monitor_vpn:
                     current_hash = get_file_stats(f_path)
                     if current_hash != file_hashes[f_path]:
+                        # Deduplicate immediately if changed
+                        if deduplicate_list_file(f_path):
+                            # Update hash to the cleaned version
+                            current_hash = get_file_stats(f_path)
+                            
                         file_hashes[f_path] = current_hash
                         vpn_changed = True
 
@@ -10764,6 +11058,9 @@ function FindProxyForURL(url, host) {{
                         pac_manager.refresh_system_options()
                         log_func("[PAC] Списки VPN обновлены.")
                     
+                    # 1.1 Hot Restart WinWS to apply list changes to strategies
+                    perform_hot_restart_backend()
+
                     # 2. Optimize General (might trigger general_changed next loop, or now)
                     if optimize_general_list():
                         # If optimization changed the file, update hash immediately to avoid double trigger
@@ -10809,15 +11106,6 @@ function FindProxyForURL(url, host) {{
                 with open(ip_cache_file, "r") as f:
                     last_ip = f.read().strip()
                     
-            # Helper for privacy
-            def mask_ip(ip_str):
-                try:
-                    parts = ip_str.split('.')
-                    if len(parts) == 4:
-                        return f"***.***.{parts[2]}.{parts[3]}"
-                    return "***"
-                except: return "***"
-
             if current_ip == last_ip:
                 log_func(f"[Init] IP не изменился ({mask_ip(current_ip)}). Повторная проверка доменов не требуется.")
             else:
@@ -10845,8 +11133,8 @@ function FindProxyForURL(url, host) {{
         RETRY_PAUSE = 3
         CHECK_INTERVAL = 15
         
-        # Initial delay to let everything start
-        time.sleep(30)
+        # Initial delay to let everything start (increased to avoid premature reconnection)
+        time.sleep(60)
         
         while not is_closing:
             if SERVICE_RUN_ID != my_run_id: break
@@ -10860,8 +11148,8 @@ function FindProxyForURL(url, host) {{
                 if len(retry_timestamps) >= MAX_RETRIES:
                     continue  # Rate limit reached, skip
                 
-                # Check WARP
-                if warp_manager:
+                # Check WARP (only if it was ever connected successfully)
+                if warp_manager and getattr(warp_manager, 'is_connected', False):
                     status = warp_manager.get_status()
                     if status and "Disconnected" in status:
                         log_func("[RU] Обнаружено отключение. Переподключение...")
@@ -10922,7 +11210,6 @@ function FindProxyForURL(url, host) {{
         try:
             # FIX: Import requests here to ensure it's available in this thread
             import requests
-            log_func("[Update] Модуль requests успешно инициализирован")
         except ImportError as e:
             log_func(f"[Update] CRITICAL: Ошибка импорта requests: {e}")
             return
@@ -11532,31 +11819,26 @@ function FindProxyForURL(url, host) {{
                 SERVICE_RUN_ID += 1
         except: pass
 
-        # FIX: Check & Download dependencies FIRST (Synchronous)
-        # This prevents race conditions where services try to start before binaries exist
-        try:
-             logger = globals().get('log_print', safe_trace)
-             
-             def update_loading_status_sync(msg):
-                 try:
-                     if 'status_label' in globals() and 'root' in globals() and root:
-                         root.after(0, lambda: status_label.config(text=msg))
-                 except: pass
+        # === SYNC INIT: Dependencies MUST exist before we try to launch anything ===
+        logger = globals().get('log_print', safe_trace)
+        def update_loading_status_sync(msg):
+            try:
+                if 'status_label' in globals() and 'root' in globals() and root:
+                    root.after(0, lambda: status_label.config(text=msg))
+            except: pass
 
-             if not download_dependencies(logger, status_callback=update_loading_status_sync):
-                 msg = "Не удалось загрузить необходимые компоненты!\nПроверьте интернет и повторите попытку."
-                 safe_trace(f"[Init] {msg}")
-                 if not silent:
-                     root.after(0, lambda: messagebox.showerror("Ошибка", msg))
-                 return
-             
-             # Restore status
-             update_loading_status_sync("ЗАПУСК . . .")
-        except Exception as e:
-             safe_trace(f"[Init] Dependency download error: {e}")
+        if not restart_mode:
+            if not download_dependencies(logger, status_callback=update_loading_status_sync):
+                msg = "Не удалось загрузить необходимые компоненты!\nПроверьте интернет и повторите попытку."
+                if not silent:
+                    root.after(0, lambda: messagebox.showerror("Ошибка", msg))
+                return
+            
+            # Show "STARTING" only after successful download
+            update_loading_status_sync("ЗАПУСК . . .")
 
-        # === WARP & PAC INIT (ASYNC) ===
-        def warp_startup_task():
+        # === ASYNC INIT WRAPPER for background services ===
+        def start_bg_services():
             try:
                 def safe_log(msg):
                     try: 
@@ -11564,50 +11846,28 @@ function FindProxyForURL(url, host) {{
                         else: print(msg)
                     except: pass
                 
-                # WAIT for WinWS Service to be ACTIVE
-                # This is critical if we need WinWS to unblock Warp connection
-                max_wait = 30
-                started = False
-                for _ in range(max_wait):
-                    if is_service_active:
-                        started = True
-                        break
-                    time.sleep(1)
-                
-                if not started:
-                    safe_log("[RU] Warning: WinWS service did not start in time. Trying Warp anyway...")
-
-                # Extra delay to let WinWS fully initialize divert
-                time.sleep(2)
-
+                # Initialize managers
                 global warp_manager, pac_manager, opera_proxy_manager, sing_box_manager
                 if not warp_manager: warp_manager = WarpManager(log_func=safe_log)
                 if not pac_manager: pac_manager = PacManager(log_func=safe_log)
                 if 'sing_box_manager' not in globals() or not sing_box_manager: 
                     sing_box_manager = SingBoxManager(log_func=safe_log)
-                
-                # Start WARP (might take time if config missing)
-                # FIX: Run in background so app starts immediately
-                warp_manager.start()
-                
-                # Start Sing-Box (UDP Proxy)
-                sing_box_manager.start()
-                
-                # Start Opera Proxy
                 if not opera_proxy_manager: opera_proxy_manager = OperaProxyManager(log_func=safe_log)
-                opera_proxy_manager.start()
-                
-                # Start PAC server and set system proxy
-                pac_manager.start_server()
-                pac_manager.set_system_proxy()
-                
+
+                # Parallel execution for all services
+                threads = [
+                    threading.Thread(target=warp_manager.start, daemon=True),
+                    threading.Thread(target=sing_box_manager.start, daemon=True),
+                    threading.Thread(target=opera_proxy_manager.start, daemon=True),
+                    threading.Thread(target=lambda: (pac_manager.start_server(), pac_manager.set_system_proxy()), daemon=True)
+                ]
+                for t in threads: t.start()
             except Exception as e:
-                 print(f"WARP Init Error: {e}")
+                safe_trace(f"[Init] BG Services Error: {e}")
 
-        threading.Thread(target=warp_startup_task, daemon=True).start()
-
+        # 1. Start Main WinWS (Async)
         try:
-            _start_nova_service_logic(silent, restart_mode)
+            threading.Thread(target=lambda: _start_nova_service_logic(silent, restart_mode), daemon=True).start()
         except Exception as e:
             msg = f"Startup Error: {e}"
             print(msg)
@@ -11616,6 +11876,10 @@ function FindProxyForURL(url, host) {{
             except: pass
             try: stop_nova_service(silent=True)
             except: pass
+
+        # 2. Start Background Services (Async)
+        if not restart_mode:
+            start_bg_services()
 
 
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
@@ -11626,7 +11890,6 @@ function FindProxyForURL(url, host) {{
 
         # Сбрасываем флаг завершения при перезапуске, чтобы фоновые проверки возобновились
         is_closing = False
-        safe_trace(f"[_start_nova_service_logic] Called. Silent={silent}, Restart={restart_mode}")
         
         if not is_admin(): 
             root.after(0, lambda: messagebox.showerror("Ошибка", "Нужны права Администратора!"))
@@ -12093,6 +12356,16 @@ function FindProxyForURL(url, host) {{
                          nova_service_status = "Running"
                          # Reset Restart Flag
                          is_restarting = False
+                         
+                         # Update UI Status
+                         if not silent and root:
+                             root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
+                             root.after(0, lambda: btn_toggle.set_text("ОСТАНОВИТЬ"))
+                         
+                         # === ASYNC START: Strategy Checker ===
+                         # Launching checker system ONLY after main core is confirmed stable
+                         # to ensure winws.exe starts as early as possible.
+                         threading.Thread(target=lambda: init_checker_system(log_print), daemon=True).start()
                          break
 
                 except Exception as e:
@@ -12192,8 +12465,8 @@ function FindProxyForURL(url, host) {{
         # === НЕМЕДЛЕННОЕ обновление состояния ===
         if not restart_mode:
             is_service_active = False
-            # FIX: Kill background workers on manual stop to prevent duplication on restart
-            is_closing = True
+            # FIX: Only set is_closing in on_closing() to allow background workers (like VPN monitor)
+            # to continue running during a manual stop or VPN pause.
             SERVICES_RUNNING = False
         
         if not silent: 
@@ -12356,10 +12629,19 @@ function FindProxyForURL(url, host) {{
     def on_closing():
         global is_closing, process
         
+        # === VISUAL SPEEDUP: Hide windows immediately ===
+        try:
+            if log_window and tk.Toplevel.winfo_exists(log_window):
+                log_window.withdraw()
+            root.withdraw()
+        except: pass
+        
         # Ensure tray icon is removed
         try: cleanup_tray()
         except: pass
 
+        # FIX: Set is_closing FIRST so that background workers know we are exiting
+        is_closing = True 
         
         # Stop everything synchronously first
         try:
@@ -12372,8 +12654,6 @@ function FindProxyForURL(url, host) {{
              
              stop_nova_service(silent=True, wait_for_cleanup=True)
         except: pass
-        
-        is_closing = True 
         
         # Захватываем геометрию в главном потоке ДО уничтожения окна, чтобы избежать ошибок
         main_geo = None
@@ -12494,7 +12774,7 @@ function FindProxyForURL(url, host) {{
              # We use a lambda to pass arguments
              if root:
                  root.after(0, lambda: start_nova_service(silent=True, restart_mode=True))
-                 if IS_DEBUG_MODE: print("[HotSwap] Запрошен перезапуск через start_nova_service.")
+                 if IS_DEBUG_MODE: print("[HotSwap] Запрошен перезапуск через start_nova_service (Hot-Restart Mode).")
              else:
                  # Fallback
                  threading.Thread(target=start_nova_service, args=(True, True), daemon=True).start()
@@ -12512,7 +12792,6 @@ function FindProxyForURL(url, host) {{
         except: pass
 
         # Инициализация систем (перенесено из main)
-        init_checker_system(log_print)
         clean_hard_list()
         log_previous_session_results(log_print) # Вывод результатов прошлой сессии
         
@@ -12859,7 +13138,8 @@ function FindProxyForURL(url, host) {{
             'fresh': '--fresh' in sys.argv,
             'debug': '--debug' in sys.argv or '-debug' in sys.argv,
             'updated': '--updated' in sys.argv,
-            'show_log': '--show-log' in sys.argv  # Auto-open log window (used on restart)
+            'show_log': '--show-log' in sys.argv,
+            'minimized': '--minimized' in sys.argv
         }
         
         # Execute in correct order: 1. Fresh (cleanup), 2. Debug (logging)
@@ -13138,27 +13418,30 @@ function FindProxyForURL(url, host) {{
 
         # === Autostart Context Menu (Main Window) ===
         main_context_menu = tk.Menu(root, tearoff=0)
-        
-        main_autostart_var = tk.BooleanVar()
-        def update_main_menu_state():
-            is_auto = get_autostart_cmd() is not None
-            main_autostart_var.set(is_auto)
-            
-        main_context_menu.configure(postcommand=update_main_menu_state)
+        autostart_var = tk.BooleanVar()
         
         def toggle_autostart_main():
-            # Use global log_print if available, else print
+            # Work in background
             logger = globals().get('log_print', print)
-            toggle_startup(logger)
+            threading.Thread(target=toggle_startup, args=(logger,), daemon=True).start()
             
-        # Renamed to "Автозапуск" per request
-        main_context_menu.add_checkbutton(label="Автозапуск", variable=main_autostart_var, command=toggle_autostart_main)
-        
+        def update_main_autostart_label():
+            # Recreate completely to ensure state is fresh
+            try: main_context_menu.delete(0, 'end')
+            except: pass
+            
+            is_auto = get_autostart_cmd() is not None
+            autostart_var.set(is_auto)
+            main_context_menu.add_checkbutton(label="Автозапуск Nova", variable=autostart_var, command=toggle_autostart_main)
+
         def show_main_context_menu(event):
             try: 
-                # Use tk_popup for correct behavior (close on click outside)
-                main_context_menu.tk_popup(event.x_root, event.y_root)
+                # Update label by recreating item
+                update_main_autostart_label()
+                # Using post with return "break" prevents double-triggering from event bubbling
+                main_context_menu.post(event.x_root, event.y_root)
             except: pass
+            return "break"
             
         # Bind to Main Window and Canvas
         root.bind("<Button-3>", show_main_context_menu)
@@ -13176,24 +13459,28 @@ function FindProxyForURL(url, host) {{
         else:
             hide_log_window()
         
-        # Показываем окно ПОСЛЕ загрузки всех элементов (устранение мерцания)
-        root.deiconify()
-        
-        # Gentle Focus: Аккуратно выводим окно на передний план
-        try:
+        # Показываем окно НЕМЕДЛЕННО (устранение ощущения задержки)
+        if ARGS_PARSED.get('minimized', False):
+            root.withdraw()
+            if IS_DEBUG_MODE: log_print("[Init] Запуск в свернутом режиме (--minimized)")
+        else:
+            root.deiconify()
             root.lift()
-            root.attributes('-topmost', True)
-            root.after(50, lambda: root.attributes('-topmost', False))
             root.focus_force()
-            # FIX: Explicitly ensure log window is not stuck
-            root.after(1000, lambda: log_window.attributes('-topmost', False) if log_window and tk.Toplevel.winfo_exists(log_window) else None)
-        except: pass
+            root.update() # Принудительная отрисовка GUI
         
-        # Запуск основного ядра
-        start_nova_service()
+        # Gentle Focus (уже после того как окно показано)
+        if not ARGS_PARSED.get('minimized', False):
+            try:
+                root.attributes('-topmost', True)
+                root.after(50, lambda: root.attributes('-topmost', False))
+            except: pass
         
-        # Запуск фоновых задач после инициализации ядра
-        root.after(1000, lambda: launch_background_tasks())
+        # Запуск основного ядра С НЕБОЛЬШОЙ ЗАДЕРЖКОЙ (дает UI продышаться)
+        root.after(100, lambda: start_nova_service())
+        
+        # Запуск фоновых задач
+        root.after(500, lambda: launch_background_tasks())
         
         check_scan_status_loop() 
         
