@@ -17,7 +17,7 @@ import collections
 from datetime import datetime
 
 # === VERSION & CONFIG ===
-CURRENT_VERSION = "1.11"
+CURRENT_VERSION = "1.12"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
@@ -564,12 +564,7 @@ try:
                             shutil.copy2(internal_eu, eu_path)
                             eu_action = "Restored from Bundle (Missing)"
                     
-                    elif not has_version:
-                        if os.path.exists(internal_eu):
-                            shutil.copy2(internal_eu, eu_path)
-                            eu_action = "Restored from Bundle (No Version)"
-                    
-                    elif current_ver_in_file != CURRENT_VERSION:
+                    elif not has_version or current_ver_in_file != CURRENT_VERSION:
                          # Version Mismatch -> Smart Merge
                          if os.path.exists(internal_eu):
                              try:
@@ -648,12 +643,7 @@ try:
                             shutil.copy2(internal_ru, ru_path)
                             ru_action = "Restored from Bundle (Missing)"
                     
-                    elif not has_version:
-                        if os.path.exists(internal_ru):
-                            shutil.copy2(internal_ru, ru_path)
-                            ru_action = "Restored from Bundle (No Version)"
-                    
-                    elif current_ver_in_file != CURRENT_VERSION:
+                    elif not has_version or current_ver_in_file != CURRENT_VERSION:
                          # Version Mismatch -> Smart Merge
                          if os.path.exists(internal_ru):
                              try:
@@ -1498,6 +1488,46 @@ try:
                 except: continue
             return str(binary_data)
 
+        def find_best_endpoint(self):
+            """Scans 30 random IPs from each Cloudflare subnet to find the fastest endpoint."""
+            import ipaddress, concurrent.futures, socket, random
+            try:
+                if os.path.exists(WARP_ENDPOINT_CACHE_FILE):
+                    data = load_json_robust(WARP_ENDPOINT_CACHE_FILE)
+                    if data and time.time() - data.get("ts", 0) < 86400: return data.get("ip")
+            except: pass
+
+            self.log_func("[RU] Поиск быстрейшего сервера Cloudflare...")
+            all_ips = []
+            for cidr in CLOUDFLARE_CIDRS:
+                try:
+                    subnet_ips = list(ipaddress.ip_network(cidr))
+                    sample_size = min(30, len(subnet_ips))
+                    all_ips.extend([str(ip) for ip in random.sample(subnet_ips, sample_size)])
+                except: pass
+            random.shuffle(all_ips)
+            
+            best_ip = None; min_lat = float('inf')
+            def check_ip(ip_addr):
+                st = time.time()
+                try:
+                    with socket.create_connection((ip_addr, 443), timeout=0.5):
+                        return ip_addr, time.time() - st
+                except: return None, None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+                futures = [executor.submit(check_ip, ip) for ip in all_ips]
+                for f in concurrent.futures.as_completed(futures):
+                    ip, lat = f.result()
+                    if ip and lat < min_lat:
+                        min_lat = lat; best_ip = ip
+                        if lat < 0.05: break
+
+            if best_ip:
+                save_json_safe(WARP_ENDPOINT_CACHE_FILE, {"ip": best_ip, "ts": time.time()})
+                self.log_func(f"[RU] Выбран сервер: {best_ip} ({int(min_lat*1000)}ms)")
+            return best_ip or "162.159.193.1"
+
         def nuke_warp_data(self):
             """Physically deletes Warp registration data from ProgramData and Registry (Nuclear option)."""
             try:
@@ -1798,7 +1828,7 @@ try:
             return False
         
         def start(self):
-            """Connect to WARP using MASQUE protocol."""
+            """Connect to WARP using MASQUE protocol (Stable Version)."""
             if hasattr(self, '_is_starting_now') and self._is_starting_now:
                 return
             
@@ -1806,32 +1836,36 @@ try:
             my_run_id = SERVICE_RUN_ID
             
             try:
+                # Ensure service is running
                 if not self.ensure_service():
                     self.log_func("[RU] Не удалось запустить службу!")
                     return
                 
                 # --- SYNC WITH WINWS ---
-                max_wait_winws = 10
-                for _ in range(max_wait_winws * 2): # 0.5s intervals
-                    if is_closing or SERVICE_RUN_ID != my_run_id: return
-                    if (is_service_active and process and process.poll() is None) or is_restarting:
-                        break
-                    time.sleep(0.5)
+                # Instant sync: check if winws is starting or already active
+                if not (is_service_active or is_restarting):
+                    # Only wait if absolutely nothing is happening
+                    max_wait_winws = 5
+                    for _ in range(max_wait_winws * 5):
+                        if is_closing or SERVICE_RUN_ID != my_run_id: return
+                        if is_service_active or is_restarting: break
+                        time.sleep(0.2)
                 
                 if SERVICE_RUN_ID != my_run_id: return
-                time.sleep(0.5)
+                
+                # No extra sleep needed here, winws logic has its own buffers
 
                 # Wait for daemon to be responsive
                 status = "Unknown"
-                for i in range(20): # Up to 10s
+                for i in range(40): # Up to 12s (40 * 0.3s)
                     if is_closing or SERVICE_RUN_ID != my_run_id: return
                     status = self.get_status()
                     if status and "Unable" not in status and "Unknown" not in status:
                         break
-                    time.sleep(0.5)
+                    time.sleep(0.3)
 
                 if SERVICE_RUN_ID != my_run_id: return
-                if "Unable" in status or "Unknown" in status:
+                if "Unable to connect" in status or "Unknown" in status:
                     self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
                     return
 
@@ -1874,11 +1908,13 @@ try:
                 
                 # --- CONFIGURATION ---
                 if SERVICE_RUN_ID != my_run_id: return
+                
+                # FORCE RESET: Clear any manual endpoint/port leftovers from previous experiments
+                self.run_warp_cli("tunnel", "endpoint", "reset")
+                self.run_warp_cli("tunnel", "port", "reset")
+                self.run_warp_cli("tunnel", "ip-version", "set", "auto")
+                
                 self.ensure_masque()
-                
-                # Force IPv4 preference for better connectivity on some ISPs
-                # self.run_warp_cli("tunnel", "ip-version", "set", "4") # Adaptive logic used later
-                
                 self.set_proxy_port(self.port)
                 self.set_proxy_mode()
 
@@ -1900,7 +1936,6 @@ try:
                 if result and result.returncode == 0:
                     if not self.wait_for_connection(timeout=10):
                         status_fail = self.get_status()
-                        # Only fallback if it's a REAL error (Unable or Eyeballs), not just slow (Connecting)
                         if "Unable" in status_fail or "happy eyeballs" in status_fail.lower():
                             self.log_func("[RU] Ошибка сети. Попытка через IPv4...")
                             self.run_warp_cli("tunnel", "ip-version", "set", "4")
@@ -1916,7 +1951,6 @@ try:
                     self.log_func(f"[RU] Ошибка подключения: {error_msg}")
 
             finally:
-                IS_CRITICAL_BG_TASK_RUNNING = False
                 self._is_starting_now = False
 
         def check_port(self, port):
@@ -1936,7 +1970,21 @@ try:
                  if "Connected" in status:
                      # Check port
                      if self.check_port(self.port):
-                         self.log_func(f"[RU] {self.port} готов")
+                         # --- EXTRACT DETAILS via tunnel stats ---
+                         details = ""
+                         stats_res = self.run_warp_cli("tunnel", "stats")
+                         if stats_res and stats_res.returncode == 0:
+                             stats_out = stats_res.stdout
+                             import re
+                             # Extract Protocol
+                             proto_match = re.search(r"Protocol:\s*(.+)", stats_out, re.IGNORECASE)
+                             # Extract first IP from Endpoints
+                             ip_match = re.search(r"Endpoints:\s*([\d\.]+)", stats_out, re.IGNORECASE)
+                             
+                             if ip_match: details += f" {ip_match.group(1)}"
+                             if proto_match: details += f" {proto_match.group(1).strip()}"
+                         
+                         self.log_func(f"[RU] {self.port} готов{details}")
                          self.is_connected = True
                          return True
                      else:
@@ -1949,18 +1997,18 @@ try:
              return False
         
         def stop(self):
-            """Disconnect from WARP and stop service (keep installed for next session)."""
+            """Disconnect from WARP but keep the service running for faster restart."""
             if is_closing:
-                # Nuclear option for shutdown: just kill service, don't try to disconnect via CLI
-                self.stop_service()
+                # When closing the app, just disconnect. 
+                # We LEAVE the service running intentionally to speed up next launch.
+                try: self.run_warp_cli("disconnect")
+                except: pass
+                self.is_connected = False
                 return
 
             self.log_func("[RU] Отключение...")
             self.run_warp_cli("disconnect")
             self.is_connected = False
-            
-            # Stop service but keep it installed (preserves registration data)
-            self.stop_service()
 
 
     class PacManager:
@@ -2465,90 +2513,22 @@ function FindProxyForURL(url, host) {{
         }
         res = {}
         
-        # === EMBEDDED DEFAULTS (Updated 1.4) ===
+        # === EMBEDDED DEFAULTS (Minimal Skeleton) ===
         DEFAULT_STRATEGIES = {
-            "youtube": [
-                "--filter-tcp=443", "--dpi-desync=multisplit", "--dpi-desync-repeats=4", "--dpi-desync-fooling=ts",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-ttl=11", "--dpi-desync-autottl=2:3-64", "--new", "--filter-udp=443",
-                "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ],
-            "discord": [
-                "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-repeats=6",
-                "--dpi-desync-fooling=ts", "--dpi-desync-fakedsplit-pattern=0x00",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new",
-                "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6"
-            ],
-            "warp": [
-                "--filter-udp=443",
-                "--dpi-desync=fake,disorder2",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ],
-            "voice": [
-                "--filter-udp=596,597,598,599,1400,3478,5222,45395,32000-32100", "--dpi-desync=fake", "--dpi-desync-repeats=6"
-            ],
-            "_games": [
-                "--filter-tcp=443,25565", "--filter-udp=443,19132", "--dpi-desync=multisplit",
-                "--dpi-desync-split-pos=1,2,3,4,5,6,7", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=10"
-            ],
-            "cloudflare": [
-                "--filter-tcp=80,443", "--dpi-desync=fake,multisplit", "--dpi-desync-repeats=6",
-                "--dpi-desync-fooling=ts", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin"
-            ],
-            "telegram": [
-                "--filter-tcp=443,5222", "--dpi-desync=fake", "--dpi-desync-fooling=badsum", "--dpi-desync-repeats=10"
-            ],
-            "whatsapp": [
-                "--filter-tcp=80,443,4244,5223,5228,5242", "--dpi-desync=fake,hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts", "--new", "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
-                "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ],
-            "general": [
-                "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts",
-                "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ],
-            "hard_1": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_2": [ "--filter-tcp=80,443", "--dpi-desync=fake", "--dpi-desync-fake-tls-mod=dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_3": [ "--filter-tcp=80,443", "--dpi-desync=fake", "--dpi-desync-repeats=2", "--dpi-desync-fooling=ts", "--dpi-desync-fake-tls=fake/tls_clienthello_4pda_to.bin", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-autottl=2:3-64", "--dpi-desync-split-seqovl=2", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_4": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_5": [ "--filter-tcp=80,443", "--dpi-desync=fake", "--dpi-desync-split-pos=1", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=2", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_6": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=www.google.com", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_7": [ "--filter-tcp=80,443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=2", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=6", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_8": [ "--filter-tcp=80,443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=1", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=2", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_9": [ "--filter-tcp=80,443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rndsni", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_10": [ "--filter-tcp=80,443", "--dpi-desync=multisplit", "--dpi-desync-repeats=5", "--dpi-desync-fooling=ts", "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1", "--dpi-desync-split-seqovl=2", "--dpi-desync-autottl=2", "--dpi-desync-fake-tls=fake/tls_clienthello_4.bin", "--dpi-desync-ttl=11" ],
-            "hard_11": [ "--filter-tcp=80,443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=2", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fooling=badseq,ts", "--dpi-desync-repeats=5", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-split-seqovl=1", "--dpi-desync-autottl=1", "--dpi-desync-ttl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
-            "hard_12": [ "--filter-tcp=80,443", "--dpi-desync=multidisorder", "--dpi-desync-fake-tls-mod=rnd,dupsid", "--dpi-desync-hostfakesplit-mod=host=ya.ru", "--dpi-desync-fooling=ts", "--dpi-desync-split-seqovl=1", "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin", "--dpi-desync-autottl=1", "--new", "--filter-udp=443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin" ],
+            "youtube": [],
+            "discord": [],
+            "warp": [],
+            "voice": [],
+            "cloudflare": [],
+            "telegram": [],
+            "whatsapp": [],
+            "general": [],
             "version": CURRENT_VERSION
         }
         
         DEFAULT_DISCORD = {
             "version": CURRENT_VERSION,
-            "strategies": [
-                { "name": "discord_1", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-repeats=6", "--dpi-desync-fooling=ts", "--dpi-desync-fakedsplit-pattern=0x00", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_2", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake", "--dpi-desync-repeats=6", "--dpi-desync-fooling=ts", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_3", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-seqovl=681", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=ts", "--dpi-desync-repeats=8", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_4", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=652", "--dpi-desync-split-pos=2", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_5", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,hostfakesplit", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--dpi-desync-hostfakesplit-mod=host=www.google.com,altorder=1", "--dpi-desync-fooling=ts", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_6", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-repeats=6", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=1000", "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_8", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-seqovl=681", "--dpi-desync-split-pos=1", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-fake-repeats=6" ] },
-                { "name": "discord_9", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=2,sniext+1", "--dpi-desync-split-seqovl=679", "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_10", "args": [ "--filter-tcp=2053,2083,2087,2096,8443", "--dpi-desync=fake", "--dpi-desync-fake-tls-mod=none", "--dpi-desync-repeats=6", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=2", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_11", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=hostfakesplit", "--dpi-desync-repeats=4", "--dpi-desync-fooling=ts", "--dpi-desync-hostfakesplit-mod=host=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_12", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,fakedsplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-badseq-increment=2", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_13", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_14", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_15", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_16", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_17", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_18", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] },
-                { "name": "discord_19", "args": [ "--filter-tcp=443,2053,2083,2087,2096,8443", "--dpi-desync=fake,multisplit", "--dpi-desync-split-pos=1", "--dpi-desync-fooling=badseq", "--dpi-desync-repeats=8", "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com", "--new", "--filter-udp=19294-19344,50000-50100", "--filter-l7=discord,stun", "--dpi-desync=fake", "--dpi-desync-repeats=6" ] }
-            ]
+            "strategies": []
         }
         
         for name, content in files.items():
@@ -2559,13 +2539,18 @@ function FindProxyForURL(url, host) {{
             
         # === FIX: Config Auto-Update Logic ===
         def check_and_update_config(filename, default_data, validation_callback=None):
-            # safe_trace(f"[Config] Checking {filename}") # Verbose trace
             fpath = os.path.join(base_dir, "strat", filename)
             should_update = False
             
             try:
                 if not os.path.exists(fpath):
-                    should_update = True
+                    # ONLY create default file if we are in FROZEN (EXE) mode
+                    # If running as .pyw script, we DO NOT want to generate defaults
+                    if getattr(sys, 'frozen', False):
+                        should_update = True
+                    else:
+                        # Script mode: just return empty if file missing, do not create
+                        return
                 else:
                     with open(fpath, "r", encoding="utf-8") as f:
                         content = f.read().strip()
@@ -3638,18 +3623,35 @@ function FindProxyForURL(url, host) {{
         except:
             return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
-    def calc_log_window_pos(mx, my, mw, mh, log_w, log_h, mon_left, mon_right):
-        """Рассчитывает позицию окна логов (справа или слева)."""
-        # По умолчанию справа
-        new_x = mx + mw
-        side = "right"
+    def calc_log_window_pos(mx, my, mw, mh, log_w, log_h, mon_left, mon_right, current_side=None):
+        """Рассчитывает позицию окна логов (справа или слева) с гистерезисом."""
+        # Calculate potential availability
+        right_x = mx + mw
+        right_ok = (right_x + log_w <= mon_right)
         
-        # Если не влезает справа -> переносим налево
-        if new_x + log_w > mon_right:
-            left_x = mx - log_w
-            if left_x >= mon_left:
-                new_x = left_x
-                side = "left"
+        left_x = mx - log_w
+        left_ok = (left_x >= mon_left)
+
+        # Decision Logic (Sticky Side)
+        side = "right" # default
+        
+        if current_side == "left":
+            if left_ok: side = "left" # Stick to left if possible
+            elif right_ok: side = "right" # Switch to right if left fails
+            else: side = "right" # Fallback
+        elif current_side == "right":
+            if right_ok: side = "right" # Stick to right if possible
+            elif left_ok: side = "left" # Switch to left if right fails
+            else: side = "right" # Fallback
+        else:
+            # No history (first run or reset)
+            if right_ok: side = "right"
+            elif left_ok: side = "left"
+            else: side = "right"
+        
+        # Final Assign
+        if side == "right": new_x = right_x
+        else: new_x = left_x
         
         new_y = my # Верхняя граница совпадает
         return new_x, new_y, side
@@ -3683,7 +3685,9 @@ function FindProxyForURL(url, host) {{
                 mon_left, mon_top, mon_right, mon_bottom = get_monitor_work_area(mx + mw // 2, my + 10)
 
             # Расчет
-            new_x, new_y, side = calc_log_window_pos(mx, my, mw, mh, lw, lh, mon_left, mon_right)
+            cur_side = getattr(log_window, "current_side", None)
+            new_x, new_y, side = calc_log_window_pos(mx, my, mw, mh, lw, lh, mon_left, mon_right, cur_side)
+            log_window.current_side = side # Save state
             
             # Применение
             log_window.geometry(f"{lw}x{lh}+{new_x}+{new_y}")
@@ -11067,8 +11071,9 @@ function FindProxyForURL(url, host) {{
         
         # General list (for Hot Reload)
         file_general = os.path.join(base, "list", "general.txt")
+        file_exclude = os.path.join(base, "list", "exclude.txt")
         
-        all_monitor_files = monitor_vpn + [file_general]
+        all_monitor_files = monitor_vpn + [file_general, file_exclude]
         
         def get_file_stats(p):
             """Returns hash for robust change detection"""
@@ -11170,34 +11175,16 @@ function FindProxyForURL(url, host) {{
                         log_func("[List] Удалены дубликаты: домены из ru.txt теперь только в eu.txt")
 
                 # 1. Load combined VPN domains for general.txt optimization
-                vpn_domains = eu_domains.union(ru_domains_clean)
+                # vpn_domains = eu_domains.union(ru_domains_clean)
                 
-                # 2. Process General
-                lines = []
-                with open(file_general, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
+                # 2. Process General - DISABLED BY USER REQUEST (Feb 2026)
+                # We no longer remove domains from general even if they are in VPN lists,
+                # because winws strategies might need to be applied even if VPN is active.
+                cleaned_count = 0 
                 
-                new_lines = []
-                cleaned_count = 0
-                
-                for line in lines:
-                    stripped = line.strip().lower()
-                    if not stripped or line.startswith("#"):
-                        new_lines.append(line)
-                        continue
-                        
-                    if stripped in vpn_domains:
-                        cleaned_count += 1
-                        continue # Skip (Remove)
-                    
-                    new_lines.append(line)
-                
-                if cleaned_count > 0 or ru_changed:
-                    if cleaned_count > 0:
-                        with open(file_general, "w", encoding="utf-8") as f:
-                            f.writelines(new_lines)
-                        log_func(f"[List] Оптимизация: удалено {cleaned_count} доменов из general.txt (есть в VPN)")
+                if ru_changed:
                     return True # File(s) changed
+
                     
             except Exception as e:
                 safe_trace(f"[Optimizer] Error: {e}")
@@ -11222,6 +11209,7 @@ function FindProxyForURL(url, host) {{
             try:
                 vpn_changed = False
                 general_changed = False
+                exclude_changed = False
                 
                 # Check VPN files
                 for f_path in monitor_vpn:
@@ -11240,6 +11228,14 @@ function FindProxyForURL(url, host) {{
                 if gen_hash != file_hashes[file_general]:
                     file_hashes[file_general] = gen_hash
                     general_changed = True
+
+                # Check Exclude file
+                exc_hash = get_file_stats(file_exclude)
+                if exc_hash != file_hashes[file_exclude]:
+                    if deduplicate_list_file(file_exclude):
+                        exc_hash = get_file_stats(file_exclude)
+                    file_hashes[file_exclude] = exc_hash
+                    exclude_changed = True
                 
                 # Logic Flow
                 if vpn_changed:
@@ -11258,9 +11254,12 @@ function FindProxyForURL(url, host) {{
                         file_hashes[file_general] = get_file_stats(file_general)
                         general_changed = True # Cascading change
                         
-                if general_changed:
+                if general_changed or exclude_changed:
                     # Trigger Hot Restart
-                    log_func("[Auto] Изменен general.txt -> Перезапуск ядра...")
+                    reason = "general.txt" if general_changed else "exclude.txt"
+                    if general_changed and exclude_changed: reason = "general.txt и exclude.txt"
+                    
+                    log_func(f"[Auto] Изменен {reason} -> Перезапуск ядра...")
                     perform_hot_restart_backend()
                     
                     # Also update PAC if general is used there (usually not, but good practice if logic changes)
@@ -12078,6 +12077,9 @@ function FindProxyForURL(url, host) {{
         
         
         # TRACE LOGGING
+        if restart_mode and not silent:
+            if 'log_print' in globals():
+                 log_print("[Init] Ядро перезапущено после изменений в list/general.txt")
 
         # Сбрасываем флаг завершения при перезапуске, чтобы фоновые проверки возобновились
         is_closing = False
@@ -12827,6 +12829,15 @@ function FindProxyForURL(url, host) {{
     def on_closing():
         global is_closing, process
         
+        # Захватываем геометрию в главном потоке ДО уничтожения/скрытия окна
+        main_geo = None
+        log_geo = None
+        try:
+            main_geo = root.geometry()
+            if log_window and tk.Toplevel.winfo_exists(log_window):
+                log_geo = log_window.geometry()
+        except: pass
+        
         # === VISUAL SPEEDUP: Hide windows immediately ===
         try:
             if log_window and tk.Toplevel.winfo_exists(log_window):
@@ -12853,14 +12864,7 @@ function FindProxyForURL(url, host) {{
              stop_nova_service(silent=True, wait_for_cleanup=True)
         except: pass
         
-        # Захватываем геометрию в главном потоке ДО уничтожения окна, чтобы избежать ошибок
-        main_geo = None
-        log_geo = None
-        try:
-            main_geo = root.geometry()
-            if log_window and tk.Toplevel.winfo_exists(log_window):
-                log_geo = log_window.geometry()
-        except: pass
+        # (Geometry already captured above)
 
         # === Быстрое сохранение состояния (в отдельном потоке если долго) ===
         def save_state_and_cleanup(m_geo, l_geo):
@@ -13327,6 +13331,77 @@ function FindProxyForURL(url, host) {{
                 self._draw_bg()
         def place(self, **kwargs): pass
 
+    # === CRITICAL MIGRATION LOGIC ===
+    def perform_critical_migrations(log_func=None):
+        try:
+            base = get_base_dir()
+            u_strat = os.path.join(base, "strat", "strategies.json")
+            u_discord = os.path.join(base, "strat", "discord.json")
+            
+            # 1. Check strategies.json
+            if os.path.exists(u_strat):
+                try:
+                    curr = load_json_robust(u_strat)
+                    if curr:
+                        mod = False
+                        
+                        d_args = curr.get("discord", [])
+                        bad_d = any("--filter-tcp=" in x and "443" in x for x in d_args)
+                        
+                        w_args = curr.get("warp", [])
+                        w_udp = next((x for x in w_args if "--filter-udp=" in x), "")
+                        bad_w = "500" not in w_udp or "1701" not in w_udp
+                        
+                        if bad_d or bad_w:
+                            ref = {}
+                            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+                                i_strat = os.path.join(sys._MEIPASS, "strat", "strategies.json")
+                                if os.path.exists(i_strat):
+                                    ref = load_json_robust(i_strat)
+                            
+                            if ref:
+                                if bad_d and "discord" in ref:
+                                    curr["discord"] = ref["discord"]
+                                    mod = True
+                                    if log_func: log_func("[Init] Discord стратегия обновлена из пакета (v1.12).")
+                                if bad_w and "warp" in ref:
+                                    curr["warp"] = ref["warp"]
+                                    mod = True
+                                    if log_func: log_func("[Init] WARP стратегия обновлена из пакета (v1.12).")
+                            
+                            if mod:
+                                 curr["version"] = CURRENT_VERSION
+                                 save_json_safe(u_strat, curr)
+                except: pass
+
+            # 2. Check discord.json
+            if os.path.exists(u_discord):
+                 try:
+                     with open(u_discord, "r", encoding="utf-8", errors="ignore") as f:
+                         raw = f.read()
+                     if '"--filter-tcp=443,' in raw:
+                         if log_func: log_func("[Init] Удален устаревший discord.json для обновления.")
+                         f.close()
+                         os.remove(u_discord)
+                         # Restore immediately to get the new version
+                         restore_missing_strategies()
+                 except: pass
+
+            # 3. Check list/discord.txt
+            u_discord_txt = os.path.join(base, "list", "discord.txt")
+            if os.path.exists(u_discord_txt):
+                try:
+                    with open(u_discord_txt, "r", encoding="utf-8", errors="ignore") as f:
+                        raw_txt = f.read()
+                    if 'discord.media' not in raw_txt:
+                        if log_func: log_func("[Init] Удален устаревший discord.txt для обновления списка доменов.")
+                        f.close()
+                        os.remove(u_discord_txt)
+                        # Восстанавливаем из ресурсов (чтобы сразу появился правильный список)
+                        restore_missing_strategies()
+                except: pass
+        except: pass
+
     # ================= STARTUP =================
     if __name__ == "__main__":
         safe_trace("[Main] Entry point reached.")
@@ -13454,6 +13529,8 @@ function FindProxyForURL(url, host) {{
                         sys.exit()
 
         # === DEFERRED INIT PLACEHOLDER ===
+
+        # === DEFERRED INIT PLACEHOLDER ===
         # dns_manager инициализируется в launch_background_tasks
 
         # === INFRASTRUCTURE DEPLOY ===
@@ -13462,10 +13539,18 @@ function FindProxyForURL(url, host) {{
         # Check First Run Condition BEFORE deploy (if strat folder missing, it's a fresh install)
         is_first_run_condition = not os.path.exists(os.path.join(get_base_dir(), "strat"))
         
-        dep_logs = deploy_infrastructure()
+        try:
+            dep_logs = deploy_infrastructure()
+        except Exception as e:
+            print(f"Deploy failed: {e}")
+            dep_logs = []
         
         # Исправляем стратегии синхронно перед запуском GUI, чтобы избежать гонок
-        rest_logs = restore_missing_strategies()
+        try:
+            rest_logs = restore_missing_strategies()
+        except Exception as e:
+            print(f"Restore failed: {e}")
+            rest_logs = []
         
         # Show Update Report
         total_logs = (dep_logs or []) + (rest_logs or [])
@@ -13494,9 +13579,11 @@ function FindProxyForURL(url, host) {{
         
         try:
             # FIX: Use absolute path to ensure we find the correct file
+            base_exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
             old_exe_chk = os.path.abspath(sys.argv[0]) + ".old" 
+            
+            # Cleanup .old exe
             if os.path.exists(old_exe_chk):
-                 # Пытаемся удалить старый exe.
                  for _ in range(3):
                      try: 
                          os.remove(old_exe_chk)
@@ -13504,9 +13591,18 @@ function FindProxyForURL(url, host) {{
                          break
                      except: 
                          time.sleep(0.5)
+            
+            # Cleanup .vbs scripts from update
+            for script_name in ["restart_helper.vbs", "updater.vbs"]:
+                s_path = os.path.join(base_exe_dir, script_name)
+                if os.path.exists(s_path):
+                    try: os.remove(s_path)
+                    except: pass
+
         except: pass
 
         app_mutex = check_single_instance()
+
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Nova.App.Main.1")
         except: pass
 
@@ -13532,10 +13628,7 @@ function FindProxyForURL(url, host) {{
         def start_move(event):
             root._drag_start_x = event.x
             root._drag_start_y = event.y
-            # Cache monitor info once per drag start
-            try:
-                root._cached_mon_bounds = get_monitor_work_area(root.winfo_x() + root.winfo_width()//2, root.winfo_y() + 10)
-            except: root._cached_mon_bounds = None
+            # Monitor bounds are queried dynamically in do_move to handle multi-monitor transitions correctly
             
             # === НОВОЕ: При клике на главное окно поднимаем лог на передний план (если открыт) ===
             try:
@@ -13555,7 +13648,7 @@ function FindProxyForURL(url, host) {{
             # 2. Update Log Window immediately (Synchronous Sync)
             # This makes the log window feel "glued" to the main window
             if log_window and log_window.state() == "normal":
-                align_log_window_to_main(forced_main_geom=(x, y, root.winfo_width(), root.winfo_height()), cached_mon_bounds=getattr(root, '_cached_mon_bounds', None))
+                align_log_window_to_main(forced_main_geom=(x, y, root.winfo_width(), root.winfo_height()))
 
         root.bind("<Button-1>", start_move)
         root.bind("<B1-Motion>", do_move)
@@ -13670,10 +13763,15 @@ function FindProxyForURL(url, host) {{
         # Gentle Focus (уже после того как окно показано)
         if not ARGS_PARSED.get('minimized', False):
             try:
+                root.deiconify()
                 root.attributes('-topmost', True)
                 root.after(50, lambda: root.attributes('-topmost', False))
             except: pass
         
+        # Миграция конфигурации перед запуском сервисов
+        # Миграция конфигурации перед запуском сервисов
+        root.after(50, lambda: perform_critical_migrations(lambda m: logging.info(m) if 'logging' in globals() else None))
+
         # Запуск основного ядра С НЕБОЛЬШОЙ ЗАДЕРЖКОЙ (дает UI продышаться)
         root.after(100, lambda: start_nova_service())
         
