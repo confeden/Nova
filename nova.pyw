@@ -21,6 +21,9 @@ CURRENT_VERSION = "1.12"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
+print(f"!!! DEBUG: NOVA SCRIPT LOADING FROM: {os.path.abspath(__file__)} !!!")
+print(f"!!! DEBUG: VERSION: {CURRENT_VERSION} !!!")
+
 # === PORTABLE PATH SAFEGUARD ===
 def apply_path_safeguard():
     try:
@@ -288,6 +291,13 @@ try:
     import winreg
     import glob
 
+    # === HELPER: Path Resolution ===
+    def get_base_dir():
+        """Returns the absolute path to the application directory."""
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
     def mask_ip(ip_str):
         """
         Masks the first two octets of an IP address (e.g., 192.168.1.1 -> ***.***.1.1).
@@ -300,6 +310,46 @@ try:
                 return f"***.***.{parts[2]}.{parts[3]}"
             return "***"
         except: return "***"
+
+    # === WINDOW STATE MANAGEMENT (Global Helper) ===
+    def load_window_state():
+        try:
+            path = os.path.join(get_base_dir(), "temp", "window_state.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except: pass
+        return {}
+
+    def save_window_state(**kwargs):
+        try:
+            path = os.path.join(get_base_dir(), "temp", "window_state.json")
+            target_dir = os.path.dirname(path)
+            if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
+            
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except: pass
+            
+            data.update(kwargs)
+            
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+                
+            # DEBUG LOG (Temporary)
+            try:
+                with open(os.path.join(get_base_dir(), "debug_geo.log"), "a", encoding="utf-8") as d:
+                    d.write(f"Saved: {kwargs}\n")
+            except: pass
+            
+        except Exception as e:
+            try:
+                with open(os.path.join(get_base_dir(), "debug_geo.log"), "a", encoding="utf-8") as d:
+                     d.write(f"Save ERROR: {e}\n")
+            except: pass
 
     def mask_ips_in_text(text):
         """Masks all IPv4 addresses in a text string."""
@@ -1460,6 +1510,9 @@ try:
 
     # === NEW: Service Run ID for zombie thread suppression ===
     SERVICE_RUN_ID = 0
+    
+    # === VOICE TUNNEL MANAGER ===
+    sing_box_manager = None # Will be initialized in main
 
 
     # ================= WARP & PROXY MANAGER =================
@@ -1471,6 +1524,132 @@ try:
                   987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 
                   1387, 1843, 2371, 2506, 3138, 3476, 3581, 3854, 4177, 
                   4198, 4233, 5279, 5956]
+    
+    CLOUDFLARE_CIDRS = [
+        "162.159.192.0/24", "162.159.193.0/24", "162.159.195.0/24", 
+        "188.114.96.0/24", "188.114.97.0/24", "188.114.98.0/24", "188.114.99.0/24"
+    ]
+    
+    class SingBoxManager:
+        """Manages sing-box for surgical routing of specific apps (Voice/UDP) into WARP."""
+        def __init__(self, log_func=None):
+            self.log_func = log_func or print
+            self.bin_dir = os.path.join(get_base_dir(), "bin")
+            self.temp_dir = os.path.join(get_base_dir(), "temp")
+            self.exe_path = os.path.join(self.bin_dir, "sing-box.exe")
+            self.config_path = os.path.join(self.temp_dir, "sing-box-conf.json")
+            self.log_path = os.path.join(self.temp_dir, "sing-box.log")
+            self.process = None
+
+        def create_config(self):
+            """Generates sing-box config securely from scratch on every run."""
+            try:
+                # Ensure path is always fresh/absolute pointing to TEMP
+                self.config_path = os.path.join(self.temp_dir, "sing-box-conf.json")
+                if not os.path.exists(self.temp_dir): os.makedirs(self.temp_dir, exist_ok=True)
+
+                config = {
+                    "log": {
+                        "level": "info",
+                        "output": self.log_path,
+                        "timestamp": True
+                    },
+                    "inbounds": [
+                        {
+                            "type": "tun",
+                            "tag": "tun-in",
+                            "interface_name": "NovaVoiceTun",
+                            "inet4_address": "172.19.0.1/30",
+                            "auto_route": True,
+                            "strict_route": True,
+                            "stack": "system",
+                            "sniff": True
+                        }
+                    ],
+                    "outbounds": [
+                        {
+                            "type": "socks",
+                            "tag": "warp-socks",
+                            "server": "127.0.0.1",
+                            "port": globals().get('WARP_PORT', 1370)
+                        },
+                        {
+                            "type": "direct",
+                            "tag": "direct"
+                        }
+                    ],
+                    "route": {
+                        "rules": [
+                            {
+                                "process_name": [
+                                    "Discord.exe", "Update.exe", 
+                                    "Telegram.exe", "AyuGram.exe",
+                                    "WhatsApp.exe",
+                                ],
+                                "outbound": "warp-socks"
+                            }
+                        ],
+                        "final": "direct",
+                        "auto_detect_interface": True
+                    }
+                }
+                
+                with open(self.config_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4)
+                    
+            except Exception as e:
+                self.log_func(f"[SingBox] Ошибка создания конфига: {e}")
+
+        def start(self):
+            """Starts sing-box if not already running."""
+            if self.process and self.process.poll() is None:
+                return # Already running
+
+            if not os.path.exists(self.exe_path):
+                self.log_func("[SingBox] Бинарный файл не найден.")
+                return
+
+            self.stop()
+            self.create_config()
+            
+            if not os.path.exists(self.config_path):
+                self.log_func(f"[SingBox] Ошибка: Конфиг не создан! Путь: {self.config_path}")
+                return
+
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                
+                cmd = [self.exe_path, "run", "-c", self.config_path]
+
+                self.process = subprocess.Popen(
+                    cmd,
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    cwd=self.bin_dir
+                )
+                self.log_func(f"[SingBox] Голосовой туннель активен.")
+            except Exception as e:
+                self.log_func(f"[SingBox] Ошибка запуска: {e}")
+
+        def stop(self):
+            """Stops sing-box aggressively."""
+            if self.process:
+                try:
+                    self.process.terminate()
+                    self.process.wait(timeout=1)
+                except: pass
+                try:
+                    self.process.kill()
+                except: pass
+                self.process = None
+            
+            # Failsafe cleanup
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"], 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except: pass
     
     class WarpManager:
         """WARP Manager using official warp-cli with MASQUE protocol.
@@ -1576,7 +1755,8 @@ try:
             self.bin_dir = os.path.join(get_base_dir(), "bin")
             self.warp_cli_path = os.path.join(self.bin_dir, "warp-cli.exe")
             self.warp_svc_path = os.path.join(self.bin_dir, "warp-svc.exe")
-            self.port = 1370
+            self.port = globals().get('WARP_PORT', 1370)
+            self.port_legacy = globals().get('WARP_PORT_LEGACY', 1370)
             self.is_connected = False
             self.service_process = None 
             self.service_installed_by_us = False  # Track if we installed the service
@@ -1928,30 +2108,78 @@ try:
                         self.is_connected = True
                     return
                 
-                # --- CONNECT ---
-                if SERVICE_RUN_ID != my_run_id: return
-                self.log_func("[RU] Подключение...")
-                result = self.run_warp_cli("connect")
+                # --- CONNECT ATTEMPTS ---
+                # Strategy: Ports 443, 500, 1701, 4500 -> MASQUE then WireGuard
+                # Phase 1: Auto IP
+                # Phase 2: IPv4 Force (if Phase 1 fails)
                 
-                if result and result.returncode == 0:
-                    if not self.wait_for_connection(timeout=10):
-                        status_fail = self.get_status()
-                        if "Unable" in status_fail or "happy eyeballs" in status_fail.lower():
-                            self.log_func("[RU] Ошибка сети. Попытка через IPv4...")
-                            self.run_warp_cli("tunnel", "ip-version", "set", "4")
-                            self.run_warp_cli("connect") 
-                            if self.wait_for_connection(timeout=10):
+                ports = [443, 500, 1701, 4500]
+                protocols = ["masque", "warp"] # warp = WireGuard in cli
+                
+                # Pre-calculate best endpoint IP (generic)
+                # Pre-calculate best endpoint IP (generic)
+                # best_ep = self.find_best_endpoint() 
+                best_ep = "engage.cloudflareclient.com" # Standard Anycast hostname (auto-routes to best IP)
+                
+                # Outer loop: IP Modes (Auto -> IPv4)
+                ip_modes = ["auto", "4"]
+                
+                for ip_mode in ip_modes:
+                    if is_closing or SERVICE_RUN_ID != my_run_id: return
+                    
+                    self.run_warp_cli("tunnel", "ip-version", "set", ip_mode)
+                    if ip_mode == "4":
+                         self.log_func("[RU] Авто-режим не сработал. Переключаемся на принудительный IPv4...")
+
+                    for port in ports:
+                        # Set Endpoint: best_ep + port
+                        # Note: If best_ep is IPv6 but we force IPv4, it might fail or fallback.
+                        # WARP usually handles this.
+                        ep_str = f"{best_ep}:{port}"
+                        self.run_warp_cli("tunnel", "endpoint", "set", ep_str)
+                        
+                        for proto in protocols:
+                            if is_closing or SERVICE_RUN_ID != my_run_id: return
+                            
+                            proto_display = "MASQUE" if proto == "masque" else "WireGuard"
+                            self.log_func(f"[RU] Подключение: {proto_display} порт {port} ({'IPv4' if ip_mode == '4' else 'Auto'})...")
+                            
+                            self.run_warp_cli("tunnel", "protocol", "set", proto)
+                            self.run_warp_cli("connect")
+                            
+                            # Short timeout for rapid iteration
+                            if self.wait_for_connection(timeout=8):
                                 self.is_connected = True
+                                # START VOICE TUNNEL (Sing-Box)
+                                # It uses the SOCKS5 proxy we just set up (127.0.0.1:40000)
+                                global sing_box_manager
+                                if sing_box_manager:
+                                    sing_box_manager.start()
                                 return
-                    else:
-                        self.is_connected = True
-                        return
-                else:
-                    error_msg = (result.stderr if result else "Unknown error") or "Unknown"
-                    self.log_func(f"[RU] Ошибка подключения: {error_msg}")
+                            
+                            self.run_warp_cli("disconnect")
+                            time.sleep(0.5)
+                
+                self.log_func("[RU] [Warning] Все попытки подключения (Auto и IPv4) исчерпаны.")
+            
+            except Exception as e:
+                self.log_func(f"[RU] КРИТИЧЕСКАЯ ОШИБКА WARP: {e}")
+                import traceback
+                if IS_DEBUG_MODE: traceback.print_exc()
 
             finally:
                 self._is_starting_now = False
+
+        def stop_service(self):
+            """Stop WARP service and clean up."""
+            try:
+                # Stop Voice Tunnel first
+                global sing_box_manager
+                if sing_box_manager:
+                    sing_box_manager.stop()
+                    
+                subprocess.run(["sc", "stop", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            except: pass
 
         def check_port(self, port):
             import socket
@@ -1974,15 +2202,30 @@ try:
                          details = ""
                          stats_res = self.run_warp_cli("tunnel", "stats")
                          if stats_res and stats_res.returncode == 0:
-                             stats_out = stats_res.stdout
+                             stats_out = self.decode_output(stats_res.stdout)
                              import re
+                             
                              # Extract Protocol
                              proto_match = re.search(r"Protocol:\s*(.+)", stats_out, re.IGNORECASE)
-                             # Extract first IP from Endpoints
-                             ip_match = re.search(r"Endpoints:\s*([\d\.]+)", stats_out, re.IGNORECASE)
+                             proto_str = proto_match.group(1).strip() if proto_match else "Unknown"
                              
-                             if ip_match: details += f" {ip_match.group(1)}"
-                             if proto_match: details += f" {proto_match.group(1).strip()}"
+                             # Extract Endpoint IP
+                             ip_match = re.search(r"Endpoints:\s*([^\s]+)", stats_out, re.IGNORECASE)
+                             ip_str = ip_match.group(1).strip() if ip_match else "Unknown"
+                             
+                             # Mask IP & Detect Type
+                             masked_ip = ip_str
+                             conn_type = "Unknown"
+                             
+                             if "." in ip_str and ":" not in ip_str:
+                                 conn_type = "IPv4"
+                                 parts = ip_str.split(".")
+                                 if len(parts) == 4: masked_ip = f"***.***.{parts[2]}.{parts[3]}"
+                             elif ":" in ip_str:
+                                 conn_type = "IPv6"
+                                 masked_ip = "IPv6:***"
+                             
+                             details = f" {masked_ip} {proto_str} ({conn_type})"
                          
                          self.log_func(f"[RU] {self.port} готов{details}")
                          self.is_connected = True
@@ -2018,7 +2261,7 @@ try:
             self.server_port = 1369
             self.server_thread = None
             self.httpd = None
-            self.warp_port = 1370
+            self.warp_port = 1370 # Restore missing attribute
             self.registry_backup = {}
 
         def _load_domain_list(self, filepath):
@@ -2296,107 +2539,9 @@ function FindProxyForURL(url, host) {{
             except: pass
 
 
-    class SingBoxManager:
-        """Manages sing-box process for SOCKS5 UDP support."""
-        
-        def __init__(self, log_func=None):
-            self.log_func = log_func or print
-            self.bin_dir = os.path.join(get_base_dir(), "bin")
-            self.exe_path = os.path.join(self.bin_dir, "sing-box.exe")
-            self.config_path = os.path.join(self.bin_dir, "sing-box-config.json")
-            self.process = None
-            self.port = 1372
-
-        def start(self):
-            if not os.path.exists(self.exe_path):
-                return
-            
-            if not os.path.exists(self.config_path):
-                self.log_func(f"[SingBox] Config not found at: {self.config_path} (run keygen first).")
-                return
-
-            # Kill existing
-            try:
-                subprocess.run(["taskkill", "/f", "/im", "sing-box.exe"], 
-                             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            except: pass
-
-            try:
-                # Start sing-box run -c config.json
-                # We need to hide window
-                cmd = [self.exe_path, "run", "-c", self.config_path]
-                
-                # Fix for Sing-Box 1.12+ Legacy DNS error
-                env = os.environ.copy()
-                env["ENABLE_DEPRECATED_LEGACY_DNS_SERVERS"] = "true"
-                env["ENABLE_DEPRECATED_WIREGUARD_OUTBOUND"] = "true"
-                env["ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER"] = "true"
-                
-                # Log to file for debugging
-                log_dir = os.path.join(get_base_dir(), "temp")
-                if not os.path.exists(log_dir): os.makedirs(log_dir)
-                self.log_file = os.path.join(log_dir, "singbox.log")
-                self.f_log = open(self.log_file, "w", encoding='utf-8')
-
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=self.bin_dir,
-                    stdout=self.f_log,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    env=env, # Pass updated env
-                    text=True,
-                    encoding='utf-8', errors='replace'
-                )
-                
-                # FIX: Wait for port 1372 to actually open before reporting ready
-                def wait_for_singbox_ready():
-                    import socket
-                    start_t = time.time()
-                    while time.time() - start_t < 10: # Max 10s wait
-                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                            s.settimeout(0.5)
-                            if s.connect_ex(('127.0.0.1', self.port)) == 0:
-                                self.log_func(f"[SingBox] {self.port} готов")
-                                return
-                        time.sleep(0.5)
-                    if IS_DEBUG_MODE: self.log_func("[SingBox] Предупреждение: Порт 1372 не открылся вовремя.")
-
-                threading.Thread(target=wait_for_singbox_ready, daemon=True).start()
-                
-            except Exception as e:
-                try:
-                    exit_code = self.process.wait(timeout=0.5)
-                    if exit_code is not None:
-                        if IS_DEBUG_MODE: self.log_func(f"[SingBox] Ошибка запуска (код {exit_code}). Лог: {self.log_file}")
-                except subprocess.TimeoutExpired:
-                    pass # Running ok
-                    
-            except Exception as e:
-                self.log_func(f"[SingBox] Exception: {e}")
-
-        def stop(self):
-            if self.process:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=1)
-                except:
-                    self.process.kill()
-                self.process = None
-            
-            # Close log file if open
-            if hasattr(self, 'f_log') and self.f_log:
-                try:
-                    self.f_log.close()
-                    self.f_log = None
-                except: pass
-            
-            # Ensure cleanup
-            try:
-                subprocess.run(["taskkill", "/f", "/im", "sing-box.exe"], 
-                             capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            except: pass
+    # [REMOVED] Duplicate SingBoxManager class was here. 
+    # The correct implementation is now at the top of the file (around line 1480).
+    # This suppression fixes the "run keygen first" error and enables the new voice routing logic.
 
 
     class OperaProxyManager:
@@ -5659,6 +5804,8 @@ function FindProxyForURL(url, host) {{
                 # Strategy restricted to 4 concurrent processes (winws)
                 STRATEGY_THREADS = 4 
                 PORTS_PER_STRAT = 7
+                WARP_PORT = 1370
+                WARP_PORT_LEGACY = 1370
                 BASE_PORT = 16000 # Range 16000-16500
                 
                 # Use Global Strategy Ports (Pre-allocated 16000-16400)
@@ -11200,7 +11347,7 @@ function FindProxyForURL(url, host) {{
         # Capture current run ID
         my_run_id = SERVICE_RUN_ID
         
-        log_func("[PAC] Мониторинг списков запущен (Hot Reload активен)")
+        log_func("[PAC] Мониторинг списков запущен")
         
         while not is_closing:
             if SERVICE_RUN_ID != my_run_id: break
@@ -11243,7 +11390,7 @@ function FindProxyForURL(url, host) {{
                     if pac_manager:
                         pac_manager.generate_pac()
                         pac_manager.refresh_system_options()
-                        log_func("[PAC] Списки VPN обновлены.")
+                        log_func("[PAC] Списки VPN обновлены")
                     
                     # 1.1 Hot Restart WinWS to apply list changes to strategies
                     perform_hot_restart_backend()
@@ -11259,7 +11406,7 @@ function FindProxyForURL(url, host) {{
                     reason = "general.txt" if general_changed else "exclude.txt"
                     if general_changed and exclude_changed: reason = "general.txt и exclude.txt"
                     
-                    log_func(f"[Auto] Изменен {reason} -> Перезапуск ядра...")
+                    log_func(f"[Auto] Изменен {reason} -> Ядро перезапущено")
                     perform_hot_restart_backend()
                     
                     # Also update PAC if general is used there (usually not, but good practice if logic changes)
@@ -11297,7 +11444,8 @@ function FindProxyForURL(url, host) {{
                     last_ip = f.read().strip()
                     
             if current_ip == last_ip:
-                log_func(f"[Init] IP не изменился ({mask_ip(current_ip)}). Повторная проверка доменов не требуется.")
+                pass # Silent success (User request: reduce log spam)
+
             else:
                 log_func(f"[Init] IP изменился ({mask_ip(last_ip)} -> {mask_ip(current_ip)}). Сброс кэша проверок.")
                 try:
@@ -11339,7 +11487,11 @@ function FindProxyForURL(url, host) {{
                     continue  # Rate limit reached, skip
                 
                 # Check WARP (only if it was ever connected successfully)
-                if warp_manager and getattr(warp_manager, 'is_connected', False):
+                if warp_manager:
+                    if not getattr(warp_manager, 'is_connected', False):
+                         # Не проводим повторные полные циклы, если первый раз не удалось
+                         continue
+                        
                     status = warp_manager.get_status()
                     if status and "Disconnected" in status:
                         log_func("[RU] Обнаружено отключение. Переподключение...")
@@ -12002,6 +12154,10 @@ function FindProxyForURL(url, host) {{
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
         global warp_manager, pac_manager, opera_proxy_manager, sing_box_manager, SERVICE_RUN_ID, state_lock
+
+        # Initialize SingBoxManager if not already done
+        if 'sing_box_manager' not in globals() or sing_box_manager is None:
+             sing_box_manager = SingBoxManager(log_func=log_print)
 
         # Increment run ID
         try:
@@ -12866,45 +13022,48 @@ function FindProxyForURL(url, host) {{
         
         # (Geometry already captured above)
 
-        # === Быстрое сохранение состояния (в отдельном потоке если долго) ===
-        def save_state_and_cleanup(m_geo, l_geo):
-            """Сохраняет состояние и завершает процессы"""
-            try:
-                state_to_save = {}
-                if m_geo: state_to_save["main_geometry"] = m_geo
-                if l_geo: state_to_save["log_size"] = l_geo
-                
-                if state_to_save:
-                    save_window_state(**state_to_save)
-            except:
-                pass
+        # === Быстрое сохранение состояния (СИНХРОННО) ===
+        try:
+            state_to_save = {}
+            if main_geo: state_to_save["main_geometry"] = main_geo
+            if log_geo: state_to_save["log_size"] = log_geo
             
-            # === Сохраняем адаптивную систему при выходе ===
+            # DEBUG LOGGING (Temporary)
             try:
-                if dns_manager:
-                    dns_manager.save_cache()
-                save_visited_domains()
-                save_ip_history()
-                save_exclude_auto_checked()
-                flush_learning_data()
-                # strategy_learner.save() # Сохраняем знания AI (DISABLED: Conflicts with main learning_data system)
-            except Exception as e:
-                print(f"[AdaptiveSystem] Ошибка сохранения при выходе: {e}")
-            
-            try:
-                queue_list = []
-                while not check_queue.empty():
-                    try: queue_list.append(check_queue.get_nowait())
-                    except: break
-                
-                if queue_list:
-                    try:
-                        with open(PENDING_CHECKS_FILE, "w", encoding="utf-8") as f:
-                            json.dump(queue_list, f)
-                    except: pass
+                with open(os.path.join(get_base_dir(), "debug_geo.log"), "a", encoding="utf-8") as d:
+                    d.write(f"Closing. main_geo={main_geo}, log_geo={log_geo}\n")
             except: pass
+            
+            if state_to_save:
+                save_window_state(**state_to_save)
+        except: pass
+        
+        # === Сохраняем адаптивную систему (СИНХРОННО) ===
+        try:
+            if dns_manager:
+                dns_manager.save_cache()
+            save_visited_domains()
+            save_ip_history()
+            save_exclude_auto_checked()
+            flush_learning_data()
+        except Exception as e:
+            print(f"[AdaptiveSystem] Ошибка сохранения при выходе: {e}")
+        
+        try:
+            queue_list = []
+            while not check_queue.empty():
+                try: queue_list.append(check_queue.get_nowait())
+                except: break
+            
+            if queue_list:
+                try:
+                    with open(PENDING_CHECKS_FILE, "w", encoding="utf-8") as f:
+                        json.dump(queue_list, f)
+                except: pass
+        except: pass
 
-            # Завершение процессов (асинхронно)
+        # Завершение процессов (финальная зачистка)
+        def final_cleanup():
             if process:
                 try: subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except: pass
@@ -12916,14 +13075,15 @@ function FindProxyForURL(url, host) {{
             try: smart_update_general()
             except: pass
         
-        # Запускаем сохранение в отдельном потоке, не блокируя основной UI
-        cleanup_thread = threading.Thread(target=save_state_and_cleanup, args=(main_geo, log_geo), daemon=True)
-        cleanup_thread.start()
-        
-        # Немедленно закрываем окно (не ждём завершения фонового потока)
+        # Запускаем финальную зачистку (можно и синхронно, но чтобы окно закрылось быстрее - оставим тут или сделаем синхронно)
+        # Так как мы делаем exit, поток может не успеть. Лучше сделать быстро синхронно.
+        try: final_cleanup()
+        except: pass
+
+        # Немедленно закрываем окно
         try: root.destroy()
         except: pass
-        # Выходим (фоновый поток завершится сам)
+        # Выходим
         os._exit(0)
 
     # === HOT SWAP COOLDOWN ===
@@ -13402,6 +13562,8 @@ function FindProxyForURL(url, host) {{
                 except: pass
         except: pass
 
+
+
     # ================= STARTUP =================
     if __name__ == "__main__":
         safe_trace("[Main] Entry point reached.")
@@ -13592,9 +13754,10 @@ function FindProxyForURL(url, host) {{
                      except: 
                          time.sleep(0.5)
             
-            # Cleanup .vbs scripts from update
+            # Cleanup .vbs scripts from update/restart (now in temp)
+            temp_dir = os.path.join(get_base_dir(), "temp")
             for script_name in ["restart_helper.vbs", "updater.vbs"]:
-                s_path = os.path.join(base_exe_dir, script_name)
+                s_path = os.path.join(temp_dir, script_name)
                 if os.path.exists(s_path):
                     try: os.remove(s_path)
                     except: pass
@@ -13684,7 +13847,8 @@ function FindProxyForURL(url, host) {{
         main_canvas.bind("<Button-1>", start_move)
         main_canvas.bind("<B1-Motion>", do_move)
 
-        bg_image = None
+        # Beta Mode Flag
+        is_beta_mode = False
         try:
             img_path = get_internal_path(os.path.join("img", "background.png"))
             # Проверка на частую ошибку с JPG
@@ -13696,6 +13860,46 @@ function FindProxyForURL(url, host) {{
                 main_canvas.bg_image = bg_image # Сохраняем ссылку, чтобы сборщик мусора не удалил картинку
                 main_canvas.create_image(0, 0, image=bg_image, anchor="nw")
                 # print(f"[UI] Фон успешно загружен: {img_path}")
+            else:
+                # Fallback: Gradient Background (Sapphire -> Yogurt)
+                # Only if running as script (.pyw)
+                if not getattr(sys, 'frozen', False):
+                    is_beta_mode = True # Set flag
+                    # Draw Gradient Rectangle
+                    # Sapphire (#0F52BA) to Yogurt (#FFB6C1)
+                    # We can simulate this with lines or a pill image stretched
+                    w_c = main_canvas.winfo_reqwidth()
+                    h_c = main_canvas.winfo_reqheight()
+                    if w_c < 10: w_c, h_c = w, h
+                    
+                    # Create gradient image manually
+                    try:
+                        from PIL import Image, ImageTk, ImageDraw
+                        grad = Image.new('RGB', (w_c, h_c), "#0F52BA")
+                        draw = ImageDraw.Draw(grad)
+                        
+                        r1, g1, b1 = 15, 82, 186   # Sapphire
+                        r2, g2, b2 = 255, 182, 193 # Yogurt
+                        
+                        for i in range(h_c):
+                            r = int(r1 + (r2 - r1) * i / h_c)
+                            g = int(g1 + (g2 - g1) * i / h_c)
+                            b = int(b1 + (b2 - b1) * i / h_c)
+                            draw.line([(0, i), (w_c, i)], fill=(r, g, b))
+                            
+                        grad_tk = ImageTk.PhotoImage(grad)
+                        main_canvas.bg_image = grad_tk
+                        main_canvas.create_image(0, 0, image=grad_tk, anchor="nw")
+                        
+                        # Add Beta Tester Label
+                        # Position: Below the toggle button (h/2 + 10 + 40 + gap)
+                        # Center: w/2
+                        main_canvas.create_text(w/2, h/2 + 65, text="версия для бета-тестеров", 
+                                              font=("Segoe UI", 8), fill="#FFFFFF")
+
+                    except ImportError:
+                        pass # PIL not found, fallback to default bg color
+                        
         except Exception as e:
             print(f"[UI] Ошибка загрузки фона: {e}")
 
@@ -13705,7 +13909,14 @@ function FindProxyForURL(url, host) {{
         
         btn_toggle = RoundedButton(main_canvas, w/2, h/2 + 10, 160, 40, 20, COLOR_BLUEBERRY_YOGURT, "ЗАПУСТИТЬ", toggle_service)
         
-        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, fg="#777777", bg_color="#E0E0E0")
+        # Style for Log Button
+        log_fg = "#777777"
+        log_bg = "#E0E0E0"
+        if is_beta_mode:
+             log_fg = "#FFFFFF"     # White Text
+             log_bg = "#0F52BA"     # Sapphire Background
+             
+        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, fg=log_fg, bg_color=log_bg)
 
         # === Autostart Context Menu (Main Window) ===
         main_context_menu = tk.Menu(root, tearoff=0)
