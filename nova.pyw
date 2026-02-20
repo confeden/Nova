@@ -151,6 +151,50 @@ def safe_trace(msg):
 
 safe_trace("=== NOVA SCRIPT STARTED ===")
 
+def restart_nova():
+    """Перезапускает Nova: корректная остановка -> перезапуск (Глобальная функция)"""
+    def do_restart():
+        try:
+            # 1. Остановка логики
+            save_visited_domains_func = globals().get('save_visited_domains')
+            if save_visited_domains_func:
+                try: save_visited_domains_func()
+                except: pass
+
+            log_func = globals().get('log_print', print)
+            log_func("[Restart] Остановка сервисов...")
+            
+            stop_func = globals().get('stop_nova_service')
+            if stop_func:
+                try: stop_func(silent=False, wait_for_cleanup=True)
+                except: pass
+            
+            # 2. Освобождение мьютекса
+            try:
+                kernel32 = ctypes.windll.kernel32
+                app_mut = globals().get('app_mutex')
+                if app_mut:
+                    kernel32.CloseHandle(app_mut)
+                    log_func("[Restart] Mutex освобожден")
+            except: pass
+            
+            time.sleep(0.5)
+            
+            # 3. Перезапуск процесса
+            log_func("[Restart] Запуск новой копии...")
+            if getattr(sys, 'frozen', False):
+                subprocess.Popen([sys.executable, "--show-log"], creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), "--show-log"], creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            time.sleep(0.3)
+            os._exit(0)
+        except Exception as e:
+            print(f"Restart failed: {e}")
+
+    import threading, time
+    threading.Thread(target=do_restart, daemon=True).start()
+
 # === FIX: Force Hide Console (Safeguard) ===
 # Проверяем, запущено ли как скомпилированный EXE
 is_compiled = getattr(sys, 'frozen', False) or (sys.argv[0].lower().endswith(".exe"))
@@ -1558,7 +1602,7 @@ try:
                         {
                             "type": "tun",
                             "tag": "tun-in",
-                            "interface_name": "NovaVoiceTun",
+                            "interface_name": "NovaVoice",
                             "inet4_address": "172.19.0.1/30",
                             "auto_route": True,
                             "strict_route": True,
@@ -1708,43 +1752,59 @@ try:
             return best_ip or "162.159.193.1"
 
         def nuke_warp_data(self):
-            """Physically deletes Warp registration data from ProgramData and Registry (Nuclear option)."""
+            """Resets local WARP runtime state and service registration."""
             try:
-                self.log_func("[RU] Глубокая очистка данных WARP...")
+                self.log_func("[RU] Сброс данных WARP...")
+                try:
+                    self.run_warp_cli("disconnect", timeout=8)
+                except:
+                    pass
+
                 self.stop_service()
-                time.sleep(2)
-                
-                # 1. Clear Registry Keys (Very important for IPC fixes)
-                try:
-                    import winreg
-                    for root_key in [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]:
-                        reg_path = r"SOFTWARE\Cloudflare"
-                        try:
-                            # Note: DeleteKey doesn't work on keys with subkeys in some Python versions
-                            # but for Cloudflare it usually works or we can use a loop
-                            winreg.DeleteKey(root_key, reg_path)
-                        except: pass
-                except: pass
+                for proc_name in ["warp-svc.exe", "warp-taskbar.exe", "Cloudflare WARP.exe", "warp-cli.exe"]:
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/IM", proc_name, "/T"],
+                            capture_output=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                    except:
+                        pass
 
-                # 2. Clear ProgramData Files
-                program_data = os.environ.get('ProgramData', 'C:\\ProgramData')
-                warp_data_dir = os.path.join(program_data, 'Cloudflare')
-                
-                if os.path.exists(warp_data_dir):
-                    for _ in range(3):
-                        try:
-                            shutil.rmtree(warp_data_dir, ignore_errors=True)
-                            if not os.path.exists(warp_data_dir): break
-                        except: pass
-                        time.sleep(1)
-                
-                # 3. Final cleanup of any potential lock files
-                try:
-                    subprocess.run(["sc", "delete", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                except: pass
+                time.sleep(1.0)
 
-                self.start_service()
-                time.sleep(5) # Give more time after full nuke
+                # Remove service registration (it will be recreated on next launch)
+                try:
+                    subprocess.run(
+                        ["sc", "delete", self.SERVICE_NAME],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except:
+                    pass
+
+                # Remove ProgramData + service profile runtime cache
+                try:
+                    import shutil
+                    pdata = os.environ.get('ProgramData', 'C:\\ProgramData')
+                    windir = os.environ.get('WINDIR', 'C:\\Windows')
+                    profile_dirs = [
+                        os.path.join(pdata, "Cloudflare"),
+                        os.path.join(windir, "System32", "config", "systemprofile", "AppData", "Local", "Cloudflare"),
+                        os.path.join(windir, "ServiceProfiles", "LocalService", "AppData", "Local", "Cloudflare"),
+                        os.path.join(windir, "ServiceProfiles", "NetworkService", "AppData", "Local", "Cloudflare"),
+                    ]
+
+                    for target_dir in profile_dirs:
+                        try:
+                            if os.path.exists(target_dir):
+                                shutil.rmtree(target_dir, ignore_errors=True)
+                        except:
+                            pass
+                except:
+                    pass
+
+                self.log_func("[RU] Сброс данных завершен.")
                 return True
             except Exception as e:
                 self.log_func(f"[RU] Ошибка глубокой очистки: {e}")
@@ -1758,155 +1818,359 @@ try:
             self.port = globals().get('WARP_PORT', 1370)
             self.port_legacy = globals().get('WARP_PORT_LEGACY', 1370)
             self.is_connected = False
-            self.service_process = None 
-            self.service_installed_by_us = False  # Track if we installed the service
-        
+            self.service_process = None
+            self.bootstrap_event = threading.Event()
+            self.bootstrap_ok = False
+
+        def mark_bootstrap(self, ok):
+            try:
+                self.bootstrap_ok = bool(ok)
+                self.bootstrap_event.set()
+            except:
+                pass
+
+        def wait_for_bootstrap(self, timeout=25):
+            try:
+                self.bootstrap_event.wait(timeout=max(0, timeout))
+                return bool(self.bootstrap_ok)
+            except:
+                return False
+
+        def _run_sc(self, *args, timeout=20):
+            try:
+                result = subprocess.run(
+                    ["sc"] + list(args),
+                    capture_output=True,
+                    timeout=timeout,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                return (
+                    result.returncode,
+                    self.decode_output(result.stdout),
+                    self.decode_output(result.stderr)
+                )
+            except Exception as e:
+                return -1, "", str(e)
+
+        def _set_service_proxy_environment(self, enable_proxy=True):
+            """Set service-specific proxy env so LocalSystem daemon can reach Cloudflare API."""
+            try:
+                import winreg
+                reg_path = fr"SYSTEM\CurrentControlSet\Services\{self.SERVICE_NAME}"
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE)
+
+                if enable_proxy:
+                    env = [
+                        "HTTP_PROXY=http://127.0.0.1:1371",
+                        "HTTPS_PROXY=http://127.0.0.1:1371",
+                        "NO_PROXY=127.0.0.1,localhost,::1",
+                        "http_proxy=http://127.0.0.1:1371",
+                        "https_proxy=http://127.0.0.1:1371",
+                        "no_proxy=127.0.0.1,localhost,::1",
+                    ]
+                    winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, env)
+                    if IS_DEBUG_MODE:
+                        self.log_func("[RU] [Diag] Прокси-окружение службы CloudflareWARP установлено (127.0.0.1:1371).")
+                else:
+                    try:
+                        winreg.DeleteValue(key, "Environment")
+                        if IS_DEBUG_MODE:
+                            self.log_func("[RU] [Diag] Прокси-окружение службы CloudflareWARP очищено.")
+                    except FileNotFoundError:
+                        pass
+
+                winreg.CloseKey(key)
+            except Exception as e:
+                if IS_DEBUG_MODE:
+                    self.log_func(f"[RU] [Diag] Не удалось обновить Environment службы: {e}")
+
+        def _check_direct_cloudflare_api(self, timeout=8):
+            """Return True if direct HTTPS to Cloudflare API is reachable (without proxy)."""
+            try:
+                import urllib.request
+                import urllib.error
+
+                # Check both host forms: normal and trailing-dot FQDN used by daemon logs.
+                endpoints = [
+                    "https://api.cloudflareclient.com/v0/reg",
+                    "https://api.cloudflareclient.com./v0/reg",
+                ]
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+                for url in endpoints:
+                    req = urllib.request.Request(url, method="GET")
+                    try:
+                        with opener.open(req, timeout=timeout):
+                            return True
+                    except urllib.error.HTTPError:
+                        # Any HTTP response means transport path is reachable.
+                        return True
+                    except:
+                        continue
+            except:
+                pass
+            return False
+
+        def _ensure_opera_proxy_ready(self, timeout=12):
+            """Ensure local Opera proxy is reachable on 127.0.0.1:1371."""
+            import socket
+            try:
+                opm = globals().get("opera_proxy_manager")
+                if opm:
+                    opm.start()
+            except:
+                pass
+
+            start_t = time.time()
+            while time.time() - start_t < timeout:
+                if is_closing:
+                    return False
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.4)
+                        if s.connect_ex(('127.0.0.1', 1371)) == 0:
+                            return True
+                except:
+                    pass
+                time.sleep(0.25)
+            return False
+
         def is_service_installed(self):
             """Check if CloudflareWARP service is installed."""
-            try:
-                result = subprocess.run(
-                    ["sc", "query", self.SERVICE_NAME],
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                return result.returncode == 0
-            except:
-                return False
-        
+            rc, _, _ = self._run_sc("query", self.SERVICE_NAME)
+            return rc == 0
+
         def is_service_running(self):
             """Check if CloudflareWARP service is running."""
-            try:
-                result = subprocess.run(
-                    ["sc", "query", self.SERVICE_NAME],
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                out = self.decode_output(result.stdout)
-                return "RUNNING" in out.upper()
-            except:
-                return False
+            rc, out, _ = self._run_sc("query", self.SERVICE_NAME)
+            return rc == 0 and "RUNNING" in (out or "").upper()
         
-        def install_service(self):
-            """Install CloudflareWARP service from bin folder (requires admin)."""
-            if not os.path.exists(self.warp_svc_path):
-                self.log_func("[RU] warp-svc.exe не найден!")
-                return False
-            
+        def _log_warp_service_log_tail(self, lines=12):
             try:
-                self.log_func("[RU] Установка службы CloudflareWARP...")
-                # Split parameters into separate arguments to ensure space handling is perfect
-                quoted_path = f'"{self.warp_svc_path}"'
-                cmd = [
-                    "sc", "create", self.SERVICE_NAME, 
-                    "binPath=", quoted_path,
-                    "start=", "demand",
-                    "DisplayName=", "Cloudflare WARP (Nova)"
+                pdata = os.environ.get('ProgramData', 'C:\\ProgramData')
+                cf_dir = os.path.join(pdata, "Cloudflare")
+                candidates = [
+                    ("warp-svc.log", os.path.join(cf_dir, "warp-svc.log")),
+                    ("cfwarp_service_log.txt", os.path.join(cf_dir, "cfwarp_service_log.txt")),
                 ]
-                
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW
+
+                found_any = False
+                for label, path in candidates:
+                    if not os.path.exists(path):
+                        continue
+
+                    found_any = True
+                    with open(path, "r", errors="ignore") as f:
+                        all_lines = f.readlines()
+                    tail = all_lines[-lines:]
+                    if tail:
+                        self.log_func(f"[RU] [Diag] Последние строки {label}:")
+                        for line in tail:
+                            line = line.rstrip()
+                            if line:
+                                low = line.lower()
+                                # Skip ultra-noisy telemetry blobs to keep startup logs readable.
+                                if "upload_stats{" in low or "statspayload" in low:
+                                    continue
+                                if len(line) > 520:
+                                    line = line[:520] + " ...[truncated]"
+                                self.log_func(f"[RU] [Diag] {line}")
+                    else:
+                        self.log_func(f"[RU] [Diag] {label} найден, но пуст.")
+
+                    # Detect known hang pattern: daemon watchdog kill on API timeout.
+                    recent = [ln.lower() for ln in all_lines[-220:]]
+                    if any("warp ipc listening" in ln for ln in recent):
+                        self.log_func("[RU] [Diag] Daemon поднял IPC, но завис в main loop.")
+                    if any(("api.cloudflareclient.com" in ln and "timedout" in ln) for ln in recent):
+                        self.log_func("[RU] [Diag] Есть таймауты к api.cloudflareclient.com (прямой выход из daemon блокируется/ломается).")
+                    if any("watchdog is shutting down an overly hung daemon" in ln for ln in recent):
+                        self.log_func("[RU] [Diag] Daemon остановлен watchdog из-за зависания.")
+
+                if not found_any:
+                    self.log_func("[RU] [Diag] Логи службы Cloudflare не найдены в ProgramData\\Cloudflare.")
+            except Exception as e:
+                self.log_func(f"[RU] [Diag] Ошибка чтения логов службы: {e}")
+
+        def _log_service_diagnostics(self):
+            for cmd in (
+                ("query", self.SERVICE_NAME),
+                ("queryex", self.SERVICE_NAME),
+                ("qc", self.SERVICE_NAME),
+            ):
+                rc, out, err = self._run_sc(*cmd)
+                msg = (out or err or "").strip().replace("\r", " ").replace("\n", " | ")
+                if len(msg) > 420:
+                    msg = msg[:420] + "..."
+                self.log_func(f"[RU] [Diag] sc {' '.join(cmd)} -> rc={rc}; {msg or 'no output'}")
+
+        def _ensure_service_registered(self):
+            quoted_path = f'"{self.warp_svc_path}"'
+
+            rc, out, err = self._run_sc("query", self.SERVICE_NAME)
+            query_msg = f"{out}\n{err}".lower()
+            service_missing = (
+                rc != 0 and (
+                    "1060" in query_msg or
+                    "does not exist" in query_msg or
+                    "не существует" in query_msg
                 )
-                
-                stdout = self.decode_output(result.stdout)
-                if result.returncode == 0 or "EXISTS" in stdout.upper():
-                    # Update path anyway
+            )
+
+            if service_missing:
+                rc, out, err = self._run_sc(
+                    "create", self.SERVICE_NAME,
+                    "binPath=", quoted_path,
+                    "type=", "own",
+                    "start=", "demand",
+                    "obj=", "LocalSystem",
+                    "DisplayName=", "Cloudflare WARP (Nova)"
+                )
+                if rc != 0:
+                    msg = (err or out or f"code {rc}").strip()
+                    self.log_func(f"[RU] Ошибка создания службы: {msg}")
+                    return False
+
+            rc, out, err = self._run_sc(
+                "config", self.SERVICE_NAME,
+                "binPath=", quoted_path,
+                "type=", "own",
+                "start=", "demand",
+                "obj=", "LocalSystem",
+                "DisplayName=", "Cloudflare WARP (Nova)"
+            )
+            if rc != 0:
+                msg = (err or out or f"code {rc}").strip()
+                self.log_func(f"[RU] Ошибка конфигурации службы: {msg}")
+                return False
+
+            return True
+
+        def start_service(self):
+            """Start warp-svc.exe as a deterministic Windows service."""
+            try:
+                if not os.path.exists(self.warp_svc_path):
+                    self.log_func(f"[RU] ОШИБКА: Бинарный файл {self.warp_svc_path} не найден!")
+                    return False
+
+                # Keep WARP helper GUI processes away from service bootstrap.
+                for proc_name in ["warp-taskbar.exe", "Cloudflare WARP.exe", "warp-cli.exe", "warp-svc.exe"]:
                     subprocess.run(
-                        ["sc", "config", self.SERVICE_NAME, "binPath=", quoted_path],
+                        ["taskkill", "/F", "/IM", proc_name, "/T"],
+                        capture_output=True,
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
-                    self.service_installed_by_us = True
-                    self.log_func("[RU] Служба установлена.")
-                    return True
-                else:
-                    stderr = self.decode_output(result.stderr)
-                    err_msg = stderr or stdout
-                    self.log_func(f"[RU] Ошибка установки службы (Код {result.returncode}): {err_msg}")
-                    return False
-            except Exception as e:
-                self.log_func(f"[RU] Исключение при установке службы: {e}")
-                return False
-        
-        def start_service(self):
-            """Start warp-svc.exe as a clean Windows Service."""
-            try:
-                # 1. HARD CLEANUP: Kill all possible Cloudflare processes
-                # Official app might be running and locking the IPC pipe
-                for proc_name in ["warp-svc.exe", "warp-taskbar.exe", "Cloudflare WARP.exe"]:
-                    subprocess.run(["taskkill", "/F", "/IM", proc_name], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                
-                # Stop official service if it exists (conflicts with our portable version)
-                subprocess.run(["sc", "stop", "Cloudflare WARP"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                
-                # Stop our service
-                subprocess.run(["sc", "stop", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                subprocess.run(["sc", "delete", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                time.sleep(1.5)
-                
+
+                try:
+                    pdata = os.environ.get('ProgramData', 'C:\\ProgramData')
+                    cf_dir = os.path.join(pdata, "Cloudflare")
+                    os.makedirs(cf_dir, exist_ok=True)
+                except:
+                    pass
+
+                def _start_and_wait_ipc():
+                    rc, out, err = self._run_sc("start", self.SERVICE_NAME, timeout=12)
+                    start_msg = f"{out}\n{err}".lower()
+                    if rc != 0 and not any(x in start_msg for x in ["1056", "already running", "already been started"]):
+                        return False, "Unknown", (err or out or f"code {rc}").strip()
+
+                    self.log_func("[RU] Ожидание инициализации службы...")
+                    last_status = "Unknown"
+                    last_error = ""
+                    for _ in range(50):
+                        if is_closing:
+                            return False, last_status, "closing"
+
+                        if not self.is_service_running():
+                            time.sleep(0.4)
+                            continue
+
+                        status_result = self.run_warp_cli("status", timeout=8)
+                        if status_result:
+                            status_text = (status_result.stdout or "").strip()
+                            err_text = (status_result.stderr or "").strip()
+                            if status_result.returncode == 0 and status_text and "Unable" not in status_text and "Unknown" not in status_text:
+                                return True, status_text, ""
+                            if status_text:
+                                last_status = status_text
+                            if err_text:
+                                last_error = err_text
+                        else:
+                            last_error = "timeout"
+
+                        time.sleep(0.5)
+
+                    return False, last_status, last_error
+
+                self._run_sc("stop", self.SERVICE_NAME, timeout=10)
+                time.sleep(0.8)
+
                 self.log_func("[RU] Установка и запуск службы...")
-                
-                # 2. Re-create service with absolute paths and quotes
-                quoted_path = f'"{self.warp_svc_path}"'
-                cmd = [
-                    "sc", "create", self.SERVICE_NAME, 
-                    "binPath=", quoted_path,
-                    "start=", "demand",
-                    "DisplayName=", "Cloudflare WARP (Nova)"
-                ]
-                subprocess.run(cmd, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                
-                # 3. Start service
-                result = subprocess.run(["sc", "start", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                
-                # 4. Wait for IPC response
-                for i in range(10): # 5s wait
-                    status = self.get_status()
-                    if status and "Unable" not in status and "Unknown" not in status:
-                        return True
-                    time.sleep(0.5)
-                return True
+                if not self._ensure_service_registered():
+                    self._log_service_diagnostics()
+                    return False
+
+                # Policy requested: direct path first, then fallback through Opera proxy.
+                launch_mode = "direct"
+                if self._check_direct_cloudflare_api(timeout=8):
+                    self._set_service_proxy_environment(enable_proxy=False)
+                    self.log_func("[RU] [Diag] Режим запуска WARP: direct (без прокси).")
+                else:
+                    self.log_func("[RU] [Diag] Прямой доступ к Cloudflare API недоступен. Включаем fallback через Opera VPN прокси...")
+                    if self._ensure_opera_proxy_ready(timeout=12):
+                        self._set_service_proxy_environment(enable_proxy=True)
+                        launch_mode = "opera_proxy"
+                        self.log_func("[RU] [Diag] Режим запуска WARP: Opera VPN proxy fallback.")
+                    else:
+                        self._set_service_proxy_environment(enable_proxy=False)
+                        self.log_func("[RU] [Warning] Opera VPN прокси недоступен. Пробуем запуск службы напрямую.")
+
+                ok, last_status, last_error = _start_and_wait_ipc()
+                if ok:
+                    return True
+
+                # If direct path failed to raise IPC, force a second attempt via Opera proxy.
+                if not is_closing and launch_mode == "direct":
+                    self.log_func("[RU] [Warning] Direct-режим не поднял IPC. Повтор запуска через Opera VPN прокси...")
+                    if self._ensure_opera_proxy_ready(timeout=15):
+                        self._run_sc("stop", self.SERVICE_NAME, timeout=10)
+                        time.sleep(0.8)
+                        self._set_service_proxy_environment(enable_proxy=True)
+                        ok2, status2, err2 = _start_and_wait_ipc()
+                        if ok2:
+                            self.log_func("[RU] [Diag] Служба поднялась после fallback через Opera VPN прокси.")
+                            return True
+                        if status2:
+                            last_status = status2
+                        if err2:
+                            last_error = err2
+                    else:
+                        self.log_func("[RU] [Warning] Opera VPN прокси недоступен. Повторный fallback пропущен.")
+
+                self.log_func("[RU] [Warning] Служба не отвечает на IPC.")
+                if last_status and last_status != "Unknown":
+                    self.log_func(f"[RU] [Diag] Последний статус: {last_status}")
+                if last_error:
+                    self.log_func(f"[RU] [Diag] Последняя ошибка warp-cli: {last_error}")
+
+                self._log_service_diagnostics()
+                self._log_warp_service_log_tail()
+                self.log_func("[RU] [Hint] Если есть таймауты к api.cloudflareclient.com, убедитесь что домен в general, не в exclude, и проверьте IPv6/маршрутизацию.")
+                return False
             except Exception as e:
                 self.log_func(f"[RU] Ошибка запуска службы: {e}")
                 return False
-        
-        def stop_service(self):
-            """Stop and remove the CloudflareWARP service."""
-            try:
-                subprocess.run(["sc", "stop", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                # We don't delete on manual stop to save time, only on full start
-                subprocess.run(["taskkill", "/F", "/IM", "warp-svc.exe"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            except: pass
-        
-        def uninstall_service(self):
-            """Uninstall the CloudflareWARP service (only if we installed it)."""
-            if not self.service_installed_by_us:
-                return
-            
-            try:
-                self.log_func("[RU] Удаление временной службы...")
-                self.stop_service()
-                import time
-                time.sleep(1)
-                subprocess.run(
-                    ["sc", "delete", self.SERVICE_NAME],
-                    capture_output=True, text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                self.log_func("[RU] Служба удалена.")
-            except Exception as e:
-                self.log_func(f"[RU] Ошибка удаления службы: {e}")
-        
+
         def ensure_service(self):
             """Ensure warp-svc.exe is running as a service."""
-            # For reliability, we always re-install on cold start
+            # If service is already running and IPC is responsive, don't restart it
+            if self.is_service_running():
+                status = self.get_status()
+                if status and "Unable" not in status and "Unknown" not in status:
+                    return True
+            
+            # Otherwise, perform a clean restart
             return self.start_service()
-        
-        def is_port_open(self, port):
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                return s.connect_ex(('127.0.0.1', port)) == 0
 
         def run_warp_cli(self, *args, timeout=30):
             """Run warp-cli command and return result."""
@@ -1916,31 +2180,28 @@ try:
             try:
                 cmd = [self.warp_cli_path] + list(args)
                 
-                # --- FAILOVER PROXY LOGIC ---
-                # For registration/account tasks, use a proxy to bypass blocks.
-                # Priority: 1370 (Warp itself/existing) -> 1371 (Opera VPN)
+                # Setup Environment
                 env = os.environ.copy()
-                env["NO_PROXY"] = "127.0.0.1,localhost"
+                # Prevent inherited proxies from breaking local daemon IPC.
+                for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
+                    env.pop(key, None)
+                env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+                env["no_proxy"] = "127.0.0.1,localhost,::1"
                 
                 is_reg_cmd = any(x in args for x in ["registration", "account", "license"])
                 
                 if is_reg_cmd and not is_closing:
                     proxy_to_use = None
-                    # 1. Try 1370 first (if it's already up)
-                    if self.is_port_open(1370):
-                        proxy_to_use = "http://127.0.0.1:1370"
-                    else:
-                        # 2. If 1370 is down, wait for 1371 (Opera)
-                        for _ in range(10):
-                            if is_closing or self.is_port_open(1371): break
-                            time.sleep(1)
+                    # Use Opera (1371) IF main kernel is NOT yet active (failsafe)
+                    if not globals().get('is_service_active', False):
                         if self.is_port_open(1371):
                             proxy_to_use = "http://127.0.0.1:1371"
                     
                     if proxy_to_use and not is_closing:
                         env["HTTPS_PROXY"] = proxy_to_use
                         env["HTTP_PROXY"] = proxy_to_use
-                        # if IS_DEBUG_MODE: self.log_func(f"[RU] Регистрация через прокси {proxy_to_use}")
+                        env["https_proxy"] = proxy_to_use
+                        env["http_proxy"] = proxy_to_use
 
                 if is_closing: return None
 
@@ -2013,27 +2274,19 @@ try:
                 return
             
             self._is_starting_now = True
+            self.bootstrap_ok = False
+            try:
+                self.bootstrap_event.clear()
+            except:
+                pass
             my_run_id = SERVICE_RUN_ID
             
             try:
                 # Ensure service is running
                 if not self.ensure_service():
+                    self.mark_bootstrap(False)
                     self.log_func("[RU] Не удалось запустить службу!")
                     return
-                
-                # --- SYNC WITH WINWS ---
-                # Instant sync: check if winws is starting or already active
-                if not (is_service_active or is_restarting):
-                    # Only wait if absolutely nothing is happening
-                    max_wait_winws = 5
-                    for _ in range(max_wait_winws * 5):
-                        if is_closing or SERVICE_RUN_ID != my_run_id: return
-                        if is_service_active or is_restarting: break
-                        time.sleep(0.2)
-                
-                if SERVICE_RUN_ID != my_run_id: return
-                
-                # No extra sleep needed here, winws logic has its own buffers
 
                 # Wait for daemon to be responsive
                 status = "Unknown"
@@ -2042,12 +2295,20 @@ try:
                     status = self.get_status()
                     if status and "Unable" not in status and "Unknown" not in status:
                         break
+                    
+                    # if i > 0 and i % 30 == 0:
+                    #     # self.log_func(f"[RU] Проверка связи с демоном ({int(i*0.3)} сек)...")
+                    #     pass
+                        
                     time.sleep(0.3)
 
                 if SERVICE_RUN_ID != my_run_id: return
                 if "Unable to connect" in status or "Unknown" in status:
+                    self.mark_bootstrap(False)
                     self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
                     return
+                else:
+                    self.mark_bootstrap(True)
 
                 # Check if registration is needed
                 if "Registration Missing" in status:
@@ -2073,15 +2334,14 @@ try:
                                 continue
 
                             if any(x in last_error.lower() for x in ["old registration", "registration delete", "already exists", "conflict"]):
-                                if attempt == 0:
-                                    self.log_func(f"[RU] Очистка старой регистрации...")
-                                    self.run_warp_cli("registration", "delete")
-                                else:
-                                    self.nuke_warp_data()
+                                self.log_func("[RU] Очистка старой регистрации...")
+                                self.run_warp_cli("registration", "delete")
+                                time.sleep(1.0)
                                 continue 
                         time.sleep(1)
                     
                     if not reg_success:
+                        self.mark_bootstrap(False)
                         self.log_func(f"[RU] Ошибка регистрации: {last_error}")
                         return
                     status = self.get_status()
@@ -2100,7 +2360,7 @@ try:
 
                 # Check if already connected
                 if "Connected" in status:
-                    if self.check_port(self.port):
+                    if self.is_port_open(self.port):
                         self.log_func(f"[RU] {self.port} готов")
                         self.is_connected = True
                     else:
@@ -2168,6 +2428,8 @@ try:
                 if IS_DEBUG_MODE: traceback.print_exc()
 
             finally:
+                if not self.bootstrap_event.is_set():
+                    self.mark_bootstrap(False)
                 self._is_starting_now = False
 
         def stop_service(self):
@@ -2181,13 +2443,15 @@ try:
                 subprocess.run(["sc", "stop", self.SERVICE_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
             except: pass
 
-        def check_port(self, port):
+        def is_port_open(self, port):
             import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', port))
-            sock.close()
-            return result == 0
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(('127.0.0.1', port))
+                sock.close()
+                return result == 0
+            except: return False
 
         def wait_for_connection(self, timeout=20):
              import time
@@ -2197,7 +2461,7 @@ try:
                  status = self.get_status()
                  if "Connected" in status:
                      # Check port
-                     if self.check_port(self.port):
+                     if self.is_port_open(self.port):
                          # --- EXTRACT DETAILS via tunnel stats ---
                          details = ""
                          stats_res = self.run_warp_cli("tunnel", "stats")
@@ -2816,6 +3080,88 @@ function FindProxyForURL(url, host) {{
         
         return res
 
+    def ensure_warp_control_exclusions(log_func=None):
+        """Route Cloudflare API host through General strategy and keep only service-side excludes."""
+        try:
+            base_dir = get_base_dir()
+            ex_path = os.path.join(base_dir, "list", "exclude.txt")
+            gen_path = os.path.join(base_dir, "list", "general.txt")
+
+            api_domains = {"api.cloudflareclient.com", "api.cloudflareclient.com."}
+            general_required = ["api.cloudflareclient.com", "api.cloudflareclient.com."]
+            required_excludes = [
+                "engage.cloudflareclient.com",
+                "connectivity.cloudflareclient.com",
+                "connectivity-check.warp-svc",
+                "notifications.cloudflareclient.com",
+            ]
+
+            ex_lines = []
+            if os.path.exists(ex_path):
+                with open(ex_path, "r", encoding="utf-8") as f:
+                    ex_lines = f.read().splitlines()
+
+            new_ex_lines = []
+            removed_from_exclude = 0
+            existing_ex = set()
+
+            for ln in ex_lines:
+                raw = ln.strip()
+                if not raw:
+                    new_ex_lines.append(ln)
+                    continue
+                if raw.startswith("#"):
+                    new_ex_lines.append(ln)
+                    continue
+
+                if raw.lower() in api_domains:
+                    removed_from_exclude += 1
+                    continue
+
+                existing_ex.add(raw.lower())
+                new_ex_lines.append(raw)
+
+            added_excludes = 0
+            for d in required_excludes:
+                if d.lower() not in existing_ex:
+                    new_ex_lines.append(d)
+                    existing_ex.add(d.lower())
+                    added_excludes += 1
+
+            exclude_changed = (new_ex_lines != ex_lines) or (not os.path.exists(ex_path))
+            if exclude_changed:
+                with open(ex_path, "w", encoding="utf-8") as f:
+                    for ln in new_ex_lines:
+                        f.write(f"{ln}\n")
+
+            # Ensure API endpoint is in general list for default strategy processing.
+            gen_lines = []
+            if os.path.exists(gen_path):
+                with open(gen_path, "r", encoding="utf-8") as f:
+                    gen_lines = f.read().splitlines()
+
+            existing_gen = {ln.strip().lower() for ln in gen_lines if ln.strip() and not ln.strip().startswith("#")}
+            added_to_general = 0
+            for d in general_required:
+                if d.lower() not in existing_gen:
+                    gen_lines.append(d)
+                    existing_gen.add(d.lower())
+                    added_to_general += 1
+
+            if added_to_general:
+                with open(gen_path, "w", encoding="utf-8") as f:
+                    for ln in gen_lines:
+                        f.write(f"{ln}\n")
+
+            if log_func and (exclude_changed or added_to_general):
+                log_func(
+                    f"[Init] Маршрутизация Cloudflare API: general +{added_to_general}, "
+                    f"exclude -{removed_from_exclude}, служебных exclude +{added_excludes}"
+                )
+        except Exception as e:
+            if log_func and IS_DEBUG_MODE:
+                log_func(f"[Init] Не удалось обновить правила Cloudflare API: {e}")
+
     def load_strategies_from_file(filepath):
         if not os.path.exists(filepath): return {}
         try:
@@ -3069,38 +3415,39 @@ function FindProxyForURL(url, host) {{
 
     def check_single_instance():
         kernel32 = ctypes.windll.kernel32
-        # FIX: Retry loop for auto-update restart race condition
-        # Old process might take a moment to release the mutex
         for i in range(10): 
             app_mutex = kernel32.CreateMutexW(None, False, "Nova_Unique_Mutex_Lock")
             last_err = kernel32.GetLastError()
             
             if last_err == 183: # ERROR_ALREADY_EXISTS
-                # Mutex exists, maybe old process is still closing?
-                # Close the handle we just grabbed to avoid leaking/keeping it alive
                 kernel32.CloseHandle(app_mutex)
+                try:
+                    # Пытаемся найти окно по частичному соответствию заголовка
+                    def enum_windows_proc(hwnd, lParam):
+                        window_text = ctypes.create_unicode_buffer(512)
+                        ctypes.windll.user32.GetWindowTextW(hwnd, window_text, 512)
+                        if f"Nova v" in window_text.value:
+                            ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
+                            ctypes.windll.user32.SetForegroundWindow(hwnd)
+                            return False # Stop enumeration
+                        return True
+                    
+                    EnumWindows = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+                    ctypes.windll.user32.EnumWindows(EnumWindows(enum_windows_proc), 0)
+                    sys.exit(0)
+                except: pass
+                
                 time.sleep(0.3)
                 continue
-            
-            # Success!
             return app_mutex
-
-        # If we got here, Mutex is still held after 3 seconds
+        
         try:
-            temp_root = tk.Tk()
-            temp_root.withdraw()
-            # Make sure window is top level to be seen
-            temp_root.attributes("-topmost", True)
-            
-            # Check if we were restarted (auto-update)
-            msg = "Программа уже запущена!"
-            if "--updated" in sys.argv:
-                msg += "\n(Ошибка обновления: предыдущая версия не закрылась)"
-                
-            messagebox.showerror("Ошибка запуска", msg)
+            temp_root = tk.Tk(); temp_root.withdraw(); temp_root.attributes("-topmost", True)
+            msg = "Программа уже запущена!\n\nПроверьте системный трей (возле часов) или завершите процессы pythonw.exe / Nova.exe в Диспетчере задач."
+            messagebox.showerror("Nova - Ошибка запуска", msg)
             temp_root.destroy()
         except: pass
-        sys.exit()
+        sys.exit(1)
 
     class POINT(ctypes.Structure): _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
     def is_monitor_available(x, y):
@@ -3394,6 +3741,7 @@ function FindProxyForURL(url, host) {{
     def smart_update_general(new_domains_list=None):
         with general_list_lock:
             filepath = os.path.join(get_base_dir(), "list", "general.txt")
+            preserve_exact_domains = {"api.cloudflareclient.com", "api.cloudflareclient.com."}
             
             current_lines = []
             version_header = f"# version: {CURRENT_VERSION}\n"
@@ -3409,13 +3757,25 @@ function FindProxyForURL(url, host) {{
             unique_domains = set()
             for line in current_lines:
                 raw = line.split('#')[0].strip() # Skip comments
-                if not raw: continue
-                unique_domains.add(get_registered_domain(raw))
+                if not raw:
+                    continue
+                raw_l = raw.lower()
+                if raw_l in preserve_exact_domains:
+                    unique_domains.add(raw_l)
+                else:
+                    unique_domains.add(get_registered_domain(raw))
                 
             if new_domains_list:
                 for d in new_domains_list:
-                    clean_new = get_registered_domain(d)
-                    if clean_new: unique_domains.add(clean_new)
+                    raw_new = str(d).split('#')[0].strip().lower()
+                    if not raw_new:
+                        continue
+                    if raw_new in preserve_exact_domains:
+                        unique_domains.add(raw_new)
+                    else:
+                        clean_new = get_registered_domain(raw_new)
+                        if clean_new:
+                            unique_domains.add(clean_new)
             
             sorted_list = sorted(list(unique_domains))
             
@@ -4229,54 +4589,19 @@ function FindProxyForURL(url, host) {{
         context_menu.configure(postcommand=update_autostart_label)
         context_menu.add_separator()
 
+        def force_reset_warp_ui():
+            global warp_manager
+            if warp_manager:
+                def run_nuke():
+                    warp_manager.nuke_warp_data()
+                    log_print("[RU] Сброс WARP выполнен. Перезапустите программу.")
+                threading.Thread(target=run_nuke, daemon=True).start()
+
+        context_menu.add_command(label="Сбросить WARP (Очистка)", command=force_reset_warp_ui)
+        context_menu.add_separator()
         
-        def restart_nova():
-            """Перезапускает Nova: корректная остановка -> перезапуск"""
-            def do_restart():
-                try:
-                    # Step 1: Stop service properly (like clicking STOP button)
-                    log_print("[Restart] Остановка Nova...")
-                    stop_nova_service(silent=False, wait_for_cleanup=True)
-                    
-                    # Step 2: Release mutex immediately (no need to wait)
-                    mutex_released = False
-                    try:
-                        kernel32 = ctypes.windll.kernel32
-                        if 'app_mutex' in globals() and app_mutex:
-                            # Check if mutex handle is valid before closing
-                            kernel32.CloseHandle(app_mutex)
-                            mutex_released = True
-                            log_print("[Restart] Mutex освобожден")
-                    except Exception as e:
-                        log_print(f"[Restart] Предупреждение: не удалось освободить mutex: {e}")
-                    
-                    # Step 3: Short wait for cleanup (reduced from 1.5s to 0.5s)
-                    time.sleep(0.5)
-                    
-                    # Step 4: Restart application with --show-log flag
-                    log_print("[Restart] Перезапуск Nova...")
-                    
-                    # Get current executable path
-                    if getattr(sys, 'frozen', False):
-                        # Running as compiled .exe
-                        current_exe = sys.executable
-                        # Add --show-log argument to open log window on restart
-                        subprocess.Popen([current_exe, "--show-log"], creationflags=subprocess.CREATE_NO_WINDOW)
-                    else:
-                        # Running as .pyw script
-                        current_exe = sys.executable
-                        script_path = os.path.abspath(__file__)
-                        subprocess.Popen([current_exe, script_path, "--show-log"], creationflags=subprocess.CREATE_NO_WINDOW)
-                    
-                    # Step 5: Exit current instance (reduced delay)
-                    time.sleep(0.3)
-                    os._exit(0)
-                    
-                except Exception as e:
-                    log_print(f"[Restart] Ошибка перезапуска: {e}")
-            
-            # Run restart in separate thread to avoid blocking UI
-            threading.Thread(target=do_restart, daemon=True).start()
+        # restart_nova moved to GLOBAL scope to be accessible from all menus
+        pass 
         
         context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
 
@@ -5246,7 +5571,7 @@ function FindProxyForURL(url, host) {{
                         with ip_cache_lock:
                             with open(IP_CACHE_FILE, "a", encoding="utf-8") as f:
                                 f.write("\n" + "\n".join(resolved_ips))
-                        log_func(f"[Auto-Exclude] Кэш IP обновлен (+{len(resolved_ips)}).")
+                            os.utime(IP_CACHE_FILE, None) # Обновляем дату изменения файла
                     except Exception as e:
                         log_func(f"[Auto-Exclude] Ошибка записи IP: {e}")
                 
@@ -5380,7 +5705,6 @@ function FindProxyForURL(url, host) {{
                 while not is_closing:
                     time_since_last = time.time() - last_strategy_check_time
                     if time_since_last >= 600:  # 10 minutes
-                        # Cooldown complete
                         break
                     
                     if is_closing:
@@ -6186,9 +6510,20 @@ function FindProxyForURL(url, host) {{
                                 if proc.returncode in (34, 177) or \
                                    ("service cannot be started" in err_msg and "disabled" in err_msg) or \
                                    ("device which does not exist" in err_msg):
-                                    log_func(f"[Check] Обнаружена проблема с драйвером (Code {proc.returncode}). Запуск восстановления...")
-                                    try: repair_windivert_driver(log_func)
-                                    except: pass
+                                    
+                                    # Ограничиваем количество попыток ремонта
+                                    repair_attempts = getattr(self, '_repair_attempts', 0)
+                                    if repair_attempts < 3:
+                                        log_func(f"[Check] Обнаружена проблема с драйвером (Code {proc.returncode}). Запуск восстановления...")
+                                        try: 
+                                            repair_windivert_driver(log_func)
+                                            self._repair_attempts = repair_attempts + 1
+                                        except: pass
+                                    else:
+                                        log_func(f"[Error] Не удалось восстановить драйвер WinDivert после 3 попыток. Проверьте 'Изоляцию ядра' в Windows.")
+                                        # Больше не пытаемся чинить в этой сессии
+                                        time.sleep(60) 
+                                    
                                     time.sleep(1.0)
                                     continue # Retry immediately
                                 
@@ -9297,82 +9632,6 @@ function FindProxyForURL(url, host) {{
         except: pass
         return added_new
 
-    def cleanup_redundant_domains_worker(log_func):
-        """
-        Фоновая задача: удаляет домены из general.txt, если они уже есть в специфических списках.
-        Запускается один раз при старте. Если были изменения -> Hot Restart.
-        """
-        time.sleep(10) # Даем системе прогрузиться
-        
-        try:
-            base_dir = get_base_dir()
-            general_path = os.path.join(base_dir, "list", "general.txt")
-            
-            if not os.path.exists(general_path): return
-            
-            # 1. Загружаем general
-            general_domains = set()
-            with open(general_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                
-            header = None
-            if lines and lines[0].strip().startswith("# version"):
-                header = lines[0]
-                
-            for line in lines:
-                d = line.split('#')[0].strip().lower()
-                if d and not line.strip().startswith("#"): general_domains.add(d)
-                
-            if not general_domains: return
-            
-            # 2. Собираем все "специальные" домены (из всех остальных списков)
-            special_domains = set()
-            
-            # Стратегии, определенные в файлах
-            strat_files = [f for f in os.listdir(os.path.join(base_dir, "list")) if f.endswith(".txt") and f != "general.txt" and not f.startswith("exclude")]
-            
-            for fname in strat_files:
-                fpath = os.path.join(base_dir, "list", fname)
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        for line in f:
-                            d = line.split('#')[0].strip().lower()
-                            if d: special_domains.add(d)
-                except: pass
-                
-            # 3. Ищем пересечения
-            duplicates = general_domains.intersection(special_domains)
-            
-            if duplicates:
-                log_func(f"[Cleanup] Найдено {len(duplicates)} дубликатов в general.txt (есть в других стратегиях). Удаляем...")
-                
-                # 4. Удаляем из general
-                new_general_content = []
-                # Сохраняем генеральный список без дубликатов, с сортировкой
-                final_domains = sorted(list(general_domains - duplicates))
-                
-                # FIX: Ensure we write back the CORRECT version header to avoid re-update loop
-                new_general_content = [f"# version: {CURRENT_VERSION}\n"]
-                
-                for d in final_domains:
-                     new_general_content.append(f"{d}\n")
-                     
-                with general_list_lock:
-                    with open(general_path, "w", encoding="utf-8") as f:
-                        f.writelines(new_general_content)
-                        
-                log_func(f"[Cleanup] general.txt очищен. Требуется перезапуск ядра.")
-                
-                # 5. Hot Restart для применения изменений
-                if root: root.after(1000, perform_hot_restart)
-            
-            else:
-                # log_func("[Cleanup] Дубликатов в general.txt не найдено.")
-                pass
-                
-        except Exception as e:
-            log_func(f"[Cleanup] Ошибка при очистке дубликатов: {e}")
-
     # ================= НОВЫЕ ФУНКЦИИ (Hard Checker & Robust Check) =================
 
     # Состояние для отслеживания замедленных доменов
@@ -12149,7 +12408,6 @@ function FindProxyForURL(url, host) {{
         threading.Thread(target=batch_exclude_worker, args=(log_func,), daemon=True).start()
         
         threading.Thread(target=domain_cleaner_worker, args=(log_func,), daemon=True).start()
-        threading.Thread(target=cleanup_redundant_domains_worker, args=(log_func,), daemon=True).start()
 
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
@@ -12167,6 +12425,9 @@ function FindProxyForURL(url, host) {{
 
         # === SYNC INIT: Dependencies MUST exist before we try to launch anything ===
         logger = globals().get('log_print', safe_trace)
+
+        pass
+
         def update_loading_status_sync(msg):
             try:
                 if 'status_label' in globals() and 'root' in globals() and root:
@@ -12183,6 +12444,30 @@ function FindProxyForURL(url, host) {{
             # Show "STARTING" only after successful download
             update_loading_status_sync("ЗАПУСК . . .")
 
+            # Kill stale WinWS/driver BEFORE WARP bootstrap, otherwise old filters
+            # can block daemon API startup and trigger watchdog panic.
+            try:
+                logger("[Init] Предочистка WinWS/Windivert перед запуском WARP...")
+                for p in [WINWS_FILENAME, "winws.exe", "winws_test.exe"]:
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/IM", p, "/T"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                    except:
+                        pass
+                subprocess.run(
+                    ["sc", "stop", "windivert"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                time.sleep(0.4)
+            except:
+                pass
+
         # === ASYNC INIT WRAPPER for background services ===
         def start_bg_services():
             try:
@@ -12196,36 +12481,30 @@ function FindProxyForURL(url, host) {{
                 global warp_manager, pac_manager, opera_proxy_manager, sing_box_manager
                 if not warp_manager: warp_manager = WarpManager(log_func=safe_log)
                 if not pac_manager: pac_manager = PacManager(log_func=safe_log)
-                if 'sing_box_manager' not in globals() or not sing_box_manager: 
+                
+                # sing_box_manager can be None here if not initialized in main
+                if not sing_box_manager: 
                     sing_box_manager = SingBoxManager(log_func=safe_log)
+                
                 if not opera_proxy_manager: opera_proxy_manager = OperaProxyManager(log_func=safe_log)
 
-                # Parallel execution for all services
-                threads = [
-                    threading.Thread(target=warp_manager.start, daemon=True),
-                    threading.Thread(target=sing_box_manager.start, daemon=True),
-                    threading.Thread(target=opera_proxy_manager.start, daemon=True),
-                    threading.Thread(target=lambda: (pac_manager.start_server(), pac_manager.set_system_proxy()), daemon=True)
-                ]
-                for t in threads: t.start()
+                # Start Opera proxy early, but WARP daemon bootstrap is deferred until kernel is up.
+                threading.Thread(target=opera_proxy_manager.start, daemon=True).start()
+                threading.Thread(target=lambda: (pac_manager.start_server(), pac_manager.set_system_proxy()), daemon=True).start()
             except Exception as e:
                 safe_trace(f"[Init] BG Services Error: {e}")
 
-        # 1. Start Main WinWS (Async)
-        try:
-            threading.Thread(target=lambda: _start_nova_service_logic(silent, restart_mode), daemon=True).start()
-        except Exception as e:
-            msg = f"Startup Error: {e}"
-            print(msg)
-            try:
-                 if 'log_print' in globals(): log_print(msg)
-            except: pass
-            try: stop_nova_service(silent=True)
-            except: pass
-
-        # 2. Start Background Services (Async)
+        # 1. IMMEDIATE ASYNC START
         if not restart_mode:
             start_bg_services()
+
+        # 2. Kernel Start
+        try:
+            threading.Thread(target=lambda: _start_nova_service_logic(silent, restart_mode), daemon=True).start()
+        except: pass
+
+        # 2. Start Background Services (Async)
+        pass
 
 
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
@@ -12243,7 +12522,6 @@ function FindProxyForURL(url, host) {{
         if not is_admin(): 
             root.after(0, lambda: messagebox.showerror("Ошибка", "Нужны права Администратора!"))
             return
-        
 
         
         exe_path = os.path.join(get_base_dir(), "bin", WINWS_FILENAME)
@@ -12339,6 +12617,7 @@ function FindProxyForURL(url, host) {{
         root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
         
         paths = ensure_structure()
+        ensure_warp_control_exclusions(log_print if not silent else None)
         
         # Гарантируем существование файлов исключений перед запуском winws
         for fpath in [IP_CACHE_FILE, paths['list_exclude_auto']]:
@@ -12717,6 +12996,18 @@ function FindProxyForURL(url, host) {{
                          if not silent and root:
                              root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
                              root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
+
+                         # Start WARP only AFTER WinWS core is confirmed running.
+                         if not restart_mode:
+                             try:
+                                 wm = globals().get("warp_manager")
+                                 if wm:
+                                     if not silent:
+                                         log_print("[Init] Запуск WARP после старта ядра...")
+                                     threading.Thread(target=wm.start, daemon=True).start()
+                             except Exception as _e:
+                                 if IS_DEBUG_MODE and not silent:
+                                     log_print(f"[Init] Ошибка отложенного запуска WARP: {_e}")
                          
                          # === ASYNC START: Strategy Checker ===
                          # Launching checker system ONLY after main core is confirmed stable
@@ -13929,12 +14220,19 @@ function FindProxyForURL(url, host) {{
             
         def update_main_autostart_label():
             # Recreate completely to ensure state is fresh
-            try: main_context_menu.delete(0, 'end')
+            try:
+                # Safer cleanup of menu items
+                last_idx = main_context_menu.index('end')
+                if last_idx is not None:
+                    for i in range(last_idx, -1, -1):
+                        main_context_menu.delete(i)
             except: pass
             
             is_auto = get_autostart_cmd() is not None
             autostart_var.set(is_auto)
             main_context_menu.add_checkbutton(label="Автозапуск Nova", variable=autostart_var, command=toggle_autostart_main)
+            main_context_menu.add_separator()
+            main_context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
 
         def show_main_context_menu(event):
             try: 
@@ -13964,12 +14262,15 @@ function FindProxyForURL(url, host) {{
         # Показываем окно НЕМЕДЛЕННО (устранение ощущения задержки)
         if ARGS_PARSED.get('minimized', False):
             root.withdraw()
-            if IS_DEBUG_MODE: log_print("[Init] Запуск в свернутом режиме (--minimized)")
+            if IS_DEBUG_MODE: log_print("[Init] Запуск в свернутом режиме (--minimized). Проверьте трей.")
         else:
             root.deiconify()
             root.lift()
             root.focus_force()
             root.update() # Принудительная отрисовка GUI
+            # Дополнительный форсированный подъем окна
+            root.attributes("-topmost", True)
+            root.after(200, lambda: root.attributes("-topmost", False))
         
         # Gentle Focus (уже после того как окно показано)
         if not ARGS_PARSED.get('minimized', False):
