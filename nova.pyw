@@ -203,11 +203,15 @@ def restart_nova():
             
             # 3. Перезапуск процесса
             log_func("[Restart] Запуск новой копии...")
-            base_dir = None
             try:
-                base_dir = get_base_dir()
-            except:
                 base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                if not base_dir:
+                    raise RuntimeError("empty base dir")
+            except:
+                try:
+                    base_dir = get_base_dir()
+                except:
+                    base_dir = os.getcwd()
 
             create_flags = 0
             try:
@@ -219,31 +223,99 @@ def restart_nova():
             except:
                 pass
 
+            # Build robust launch plans (different environments expose different runtime paths).
+            launch_plans = []
+            restart_args = ["--show-log", "--restart", "--force-instance"]
+
+            def _add_plan(cmd_list, cwd_hint=None):
+                if not cmd_list:
+                    return
+                exe_path = str(cmd_list[0]).strip().strip('"')
+                if not exe_path or not os.path.exists(exe_path):
+                    return
+                launch_plans.append((cmd_list, cwd_hint or base_dir))
+
             if getattr(sys, 'frozen', False):
-                cmd = [sys.executable, "--show-log", "--restart", "--force-instance"]
+                # In onefile builds sys.executable may point to transient runtime path.
+                # sys.argv[0] is usually the stable launcher path on disk.
+                exe_candidates = []
+                for p in [sys.argv[0], sys.executable]:
+                    try:
+                        ap = os.path.abspath(str(p))
+                    except:
+                        continue
+                    if ap and ap not in exe_candidates:
+                        exe_candidates.append(ap)
+                for exe_path in exe_candidates:
+                    _add_plan([exe_path] + restart_args, os.path.dirname(exe_path))
             else:
-                script_path = os.path.abspath(__file__)
-                cmd = [sys.executable, script_path, "--show-log", "--restart", "--force-instance"]
+                py_candidates = []
+                for p in [sys.executable, sys.executable.lower().replace("pythonw.exe", "python.exe")]:
+                    try:
+                        ap = os.path.abspath(str(p))
+                    except:
+                        continue
+                    if ap and ap not in py_candidates:
+                        py_candidates.append(ap)
+
+                script_candidates = []
+                for p in [globals().get("__file__", ""), sys.argv[0]]:
+                    try:
+                        ap = os.path.abspath(str(p))
+                    except:
+                        continue
+                    if ap and ap not in script_candidates:
+                        script_candidates.append(ap)
+
+                for py_path in py_candidates:
+                    for script_path in script_candidates:
+                        _add_plan([py_path, script_path] + restart_args, os.path.dirname(script_path))
 
             launched = False
             launch_exc = None
-            try:
-                subprocess.Popen(
-                    cmd,
-                    creationflags=create_flags,
-                    cwd=base_dir
-                )
-                launched = True
-            except Exception as e:
-                launch_exc = e
+            if not launch_plans:
+                launch_exc = FileNotFoundError("No valid restart launch targets found")
+            for cmd, cmd_cwd in launch_plans:
+                try:
+                    subprocess.Popen(
+                        cmd,
+                        creationflags=create_flags,
+                        cwd=cmd_cwd
+                    )
+                    launched = True
+                    break
+                except Exception as e:
+                    launch_exc = e
 
             if not launched:
-                # Fallback launch without flags.
+                for cmd, cmd_cwd in launch_plans:
+                    try:
+                        subprocess.Popen(cmd, cwd=cmd_cwd)
+                        launched = True
+                        break
+                    except Exception as e2:
+                        launch_exc = e2
+
+            # Last resort for frozen builds: shell open the executable.
+            if not launched and getattr(sys, 'frozen', False):
                 try:
-                    subprocess.Popen(cmd, cwd=base_dir)
-                    launched = True
-                except Exception as e2:
-                    launch_exc = e2
+                    exe_path = os.path.abspath(str(sys.argv[0]))
+                    if os.path.exists(exe_path):
+                        params = " ".join(restart_args)
+                        rc = ctypes.windll.shell32.ShellExecuteW(
+                            None,
+                            "open",
+                            exe_path,
+                            params,
+                            os.path.dirname(exe_path) or None,
+                            1
+                        )
+                        if rc and int(rc) > 32:
+                            launched = True
+                        else:
+                            launch_exc = RuntimeError(f"ShellExecuteW code={rc}")
+                except Exception as e3:
+                    launch_exc = e3
 
             if not launched:
                 raise RuntimeError(f"Не удалось запустить новую копию: {launch_exc}")
@@ -4291,12 +4363,97 @@ try:
                 if "MASQUE" not in result.stdout:
                     if IS_DEBUG_MODE: self.log_func("[RU] Переключение на протокол MASQUE...")
                     self.run_warp_cli("tunnel", "protocol", "set", "MASQUE")
+
+        def _propagate_warp_port(self, port):
+            """Synchronize active WARP SOCKS port across runtime components."""
+            try:
+                p = int(port)
+            except:
+                return
+            changed = False
+            try:
+                if int(globals().get("WARP_PORT", p)) != p:
+                    changed = True
+                globals()["WARP_PORT"] = p
+                globals()["WARP_PORT_LEGACY"] = p
+            except:
+                pass
+            try:
+                pm = globals().get("pac_manager")
+                if pm:
+                    pm_changed = False
+                    try:
+                        pm_changed = int(getattr(pm, "warp_port", p)) != p
+                    except:
+                        pm_changed = True
+                    pm.warp_port = p
+                    if pm_changed or changed:
+                        try:
+                            pm.generate_pac()
+                            pm.refresh_system_options()
+                        except:
+                            pass
+            except:
+                pass
+
+        def _get_proxy_port_candidates(self):
+            out = []
+            seen = set()
+
+            def _add(v):
+                try:
+                    iv = int(v)
+                except:
+                    return
+                if not (1 <= iv <= 65535):
+                    return
+                if iv in seen:
+                    return
+                seen.add(iv)
+                out.append(iv)
+
+            _add(self.port)
+            _add(self.port_legacy)
+            for p in (1370, 1372, 1374, 1080, 10808):
+                _add(p)
+
+            raw = str(os.environ.get("NOVA_WARP_PORT_CANDIDATES", "")).strip()
+            if raw:
+                for part in raw.replace(";", ",").split(","):
+                    _add(part.strip())
+            return out
+
+        def _try_alternate_proxy_ports(self):
+            """Try alternate local SOCKS ports when current port won't open on this host."""
+            start_port = self.port
+            for cand in self._get_proxy_port_candidates():
+                prev = self.port
+                if cand != prev:
+                    self.log_func(f"[RU] [Diag] Пробуем резервный SOCKS порт {cand}...")
+                if not self.set_proxy_port(cand):
+                    continue
+                self.set_proxy_mode()
+
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if self.is_port_open(cand):
+                        self._propagate_warp_port(cand)
+                        if cand != prev:
+                            self.log_func(f"[RU] [Diag] Активирован резервный SOCKS порт {cand}.")
+                        return True
+                    time.sleep(0.25)
+            # Restore original preference if no candidate produced a listener.
+            if self.port != start_port:
+                self.set_proxy_port(start_port)
+                self.set_proxy_mode()
+            return False
         
         def set_proxy_port(self, port):
             """Set WARP proxy port."""
             result = self.run_warp_cli("proxy", "port", str(port))
             if result and result.returncode == 0:
                 self.port = port
+                self._propagate_warp_port(port)
                 self.log_func(f"[RU] Настройки порта ({port}) отправлены.")
                 return True
             else:
@@ -4486,6 +4643,9 @@ try:
                     if not proto_res or proto_res.returncode != 0:
                         msg = (proto_res.stderr.strip() if proto_res else "timeout/unknown")
                         self.log_func(f"[RU] [Diag] Не удалось применить protocol {proto_cli}: {msg}")
+                    # Some warp-cli builds reset local proxy mode/port after tunnel tweaks.
+                    self.set_proxy_port(self.port)
+                    self.set_proxy_mode()
                     self.run_warp_cli("connect")
                     if self.wait_for_connection(timeout=20):
                         self.is_connected = True
@@ -4536,6 +4696,9 @@ try:
             import time
             start_time = time.time()
             port_open_streak = 0
+            proxy_repair_attempts = 0
+            last_proxy_repair_ts = 0.0
+            alt_ports_checked = False
             while time.time() - start_time < timeout:
                 # Primary success signal: local SOCKS proxy is listening.
                 port_open = self.is_port_open(self.port)
@@ -4586,6 +4749,38 @@ try:
                 status = self.get_status()
                 status_low = (status or "").lower()
                 if "connected" in status_low:
+                    now_ts = time.time()
+                    elapsed = now_ts - start_time
+                    if (
+                        not port_open
+                        and elapsed >= 5
+                        and proxy_repair_attempts < 2
+                        and (now_ts - last_proxy_repair_ts) >= 4
+                    ):
+                        proxy_repair_attempts += 1
+                        last_proxy_repair_ts = now_ts
+                        self.log_func(
+                            f"[RU] [Diag] Статус Connected, но порт {self.port} закрыт. Повторяем mode proxy/port ({proxy_repair_attempts}/2)..."
+                        )
+                        self.set_proxy_port(self.port)
+                        self.set_proxy_mode()
+                    if (
+                        not port_open
+                        and elapsed >= 10
+                        and proxy_repair_attempts >= 2
+                        and not alt_ports_checked
+                    ):
+                        alt_ports_checked = True
+                        self.log_func("[RU] [Diag] Базовый порт недоступен. Пытаемся подобрать резервный SOCKS порт...")
+                        try:
+                            if self._try_alternate_proxy_ports():
+                                # Re-check immediately after switching port.
+                                if self.is_port_open(self.port):
+                                    self.log_func(f"[RU] [Diag] Резервный порт {self.port} активен.")
+                                    continue
+                        except Exception as e:
+                            if IS_DEBUG_MODE:
+                                self.log_func(f"[RU] [Diag] Ошибка подбора резервного порта: {e}")
                     if IS_DEBUG_MODE:
                         self.log_func(f"[RU] Статус Connected, порт {self.port} пока закрыт...")
                 elif "ipc call hit a timeout" in status_low or "error communicating with daemon" in status_low:
@@ -4636,7 +4831,7 @@ try:
             self.server_port = 1369
             self.server_thread = None
             self.httpd = None
-            self.warp_port = 1370 # Restore missing attribute
+            self.warp_port = int(globals().get("WARP_PORT", 1370))
             self.registry_backup = {}
             self._last_route_signature = None
             self._last_eu_route_state = None
@@ -4917,9 +5112,9 @@ try:
                 if eu_route_state != self._last_eu_route_state:
                     self._last_eu_route_state = eu_route_state
                     if eu_route_state == "opera+warp":
-                        self.log_func("[PAC] EU маршрут: PROXY 127.0.0.1:1371; SOCKS5/PROXY 127.0.0.1:1370; DIRECT")
+                        self.log_func(f"[PAC] EU маршрут: PROXY 127.0.0.1:1371; SOCKS5/PROXY 127.0.0.1:{self.warp_port}; DIRECT")
                     elif eu_route_state == "warp":
-                        self.log_func("[PAC] EU маршрут: SOCKS5/PROXY 127.0.0.1:1370; DIRECT")
+                        self.log_func(f"[PAC] EU маршрут: SOCKS5/PROXY 127.0.0.1:{self.warp_port}; DIRECT")
                     elif eu_route_state == "opera":
                         self.log_func("[PAC] EU маршрут: PROXY 127.0.0.1:1371; DIRECT")
                     else:
@@ -4939,7 +5134,7 @@ try:
                     if opera_port_open and not opera_proxy_ok:
                         self.log_func("[PAC] [Diag] Порт 1371 открыт, но HTTP-прокси не отвечает корректно.")
                     elif not opera_port_open:
-                        self.log_func("[PAC] [Diag] Порт 1371 недоступен: EU маршрут работает через fallback (1370/DIRECT).")
+                        self.log_func(f"[PAC] [Diag] Порт 1371 недоступен: EU маршрут работает через fallback ({self.warp_port}/DIRECT).")
             except Exception as e:
                 self.log_func(f"[PAC] Ошибка генерации: {e}")
 
