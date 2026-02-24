@@ -1717,6 +1717,7 @@ try:
             self.exe_path = os.path.join(self.bin_dir, "sing-box.exe")
             self.config_path = os.path.join(self.temp_dir, "sing-box-conf.json")
             self.log_path = os.path.join(self.temp_dir, "sing-box.log")
+            self.stderr_path = os.path.join(self.temp_dir, "sing-box.stderr.log")
             self.warp_native_profile_path = os.path.join(self.temp_dir, "warp-native-profile.json")
             self.process = None
             self.max_log_size = 8 * 1024 * 1024
@@ -1740,6 +1741,12 @@ try:
             self._allow_1371_tcp_fallback = str(
                 os.environ.get("NOVA_ALLOW_1371_TCP_FALLBACK", "1")
             ).strip().lower() in ("1", "true", "yes", "on")
+            self._auto_disable_wg_on_crash = str(
+                os.environ.get("NOVA_WG_AUTODISABLE", "1")
+            ).strip().lower() in ("1", "true", "yes", "on")
+            self._force_disable_native_wg = False
+            self._wg_disable_notice_logged = False
+            self._wg_exit_timestamps = []
 
         def _detect_target_app_from_path(self, process_path):
             try:
@@ -2156,6 +2163,55 @@ try:
             except:
                 pass
 
+        def _read_file_tail(self, path, max_lines=8):
+            out = []
+            try:
+                if not os.path.exists(path):
+                    return out
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    out = [ln.strip() for ln in f.readlines()[-max_lines:] if ln.strip()]
+            except:
+                out = []
+            return out
+
+        def _report_runtime_exit(self, exit_code=None, context="runtime"):
+            try:
+                if exit_code is not None:
+                    self.log_func(f"[SingBox] Процесс завершился ({context}, код: {exit_code}).")
+                else:
+                    self.log_func(f"[SingBox] Процесс завершился ({context}).")
+            except:
+                pass
+
+            sb_tail = self._read_file_tail(self.log_path, max_lines=8)
+            if sb_tail:
+                self.log_func("[SingBox] [Diag] Последние строки sing-box.log:")
+                for ln in sb_tail:
+                    self.log_func(f"[SingBox] {ln}")
+
+            err_tail = self._read_file_tail(self.stderr_path, max_lines=8)
+            if err_tail:
+                self.log_func("[SingBox] [Diag] Последние строки sing-box.stderr.log:")
+                for ln in err_tail:
+                    self.log_func(f"[SingBox] {ln}")
+
+        def _handle_runtime_exit(self, exit_code=None, context="runtime"):
+            self._report_runtime_exit(exit_code=exit_code, context=context)
+            if not self._auto_disable_wg_on_crash:
+                return
+            if not self._using_wireguard_outbound:
+                return
+            if self._force_disable_native_wg:
+                return
+
+            now = time.time()
+            self._wg_exit_timestamps = [t for t in self._wg_exit_timestamps if (now - t) < 180]
+            self._wg_exit_timestamps.append(now)
+            if len(self._wg_exit_timestamps) >= 3:
+                self._force_disable_native_wg = True
+                self._wg_disable_notice_logged = False
+                self.log_func("[SingBox] [WG] Частые падения с native WireGuard. Временно отключаем WG-UDP и используем direct/winws.")
+
         def _load_warp_native_profile(self):
             try:
                 if not os.path.exists(self.warp_native_profile_path):
@@ -2560,7 +2616,13 @@ try:
             target_udp = "direct"
 
             # Preferred UDP path: native WireGuard profile from Cloudflare API.
-            profile = self._get_warp_native_profile()
+            profile = None
+            if self._force_disable_native_wg:
+                if not self._wg_disable_notice_logged:
+                    self._wg_disable_notice_logged = True
+                    self.log_func("[SingBox] [WG] Native WireGuard отключен из-за crash-loop. UDP путь: direct/winws (reserve).")
+            else:
+                profile = self._get_warp_native_profile()
             if profile:
                 try:
                     server = str(profile.get("server") or "").strip()
@@ -3492,11 +3554,9 @@ try:
 
             self.stop()
             self._rotate_log_if_needed()
-            pre_log_mtime = 0.0
             pre_log_size = 0
             try:
                 if os.path.exists(self.log_path):
-                    pre_log_mtime = os.path.getmtime(self.log_path)
                     pre_log_size = os.path.getsize(self.log_path)
             except:
                 pass
@@ -3538,36 +3598,33 @@ try:
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
                 cmd = [self.exe_path, "run", "-c", self.config_path]
+                stderr_sink = None
+                try:
+                    os.makedirs(self.temp_dir, exist_ok=True)
+                    stderr_sink = open(self.stderr_path, "a", encoding="utf-8", errors="ignore")
+                except:
+                    stderr_sink = open(os.devnull, "w")
 
-                self.process = subprocess.Popen(
-                    cmd,
-                    startupinfo=startupinfo,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    cwd=self.bin_dir,
-                    env=sb_env
-                )
-                time.sleep(0.4)
-                if self.process.poll() is not None:
-                    self.log_func("[SingBox] Процесс завершился сразу после запуска.")
+                try:
+                    self.process = subprocess.Popen(
+                        cmd,
+                        startupinfo=startupinfo,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        cwd=self.bin_dir,
+                        env=sb_env,
+                        stdout=stderr_sink,
+                        stderr=stderr_sink
+                    )
+                finally:
                     try:
-                        log_has_new_data = False
-                        if os.path.exists(self.log_path):
-                            try:
-                                log_has_new_data = os.path.getmtime(self.log_path) > pre_log_mtime
-                            except:
-                                log_has_new_data = True
-
-                        if os.path.exists(self.log_path) and log_has_new_data:
-                            with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
-                                tail = f.readlines()[-6:]
-                            for line in tail:
-                                line = line.strip()
-                                if line:
-                                    self.log_func(f"[SingBox] {line}")
-                        else:
-                            self.log_func("[SingBox] Лог не обновился в этом запуске (старые строки не выводятся).")
+                        if stderr_sink:
+                            stderr_sink.close()
                     except:
                         pass
+                time.sleep(0.4)
+                if self.process.poll() is not None:
+                    exit_code = self.process.poll()
+                    self._handle_runtime_exit(exit_code=exit_code, context="startup")
                     self.process = None
                     return
 
@@ -4370,7 +4427,7 @@ try:
                 # FORCE RESET: Clear any manual endpoint/port leftovers from previous experiments
                 self.run_warp_cli("tunnel", "endpoint", "reset")
                 self.run_warp_cli("tunnel", "protocol", "reset")
-                self.run_warp_cli("tunnel", "ip-version", "reset")
+                self.run_warp_cli("tunnel", "masque-options", "reset")
                 
                 self.ensure_masque()
                 self.set_proxy_port(self.port)
@@ -4399,6 +4456,7 @@ try:
                 self.log_func("[RU] Подключение: MASQUE endpoint default (Auto)...")
                 self.run_warp_cli("tunnel", "endpoint", "reset")
                 self.run_warp_cli("tunnel", "protocol", "set", "MASQUE")
+                self.run_warp_cli("tunnel", "masque-options", "set", "h3-with-h2-fallback")
                 self.run_warp_cli("connect")
                 if self.wait_for_connection(timeout=25):
                     self.is_connected = True
@@ -4409,19 +4467,19 @@ try:
 
                 # Safer fallback: avoid explicit endpoint overrides (recent builds can produce IPv6 :0 states).
                 fallback_attempts = [
-                    ("MASQUE", "MASQUE (IPv4 forced)", ("tunnel", "ip-version", "set", "4")),
-                    ("WireGuard", "WireGuard (Auto)", ("tunnel", "ip-version", "reset")),
-                    ("WireGuard", "WireGuard (IPv4 forced)", ("tunnel", "ip-version", "set", "4")),
+                    ("MASQUE", "MASQUE h2-only", ("tunnel", "masque-options", "set", "h2-only")),
+                    ("MASQUE", "MASQUE h3-only", ("tunnel", "masque-options", "set", "h3-only")),
+                    ("WireGuard", "WireGuard (Auto)", ("tunnel", "masque-options", "reset")),
                 ]
 
-                for proto_cli, attempt_label, ipver_cmd in fallback_attempts:
+                for proto_cli, attempt_label, tune_cmd in fallback_attempts:
                     if is_closing or SERVICE_RUN_ID != my_run_id: return
                     self.run_warp_cli("tunnel", "endpoint", "reset")
-                    if ipver_cmd:
-                        ipver_res = self.run_warp_cli(*ipver_cmd)
-                        if not ipver_res or ipver_res.returncode != 0:
-                            msg = (ipver_res.stderr.strip() if ipver_res else "timeout/unknown")
-                            self.log_func(f"[RU] [Diag] Не удалось применить {' '.join(ipver_cmd)}: {msg}")
+                    if tune_cmd:
+                        tune_res = self.run_warp_cli(*tune_cmd)
+                        if not tune_res or tune_res.returncode != 0:
+                            msg = (tune_res.stderr.strip() if tune_res else "timeout/unknown")
+                            self.log_func(f"[RU] [Diag] Не удалось применить {' '.join(tune_cmd)}: {msg}")
 
                     self.log_func(f"[RU] Подключение: {attempt_label} (fallback)...")
                     proto_res = self.run_warp_cli("tunnel", "protocol", "set", proto_cli)
@@ -4438,7 +4496,8 @@ try:
 
                 # Restore defaults before giving up.
                 self.run_warp_cli("tunnel", "endpoint", "reset")
-                self.run_warp_cli("tunnel", "ip-version", "reset")
+                self.run_warp_cli("tunnel", "masque-options", "reset")
+                self.run_warp_cli("tunnel", "protocol", "reset")
                 
                 self.log_func("[RU] [Warning] Все попытки подключения исчерпаны.")
             
@@ -14779,8 +14838,19 @@ try:
                 # Check SingBox voice tunnel; recover if it died after startup.
                 if sing_box_manager and warp_manager and getattr(warp_manager, 'is_connected', False):
                     sb_proc = getattr(sing_box_manager, "process", None)
-                    sb_alive = bool(sb_proc and sb_proc.poll() is None)
+                    sb_exit_code = None
+                    if sb_proc:
+                        try:
+                            sb_exit_code = sb_proc.poll()
+                        except:
+                            sb_exit_code = None
+                    sb_alive = bool(sb_proc and sb_exit_code is None)
                     if not sb_alive:
+                        if sb_proc and sb_exit_code is not None:
+                            try:
+                                sing_box_manager._handle_runtime_exit(exit_code=sb_exit_code, context="watchdog")
+                            except:
+                                pass
                         log_func("[SingBox] Процесс неактивен. Перезапуск голосового туннеля...")
                         retry_timestamps.append(now)
                         time.sleep(1.0)
