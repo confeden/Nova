@@ -17,7 +17,7 @@ import collections
 from datetime import datetime
 
 # === VERSION & CONFIG ===
-CURRENT_VERSION = "1.13"
+CURRENT_VERSION = "1.14"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
@@ -158,6 +158,24 @@ def restart_nova():
             if getattr(restart_nova, "_in_progress", False):
                 return
             restart_nova._in_progress = True
+
+            # 0. Сохраняем геометрию окна ДО остановки (on_closing не вызывается при restart)
+            try:
+                _root = globals().get('root')
+                _log_window = globals().get('log_window')
+                _save_ws = globals().get('save_window_state')
+                if _root and _save_ws:
+                    _state = {}
+                    try: _state['main_geometry'] = _root.geometry()
+                    except: pass
+                    try:
+                        import tkinter as _tk
+                        if _log_window and _tk.Toplevel.winfo_exists(_log_window):
+                            _state['log_size'] = _log_window.geometry()
+                    except: pass
+                    if _state:
+                        _save_ws(**_state)
+            except: pass
 
             # 1. Остановка логики
             save_visited_domains_func = globals().get('save_visited_domains')
@@ -1800,7 +1818,7 @@ try:
             self._log_mode_hint_done = False
             self._activity_monitor_thread = None
             self._activity_monitor_stop = threading.Event()
-            self._seen_call_udp_apps = set()
+            self._seen_call_udp_apps = {}
             self._seen_tcp_apps = set()
             self._seen_tcp_fallback_apps = set()
             self._activity_ip_nets = {"Telegram": [], "Discord": [], "WhatsApp": []}
@@ -1811,7 +1829,7 @@ try:
             # Enabled by default because some hosts (notably WhatsApp Web/Desktop bootstrap) can fail via WARP SOCKS.
             # Set NOVA_ALLOW_1371_TCP_FALLBACK=0 to force pure WARP SOCKS TCP.
             self._allow_1371_tcp_fallback = str(
-                os.environ.get("NOVA_ALLOW_1371_TCP_FALLBACK", "1")
+                os.environ.get("NOVA_ALLOW_1371_TCP_FALLBACK", "0")
             ).strip().lower() in ("1", "true", "yes", "on")
             self._auto_disable_wg_on_crash = str(
                 os.environ.get("NOVA_WG_AUTODISABLE", "1")
@@ -1819,6 +1837,94 @@ try:
             self._force_disable_native_wg = False
             self._wg_disable_notice_logged = False
             self._wg_exit_timestamps = []
+            # Performance knobs (defaults tuned for lower CPU on average desktops).
+            def _env_bool(name, default):
+                raw = os.environ.get(name, None)
+                if raw is None:
+                    return bool(default)
+                return str(raw).strip().lower() in ("1", "true", "yes", "on")
+            def _env_int(name, default, min_v, max_v):
+                raw = os.environ.get(name, None)
+                if raw is None:
+                    return int(default)
+                try:
+                    val = int(str(raw).strip())
+                except:
+                    return int(default)
+                if val < min_v:
+                    val = min_v
+                if val > max_v:
+                    val = max_v
+                return int(val)
+            # Default to balanced mode for maximum compatibility (Discord/WhatsApp/TG bootstrap + voice).
+            # Low-CPU remains available via NOVA_SINGBOX_LOW_CPU=1.
+            self._low_cpu_mode = _env_bool("NOVA_SINGBOX_LOW_CPU", False)
+            # Keep sniff enabled by default even in low-cpu mode: improves domain matching
+            # for Discord/WhatsApp bootstrap and voice edge-cases.
+            self._tun_sniff_enabled = _env_bool("NOVA_SINGBOX_SNIFF", True)
+            self._tun_route_cap = _env_int(
+                "NOVA_SINGBOX_TUN_CAP",
+                160 if self._low_cpu_mode else 0,
+                0,
+                4096
+            )
+            self._wg_workers = _env_int(
+                "NOVA_SINGBOX_WG_WORKERS",
+                1 if self._low_cpu_mode else 2,
+                1,
+                8
+            )
+            # Discord voice compatibility (opt-in):
+            # forcing Discord TCP over WG can improve voice on some networks,
+            # but may break startup/login on others.
+            self._discord_tcp_via_wg = _env_bool("NOVA_DISCORD_TCP_VIA_WG", False)
+            # Default Discord UDP path should be WARP WG; direct/winws remains opt-in emergency mode.
+            self._discord_udp_direct = _env_bool("NOVA_DISCORD_UDP_DIRECT", False)
+            # Keep Discord TCP on WARP SOCKS by default; 1371 fallback is opt-in for edge ISPs.
+            self._discord_tcp_fallback_1371 = _env_bool("NOVA_DISCORD_TCP_FALLBACK_1371", False)
+            # Resolve current Discord edges to /32 at startup to improve capture on dynamic IP pools.
+            self._discord_dns_warmup = _env_bool("NOVA_DISCORD_DNS_WARMUP", True)
+            # Keep sing-box disk writes low in normal user mode.
+            self._persist_main_log = _env_bool(
+                "NOVA_SINGBOX_LOG_FILE",
+                (not self._low_cpu_mode)
+            )
+            self._activity_monitor_enabled = _env_bool(
+                "NOVA_SINGBOX_ACTIVITY_MONITOR",
+                (not self._low_cpu_mode)
+            )
+            if self._activity_monitor_enabled and not self._persist_main_log:
+                self._persist_main_log = True
+            self._persist_stderr_log = _env_bool(
+                "NOVA_SINGBOX_STDERR_LOG",
+                IS_DEBUG_MODE and (not self._low_cpu_mode)
+            )
+            self._perf_mode_logged = False
+            self._lifecycle_lock = threading.RLock()
+            self._startup_in_progress = False
+            self._startup_deadline = 0.0
+            self._startup_started_ts = 0.0
+
+        def _set_startup_state(self, active, timeout_sec=0.0):
+            now = time.time()
+            if active:
+                self._startup_in_progress = True
+                self._startup_started_ts = now
+                self._startup_deadline = now + max(0.0, float(timeout_sec or 0.0))
+            else:
+                self._startup_in_progress = False
+                self._startup_deadline = 0.0
+                self._startup_started_ts = 0.0
+
+        def is_startup_in_progress(self):
+            with self._lifecycle_lock:
+                if not self._startup_in_progress:
+                    return False
+                deadline = float(self._startup_deadline or 0.0)
+                if deadline and time.time() > deadline:
+                    self._set_startup_state(False)
+                    return False
+                return True
 
         def _detect_target_app_from_path(self, process_path):
             try:
@@ -2054,9 +2160,27 @@ try:
 
         def _activity_monitor_worker(self, start_offset=0):
             conn_to_app = {}
+            conn_to_endpoint = {}
+            endpoint_owner = {}
+            endpoint_owner_ts = {}
+            dns_conn_ids = set()
             last_target_app = None
             last_target_app_ts = 0.0
             app_seen_ts = {"Telegram": 0.0, "Discord": 0.0, "WhatsApp": 0.0}
+
+            def _endpoint_key(raw_endpoint):
+                try:
+                    ep = str(raw_endpoint or "").strip().lower()
+                    if not ep:
+                        return ""
+                    if ep.startswith("[") and "]" in ep:
+                        ep = ep[1:ep.index("]")]
+                    elif ep.count(":") == 1 and "." in ep:
+                        ep = ep.split(":", 1)[0]
+                    return ep
+                except:
+                    return ""
+
             offset = max(0, int(start_offset or 0))
             self._last_dns_hint_app = None
             self._last_dns_hint_ts = 0.0
@@ -2121,6 +2245,13 @@ try:
                             conn_id = self._extract_conn_id(line)
                             endpoint = self._extract_endpoint(line)
 
+                            # Remember inbound destination per-connection to classify later outbound lines.
+                            if conn_id and "inbound/tun[tun-in]: inbound packet connection to " in ll:
+                                if endpoint:
+                                    conn_to_endpoint[conn_id] = endpoint
+                                    if str(endpoint).endswith(":53"):
+                                        dns_conn_ids.add(conn_id)
+
                             if "found process path:" in ll:
                                 try:
                                     path_part = line.split("found process path:", 1)[1].strip()
@@ -2137,6 +2268,8 @@ try:
 
                             app = None
                             app_source = None
+                            if not endpoint and conn_id and conn_id in conn_to_endpoint:
+                                endpoint = conn_to_endpoint.get(conn_id)
                             if conn_id and conn_id in conn_to_app:
                                 app = conn_to_app.get(conn_id)
                                 app_source = "conn"
@@ -2161,7 +2294,11 @@ try:
 
                             # Skip infrastructure DNS noise: sing-box.exe generates 100k+ DNS packets
                             # through direct that pollute the UDP detection if associated with messenger conn_ids.
-                            is_dns_noise = ":53" in line and "outbound/direct" in ll and "outbound packet" in ll
+                            is_dns_noise = False
+                            if conn_id and conn_id in dns_conn_ids and "outbound packet connection" in ll:
+                                is_dns_noise = True
+                            elif ":53" in line and "outbound/direct" in ll and "outbound packet" in ll:
+                                is_dns_noise = True
                             if is_dns_noise:
                                 continue
 
@@ -2170,19 +2307,46 @@ try:
                             is_udp_wg = ("outbound/wireguard[" in ll or "endpoint/wireguard[" in ll) and "outbound packet connection" in ll
                             is_udp_socks = "outbound/socks[warp-socks]" in ll and "outbound packet connection" in ll
                             if is_udp_tun or is_udp_wg or is_udp_socks or is_udp_direct:
-                                if app not in self._seen_call_udp_apps:
-                                    self._seen_call_udp_apps.add(app)
+                                # UDP call telemetry must not rely on weak heuristics,
+                                # otherwise Discord-only calls can be mislabeled as Telegram/WhatsApp.
+                                if app_source in ("recent_process", "dns"):
+                                    continue
+                                if not endpoint and conn_id and conn_id in conn_to_endpoint:
+                                    endpoint = conn_to_endpoint.get(conn_id)
+                                ep_key = _endpoint_key(endpoint)
+                                if ep_key:
+                                    if app_source == "conn":
+                                        endpoint_owner[ep_key] = app
+                                        endpoint_owner_ts[ep_key] = time.time()
+                                    elif app_source == "endpoint":
+                                        owner = endpoint_owner.get(ep_key)
+                                        owner_ts = float(endpoint_owner_ts.get(ep_key, 0.0) or 0.0)
+                                        if owner and owner != app and (time.time() - owner_ts) <= 180.0:
+                                            continue
+                                # Prefer TUN/WG reports; direct without peer is often DNS/control-plane noise.
+                                if is_udp_tun:
+                                    path = "CloudflareWARP"
+                                    rank = 2
+                                elif is_udp_wg:
+                                    path = "WARP WG"
+                                    rank = 3
+                                elif is_udp_socks:
+                                    path = "WARP SOCKS"
+                                    rank = 1
+                                else:
+                                    path = "direct/winws"
+                                    rank = 0
+                                    if not endpoint or str(endpoint).endswith(":53"):
+                                        continue
+
+                                prev_rank = int(self._seen_call_udp_apps.get(app, -1))
+                                if rank > prev_rank:
+                                    self._seen_call_udp_apps[app] = rank
                                     peer = endpoint if endpoint else "unknown-endpoint"
-                                    # Prefer TUN report
-                                    if is_udp_tun:
-                                        path = "CloudflareWARP"
-                                    elif is_udp_wg:
-                                        path = "WARP WG"
-                                    elif is_udp_socks:
-                                        path = "WARP SOCKS"
+                                    if prev_rank < 0:
+                                        self.log_func(f"[SingBox] [Call] {app} UDP через {path} активен ({peer}).")
                                     else:
-                                        path = "direct/winws"
-                                    self.log_func(f"[SingBox] [Call] {app} UDP через {path} активен ({peer}).")
+                                        self.log_func(f"[SingBox] [Call] {app} UDP переключён на {path} ({peer}).")
                                 continue
 
                             if ("outbound/http[opera-1371]" in ll or "outbound/http[opera-http-1371]" in ll) and "outbound connection to" in ll:
@@ -2207,7 +2371,7 @@ try:
             self._stop_activity_monitor()
             self._load_activity_ip_nets()
             self._activity_monitor_stop.clear()
-            self._seen_call_udp_apps = set()
+            self._seen_call_udp_apps = {}
             self._seen_tcp_apps = set()
             self._seen_tcp_fallback_apps = set()
             self._activity_monitor_thread = threading.Thread(
@@ -2679,86 +2843,25 @@ try:
                 "tag": "warp-socks",
                 "server": "127.0.0.1",
                 "server_port": int(globals().get('WARP_PORT', 1370)),
-                "version": "5",
+                "version": "4",
+                "domain_strategy": "ipv4_only"
             }
 
             outbounds = [warp_socks]
             target_tcp = "warp-socks"
-            # Last-resort path if native WG can't be prepared on this run.
+            # Стратегия UDP для мессенджеров в режиме WARP SOCKS:
+            #
+            # Мы возвращаемся на "direct". 
+            # 1. WARP SOCKS (1370) не поддерживает UDP.
+            # 2. Локальный "block" на Windows в режиме "system" stack (без gvisor) дропает пакеты
+            #    без отправки ICMP Port Unreachable. Из-за этого приложение (Discord/WhatsApp) 
+            #    ждёт socket timeout 1-2 минуты перед переходом на TCP.
+            # 3. Gvisor (который отправляет ICMP) ломает TCP-потоки для UWP/Electron (update failing).
+            # 4. В режиме "direct" пакеты уходят провайдеру напрямую, но поскольку параллельно
+            #    работает winws (Zapret), он в большинстве случаев успешно обходит блокировки UDP.
+            # Итог: direct с winws работает быстрее всего, без искусственных 2-минутных задержек.
             target_udp = "direct"
-
-            # Preferred UDP path: native WireGuard profile from Cloudflare API.
-            profile = None
-            if self._force_disable_native_wg:
-                if not self._wg_disable_notice_logged:
-                    self._wg_disable_notice_logged = True
-                    self.log_func("[SingBox] [WG] Native WireGuard отключен из-за crash-loop. UDP путь: direct/winws (reserve).")
-            else:
-                profile = self._get_warp_native_profile()
-            if profile:
-                try:
-                    server = str(profile.get("server") or "").strip()
-                    local_addresses = [str(x).strip() for x in (profile.get("local_addresses") or []) if str(x).strip()]
-                    private_key = str(profile.get("private_key") or "").strip()
-                    peer_public_key = str(profile.get("peer_public_key") or "").strip()
-                    ports = [int(x) for x in (profile.get("ports") or []) if str(x).isdigit()]
-                    ports = [p for p in ports if 1 <= p <= 65535 and p != 2408]
-                    if not ports:
-                        ports = [443, 500, 1701, 4500]
-
-                    preferred = profile.get("last_good_port")
-                    forced_port = None
-                    try:
-                        forced_raw = str(os.environ.get("NOVA_WG_UDP_PORT", "")).strip()
-                        if forced_raw.isdigit():
-                            fp = int(forced_raw)
-                            if 1 <= fp <= 65535:
-                                forced_port = fp
-                    except:
-                        forced_port = None
-
-                    ordered = []
-                    if isinstance(forced_port, int) and forced_port in ports:
-                        ordered.append(forced_port)
-                    if isinstance(preferred, int) and preferred in ports and preferred not in ordered:
-                        ordered.append(preferred)
-                    for p in [443, 500, 1701, 4500]:
-                        if p in ports and p not in ordered:
-                            ordered.append(p)
-                    for p in ports:
-                        if p not in ordered:
-                            ordered.append(p)
-
-                    if server and local_addresses and private_key and peer_public_key:
-                        primary_port = ordered[0] if ordered else 443
-                        wg_tag = f"warp-wg-udp-{primary_port}"
-                        wg_ob = {
-                            "type": "wireguard",
-                            "tag": wg_tag,
-                            "server": server,
-                            "server_port": int(primary_port),
-                            "local_address": local_addresses,
-                            "private_key": private_key,
-                            "peer_public_key": peer_public_key,
-                            "workers": 2,
-                            "mtu": 1280
-                        }
-                        reserved = profile.get("reserved")
-                        if isinstance(reserved, list) and len(reserved) == 3:
-                            wg_ob["reserved"] = reserved
-                        outbounds.append(wg_ob)
-                        target_udp = wg_tag
-                        self._using_wireguard_outbound = True
-                        self._wg_socks_mode_logged = False
-                        self.log_func(f"[SingBox] [WG] UDP через native WireGuard (порт {primary_port}), TCP через WARP SOCKS (1370).")
-                except Exception as e:
-                    if not self._wg_socks_mode_logged:
-                        self._wg_socks_mode_logged = True
-                        self.log_func(f"[SingBox] [WG] Ошибка native UDP пути: {e}. Используем direct/winws как резерв для UDP.")
-            else:
-                if not self._wg_socks_mode_logged:
-                    self._wg_socks_mode_logged = True
-                    self.log_func("[SingBox] [WG] Native профиль недоступен. Используем direct/winws как резерв для UDP.")
+            self.log_func("[SingBox] [Route] UDP голос → direct (обработка через системный winws, без таймаутов).")
 
             # Optional TCP bootstrap fallback via local Opera proxy.
             if self._allow_1371_tcp_fallback:
@@ -2778,8 +2881,7 @@ try:
                     pass
 
             outbounds.append({"type": "direct", "tag": "direct"})
-            udp_path = "WG (Native)" if self._using_wireguard_outbound else "direct/winws (reserve)"
-            self.log_func(f"[SingBox] [Route] TCP → {target_tcp} (WARP MASQUE). UDP голос → {udp_path}.")
+            self.log_func(f"[SingBox] [Route] TCP → {target_tcp} (WARP MASQUE). UDP голос → {target_udp}.")
             return outbounds, [], target_udp, target_tcp
 
 
@@ -2790,6 +2892,8 @@ try:
                 self.config_path = os.path.join(self.temp_dir, "sing-box-conf.json")
                 if not os.path.exists(self.temp_dir): os.makedirs(self.temp_dir, exist_ok=True)
                 import ipaddress
+                import socket
+                import random
 
                 def _read_domains(path):
                     out = set()
@@ -2861,6 +2965,39 @@ try:
                         pass
                     return out
 
+                def _resolve_domains_to_ipv4_cidrs(domains, max_domains=24, max_per_domain=8):
+                    """Resolve a compact set of dynamic domains to /32 routes."""
+                    out = set()
+                    try:
+                        candidates = []
+                        for d in sorted(set(domains or [])):
+                            ds = str(d or "").strip().lower()
+                            if ds and "/" not in ds and " " not in ds:
+                                candidates.append(ds)
+                        if max_domains > 0:
+                            candidates = candidates[:max_domains]
+                    except:
+                        candidates = []
+                    for domain in candidates:
+                        try:
+                            _, _, ips = socket.gethostbyname_ex(domain)
+                        except:
+                            continue
+                        added = 0
+                        for ip in ips or []:
+                            ip_s = str(ip).strip()
+                            try:
+                                ip_obj = ipaddress.ip_address(ip_s)
+                            except:
+                                continue
+                            if ip_obj.version != 4:
+                                continue
+                            out.add(f"{ip_s}/32")
+                            added += 1
+                            if max_per_domain > 0 and added >= max_per_domain:
+                                break
+                    return out
+
                 def _filter_tun_route_cidrs(cidrs):
                     """
                     Keep TUN capture surgical:
@@ -2874,20 +3011,54 @@ try:
                             net = ipaddress.ip_network(str(raw).strip(), strict=False)
                         except:
                             continue
-                        if net.version == 4 and net.prefixlen < 20:
-                            # Accept moderate broad ranges from app lists by splitting to /20.
-                            # Avoid huge hijacks like /10, but allow /14-/19 for messenger CDNs.
-                            if 14 <= net.prefixlen <= 19:
-                                try:
-                                    for sn in net.subnets(new_prefix=20):
-                                        out.add(str(sn))
-                                except:
-                                    pass
-                            continue
+                        if net.version == 4:
+                            if self._low_cpu_mode:
+                                # In low-cpu keep medium ranges as-is (>= /16) to preserve Discord/WhatsApp reachability,
+                                # but still reject very broad captures (/0-/15).
+                                if net.prefixlen < 16:
+                                    continue
+                                out.add(str(net))
+                                continue
+                            if net.prefixlen < 20:
+                                # Balanced mode: split moderate broad ranges to /20.
+                                # Avoid huge hijacks like /10, but allow /14-/19 for messenger CDNs.
+                                if 14 <= net.prefixlen <= 19:
+                                    try:
+                                        for sn in net.subnets(new_prefix=20):
+                                            out.add(str(sn))
+                                    except:
+                                        pass
+                                continue
                         if net.version == 6 and net.prefixlen < 32:
                             continue
                         out.add(str(net))
                     return out
+
+                def _cap_route_cidrs(cidrs, cap):
+                    """Keep route sets bounded to reduce sing-box routing overhead on weak CPUs."""
+                    try:
+                        cap = int(cap or 0)
+                    except:
+                        cap = 0
+                    normalized = set()
+                    for raw in cidrs:
+                        txt = str(raw or "").strip()
+                        if txt:
+                            normalized.add(txt)
+                    if cap <= 0 or len(normalized) <= cap:
+                        return normalized
+
+                    def _key(raw):
+                        try:
+                            net = ipaddress.ip_network(raw, strict=False)
+                            family = 0 if net.version == 4 else 1
+                            # Keep more specific prefixes first, then stable lexical order.
+                            return (family, -int(net.prefixlen), str(net.network_address), raw)
+                        except:
+                            return (9, 0, raw, raw)
+
+                    ordered = sorted(normalized, key=_key)
+                    return set(ordered[:cap])
 
                 def _prune_infra_conflicts(cidrs):
                     """
@@ -3068,6 +3239,23 @@ try:
                     r"(?i)^.*\\whatsapp\.root\.exe$",
                     r"(?i)^.*\\msedgewebview2\.exe$",
                 ]
+                discord_processes = [
+                    "Discord.exe",
+                    "Discord",
+                    "discord.exe",
+                    "discord",
+                    "DiscordCanary.exe",
+                    "DiscordCanary",
+                    "discordcanary.exe",
+                    "discordcanary",
+                    "DiscordPTB.exe",
+                    "DiscordPTB",
+                    "discordptb.exe",
+                    "discordptb",
+                ]
+                discord_path_regex = [
+                    r"(?i)^.*\\discord(?:canary|ptb)?\\.*\.exe$",
+                ]
                 whatsapp_processes = [
                     "WhatsApp.exe",
                     "WhatsApp",
@@ -3126,6 +3314,12 @@ try:
                     r"(?i)^.*\\appdata\\local\\whatsapp\\update\.exe$",
                     r"(?i)^.*\\appdata\\local\\whatsapp\\updater\.exe$",
                 ]
+                discord_update_path_regex = [
+                    r"(?i)^.*\\discord(?:canary|ptb)?\\update\.exe$",
+                    r"(?i)^.*\\discord(?:canary|ptb)?\\updater\.exe$",
+                    r"(?i)^.*\\appdata\\local\\discord(?:canary|ptb)?\\update\.exe$",
+                    r"(?i)^.*\\appdata\\local\\discord(?:canary|ptb)?\\updater\.exe$",
+                ]
                 whatsapp_update_path_regex = [
                     r"(?i)^.*\\whatsapp\\update\.exe$",
                     r"(?i)^.*\\whatsapp\\updater\.exe$",
@@ -3179,9 +3373,14 @@ try:
                     "185.104.210.0/24",
                 }
                 discord_ip_cidrs = {
+                    # Cloudflare — Discord CDN и relay ноды (конкретный /20, не весь /17!)
                     "162.159.128.0/20",
                     "188.114.96.0/20",
-                    "35.186.224.0/20",
+                    # Google Cloud — Discord CDN
+                    "35.186.224.0/20",  # europe-west1 CDN
+                    # Google Cloud — Discord voice server (подтверждено из лога: 35.214.180.190)
+                    "35.214.0.0/16",
+                    # Legacy Discord ASN 36459
                     "66.22.192.0/20",
                     "66.22.208.0/20",
                     "66.22.224.0/20",
@@ -3221,6 +3420,27 @@ try:
                 discord_ip_cidrs.update(
                     _read_ip_cidrs_glob([os.path.join(ip_dir, "discord*.txt")])
                 )
+                if self._discord_dns_warmup:
+                    warmup_domains = set(discord_domains)
+                    warmup_domains.update(
+                        {
+                            "discord.com",
+                            "discord.gg",
+                            "gateway.discord.gg",
+                            "media.discordapp.net",
+                            "cdn.discordapp.com",
+                            "cdn.discordapp.net",
+                            "status.discord.com",
+                            "ptb.discord.com",
+                            "canary.discord.com",
+                        }
+                    )
+                    warmup_cidrs = _resolve_domains_to_ipv4_cidrs(
+                        warmup_domains, max_domains=28, max_per_domain=10
+                    )
+                    if warmup_cidrs:
+                        discord_ip_cidrs.update(warmup_cidrs)
+                        self.log_func(f"[SingBox] [Route] Discord DNS warmup: +{len(warmup_cidrs)} IP (/32).")
                 whatsapp_ip_cidrs.update(_read_ip_cidrs(os.path.join(ip_dir, "whatsapp.txt")))
                 whatsapp_ip_cidrs.update(
                     _read_ip_cidrs_glob([os.path.join(ip_dir, "whatsapp*.txt")])
@@ -3235,11 +3455,21 @@ try:
                 # TUN must not become a system-wide choke point: capture only messenger-related subnets.
                 tun_route_cidrs = set(service_ip_cidrs)
                 tun_route_cidrs = _filter_tun_route_cidrs(tun_route_cidrs)
+                discord_route_cidrs = _filter_tun_route_cidrs(discord_ip_cidrs)
                 telegram_udp_route_cidrs = _filter_tun_route_cidrs(telegram_ip_cidrs)
                 whatsapp_route_cidrs = _filter_tun_route_cidrs(whatsapp_ip_cidrs)
                 discord_whatsapp_udp_route_cidrs = _filter_tun_route_cidrs(
                     set(discord_ip_cidrs).union(whatsapp_ip_cidrs)
                 )
+                if self._tun_route_cap > 0:
+                    udp_cap = max(80, min(int(self._tun_route_cap), 180))
+                    tun_route_cidrs = _cap_route_cidrs(tun_route_cidrs, self._tun_route_cap)
+                    discord_route_cidrs = _cap_route_cidrs(discord_route_cidrs, udp_cap)
+                    telegram_udp_route_cidrs = _cap_route_cidrs(telegram_udp_route_cidrs, udp_cap)
+                    whatsapp_route_cidrs = _cap_route_cidrs(whatsapp_route_cidrs, udp_cap)
+                    discord_whatsapp_udp_route_cidrs = _cap_route_cidrs(
+                        discord_whatsapp_udp_route_cidrs, self._tun_route_cap
+                    )
                 discord_whatsapp_domains = set(discord_domains).union(whatsapp_domains)
 
                 outbounds, wg_endpoints, warp_target_udp_outbound, warp_target_tcp_outbound = self._build_warp_outbounds()
@@ -3282,75 +3512,209 @@ try:
                         "outbound": "direct"
                     },
                 ]
+                # Discord voice compatibility mode:
+                # keep Discord signaling TCP on the same WG path as Discord UDP.
+                if self._using_wireguard_outbound and self._discord_tcp_via_wg:
+                    route_rules.extend(
+                        [
+                            {
+                                "process_name": discord_processes,
+                                "network": ["tcp"],
+                                "action": "route",
+                                "outbound": warp_target_udp_outbound
+                            },
+                            {
+                                "process_path_regex": discord_path_regex,
+                                "network": ["tcp"],
+                                "action": "route",
+                                "outbound": warp_target_udp_outbound
+                            },
+                            {
+                                "process_name": generic_update_process_names,
+                                "process_path_regex": discord_update_path_regex,
+                                "network": ["tcp"],
+                                "action": "route",
+                                "outbound": warp_target_udp_outbound
+                            },
+                        ]
+                    )
+                    if discord_domains:
+                        route_rules.append(
+                            {
+                                "domain_suffix": sorted(discord_domains),
+                                "network": ["tcp"],
+                                "action": "route",
+                                "outbound": warp_target_udp_outbound
+                            }
+                        )
+                    if discord_route_cidrs:
+                        route_rules.append(
+                            {
+                                "ip_cidr": sorted(discord_route_cidrs),
+                                "network": ["tcp"],
+                                "action": "route",
+                                "outbound": warp_target_udp_outbound
+                            }
+                        )
+                    self.log_func("[SingBox] [Route] Discord TCP закреплен за WARP WG (совместимость voice).")
+
+                # Optional emergency mode for networks where Discord voice fails over WG.
+                if self._discord_udp_direct:
+                    route_rules.extend(
+                        [
+                            {
+                                "process_name": discord_processes,
+                                "network": ["udp"],
+                                "action": "route",
+                                "outbound": "direct"
+                            },
+                            {
+                                "process_path_regex": discord_path_regex,
+                                "network": ["udp"],
+                                "action": "route",
+                                "outbound": "direct"
+                            },
+                            {
+                                "process_name": generic_update_process_names,
+                                "process_path_regex": discord_update_path_regex,
+                                "network": ["udp"],
+                                "action": "route",
+                                "outbound": "direct"
+                            },
+                        ]
+                    )
+                    if discord_domains:
+                        route_rules.append(
+                            {
+                                "domain_suffix": sorted(discord_domains),
+                                "network": ["udp"],
+                                "action": "route",
+                                "outbound": "direct"
+                            }
+                        )
+                    if discord_route_cidrs:
+                        route_rules.append(
+                            {
+                                "ip_cidr": sorted(discord_route_cidrs),
+                                "network": ["udp"],
+                                "action": "route",
+                                "outbound": "direct"
+                            }
+                        )
+                    self.log_func("[SingBox] [Route] Discord UDP принудительно через direct/winws (NOVA_DISCORD_UDP_DIRECT=1).")
+                else:
+                    self.log_func("[SingBox] [Route] Discord UDP через WARP SOCKS (default).")
                 # Selective TCP fallback through local 1371 for known problematic bootstrap flows.
                 # Keep WARP as default for all other traffic.
                 if self._opera_tcp_fallback_outbound:
                     wa_fallback_ports = [5222]
+                    dc_fallback_ports = [443, 80]
                     if str(os.environ.get("NOVA_WA_FALLBACK_443", "0")).strip().lower() in ("1", "true", "yes", "on"):
                         wa_fallback_ports.insert(0, 443)
-                    route_rules.extend(
-                        [
-                            {
-                                "process_path_regex": telegram_path_regex,
-                                "network": ["tcp"],
-                                "port": 80,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "process_name": telegram_udp_processes,
-                                "network": ["tcp"],
-                                "port": 80,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "process_name": generic_update_process_names,
-                                "process_path_regex": telegram_update_path_regex,
-                                "network": ["tcp"],
-                                "port": 80,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "process_name": whatsapp_processes,
-                                "network": ["tcp"],
-                                "port": wa_fallback_ports,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "process_path_regex": whatsapp_path_regex,
-                                "network": ["tcp"],
-                                "port": wa_fallback_ports,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "process_name": generic_update_process_names,
-                                "process_path_regex": whatsapp_update_path_regex,
-                                "network": ["tcp"],
-                                "port": wa_fallback_ports,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "domain_suffix": sorted(telegram_domains),
-                                "network": ["tcp"],
-                                "port": 80,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                            {
-                                "domain_suffix": sorted(whatsapp_domains),
-                                "network": ["tcp"],
-                                "port": wa_fallback_ports,
-                                "action": "route",
-                                "outbound": self._opera_tcp_fallback_outbound
-                            },
-                        ]
-                    )
-                    if telegram_udp_route_cidrs:
+                    tg_fallback_1371 = str(
+                        os.environ.get("NOVA_TG_FALLBACK_1371", "0")
+                    ).strip().lower() in ("1", "true", "yes", "on")
+                    fallback_rules = [
+                        {
+                            "process_name": whatsapp_processes,
+                            "network": ["tcp"],
+                            "port": wa_fallback_ports,
+                            "action": "route",
+                            "outbound": self._opera_tcp_fallback_outbound
+                        },
+                        {
+                            "process_path_regex": whatsapp_path_regex,
+                            "network": ["tcp"],
+                            "port": wa_fallback_ports,
+                            "action": "route",
+                            "outbound": self._opera_tcp_fallback_outbound
+                        },
+                        {
+                            "process_name": generic_update_process_names,
+                            "process_path_regex": whatsapp_update_path_regex,
+                            "network": ["tcp"],
+                            "port": wa_fallback_ports,
+                            "action": "route",
+                            "outbound": self._opera_tcp_fallback_outbound
+                        },
+                        {
+                            "domain_suffix": sorted(whatsapp_domains),
+                            "network": ["tcp"],
+                            "port": wa_fallback_ports,
+                            "action": "route",
+                            "outbound": self._opera_tcp_fallback_outbound
+                        },
+                    ]
+                    if self._discord_tcp_fallback_1371:
+                        fallback_rules.extend(
+                            [
+                                {
+                                    "process_name": discord_processes,
+                                    "network": ["tcp"],
+                                    "port": dc_fallback_ports,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                                {
+                                    "process_path_regex": discord_path_regex,
+                                    "network": ["tcp"],
+                                    "port": dc_fallback_ports,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                                {
+                                    "process_name": generic_update_process_names,
+                                    "process_path_regex": discord_update_path_regex,
+                                    "network": ["tcp"],
+                                    "port": dc_fallback_ports,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                                {
+                                    "domain_suffix": sorted(discord_domains),
+                                    "network": ["tcp"],
+                                    "port": dc_fallback_ports,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                            ]
+                        )
+                    if tg_fallback_1371:
+                        fallback_rules.extend(
+                            [
+                                {
+                                    "process_path_regex": telegram_path_regex,
+                                    "network": ["tcp"],
+                                    "port": 80,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                                {
+                                    "process_name": telegram_udp_processes,
+                                    "network": ["tcp"],
+                                    "port": 80,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                                {
+                                    "process_name": generic_update_process_names,
+                                    "process_path_regex": telegram_update_path_regex,
+                                    "network": ["tcp"],
+                                    "port": 80,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                                {
+                                    "domain_suffix": sorted(telegram_domains),
+                                    "network": ["tcp"],
+                                    "port": 80,
+                                    "action": "route",
+                                    "outbound": self._opera_tcp_fallback_outbound
+                                },
+                            ]
+                        )
+                    route_rules.extend(fallback_rules)
+                    if tg_fallback_1371 and telegram_udp_route_cidrs:
                         route_rules.append(
                             {
                                 "ip_cidr": sorted(telegram_udp_route_cidrs),
@@ -3370,8 +3734,29 @@ try:
                                 "outbound": self._opera_tcp_fallback_outbound
                             }
                         )
+                    if self._discord_tcp_fallback_1371 and discord_route_cidrs:
+                        route_rules.append(
+                            {
+                                "ip_cidr": sorted(discord_route_cidrs),
+                                "network": ["tcp"],
+                                "port": dc_fallback_ports,
+                                "action": "route",
+                                "outbound": self._opera_tcp_fallback_outbound
+                            }
+                        )
+                        self.log_func("[SingBox] [Route] Discord TCP fallback через 1371 включен.")
                 route_rules.extend(
                     [
+                    {
+                        # Fast-fail QUIC for Discord/WhatsApp: reject strictly QUIC protocol packets on UDP 443.
+                        # This forces an immediate internal drop (ICMP Unreachable) for QUIC, 
+                        # preventing the 30s ISP blackhole delay, while perfectly preserving WebRTC/STUN voice traffic.
+                        "domain_suffix": sorted(discord_whatsapp_domains),
+                        "port": [443, 80],
+                        "network": ["udp"],
+                        "protocol": ["quic"],
+                        "action": "reject"
+                    },
                     {
                         # Telegram/AyuGram UDP goes through native WG path when available.
                         "process_name": telegram_udp_processes,
@@ -3487,6 +3872,43 @@ try:
                             "outbound": warp_target_tcp_outbound
                         }
                     )
+                if discord_domains:
+                    route_rules.append(
+                        {
+                            # TCP rule by domain — catches Discord TCP packets even before process detection.
+                            # This prevents the 20-30s "Checking Updates" hang when Discord starts before Nova.
+                            "domain_suffix": sorted(discord_domains),
+                            "network": ["tcp"],
+                            "action": "route",
+                            "outbound": warp_target_tcp_outbound
+                        }
+                    )
+                route_rules.append(
+                    {
+                        "inbound": ["mixed-in"],
+                        "action": "route",
+                        "outbound": warp_target_tcp_outbound
+                    }
+                )
+                
+                # Safety net: any flow that reached tun-in should still go through WARP paths.
+                # This prevents silent fallthrough to direct on unknown process/path metadata.
+                route_rules.append(
+                    {
+                        "inbound": ["tun-in"],
+                        "network": ["udp"],
+                        "action": "route",
+                        "outbound": warp_target_udp_outbound
+                    }
+                )
+                route_rules.append(
+                    {
+                        "inbound": ["tun-in"],
+                        "network": ["tcp"],
+                        "action": "route",
+                        "outbound": warp_target_tcp_outbound
+                    }
+                )
                 # Keep bypass rule LAST: target app/domain/IP rules must win first.
                 # Otherwise some stacks report process as sing-box and traffic leaks to direct.
                 route_rules.append(
@@ -3497,11 +3919,21 @@ try:
                     }
                 )
 
+                # Activity monitor parses per-connection lines that are emitted on info level.
+                if IS_DEBUG_MODE:
+                    log_level = "info"
+                elif self._low_cpu_mode:
+                    log_level = "error"
+                elif self._activity_monitor_enabled:
+                    log_level = "info"
+                else:
+                    log_level = "warn"
+                log_output = self.log_path if self._persist_main_log else "stderr"
                 config = {
                     "log": {
                         # Keep diagnostics available in normal mode without huge per-connection spam.
-                        "level": "info" if IS_DEBUG_MODE else "warn",
-                        "output": self.log_path,
+                        "level": log_level,
+                        "output": log_output,
                         "timestamp": True
                     },
                     "dns": {
@@ -3509,8 +3941,8 @@ try:
                         # DoH over WARP prevents ISP DPI blocks on port 53 which cause 20+ second delays.
                         "servers": [
                             {
-                                # DoH over WARP SOCKS — bypasses ISP port-53 blocking.
-                                "type": "https",
+                                # TCP DNS over WARP SOCKS — bypasses ISP port-53 UDP blocking and avoids Cloudflare DoH SNI errors.
+                                "type": "tcp",
                                 "tag": "dns-remote",
                                 "server": "1.1.1.1",
                                 "detour": warp_target_tcp_outbound
@@ -3532,9 +3964,16 @@ try:
                     },
                     "inbounds": [
                         {
+                            "type": "mixed",
+                            "tag": "mixed-in",
+                            "listen": "127.0.0.1",
+                            "listen_port": 1372,
+                            "sniff": True
+                        },
+                        {
                             "type": "tun",
                             "tag": "tun-in",
-                            "interface_name": "NovaVoice",
+                            "interface_name": f"NovaVoice-{random.randint(1000, 9999)}",
                             "address": ["172.19.0.1/30"],
                             "auto_route": True,
                             "strict_route": True,
@@ -3564,9 +4003,12 @@ try:
                                 "fc00::/7",
                                 "fe80::/10"
                             ],
+                            # Используем system stack: самый надёжный для TCP на Windows
+                            # (gvisor ломал Discord/WhatsApp, а "mixed" означает gvisor для TCP и system для UDP).
+                            # Для мгновенного ICMP-отбоя UDP используем reject в правилах маршрутизации.
                             "stack": "system",
                             # Needed for domain-based fallback rules.
-                            "sniff": True
+                            "sniff": bool(self._tun_sniff_enabled)
                         }
                     ],
                     "outbounds": outbounds,
@@ -3585,6 +4027,14 @@ try:
                 with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(config, f, indent=4)
                 self.log_func(f"[SingBox] [Route] Адаптер NovaVoice перехватывает трафик целевых мессенджеров (подсети: {len(tun_route_cidrs)}).")
+                if not self._perf_mode_logged:
+                    self._perf_mode_logged = True
+                    mode = "low-cpu" if self._low_cpu_mode else "balanced"
+                    self.log_func(
+                        f"[SingBox] [Perf] Режим {mode}: sniff={'on' if self._tun_sniff_enabled else 'off'}, "
+                        f"wg_workers={self._wg_workers}, tun_cap={self._tun_route_cap}, "
+                        f"log_file={'on' if self._persist_main_log else 'off'}, stderr_log={'on' if self._persist_stderr_log else 'off'}."
+                    )
 
             except Exception as e:
                 self.log_func(f"[SingBox] Ошибка создания конфига: {e}")
@@ -3617,38 +4067,44 @@ try:
 
         def start(self):
             """Starts sing-box if not already running."""
-            if self.process and self.process.poll() is None:
-                return # Already running
-
-            if not os.path.exists(self.exe_path):
-                self.log_func("[SingBox] Бинарный файл не найден.")
-                return
-
-            self.stop()
-            self._rotate_log_if_needed()
-            pre_log_size = 0
-            try:
-                if os.path.exists(self.log_path):
-                    pre_log_size = os.path.getsize(self.log_path)
-            except:
-                pass
-
-            # One-time startup diagnostic for WARP SOCKS UDP capability.
-            if not self._warp_udp_diag_done:
-                self._warp_udp_diag_done = True
-                udp_ok, udp_msg = self._probe_warp_socks_udp_support()
-                if udp_ok:
-                    self.log_func("[SingBox] [Diag] WARP SOCKS: UDP ASSOCIATE поддерживается.")
-                else:
-                    self.log_func(f"[SingBox] [Diag] WARP SOCKS: UDP ASSOCIATE не поддерживается ({udp_msg}). Возможны проблемы с UDP.")
-
-            self.create_config()
-            
-            if not os.path.exists(self.config_path):
-                self.log_func(f"[SingBox] Ошибка: Конфиг не создан! Путь: {self.config_path}")
-                return
+            with self._lifecycle_lock:
+                if self.process and self.process.poll() is None:
+                    return  # Already running
+                if self.is_startup_in_progress():
+                    return
+                # Give watchdog enough time to skip premature restarts while config is prepared.
+                self._set_startup_state(True, timeout_sec=45.0)
 
             try:
+                if not os.path.exists(self.exe_path):
+                    self.log_func("[SingBox] Бинарный файл не найден.")
+                    return
+
+                self.stop(preserve_startup_state=True)
+                pre_log_size = 0
+                if self._persist_main_log:
+                    self._rotate_log_if_needed()
+                    try:
+                        if os.path.exists(self.log_path):
+                            pre_log_size = os.path.getsize(self.log_path)
+                    except:
+                        pass
+
+                # One-time startup diagnostic for WARP SOCKS UDP capability.
+                if not self._warp_udp_diag_done:
+                    self._warp_udp_diag_done = True
+                    udp_ok, udp_msg = self._probe_warp_socks_udp_support()
+                    if udp_ok:
+                        self.log_func("[SingBox] [Diag] WARP SOCKS: UDP ASSOCIATE поддерживается.")
+                    else:
+                        self.log_func(f"[SingBox] [Diag] WARP SOCKS: UDP ASSOCIATE не поддерживается ({udp_msg}). Возможны проблемы с UDP.")
+
+                self.create_config()
+                
+                if not os.path.exists(self.config_path):
+                    self.log_func(f"[SingBox] Ошибка: Конфиг не создан! Путь: {self.config_path}")
+                    return
+
                 sb_env = os.environ.copy()
                 if self._using_wireguard_outbound:
                     sb_env["ENABLE_DEPRECATED_WIREGUARD_OUTBOUND"] = "true"
@@ -3672,13 +4128,16 @@ try:
                 cmd = [self.exe_path, "run", "-c", self.config_path]
                 stderr_sink = None
                 try:
-                    os.makedirs(self.temp_dir, exist_ok=True)
-                    stderr_sink = open(self.stderr_path, "a", encoding="utf-8", errors="ignore")
+                    if self._persist_stderr_log:
+                        os.makedirs(self.temp_dir, exist_ok=True)
+                        stderr_sink = open(self.stderr_path, "a", encoding="utf-8", errors="ignore")
+                    else:
+                        stderr_sink = open(os.devnull, "w")
                 except:
                     stderr_sink = open(os.devnull, "w")
 
                 try:
-                    self.process = subprocess.Popen(
+                    proc = subprocess.Popen(
                         cmd,
                         startupinfo=startupinfo,
                         creationflags=subprocess.CREATE_NO_WINDOW,
@@ -3687,42 +4146,63 @@ try:
                         stdout=stderr_sink,
                         stderr=stderr_sink
                     )
+                    with self._lifecycle_lock:
+                        self.process = proc
                 finally:
                     try:
                         if stderr_sink:
                             stderr_sink.close()
                     except:
                         pass
+
                 time.sleep(0.4)
-                if self.process.poll() is not None:
-                    exit_code = self.process.poll()
+                with self._lifecycle_lock:
+                    proc = self.process
+                if (not proc) or (proc.poll() is not None):
+                    exit_code = proc.poll() if proc else None
                     self._handle_runtime_exit(exit_code=exit_code, context="startup")
-                    self.process = None
+                    with self._lifecycle_lock:
+                        self.process = None
                     return
 
                 self.log_func("[SingBox] Голосовой туннель активен.")
-                self._start_activity_monitor(start_offset=pre_log_size)
+                if self._activity_monitor_enabled and self._persist_main_log:
+                    self._start_activity_monitor(start_offset=pre_log_size)
+                else:
+                    self.log_func("[SingBox] [Perf] Монитор активности отключён: runtime-строки [Call]/[TCP] не выводятся.")
                 if not self._log_mode_hint_done and not IS_DEBUG_MODE:
                     self._log_mode_hint_done = True
-                    self.log_func("[SingBox] [Diag] Уровень логирования: normal. Пустой sing-box.log означает отсутствие предупреждений/ошибок.")
+                    if self._persist_main_log:
+                        self.log_func("[SingBox] [Diag] Уровень логирования: normal. Пустой sing-box.log означает отсутствие предупреждений/ошибок.")
+                    else:
+                        self.log_func("[SingBox] [Diag] Уровень логирования: low-cpu (файловый лог отключён).")
                 if not self._app_proxy_hint_done:
                     self._app_proxy_hint_done = True
                     self.log_func("[SingBox] [Hint] Для стабильных звонков в Telegram/AyuGram лучше отключить 'Use system proxy settings' (TCP может работать и с ним, но иногда это добавляет задержки).")
             except Exception as e:
                 self.log_func(f"[SingBox] Ошибка запуска: {e}")
+            finally:
+                with self._lifecycle_lock:
+                    self._set_startup_state(False)
 
-        def stop(self):
+        def stop(self, preserve_startup_state=False):
             """Stops sing-box aggressively."""
-            self._stop_activity_monitor()
-            if self.process:
-                try:
-                    self.process.terminate()
-                    self.process.wait(timeout=1)
-                except: pass
-                try:
-                    self.process.kill()
-                except: pass
+            with self._lifecycle_lock:
+                self._stop_activity_monitor()
+                proc = self.process
                 self.process = None
+                if not preserve_startup_state:
+                    self._set_startup_state(False)
+            if proc:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1)
+                except:
+                    pass
+                try:
+                    proc.kill()
+                except:
+                    pass
             
             # Failsafe cleanup
             try:
@@ -3880,7 +4360,6 @@ try:
             self.bootstrap_event = threading.Event()
             self.bootstrap_ok = False
             # How daemon bootstrap reached Cloudflare control plane in current run.
-            # Values: "strategy", "opera_1371", "unknown"
             self.last_bootstrap_transport = "unknown"
 
         def mark_bootstrap(self, ok):
@@ -5008,8 +5487,7 @@ try:
                 # If Warp is down, go straight to Opera to avoid browser timeouts.
                 if warp_active:
                     ru_route_parts = [
-                        f"SOCKS5 127.0.0.1:{self.warp_port}",
-                        f"PROXY 127.0.0.1:{self.warp_port}"
+                        f"PROXY 127.0.0.1:1372"  # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
                     ]
                     if opera_active:
                         ru_route_parts.append("PROXY 127.0.0.1:1371")
@@ -5018,14 +5496,12 @@ try:
                 else:
                     ru_route = "PROXY 127.0.0.1:1371; DIRECT" if opera_active else "DIRECT"
                 if warp_active:
-                    eu_route_parts = []
+                    eu_route_parts = [
+                        f"PROXY 127.0.0.1:1372"  # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
+                    ]
                     if opera_active:
                         eu_route_parts.append("PROXY 127.0.0.1:1371")
-                    eu_route_parts.extend([
-                        f"SOCKS5 127.0.0.1:{self.warp_port}",
-                        f"PROXY 127.0.0.1:{self.warp_port}",
-                        "DIRECT"
-                    ])
+                    eu_route_parts.append("DIRECT")
                     eu_route = "; ".join(eu_route_parts)
                 else:
                     eu_route = "PROXY 127.0.0.1:1371; DIRECT" if opera_active else "DIRECT"
@@ -5099,6 +5575,8 @@ try:
                 route_signature = (bool(warp_active), bool(opera_active))
                 if route_signature != self._last_route_signature:
                     self._last_route_signature = route_signature
+                    # Force OS and browsers to immediately re-fetch the PAC file
+                    self.refresh_system_options()
 
                 # Log EU routing only when EU path really changes (depends on 1371 health, not WARP 1370 state).
                 if warp_active and opera_active:
@@ -5112,9 +5590,9 @@ try:
                 if eu_route_state != self._last_eu_route_state:
                     self._last_eu_route_state = eu_route_state
                     if eu_route_state == "opera+warp":
-                        self.log_func(f"[PAC] EU маршрут: PROXY 127.0.0.1:1371; SOCKS5/PROXY 127.0.0.1:{self.warp_port}; DIRECT")
+                        self.log_func(f"[PAC] EU маршрут: PROXY 127.0.0.1:1372; PROXY 127.0.0.1:1371; DIRECT")
                     elif eu_route_state == "warp":
-                        self.log_func(f"[PAC] EU маршрут: SOCKS5/PROXY 127.0.0.1:{self.warp_port}; DIRECT")
+                        self.log_func(f"[PAC] EU маршрут: PROXY 127.0.0.1:1372; DIRECT")
                     elif eu_route_state == "opera":
                         self.log_func("[PAC] EU маршрут: PROXY 127.0.0.1:1371; DIRECT")
                     else:
@@ -5809,8 +6287,34 @@ try:
         for name, content in files.items():
             path = os.path.join(base_dir, "list", name)
             if not os.path.exists(path) or (name == "general.txt" and os.path.getsize(path) == 0):
+                # Ensure it has version header on creation
+                if not content.startswith("# version:"):
+                    content = f"# version: {CURRENT_VERSION}\n" + content
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
+            
+        # PROACTIVE HEADER INJECTION: force # version: {CURRENT_VERSION} on ALL .txt lists
+        list_dir_path = os.path.join(base_dir, "list")
+        if os.path.exists(list_dir_path):
+            try:
+                for f in os.listdir(list_dir_path):
+                    if f.endswith(".txt"):
+                        f_path = os.path.join(list_dir_path, f)
+                        try:
+                            with open(f_path, "r", encoding="utf-8") as text_file:
+                                lines = text_file.readlines()
+                            if not lines:
+                                lines = [f"# version: {CURRENT_VERSION}\n"]
+                            elif lines[0].startswith("# version:"):
+                                if lines[0].strip() == f"# version: {CURRENT_VERSION}":
+                                    continue
+                                lines[0] = f"# version: {CURRENT_VERSION}\n"
+                            else:
+                                lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                            with open(f_path, "w", encoding="utf-8") as text_file:
+                                text_file.writelines(lines)
+                        except: pass
+            except: pass
             
         # === FIX: Config Auto-Update Logic ===
         def check_and_update_config(filename, default_data, validation_callback=None):
@@ -14815,6 +15319,7 @@ try:
         opera_bad_proxy_streak = 0
         opera_last_good_ts = 0.0
         opera_next_restart_ts = 0.0
+        singbox_next_restart_ts = 0.0
         
         # Keep first PAC/1371 refresh close to startup to minimize DIRECT window for EU domains.
         time.sleep(2)
@@ -15032,6 +15537,11 @@ try:
 
                 # Check SingBox voice tunnel; recover if it died after startup.
                 if sing_box_manager and warp_manager and getattr(warp_manager, 'is_connected', False):
+                    sb_starting = False
+                    try:
+                        sb_starting = bool(sing_box_manager.is_startup_in_progress())
+                    except:
+                        sb_starting = False
                     sb_proc = getattr(sing_box_manager, "process", None)
                     sb_exit_code = None
                     if sb_proc:
@@ -15040,7 +15550,14 @@ try:
                         except:
                             sb_exit_code = None
                     sb_alive = bool(sb_proc and sb_exit_code is None)
-                    if not sb_alive:
+                    if sb_alive:
+                        singbox_next_restart_ts = 0.0
+                    elif sb_starting:
+                        # Prevent race: startup in progress means watchdog must wait.
+                        pass
+                    elif now < singbox_next_restart_ts:
+                        pass
+                    else:
                         if sb_proc and sb_exit_code is not None:
                             try:
                                 sing_box_manager._handle_runtime_exit(exit_code=sb_exit_code, context="watchdog")
@@ -15048,6 +15565,7 @@ try:
                                 pass
                         log_func("[SingBox] Процесс неактивен. Перезапуск голосового туннеля...")
                         retry_timestamps.append(now)
+                        singbox_next_restart_ts = now + 8.0
                         time.sleep(1.0)
                         try:
                             sing_box_manager.start()
@@ -15338,14 +15856,74 @@ try:
             "winws_test.exe"
         ]
 
+        BIN_CHECK_FILE = os.path.join(temp_dir, "bin_check.json")
+        
+        def _load_bin_check():
+            try:
+                with open(BIN_CHECK_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return {}
+        
+        def _save_bin_check(data):
+            try:
+                with open(BIN_CHECK_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+            except:
+                pass
+        
+        bin_check = _load_bin_check()
+        already_verified = (
+            bin_check.get("version") == CURRENT_VERSION
+            and isinstance(bin_check.get("ok"), list)
+            and set(bin_check["ok"]) >= set(files)
+        )
+
         missing_files = []
         for f in files:
             path = os.path.join(bin_dir, f)
             if not os.path.exists(path) or os.path.getsize(path) == 0:
                 missing_files.append(f)
+
+        if not missing_files and not already_verified:
+            # Все файлы есть локально, но ещё не проверяли размеры для этой версии.
+            # Делаем однократный HEAD-запрос к GitHub и кешируем результат.
+            log_func("[Init] Проверка актуальности компонентов (однократно для v{})...".format(CURRENT_VERSION))
+            size_mismatch = []
+            try:
+                import requests
+                sess = requests.Session()
+                sess.trust_env = False
+                for f in files:
+                    url = "https://raw.githubusercontent.com/confeden/nova_updates/main/bin/{}".format(f)
+                    try:
+                        r = sess.head(url, timeout=4)
+                        if r.status_code == 200:
+                            remote_size = int(r.headers.get("content-length", 0))
+                            local_size = os.path.getsize(os.path.join(bin_dir, f))
+                            if remote_size > 0 and local_size != remote_size:
+                                log_func(f"[Init] Размер файла {f} ({local_size}) ≠ GitHub ({remote_size}). Удаляем.")
+                                try: os.remove(os.path.join(bin_dir, f))
+                                except: pass
+                                size_mismatch.append(f)
+                    except:
+                        pass
+            except:
+                pass
+            
+            if size_mismatch:
+                missing_files.extend(size_mismatch)
+            else:
+                # Все совпало → записываем в кеш, чтобы не проверять повторно
+                _save_bin_check({"version": CURRENT_VERSION, "ok": files})
+                log_func("[Init] Все компоненты актуальны. Проверка сохранена в кеш.")
         
         if not missing_files:
             return True
+
+        # Сбрасываем кеш — что-то надо скачать
+        _save_bin_check({})
+
 
         # FIX: Force cleanup processes before attempting to update files (WinError 32 fix)
         try:
@@ -15356,7 +15934,7 @@ try:
             subprocess.run(["taskkill", "/F", "/IM", "opera-proxy.windows-amd64.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             
             # Force stop driver service
-            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
             time.sleep(1.0) # Wait for release
         except: pass
 
@@ -15627,6 +16205,8 @@ try:
                 except: pass
                 
             log_func("[Init] Все компоненты успешно загружены.")
+            # Сохраняем кеш — файлы свежие, следующий запуск не будет делать HEAD-запросы
+            _save_bin_check({"version": CURRENT_VERSION, "ok": files})
             
             # Create winws_test.exe for process isolation
             try:
@@ -15740,6 +16320,23 @@ try:
             except: pass
 
         if not restart_mode:
+            # CRITICAL: Clear stale system proxy BEFORE any HTTP requests.
+            # If Nova was killed (crash/taskkill), the PAC proxy stays in Windows,
+            # causing download_dependencies and WARP registration to timeout on dead ports.
+            try:
+                import winreg
+                inet_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    0, winreg.KEY_SET_VALUE)
+                try:
+                    winreg.DeleteValue(inet_key, "AutoConfigURL")
+                except FileNotFoundError:
+                    pass
+                winreg.SetValueEx(inet_key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+                winreg.CloseKey(inet_key)
+            except:
+                pass
+
             if not download_dependencies(logger, status_callback=update_loading_status_sync):
                 msg = "Не удалось загрузить необходимые компоненты!\nПроверьте интернет и повторите попытку."
                 if not silent:
@@ -15759,7 +16356,8 @@ try:
                             ["taskkill", "/F", "/IM", p, "/T"],
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                            timeout=2
                         )
                     except:
                         pass
@@ -15767,9 +16365,9 @@ try:
                     ["sc", "stop", "windivert"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=2
                 )
-                time.sleep(0.4)
             except:
                 pass
 
@@ -15815,6 +16413,7 @@ try:
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
         global is_service_active, process, is_closing
         
+        logger = globals().get('log_print', print)
         
         # TRACE LOGGING
         if restart_mode and not silent:
@@ -15834,86 +16433,70 @@ try:
             root.after(0, lambda: messagebox.showerror("Ошибка", f"Файл {WINWS_FILENAME} не найден!"))
             return
         
-        # EARLY CLEANUP START: Initiate driver stop ASAP to run in parallel with config loading
+        # EARLY CLEANUP: Stop old driver + kill old processes. All calls have short timeouts.
+        # If any call times out, windivert is in a bad state → auto-recover with sc delete.
+        _windivert_stuck = False
+        
+        # sc stop: if driver was actually running, we MUST wait for full unload before winws starts.
+        # 0.8s was previously proven insufficient; 1.2s is required for stable re-attach.
+        # On a cold start (driver not loaded), sc stop returns non-zero instantly → skip wait.
+        _driver_was_running = False
         try:
              if not restart_mode:
-                 subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                 _sc_result = subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
+                 _driver_was_running = (_sc_result.returncode == 0)
+        except subprocess.TimeoutExpired:
+            _windivert_stuck = True
+            _driver_was_running = True
         except: pass
 
-        # === НОВОЕ: Синхронизация hard_X доменов перед запуском ===
         sync_hard_domains_to_strategies(log_print if not silent else None)
+        # Wait for WinDivert driver to fully unload before winws.exe tries to re-attach.
+        # Without this wait, winws may load a partially-released driver instance that
+        # corrupts TCP packets (causing WARP proxy connections to silently fail).
+        time.sleep(1.2 if _driver_was_running else 0.1)
+
+        # Kill old winws process
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME],
+                           creationflags=subprocess.CREATE_NO_WINDOW,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        except subprocess.TimeoutExpired:
+            _windivert_stuck = True
+        except: pass
         
-        # Wait for driver to fully release (partially covered by config loading time above)
-        time.sleep(1.2) # Back to 1.2s (0.8s proved insufficient)
-
-        # === EARLY CLEANUP: Kill old process and clean driver BEFORE loading configs ===
-        # This allows driver unload to happen in parallel with config loading
-        try: 
-            # Phase 1: Soft Kill
-            subprocess.run(["taskkill", "/IM", WINWS_FILENAME], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # Wait up to 0.4s for graceful exit
-            wait_start = time.time()
-            killed_gracefully = False
-            while time.time() - wait_start < 0.4:
-                check = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {WINWS_FILENAME}"], 
-                                     capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                if WINWS_FILENAME not in check.stdout:
-                    killed_gracefully = True
-                    break
-                time.sleep(0.05)
-            
-            if killed_gracefully:
-                # Check if driver exists (zombie from warp.bat or previous crash)
-                try:
-                    sq = subprocess.run(["sc", "query", "windivert"], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                    is_service_present = (sq.returncode == 0)
-                except: is_service_present = False
-
-                if not is_service_present:
-                    # TRUE COLD START: No cleanup needed
-                    pass
-                else:
-                    # DIRTY STATE: Need cleanup
-                    if not restart_mode:
-                        raise Exception("Driver Dirty")
-                    else:
-                        pass # Restart mode: Driver persistence is expected
-            else:
-                raise Exception("Process Stuck")
-
-        except:
-            # Phase 2: Hard Kill + Driver Cleanup
-            subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+        try:
+            subprocess.run(["sc", "stop", "windivert"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
+        except subprocess.TimeoutExpired:
+            _windivert_stuck = True
+        except: pass
+        
+        # AUTO-RECOVERY: If windivert driver is stuck (commands timed out),
+        # force-delete the service registration. The driver will be re-installed
+        # automatically when winws.exe starts next time.
+        if _windivert_stuck:
+            logger("[Init] WinDivert драйвер завис. Автоматическое лечение (sc delete)...")
             try:
-               subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-               # subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW) # Removed to avoid startup delay
+                subprocess.run(["sc", "delete", "windivert"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=3)
             except: pass
-            
-            # Start 1.0s timer - will complete during config loading below
-            cleanup_start_time = time.time()
+            time.sleep(0.5)
+            logger("[Init] WinDivert сброшен. Драйвер будет переустановлен при запуске ядра.")
         
-        # === НОВОЕ: Загрузка реестра замедленных доменов ===
+        # Load configs
         global throttled_domains_registry
         throttled_domains_registry = load_throttled_registry()
         if throttled_domains_registry and not silent and not restart_mode:
             log_print(f"[Init] Загружено {len(throttled_domains_registry)} замедленных доменов из реестра")
         
-        # === НОВОЕ: Загрузка адаптивной системы подбора стратегий ===
         visited_count = load_visited_domains()
         evo_count = load_strategies_evolution()
         ip_count = load_ip_history()
         if not silent and not restart_mode:
             log_print(f"[Init] Адаптивная система: {visited_count} посещённых доменов, {evo_count} стратегий в эволюции, {ip_count} IP в истории")
-        
-        # Wait for remaining cleanup time if needed - REMOVED (Covered by preventive Wait)
-        # try:
-        #     elapsed = time.time() - cleanup_start_time
-        #     remaining = 1.0 - elapsed
-        #     if remaining > 0:
-        #         time.sleep(remaining)
-        # except NameError: pass
 
         is_service_active = True
         try: restart_requested_event.clear()
@@ -16612,7 +17195,6 @@ try:
 
     def on_closing():
         global is_closing, process
-        managed_opera_should_kill = False
         
         # Захватываем геометрию в главном потоке ДО уничтожения/скрытия окна
         main_geo = None
@@ -16637,98 +17219,92 @@ try:
         # FIX: Set is_closing FIRST so that background workers know we are exiting
         is_closing = True 
         
-        # Stop everything synchronously first
-        try:
-             # Restore Proxy first!
-             if pac_manager:
-                 pac_manager.restore_system_proxy()
-                 pac_manager.stop_server()
-             if opera_proxy_manager:
-                 try:
-                     managed_opera_should_kill = bool(getattr(opera_proxy_manager, "owns_process", False)) or bool(getattr(opera_proxy_manager, "process", None))
-                 except:
-                     managed_opera_should_kill = False
-             if warp_manager: warp_manager.stop()
-             if 'sing_box_manager' in globals() and sing_box_manager:
-                  try: sing_box_manager.stop()
-                  except: pass
-             
-             stop_nova_service(silent=True, wait_for_cleanup=True)
-        except: pass
-        
-        # (Geometry already captured above)
-
-        # === Быстрое сохранение состояния (СИНХРОННО) ===
-        try:
-            state_to_save = {}
-            if main_geo: state_to_save["main_geometry"] = main_geo
-            if log_geo: state_to_save["log_size"] = log_geo
+        def _heavy_cleanup():
+            """All potentially-blocking cleanup. Runs in a thread with hard timeout."""
+            try:
+                # Restore Proxy first!
+                if pac_manager:
+                    pac_manager.restore_system_proxy()
+                    pac_manager.stop_server()
+            except: pass
             
-            if state_to_save:
-                save_window_state(**state_to_save)
-        except: pass
-        
-        # === Сохраняем адаптивную систему (СИНХРОННО) ===
-        try:
-            if dns_manager:
-                dns_manager.save_cache()
-            save_visited_domains()
-            save_ip_history()
-            save_exclude_auto_checked()
-            flush_learning_data()
-        except Exception as e:
-            print(f"[AdaptiveSystem] Ошибка сохранения при выходе: {e}")
-        
-        try:
-            queue_list = []
-            while not check_queue.empty():
-                try: queue_list.append(check_queue.get_nowait())
-                except: break
+            try:
+                if warp_manager:
+                    try: warp_manager.run_warp_cli("disconnect", timeout=3)
+                    except: pass
+                    warp_manager.is_connected = False
+            except: pass
             
-            if queue_list:
-                try:
+            try:
+                if 'sing_box_manager' in globals() and sing_box_manager:
+                    sing_box_manager.stop()
+            except: pass
+            
+            # Save state
+            try:
+                state_to_save = {}
+                if main_geo: state_to_save["main_geometry"] = main_geo
+                if log_geo: state_to_save["log_size"] = log_geo
+                if state_to_save:
+                    save_window_state(**state_to_save)
+            except: pass
+            
+            try:
+                if dns_manager: dns_manager.save_cache()
+                save_visited_domains()
+                save_ip_history()
+                save_exclude_auto_checked()
+                flush_learning_data()
+            except: pass
+            
+            try:
+                queue_list = []
+                while not check_queue.empty():
+                    try: queue_list.append(check_queue.get_nowait())
+                    except: break
+                if queue_list:
                     with open(PENDING_CHECKS_FILE, "w", encoding="utf-8") as f:
                         json.dump(queue_list, f)
-                except: pass
-        except: pass
-
-        # Завершение процессов (финальная зачистка)
-        def final_cleanup():
-            if process:
-                try: subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except: pass
-            
-            time.sleep(0.1)
-            try: subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except: pass
-            try: subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except: pass
-            try: subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except: pass
-            if managed_opera_should_kill:
-                for _proc_name in [
-                    "opera-proxy.windows-amd64.exe",
-                    "opera-proxy.windows-amd64",
-                    "opera-proxy.exe",
-                    "opera-proxy",
-                ]:
-                    try:
-                        subprocess.run(["taskkill", "/F", "/IM", _proc_name], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except:
-                        pass
-            
-            try: smart_update_general()
             except: pass
         
-        # Запускаем финальную зачистку (можно и синхронно, но чтобы окно закрылось быстрее - оставим тут или сделаем синхронно)
-        # Так как мы делаем exit, поток может не успеть. Лучше сделать быстро синхронно.
-        try: final_cleanup()
+        def _force_kill_all():
+            """Kill every child process. Fast, no waits."""
+            for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "sing-box.exe", "warp-svc.exe", "warp-cli.exe",
+                              "opera-proxy.windows-amd64.exe", "opera-proxy.exe"]:
+                try:
+                    subprocess.run(["taskkill", "/F", "/IM", proc_name],
+                                   creationflags=subprocess.CREATE_NO_WINDOW,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except: pass
+            try:
+                subprocess.run(["sc", "stop", "CloudflareWARP"],
+                               creationflags=subprocess.CREATE_NO_WINDOW,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except: pass
+            try:
+                subprocess.run(["sc", "stop", "windivert"],
+                               creationflags=subprocess.CREATE_NO_WINDOW,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except: pass
+            if process:
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                                   creationflags=subprocess.CREATE_NO_WINDOW,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except: pass
+        
+        # Run heavy cleanup in thread with HARD 5-second timeout
+        cleanup_thread = threading.Thread(target=_heavy_cleanup, daemon=True)
+        cleanup_thread.start()
+        cleanup_thread.join(timeout=5)
+        
+        # Force-kill all child processes (always, even if cleanup succeeded)
+        try: _force_kill_all()
         except: pass
 
-        # Немедленно закрываем окно
+        # Немедленно закрываем окно и выходим
         try: root.destroy()
         except: pass
-        # Выходим
         os._exit(0)
 
     # === HOT SWAP COOLDOWN ===
@@ -16787,84 +17363,81 @@ try:
                  threading.Thread(target=start_nova_service, args=(True, True), daemon=True).start()
 
     def launch_background_tasks():
-        """Запуск тяжелых фоновых задач ПОСЛЕ отображения окна"""
-        global dns_manager
-        
-        # 1. Инициализация DNS Manager (тяжелая операция)
-        if dns_manager is None:
-             dns_manager = DNSManager(get_base_dir())
-        
-        # Убираем процессы (перенесено из main)
-        try: subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
+        """Запуск тяжелых фоновых задач ПОСЛЕ отображения окна — в ФОНОВОМ ПОТОКЕ."""
+        def _bg_tasks_worker():
+            global dns_manager
+            try:
+                # 1. Инициализация DNS Manager (тяжелая операция)
+                if dns_manager is None:
+                     dns_manager = DNSManager(get_base_dir())
+                
 
-        # Инициализация систем (перенесено из main)
-        clean_hard_list()
-        log_previous_session_results(log_print) # Вывод результатов прошлой сессии
-        
-        # Check if updated flag was passed (set in main's ARGS_PARSED global)
-        try:
-            if ARGS_PARSED.get('updated', False):
-                log_print("Установлена последняя версия Nova.")
-                # Сообщаем об очистке, если она была (DISABLED per user request)
-                if OLD_VERSION_CLEANED:
-                     if IS_DEBUG_MODE: log_print("Следы прежней версии программы удалены")
-            
-            if ARGS_PARSED.get('fresh', False):
-                log_print("Запуск с флагом --fresh: Временные файлы и состояние стратегий сброшены.")
-
-        except NameError:
-            # ARGS_PARSED not yet defined (shouldn't happen in normal flow)
-            pass
-            
-        # === MIGRATION: Auto-convert Legacy Strategy Files to Modern Format ===
-        def migrate_service_strategies_format(log_func):
-            target_files = ["youtube.json", "discord.json", "cloudflare.json", "whatsapp.json", "telegram.json"]
-            migrated_count = 0
-            
-            for fname in target_files:
+                # Инициализация систем (перенесено из main)
+                clean_hard_list()
+                log_previous_session_results(log_print) # Вывод результатов прошлой сессии
+                
+                # Check if updated flag was passed (set in main's ARGS_PARSED global)
                 try:
-                    fpath = os.path.join(get_base_dir(), "strat", fname)
-                    if not os.path.exists(fpath): continue
+                    if ARGS_PARSED.get('updated', False):
+                        log_print("Установлена последняя версия Nova.")
+                        # Сообщаем об очистке, если она была (DISABLED per user request)
+                        if OLD_VERSION_CLEANED:
+                             if IS_DEBUG_MODE: log_print("Следы прежней версии программы удалены")
                     
-                    data = load_json_robust(fpath)
-                    if not data: continue
-                    
-                    new_data = None
-                    needs_save = False
-                    
-                    # Case 1: Legacy Dict {"strat_name": [args], ...} (No "strategies" key)
-                    if isinstance(data, dict) and "strategies" not in data:
-                        new_strats = []
-                        for k, v in data.items():
-                            if k == "version": continue
-                            new_strats.append({"name": k, "args": v})
-                        new_data = {"version": CURRENT_VERSION, "strategies": new_strats}
-                        needs_save = True
-                        log_func(f"[Migration] Сконвертирован {fname} (Legacy Dict -> Modern)")
-                    
-                    # Case 2: List [ {name, args}, ... ] (Intermediate)
-                    elif isinstance(data, list):
-                        new_data = {"version": CURRENT_VERSION, "strategies": data}
-                        needs_save = True
-                        log_func(f"[Migration] Сконвертирован {fname} (List -> Modern)")
-                        
-                    if needs_save and new_data:
-                        save_json_safe(fpath, new_data)
-                        migrated_count += 1
-                        
-                except Exception as e:
-                    # Silent fail or debug log
-                    pass
-            
-            if migrated_count > 0:
-                 log_func(f"[Migration] Успешно обновлен формат у {migrated_count} файлов стратегий.")
+                    if ARGS_PARSED.get('fresh', False):
+                        log_print("Запуск с флагом --fresh: Временные файлы и состояние стратегий сброшены.")
 
-        migrate_service_strategies_format(log_print)
+                except NameError:
+                    pass
+                    
+                # === MIGRATION: Auto-convert Legacy Strategy Files to Modern Format ===
+                def migrate_service_strategies_format(log_func):
+                    target_files = ["youtube.json", "discord.json", "cloudflare.json", "whatsapp.json", "telegram.json"]
+                    migrated_count = 0
+                    
+                    for fname in target_files:
+                        try:
+                            fpath = os.path.join(get_base_dir(), "strat", fname)
+                            if not os.path.exists(fpath): continue
+                            
+                            data = load_json_robust(fpath)
+                            if not data: continue
+                            
+                            new_data = None
+                            needs_save = False
+                            
+                            # Case 1: Legacy Dict {"strat_name": [args], ...} (No "strategies" key)
+                            if isinstance(data, dict) and "strategies" not in data:
+                                new_strats = []
+                                for k, v in data.items():
+                                    if k == "version": continue
+                                    new_strats.append({"name": k, "args": v})
+                                new_data = {"version": CURRENT_VERSION, "strategies": new_strats}
+                                needs_save = True
+                                log_func(f"[Migration] Сконвертирован {fname} (Legacy Dict -> Modern)")
+                            
+                            # Case 2: List [ {name, args}, ... ] (Intermediate)
+                            elif isinstance(data, list):
+                                new_data = {"version": CURRENT_VERSION, "strategies": data}
+                                needs_save = True
+                                log_func(f"[Migration] Сконвертирован {fname} (List -> Modern)")
+                                
+                            if needs_save and new_data:
+                                save_json_safe(fpath, new_data)
+                                migrated_count += 1
+                                
+                        except Exception as e:
+                            pass
+                    
+                    if migrated_count > 0:
+                         log_func(f"[Migration] Успешно обновлен формат у {migrated_count} файлов стратегий.")
+
+                migrate_service_strategies_format(log_print)
+            except Exception as e:
+                try: print(f"[BG Tasks] Error: {e}")
+                except: pass
         
-        # FIX: Thread starting is now handled exclusively by start_nova_service logic
-        # to prevent duplication on startup (since start_nova_service calls it too).
-        pass
+        threading.Thread(target=_bg_tasks_worker, daemon=True).start()
 
     def create_round_rect_img(width, height, radius, color, alpha=255):
         """Генерирует изображение закругленного прямоугольника с поддержкой Alpha-канала"""
