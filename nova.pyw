@@ -5535,13 +5535,19 @@ try:
                 if ru_route_state != getattr(self, "_last_ru_route_state", None):
                     self._last_ru_route_state = ru_route_state
                     if ru_route_state == "warp+opera":
-                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371")
+                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority); PROXY 127.0.0.1:1371")
                     elif ru_route_state == "warp":
-                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port}")
+                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Only)")
                     elif ru_route_state == "opera":
                         self.log_func("[PAC] RU маршрут: PROXY 127.0.0.1:1371 (Opera VPN fallback)")
                     else:
                         self.log_func("[PAC] RU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Warp/Opera недоступны)")
+
+                # Trigger refresh if statuses changed
+                status_signature = (bool(warp_active), bool(opera_active))
+                if status_signature != getattr(self, "_last_status_signature", None):
+                    self._last_status_signature = status_signature
+                    self.refresh_system_options()
 
                 openai_route_state = "opera" if opera_active else "strict_down"
                 if openai_route_state != self._last_openai_route_state:
