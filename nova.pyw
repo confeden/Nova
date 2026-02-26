@@ -16,6 +16,18 @@ import subprocess
 import collections
 from datetime import datetime
 
+# === CAPTURE ORIGINAL PATHS (Fix for Restart) ===
+try:
+    _STARTUP_CWD = os.getcwd()
+    if getattr(sys, 'frozen', False):
+        _ORIGINAL_EXE = sys.argv[0]
+        if not os.path.isabs(_ORIGINAL_EXE):
+            _ORIGINAL_EXE = os.path.join(_STARTUP_CWD, _ORIGINAL_EXE)
+    else:
+        _ORIGINAL_EXE = sys.executable
+except:
+    _ORIGINAL_EXE = sys.argv[0]
+
 # === VERSION & CONFIG ===
 CURRENT_VERSION = "1.14"
 WINWS_FILENAME = "winws.exe"
@@ -222,14 +234,9 @@ def restart_nova():
             # 3. Перезапуск процесса
             log_func("[Restart] Запуск новой копии...")
             try:
-                base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-                if not base_dir:
-                    raise RuntimeError("empty base dir")
+                base_dir = get_base_dir()
             except:
-                try:
-                    base_dir = get_base_dir()
-                except:
-                    base_dir = os.getcwd()
+                base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 
             create_flags = 0
             try:
@@ -241,7 +248,6 @@ def restart_nova():
             except:
                 pass
 
-            # Build robust launch plans (different environments expose different runtime paths).
             launch_plans = []
             restart_args = ["--show-log", "--restart", "--force-instance"]
 
@@ -249,52 +255,55 @@ def restart_nova():
                 if not cmd_list:
                     return
                 exe_path = str(cmd_list[0]).strip().strip('"')
-                if not exe_path or not os.path.exists(exe_path):
+                # Relaxed check: if absolute, check exists. If relative, assume valid in cwd.
+                if os.path.isabs(exe_path) and not os.path.exists(exe_path):
+                    if IS_DEBUG_MODE: log_func(f"[Restart] Candidate rejected (not found): {exe_path}")
                     return
                 launch_plans.append((cmd_list, cwd_hint or base_dir))
 
-            if getattr(sys, 'frozen', False):
-                # In onefile builds sys.executable may point to transient runtime path.
-                # sys.argv[0] is usually the stable launcher path on disk.
-                exe_candidates = []
-                for p in [sys.argv[0], sys.executable]:
-                    try:
-                        ap = os.path.abspath(str(p))
-                    except:
-                        continue
-                    if ap and ap not in exe_candidates:
-                        exe_candidates.append(ap)
-                for exe_path in exe_candidates:
-                    _add_plan([exe_path] + restart_args, os.path.dirname(exe_path))
-            else:
-                py_candidates = []
-                for p in [sys.executable, sys.executable.lower().replace("pythonw.exe", "python.exe")]:
-                    try:
-                        ap = os.path.abspath(str(p))
-                    except:
-                        continue
-                    if ap and ap not in py_candidates:
-                        py_candidates.append(ap)
+            # 1. Get Module File Name (WinAPI) - The most reliable source for EXE path
+            try:
+                buf = ctypes.create_unicode_buffer(32768)
+                ctypes.windll.kernel32.GetModuleFileNameW(0, buf, 32768)
+                win_path = buf.value
+                if win_path and os.path.exists(win_path):
+                     _add_plan([win_path] + restart_args, os.path.dirname(win_path))
+            except: pass
 
-                script_candidates = []
-                for p in [globals().get("__file__", ""), sys.argv[0]]:
-                    try:
-                        ap = os.path.abspath(str(p))
-                    except:
-                        continue
-                    if ap and ap not in script_candidates:
-                        script_candidates.append(ap)
+            # 2. Try sys.executable
+            try:
+                if sys.executable and os.path.exists(sys.executable):
+                     _add_plan([sys.executable] + restart_args, os.path.dirname(sys.executable))
+            except: pass
 
-                for py_path in py_candidates:
-                    for script_path in script_candidates:
-                        _add_plan([py_path, script_path] + restart_args, os.path.dirname(script_path))
+            # 3. Try captured original
+            if globals().get('_ORIGINAL_EXE') and os.path.exists(_ORIGINAL_EXE):
+                 _add_plan([_ORIGINAL_EXE] + restart_args, os.path.dirname(_ORIGINAL_EXE))
+
+            # 4. Try sys.argv[0] (Last resort)
+            try:
+                argv0 = sys.argv[0]
+                if argv0:
+                    _add_plan([argv0] + restart_args, base_dir)
+            except: pass
 
             launched = False
             launch_exc = None
             if not launch_plans:
                 launch_exc = FileNotFoundError("No valid restart launch targets found")
-            for cmd, cmd_cwd in launch_plans:
+            
+            # Deduplicate plans
+            unique_plans = []
+            seen_cmds = set()
+            for cmd, cwd in launch_plans:
+                cmd_tuple = tuple(cmd)
+                if cmd_tuple not in seen_cmds:
+                    seen_cmds.add(cmd_tuple)
+                    unique_plans.append((cmd, cwd))
+
+            for cmd, cmd_cwd in unique_plans:
                 try:
+                    if IS_DEBUG_MODE: log_func(f"[Restart] Trying: {cmd} in {cmd_cwd}")
                     subprocess.Popen(
                         cmd,
                         creationflags=create_flags,
@@ -306,34 +315,12 @@ def restart_nova():
                     launch_exc = e
 
             if not launched:
-                for cmd, cmd_cwd in launch_plans:
+                for cmd, cmd_cwd in unique_plans:
                     try:
                         subprocess.Popen(cmd, cwd=cmd_cwd)
                         launched = True
                         break
-                    except Exception as e2:
-                        launch_exc = e2
-
-            # Last resort for frozen builds: shell open the executable.
-            if not launched and getattr(sys, 'frozen', False):
-                try:
-                    exe_path = os.path.abspath(str(sys.argv[0]))
-                    if os.path.exists(exe_path):
-                        params = " ".join(restart_args)
-                        rc = ctypes.windll.shell32.ShellExecuteW(
-                            None,
-                            "open",
-                            exe_path,
-                            params,
-                            os.path.dirname(exe_path) or None,
-                            1
-                        )
-                        if rc and int(rc) > 32:
-                            launched = True
-                        else:
-                            launch_exc = RuntimeError(f"ShellExecuteW code={rc}")
-                except Exception as e3:
-                    launch_exc = e3
+                    except: pass
 
             if not launched:
                 raise RuntimeError(f"Не удалось запустить новую копию: {launch_exc}")
