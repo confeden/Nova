@@ -29,7 +29,7 @@ except:
     _ORIGINAL_EXE = sys.argv[0]
 
 # === VERSION & CONFIG ===
-CURRENT_VERSION = "1.14"
+CURRENT_VERSION = "1.14.1"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
@@ -233,99 +233,52 @@ def restart_nova():
             
             # 3. Перезапуск процесса
             log_func("[Restart] Запуск новой копии...")
+            
             try:
                 base_dir = get_base_dir()
             except:
                 base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 
-            create_flags = 0
-            try:
-                create_flags |= subprocess.CREATE_NO_WINDOW
-            except:
-                pass
-            try:
-                create_flags |= subprocess.DETACHED_PROCESS
-            except:
-                pass
-
-            launch_plans = []
             restart_args = ["--show-log", "--restart", "--force-instance"]
-
-            def _add_plan(cmd_list, cwd_hint=None):
-                if not cmd_list:
-                    return
-                exe_path = str(cmd_list[0]).strip().strip('"')
-                # Relaxed check: if absolute, check exists. If relative, assume valid in cwd.
-                if os.path.isabs(exe_path) and not os.path.exists(exe_path):
-                    if IS_DEBUG_MODE: log_func(f"[Restart] Candidate rejected (not found): {exe_path}")
-                    return
-                launch_plans.append((cmd_list, cwd_hint or base_dir))
-
-            # 1. Get Module File Name (WinAPI) - The most reliable source for EXE path
-            try:
-                buf = ctypes.create_unicode_buffer(32768)
-                ctypes.windll.kernel32.GetModuleFileNameW(0, buf, 32768)
-                win_path = buf.value
-                if win_path and os.path.exists(win_path):
-                     _add_plan([win_path] + restart_args, os.path.dirname(win_path))
-            except: pass
-
-            # 2. Try sys.executable
-            try:
-                if sys.executable and os.path.exists(sys.executable):
-                     _add_plan([sys.executable] + restart_args, os.path.dirname(sys.executable))
-            except: pass
-
-            # 3. Try captured original
-            if globals().get('_ORIGINAL_EXE') and os.path.exists(_ORIGINAL_EXE):
-                 _add_plan([_ORIGINAL_EXE] + restart_args, os.path.dirname(_ORIGINAL_EXE))
-
-            # 4. Try sys.argv[0] (Last resort)
-            try:
-                argv0 = sys.argv[0]
-                if argv0:
-                    _add_plan([argv0] + restart_args, base_dir)
-            except: pass
-
-            launched = False
-            launch_exc = None
-            if not launch_plans:
-                launch_exc = FileNotFoundError("No valid restart launch targets found")
             
-            # Deduplicate plans
-            unique_plans = []
-            seen_cmds = set()
-            for cmd, cwd in launch_plans:
-                cmd_tuple = tuple(cmd)
-                if cmd_tuple not in seen_cmds:
-                    seen_cmds.add(cmd_tuple)
-                    unique_plans.append((cmd, cwd))
+            # Formulate the definitive launch command
+            if getattr(sys, 'frozen', False) or sys.argv[0].lower().endswith(".exe"):
+                # Frozen EXE mode
+                exe_path = os.path.abspath(sys.executable)
+                cmd = [exe_path] + restart_args
+            else:
+                # Script mode (.py / .pyw)
+                exe_path = os.path.abspath(sys.executable)
+                script_path = os.path.abspath(sys.argv[0])
+                cmd = [exe_path, script_path] + restart_args
 
-            for cmd, cmd_cwd in unique_plans:
+            if IS_DEBUG_MODE: log_func(f"[Restart] Command: {cmd}")
+
+            try:
+                # Nuclear detachment on Windows
+                # We do NOT use stdout/stderr pipes here to avoid blocking
+                # We do NOT use CREATE_NO_WINDOW for the GUI app
+                subprocess.Popen(
+                    cmd,
+                    cwd=base_dir,
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True,
+                    start_new_session=True
+                )
+                launched = True
+            except Exception as e:
+                log_func(f"[Restart] Popen failed: {e}")
+                # Last ditch fallback: OS shell 'start'
                 try:
-                    if IS_DEBUG_MODE: log_func(f"[Restart] Trying: {cmd} in {cmd_cwd}")
-                    subprocess.Popen(
-                        cmd,
-                        creationflags=create_flags,
-                        cwd=cmd_cwd
-                    )
+                    cmd_line = subprocess.list2cmdline(cmd)
+                    os.system(f'start "" {cmd_line}')
                     launched = True
-                    break
-                except Exception as e:
-                    launch_exc = e
+                except: pass
 
             if not launched:
-                for cmd, cmd_cwd in unique_plans:
-                    try:
-                        subprocess.Popen(cmd, cwd=cmd_cwd)
-                        launched = True
-                        break
-                    except: pass
-
-            if not launched:
-                raise RuntimeError(f"Не удалось запустить новую копию: {launch_exc}")
+                raise RuntimeError("Не удалось запустить новую копию")
             
-            time.sleep(0.2)
+            time.sleep(1.0) # Give Windows a second to register the new process group
             os._exit(0)
         except Exception as e:
             try:
@@ -2838,17 +2791,9 @@ try:
             target_tcp = "warp-socks"
             # Стратегия UDP для мессенджеров в режиме WARP SOCKS:
             #
-            # Мы возвращаемся на "direct". 
-            # 1. WARP SOCKS (1370) не поддерживает UDP.
-            # 2. Локальный "block" на Windows в режиме "system" stack (без gvisor) дропает пакеты
-            #    без отправки ICMP Port Unreachable. Из-за этого приложение (Discord/WhatsApp) 
-            #    ждёт socket timeout 1-2 минуты перед переходом на TCP.
-            # 3. Gvisor (который отправляет ICMP) ломает TCP-потоки для UWP/Electron (update failing).
-            # 4. В режиме "direct" пакеты уходят провайдеру напрямую, но поскольку параллельно
-            #    работает winws (Zapret), он в большинстве случаев успешно обходит блокировки UDP.
-            # Итог: direct с winws работает быстрее всего, без искусственных 2-минутных задержек.
+            # Возвращаемся на "direct" (winws), т.к. WARP SOCKS не умеет в UDP.
             target_udp = "direct"
-            self.log_func("[SingBox] [Route] UDP голос → direct (обработка через системный winws, без таймаутов).")
+            self.log_func(f"[SingBox] [Route] UDP голос → {target_udp} (обработка через системный winws).")
 
             # Optional TCP bootstrap fallback via local Opera proxy.
             if self._allow_1371_tcp_fallback:
@@ -3916,6 +3861,14 @@ try:
                 else:
                     log_level = "warn"
                 log_output = self.log_path if self._persist_main_log else "stderr"
+                # Final security layer: block any leaking traffic from inbounds that should be proxied
+                route_rules.append(
+                    {
+                        "inbound": ["mixed-in", "tun-in"],
+                        "action": "reject"
+                    }
+                )
+                
                 config = {
                     "log": {
                         # Keep diagnostics available in normal mode without huge per-connection spam.
@@ -3960,10 +3913,11 @@ try:
                         {
                             "type": "tun",
                             "tag": "tun-in",
-                            "interface_name": f"NovaVoice-{random.randint(1000, 9999)}",
+                            "interface_name": "NovaVoice",
                             "address": ["172.19.0.1/30"],
                             "auto_route": True,
                             "strict_route": True,
+                            "stack": "gvisor", # Gvisor handles UDP/ICMP handshakes better for Voice
                             # Critical: avoid full-system interception and only route selected app networks.
                             "route_address": sorted(tun_route_cidrs),
                             "route_exclude_address": [
@@ -5469,32 +5423,34 @@ try:
                 except:
                     pass
                 
-                # Routing strings
-                # If Warp is active, try it first, then failover to Opera.
-                # If Warp is down, go straight to Opera to avoid browser timeouts.
+                # Routing strings for EU domains: STRICTLY Opera VPN only (1371).
+                # No fallback to WARP to ensure specific geo-routing.
+                if opera_active:
+                    eu_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
+                else:
+                    # Kill-switch for EU domains if Opera is down.
+                    eu_route = "SOCKS5 127.0.0.1:1"
+
+                # Routing strings for RU domains: Try WARP, then Opera.
                 if warp_active:
                     ru_route_parts = [
-                        f"PROXY 127.0.0.1:1372"  # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
+                        f"PROXY 127.0.0.1:1372", # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
+                        f"SOCKS5 127.0.0.1:{self.warp_port}" # Direct WARP SOCKS fallback
                     ]
                     if opera_active:
                         ru_route_parts.append("PROXY 127.0.0.1:1371")
-                    ru_route_parts.append("DIRECT")
+                    # NO DIRECT fallback for RU to prevent IP leak. Use a blackhole proxy.
+                    ru_route_parts.append("SOCKS5 127.0.0.1:1") 
                     ru_route = "; ".join(ru_route_parts)
                 else:
-                    ru_route = "PROXY 127.0.0.1:1371; DIRECT" if opera_active else "DIRECT"
-                if warp_active:
-                    eu_route_parts = [
-                        f"PROXY 127.0.0.1:1372"  # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
-                    ]
-                    if opera_active:
-                        eu_route_parts.append("PROXY 127.0.0.1:1371")
-                    eu_route_parts.append("DIRECT")
-                    eu_route = "; ".join(eu_route_parts)
-                else:
-                    eu_route = "PROXY 127.0.0.1:1371; DIRECT" if opera_active else "DIRECT"
+                    # Warp down: use Opera if available, otherwise Blackhole (No direct leak)
+                    ru_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
+                
+                # EU route is already set above. Keeping variable consistency.
+                pass
                 # Strict route for OpenAI/Codex: always 1371.
                 # No fallback to 1370/DIRECT to avoid blocked/WARP-403 paths.
-                openai_route = "PROXY 127.0.0.1:1371"
+                openai_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
                 
                 import json
                 ru_ips_js = json.dumps(ru_ips)
@@ -5565,25 +5521,27 @@ try:
                     # Force OS and browsers to immediately re-fetch the PAC file
                     self.refresh_system_options()
 
-                # Log EU routing only when EU path really changes (depends on 1371 health, not WARP 1370 state).
-                if warp_active and opera_active:
-                    eu_route_state = "opera+warp"
-                elif warp_active:
-                    eu_route_state = "warp"
-                elif opera_active:
-                    eu_route_state = "opera"
-                else:
-                    eu_route_state = "direct"
+                # Log routing states only when they change.
+                eu_route_state = "opera" if opera_active else "down"
                 if eu_route_state != self._last_eu_route_state:
                     self._last_eu_route_state = eu_route_state
-                    if eu_route_state == "opera+warp":
-                        self.log_func(f"[PAC] EU маршрут: PROXY 127.0.0.1:1372; PROXY 127.0.0.1:1371; DIRECT")
-                    elif eu_route_state == "warp":
-                        self.log_func(f"[PAC] EU маршрут: PROXY 127.0.0.1:1372; DIRECT")
-                    elif eu_route_state == "opera":
-                        self.log_func("[PAC] EU маршрут: PROXY 127.0.0.1:1371; DIRECT")
+                    if opera_active:
+                        self.log_func("[PAC] EU маршрут: PROXY 127.0.0.1:1371 (Opera VPN ONLY)")
                     else:
-                        self.log_func("[PAC] EU маршрут: DIRECT (прокси 1371 недоступен/не отвечает)")
+                        self.log_func("[PAC] EU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Opera недоступна)")
+
+                # Define RU route state for logging (includes RU + Discord)
+                ru_route_state = "warp+opera" if warp_active and opera_active else ("warp" if warp_active else ("opera" if opera_active else "down"))
+                if ru_route_state != getattr(self, "_last_ru_route_state", None):
+                    self._last_ru_route_state = ru_route_state
+                    if ru_route_state == "warp+opera":
+                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port}; PROXY 127.0.0.1:1371")
+                    elif ru_route_state == "warp":
+                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port}")
+                    elif ru_route_state == "opera":
+                        self.log_func("[PAC] RU маршрут: PROXY 127.0.0.1:1371 (Opera VPN fallback)")
+                    else:
+                        self.log_func("[PAC] RU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Warp/Opera недоступны)")
 
                 openai_route_state = "opera" if opera_active else "strict_down"
                 if openai_route_state != self._last_openai_route_state:
@@ -5599,7 +5557,7 @@ try:
                     if opera_port_open and not opera_proxy_ok:
                         self.log_func("[PAC] [Diag] Порт 1371 открыт, но HTTP-прокси не отвечает корректно.")
                     elif not opera_port_open:
-                        self.log_func(f"[PAC] [Diag] Порт 1371 недоступен: EU маршрут работает через fallback ({self.warp_port}/DIRECT).")
+                        self.log_func("[PAC] [Diag] Порт 1371 недоступен: EU маршрут ожидает восстановления Opera VPN.")
             except Exception as e:
                 self.log_func(f"[PAC] Ошибка генерации: {e}")
 
@@ -6258,7 +6216,7 @@ try:
             "youtube": [],
             "discord": [],
             "warp": [],
-            "voice": [],
+            "voice": ["--wf-udp=443,1024-65535", "--dpi-desync=fake", "--dpi-desync-fooling=badsum"],
             "cloudflare": [],
             "telegram": [],
             "whatsapp": [],
@@ -17332,7 +17290,7 @@ try:
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
 
-        time.sleep(0.5) # Increased breath for WinDivert to release resources
+        time.sleep(2.0) # Increased breath for WinDivert to release resources
         
         # 2. Restart via start_nova_service (Global context)
         # Flag restart to prevent old thread from reporting Crash
