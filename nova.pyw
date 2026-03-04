@@ -29,7 +29,7 @@ except:
     _ORIGINAL_EXE = sys.argv[0]
 
 # === VERSION & CONFIG ===
-CURRENT_VERSION = "1.15"
+CURRENT_VERSION = "1.15.1"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
@@ -1195,7 +1195,10 @@ try:
                             except: pass
                         
                         for line in target_lines:
+                             # Clean up null bytes from UTF-16 corruption 
+                             if '\x00' in line: line = line.replace('\x00', '')
                              c = line.split('#')[0].strip()
+                             c = ''.join(c.split())
                              if c: target_domains.add(c)
                     
                     # 2. Decision
@@ -1228,7 +1231,14 @@ try:
                         
                         # 2. Existing User Content (skip old header if present)
                         for i, line in enumerate(target_lines):
+                             if '\x00' in line: line = line.replace('\x00', '')
                              if i == 0 and line.strip().startswith("# version:"): continue
+                             
+                             # Remove completely broken lines like "c l o u d c o d e"
+                             c = line.split('#')[0].strip()
+                             if c != ''.join(c.split()):
+                                 line = line.replace(c, ''.join(c.split()))
+                                 
                              new_lines.append(line)
                         
                         # 3. Append Missing from Bundle
@@ -1237,7 +1247,9 @@ try:
                         first_add = True
                         
                         for line in source_lines:
+                             if '\x00' in line: line = line.replace('\x00', '')
                              c = line.split('#')[0].strip()
+                             c = ''.join(c.split())
                              # Ignore source comments/empty lines for the purpose of "missing domain" check
                              if c and c not in target_domains:
                                  # It's a new domain!
@@ -4698,7 +4710,10 @@ try:
             if os.path.exists(filepath):
                 with open(filepath, "r", encoding="utf-8") as f:
                     for line in f:
+                        # Clean up potentially corrupted text (e.g. UTF-16 saved as UTF-8)
+                        line = line.replace('\x00', '')
                         d = line.split('#')[0].strip().lower()
+                        d = ''.join(d.split()) # Remove any internal spaces
                         if not d:
                             continue
                         # Normalize common user input formats: URL, wildcard, path.
@@ -9566,12 +9581,12 @@ try:
                                    ("device which does not exist" in err_msg):
                                     
                                     # Ограничиваем количество попыток ремонта
-                                    repair_attempts = getattr(self, '_repair_attempts', 0)
+                                    repair_attempts = getattr(check_strat, '_repair_attempts', 0)
                                     if repair_attempts < 3:
                                         log_func(f"[Check] Обнаружена проблема с драйвером (Code {proc.returncode}). Запуск восстановления...")
                                         try: 
                                             repair_windivert_driver(log_func)
-                                            self._repair_attempts = repair_attempts + 1
+                                            check_strat._repair_attempts = repair_attempts + 1
                                         except: pass
                                     else:
                                         log_func(f"[Error] Не удалось восстановить драйвер WinDivert после 3 попыток. Проверьте 'Изоляцию ядра' в Windows.")
@@ -9782,11 +9797,11 @@ try:
                             # Запрет wssize
                             if "--wssize" in a or "--wsize" in a:
                                 return False
-                            # TTL <= 11
+                            # TTL must be in [4..11]
                             if "--dpi-desync-ttl=" in a:
                                 try:
                                     v = int(a.split("=")[1])
-                                    if v > 11: return False
+                                    if v < 4 or v > 11: return False
                                 except: pass
                             clean_args.append(a)
                             
@@ -9835,9 +9850,9 @@ try:
                     
                     # === ДОСТУПНЫЕ МУТАЦИИ (на основе документации zapret) ===
                     
-                    # Desync режимы
+                    # Desync режимы (Убрали hostfakesplit из-за проблем с YouTube / Kyber)
                     DESYNC_MODES = ["fake", "split", "split2", "disorder", "multisplit", 
-                                   "multidisorder", "fakedsplit", "fakeddisorder", "hostfakesplit", "syndata"]
+                                   "multidisorder", "fakedsplit", "fakeddisorder", "syndata"]
                     
                     # Fooling методы
                     FOOLING_METHODS = ["ts", "md5sig", "badseq", "badsum", "datanoack"]
@@ -9849,8 +9864,8 @@ try:
                     # Repeats значения
                     REPEATS_VALUES = [2, 3, 4, 5, 6, 8, 10, 11]
                     
-                    # TTL значения
-                    TTL_VALUES = [1, 2, 3, 4, 5, 11]
+                    # TTL значения (min=4, max=11 — ниже 4 ломает YouTube и др.)
+                    TTL_VALUES = [4, 5, 6, 7, 8, 11]
                     
                     # AutoTTL значения
                     AUTOTTL_VALUES = ["1", "2", "5", "2:3-64"]
@@ -10051,30 +10066,9 @@ try:
                                     new_segs[seg_idx][i] = f"--dpi-desync-fake-tls-mod={new_mod}"
                                     add_mutation(join_segments(new_segs))
                     
-                    # --- 9. Мутация hostfakesplit-mod ---
-                    for seg_idx, seg in enumerate(segments):
-                        if not is_tcp_segment(seg) or is_udp_segment(seg):
-                            continue
-                        
-                        has_hostmod = any("--dpi-desync-hostfakesplit-mod=" in a for a in seg)
-                        # Только если есть hostfakesplit в desync
-                        has_hostfakesplit = any("hostfakesplit" in a for a in seg)
-                        
-                        if has_hostfakesplit:
-                            if has_hostmod:
-                                for i, arg in enumerate(seg):
-                                    if arg.startswith("--dpi-desync-hostfakesplit-mod="):
-                                        new_mod = select_by_weight(HOST_MODS)
-                                        if new_mod:
-                                            new_segs = [list(s) for s in segments]
-                                            new_segs[seg_idx][i] = f"--dpi-desync-hostfakesplit-mod={new_mod}"
-                                            add_mutation(join_segments(new_segs))
-                            else:
-                                new_mod = select_by_weight(HOST_MODS)
-                                if new_mod:
-                                    new_segs = [list(s) for s in segments]
-                                    new_segs[seg_idx].append(f"--dpi-desync-hostfakesplit-mod={new_mod}")
-                                    add_mutation(join_segments(new_segs))
+                    # --- 9. Мутация hostfakesplit-mod (Отключена из-за проблем с Kyber TLS) ---
+                    # Исключен из генерации, так как может ломать многопакетные TLS ClientHello
+                    pass
                     
                     # --- 10. Мутация fake-tls bin файла ---
                     if bin_files and count_bin_files(args) < 2:
@@ -13650,8 +13644,8 @@ try:
                     f = self._weighted_choice([f"--dpi-desync-fooling={x}" for x in fooling_modes], service)
                     new_args.append(f)
                 
-                # Добавляем TTL
-                ttl = random.randint(1, 11)
+                # Добавляем TTL (min=4, max=11)
+                ttl = random.randint(4, 11)
                 new_args.append(f"--dpi-desync-ttl={ttl}")
                 
                 # Добавляем Bin (если fake)
@@ -13759,7 +13753,7 @@ try:
         strategies = []
         
         # 1. Fake (самые легкие)
-        for ttl in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+        for ttl in [4, 5, 6, 7, 8, 9, 10]:
             strategies.append(["--dpi-desync=fake", f"--dpi-desync-ttl={ttl}"])
             strategies.append(["--dpi-desync=fake", f"--dpi-desync-ttl={ttl}", "--dpi-desync-fooling=badseq"])
             strategies.append(["--dpi-desync=fake", f"--dpi-desync-ttl={ttl}", "--dpi-desync-fooling=md5sig"])
@@ -15335,7 +15329,8 @@ try:
                         # FIX: Using VBScript for reliable DELAYED restart without console windows
                         # This allows the main process to exit completely before the new one starts
                         
-                        vbs_script = os.path.join(os.path.dirname(current_exe), "restart_helper.vbs")
+                        vbs_script = os.path.join(get_base_dir(), "temp", "restart_helper.vbs")
+                        os.makedirs(os.path.dirname(vbs_script), exist_ok=True)
                         
                         # Arguments for the new process
                         # escaping quotes for VBScript can be tricky, so we keep it simple
@@ -15358,7 +15353,8 @@ try:
                         '''
                         
                         try:
-                            with open(vbs_script, "w", encoding="utf-8") as f:
+                            # FIX: Use utf-8-sig (with BOM) so wscript.exe correctly parses paths with non-ASCII characters
+                            with open(vbs_script, "w", encoding="utf-8-sig") as f:
                                 f.write(vbs_content)
                                 
                             # Execute VBScript detached
@@ -15468,36 +15464,39 @@ try:
 
         if not missing_files and not already_verified:
             # Все файлы есть локально, но ещё не проверяли размеры для этой версии.
-            # Делаем однократный HEAD-запрос к GitHub и кешируем результат.
-            log_func("[Init] Проверка актуальности компонентов (однократно для v{})...".format(CURRENT_VERSION))
-            size_mismatch = []
-            try:
-                import requests
-                sess = requests.Session()
-                sess.trust_env = False
-                for f in files:
-                    url = "https://raw.githubusercontent.com/confeden/nova_updates/main/bin/{}".format(f)
-                    try:
-                        r = sess.head(url, timeout=4)
-                        if r.status_code == 200:
-                            remote_size = int(r.headers.get("content-length", 0))
-                            local_size = os.path.getsize(os.path.join(bin_dir, f))
-                            if remote_size > 0 and local_size != remote_size:
-                                log_func(f"[Init] Размер файла {f} ({local_size}) ≠ GitHub ({remote_size}). Удаляем.")
-                                try: os.remove(os.path.join(bin_dir, f))
-                                except: pass
-                                size_mismatch.append(f)
-                    except:
-                        pass
-            except:
-                pass
+            # Делаем асинхронную проверку размеров к GitHub, чтобы не блочить UI
+            log_func("[Init] Проверка актуальности компонентов запланирована (в фоне)...")
             
-            if size_mismatch:
-                missing_files.extend(size_mismatch)
-            else:
-                # Все совпало → записываем в кеш, чтобы не проверять повторно
-                _save_bin_check({"version": CURRENT_VERSION, "ok": files})
-                log_func("[Init] Все компоненты актуальны. Проверка сохранена в кеш.")
+            def check_sizes_async():
+                size_mismatch = []
+                try:
+                    import requests
+                    sess = requests.Session()
+                    sess.trust_env = False
+                    for f in files:
+                        url = "https://raw.githubusercontent.com/confeden/nova_updates/main/bin/{}".format(f)
+                        try:
+                            r = sess.head(url, timeout=4)
+                            if r.status_code == 200:
+                                remote_size = int(r.headers.get("content-length", 0))
+                                local_size = os.path.getsize(os.path.join(bin_dir, f))
+                                if remote_size > 0 and local_size != remote_size:
+                                    log_func(f"[Init] Размер файла {f} ({local_size}) ≠ GitHub ({remote_size}). При следующем запуске он будет обновлён.")
+                                    try: os.remove(os.path.join(bin_dir, f))
+                                    except: pass
+                                    size_mismatch.append(f)
+                        except:
+                            pass
+                except:
+                    pass
+                
+                if not size_mismatch:
+                    # Все совпало → записываем в кеш, чтобы не проверять повторно
+                    _save_bin_check({"version": CURRENT_VERSION, "ok": files})
+                    log_func("[Init] Все компоненты актуальны. Проверка сохранена в кеш.")
+                    
+            import threading
+            threading.Thread(target=check_sizes_async, daemon=True).start()
         
         if not missing_files:
             return True
@@ -16262,7 +16261,6 @@ try:
 
             if num_specific_strats_added > 0:
                 args.append("--new")
-                args.extend(["--wf-raw", section_loopback_guard])
             
             num_specific_strats_added += 1
 
@@ -16290,7 +16288,7 @@ try:
             args.extend(context_args)
             
             current_strategy_args = strategies.get(strat_name, [])
-            for idx_arg, arg in enumerate(current_strategy_args):
+            for arg in current_strategy_args:
                 if not isinstance(arg, str): continue # FIX: Prevent corrupted/nested list args from crashing
                 if "=" in arg and ".bin" in arg:
                     k, v = arg.split("=", 1)
@@ -16300,20 +16298,7 @@ try:
                 
                 if arg == "--new":
                     args.append(arg)
-                    args.extend(["--wf-raw", section_loopback_guard])
-                    # FIX: Check if the NEXT section is UDP-only.
-                    # If so, don't add --hostlist (SNI matching doesn't work for UDP).
-                    # Only add exclusions and ipset.
-                    remaining = current_strategy_args[idx_arg+1:]
-                    next_has_tcp = any(isinstance(a, str) and ("--filter-tcp" in a or "--wf-tcp" in a) for a in remaining)
-                    next_is_udp_only = any(isinstance(a, str) and ("--filter-udp" in a or "--wf-udp" in a) for a in remaining) and not next_has_tcp
-                    if next_is_udp_only:
-                        # UDP section: only add exclusions, skip hostlist
-                        for ca in context_args:
-                            if "--hostlist" not in ca:
-                                args.append(ca)
-                    else:
-                        args.extend(context_args) 
+                    args.extend(context_args) 
                 elif arg.startswith("--wf-tcp"): args.append(arg.replace("--wf-tcp", "--filter-tcp"))
                 elif arg.startswith("--wf-udp"): args.append(arg.replace("--wf-udp", "--filter-udp"))
                 else: args.append(arg)
@@ -16334,7 +16319,6 @@ try:
         elif gen_list_exists or os.path.exists(paths['ip_general']):
             if num_specific_strats_added > 0:
                 args.append("--new")
-                args.extend(["--wf-raw", section_loopback_guard])
             
             # Define common args for General strategy reuse
             general_common_args = []
@@ -16365,7 +16349,6 @@ try:
 
                 if arg == "--new":
                     args.append(arg)
-                    args.extend(["--wf-raw", section_loopback_guard])
                     args.extend(general_common_args) 
                 elif arg.startswith("--wf-tcp"): args.append(arg.replace("--wf-tcp", "--filter-tcp"))
                 elif arg.startswith("--wf-udp"): args.append(arg.replace("--wf-udp", "--filter-udp"))
