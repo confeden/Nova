@@ -8,6 +8,7 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
+CURRENT_VERSION = "1.15.2"
 import sys
 import os
 import ctypes
@@ -28,8 +29,7 @@ try:
 except:
     _ORIGINAL_EXE = sys.argv[0]
 
-# === VERSION & CONFIG ===
-CURRENT_VERSION = "1.15.1"
+# === CONFIG ===
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
@@ -3196,7 +3196,6 @@ try:
                         self.log_func("[SingBox] [Diag] Уровень логирования: low-cpu (файловый лог отключён).")
                 if not self._app_proxy_hint_done:
                     self._app_proxy_hint_done = True
-                    self.log_func("[SingBox] [Hint] Для стабильных звонков в Telegram/AyuGram лучше отключить 'Use system proxy settings' (TCP может работать и с ним, но иногда это добавляет задержки).")
             except Exception as e:
                 self.log_func(f"[SingBox] Ошибка запуска: {e}")
             finally:
@@ -7911,7 +7910,7 @@ try:
                 return False
 
             # Расширенный список ключевых слов для обнаружения VPN
-            keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "hamachi", "amnezia", "warp", "cloudflare", "privado", "mullvad", "nord", "proton"]
+            keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "hamachi", "amnezia", "warp", "cloudflare", "privado", "mullvad", "nord", "proton", "happ-tun"]
             
             # Exclusions (white list)
             # Nova's own TUN adapters (NovaVoice / CloudflareWARP) must not trigger VPN auto-pause.
@@ -16682,8 +16681,42 @@ try:
                              if IS_DEBUG_MODE: print("[Debug] Игнорирование 'падения' из-за рестарта.")
                              return
 
-                        # UI Update only if we thought it was active
-                        if is_service_active:
+                        # === AUTO-RECOVERY: Restart winws on crash ===
+                        # Rate limit: max 5 restarts per 5 minutes to prevent infinite loops
+                        now = time.time()
+                        if not hasattr(run_process, '_crash_times'):
+                            run_process._crash_times = []
+                        # Cleanup old entries (older than 5 minutes)
+                        run_process._crash_times = [t for t in run_process._crash_times if now - t < 300]
+                        
+                        if len(run_process._crash_times) < 5:
+                            run_process._crash_times.append(now)
+                            
+                            # Auto-repair driver for known codes
+                            if exit_code in (34, 177):
+                                print(f"[Recovery] Обнаружена проблема с драйвером (код {exit_code}). Лечение...")
+                                try: repair_windivert_driver(log_print)
+                                except: pass
+                            
+                            delay = 3.0
+                            attempt_num = len(run_process._crash_times)
+                            print(f"[Recovery] Автоперезапуск ядра через {delay:.0f}с (попытка {attempt_num}/5)...")
+                            
+                            if root:
+                                root.after(0, lambda: status_label.config(text=f"ПЕРЕЗАПУСК ЯДРА...", fg="#FFA500"))
+                            
+                            time.sleep(delay)
+                            
+                            if not is_closing and is_service_active:
+                                print("[Recovery] Перезапуск ядра...")
+                                if root:
+                                    root.after(0, perform_hot_restart_backend)
+                                else:
+                                    threading.Thread(target=lambda: start_nova_service(silent=True, restart_mode=True), daemon=True).start()
+                                return  # Exit this thread cleanly, new one will take over
+                        else:
+                            # Too many crashes — give up and show error
+                            print(f"[Error] Слишком много падений (5 за 5 минут). Автоперезапуск остановлен.")
                             is_service_active = False
                             if root:
                                 root.after(0, lambda: btn_toggle.config(text="ЗАПУСТИТЬ"))
