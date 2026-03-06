@@ -8,7 +8,7 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.15.2"
+CURRENT_VERSION = "1.15.3"
 import sys
 import os
 import ctypes
@@ -655,774 +655,133 @@ try:
         except: pass
 
     def restore_missing_strategies():
-        """Восстанавливает отсутствующие стратегии и управляет версиями файлов (Smart Merge)."""
+        """Единое правило проверки версий файлов в list, ip, strat."""
         logs = []
         try:
             base_dir = get_base_dir()
-            strat_dir = os.path.join(base_dir, "strat")
-            if not os.path.exists(strat_dir): os.makedirs(strat_dir)
+            is_frozen_exe = getattr(sys, 'frozen', False)
             
-            # === 1. General List Version Management ===
-            try:
-                gen_path = os.path.join(base_dir, "list", "general.txt")
-                is_frozen_exe = getattr(sys, 'frozen', False)
-                
-                # Check existing file
-                target_lines = []
-                has_version = False
-                current_ver_in_file = None
-                
-                if os.path.exists(gen_path):
-                    try:
-                        with open(gen_path, "r", encoding="utf-8") as f:
-                            target_lines = f.readlines()
-                        if target_lines and target_lines[0].strip().startswith("# version:"):
-                            has_version = True
-                            try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
-                            except: pass
-                    except: pass
-                
-                g_action = ""
-                
-                # --- SCRIPT MODE (.pyw) ---
-                if not is_frozen_exe:
-                    if not os.path.exists(gen_path):
-                        pass # Do nothing
-                    elif not target_lines:
-                         # FIX: Read failed or file empty? Don't overwrite blindly
-                         logs.append("[Init] general.txt read failed or empty. Skipping header update to prevent data loss.")
-                    elif not has_version:
-                        # Append header
-                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                        try:
-                            with open(gen_path, "w", encoding="utf-8") as f:
-                                f.writelines(target_lines)
-                            g_action = "Header Added (Script)"
-                        except Exception as e:
-                            logs.append(f"[Init] Failed to write general.txt: {e}")
-                    elif current_ver_in_file != CURRENT_VERSION:
-                        # Update header
-                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                        try:
-                            with open(gen_path, "w", encoding="utf-8") as f:
-                                f.writelines(target_lines)
-                            g_action = "Header Updated (Script)"
-                        except Exception as e:
-                            logs.append(f"[Init] Failed to write general.txt: {e}")
-                
-                # --- FROZEN EXE MODE ---
-                else:
-                    internal_gen = get_internal_path(os.path.join("list", "general.txt"))
-                    
-                    if not os.path.exists(gen_path):
-                        # Missing -> Restore
-                         if os.path.exists(internal_gen):
-                             shutil.copy2(internal_gen, gen_path)
-                             g_action = "Restored from Bundle (Missing)"
-                    
-                    elif not has_version:
-                         # No Version -> Replace
-                         if os.path.exists(internal_gen):
-                             shutil.copy2(internal_gen, gen_path)
-                             g_action = "Restored from Bundle (No Version)"
-                    
-                    elif current_ver_in_file != CURRENT_VERSION:
-                         # Version Mismatch -> Force Replace from Bundle (User Request)
-                         if os.path.exists(internal_gen):
-                             shutil.copy2(internal_gen, gen_path)
-                             g_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
-
-                
-                if g_action:
-                    logs.append(f"[Init] general.txt: {g_action}")
-
-            except Exception as e:
-                logs.append(f"[Init] Ошибка проверки версии general.txt: {e}")
-
+            # Директории для проверки
+            dirs_to_check = ["list", "ip", "strat"]
             
-            # === 1.5 Discord List Independent Version Check ===
-            # Ensure discord.txt has a version header or replace it (EXE) / update it (Script)
-            try:
-                discord_path = os.path.join(base_dir, "list", "discord.txt")
-                is_frozen_exe = getattr(sys, 'frozen', False)
+            for d in dirs_to_check:
+                target_dir = os.path.join(base_dir, d)
+                internal_dir = get_internal_path(d)
                 
-                # Читаем текущий файл
-                target_lines = []
-                has_version = False
-                current_ver_in_file = None
+                if not os.path.exists(target_dir):
+                    os.makedirs(target_dir, exist_ok=True)
                 
-                if os.path.exists(discord_path):
-                    with open(discord_path, "r", encoding="utf-8") as f:
-                        target_lines = f.readlines()
-                    if target_lines and target_lines[0].strip().startswith("# version:"):
-                        has_version = True
-                        try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
-                        except: pass
+                # Получаем список файлов
+                files_to_check = set()
+                if os.path.exists(target_dir):
+                    files_to_check.update(os.listdir(target_dir))
+                if is_frozen_exe and os.path.exists(internal_dir):
+                    files_to_check.update(os.listdir(internal_dir))
                 
-                d_action = ""
-                
-                # --- SCRIPT MODE (.pyw) ---
-                if not is_frozen_exe:
-                    if not os.path.exists(discord_path):
-                        pass # Do nothing in script mode
-                    elif not has_version:
-                        # Append header to beginning
-                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                        with open(discord_path, "w", encoding="utf-8") as f:
-                            f.writelines(target_lines)
-                        d_action = "Header Added (Script)"
-                    elif current_ver_in_file != CURRENT_VERSION:
-                        # Update header only
-                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                        with open(discord_path, "w", encoding="utf-8") as f:
-                            f.writelines(target_lines)
-                        d_action = "Header Updated (Script)"
-
-                # --- FROZEN EXE MODE ---
-                else:
-                    internal_discord = get_internal_path(os.path.join("list", "discord.txt"))
+                for fname in files_to_check:
+                    if not (fname.endswith(".txt") or fname.endswith(".json")):
+                        continue
+                        
+                    target_path = os.path.join(target_dir, fname)
+                    internal_path = os.path.join(internal_dir, fname) if is_frozen_exe else None
                     
-                    if not os.path.exists(discord_path):
-                         # Missing -> Copy from bundle
-                         if os.path.exists(internal_discord):
-                             shutil.copy2(internal_discord, discord_path)
-                             d_action = "Restored from Bundle (Missing)"
+                    is_json = fname.endswith(".json")
                     
-                    elif not has_version:
-                         # No Version in User File -> Force Replace (Assume corrupted/unknown)
-                         if os.path.exists(internal_discord):
-                             shutil.copy2(internal_discord, discord_path)
-                             d_action = "Restored from Bundle (No Version)"
-                    
-                    elif current_ver_in_file != CURRENT_VERSION:
-                         # Version Mismatch -> Force Replace from Bundle
-                         if os.path.exists(internal_discord):
-                             shutil.copy2(internal_discord, discord_path)
-                             d_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
-
-                if d_action:
-                    logs.append(f"[Init] discord.txt: {d_action}")
-
-            except Exception as e:
-                logs.append(f"[Init] Ошибка проверки версии discord.txt: {e}")
-
-            # === 1.5.5 EU List Version Management (Smart Merge) ===
-            try:
-                eu_path = os.path.join(base_dir, "list", "eu.txt")
-                is_frozen_exe = getattr(sys, 'frozen', False)
-                
-                # Check existing file
-                target_lines = []
-                has_version = False
-                current_ver_in_file = None
-                
-                if os.path.exists(eu_path):
-                    try:
-                        with open(eu_path, "r", encoding="utf-8") as f:
-                            target_lines = f.readlines()
-                        if target_lines and target_lines[0].strip().startswith("# version:"):
-                            has_version = True
-                            try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
-                            except: pass
-                    except: pass
-                
-                eu_action = ""
-                
-                # --- SCRIPT MODE (.pyw) ---
-                if not is_frozen_exe:
-                    if not os.path.exists(eu_path): pass
-                    elif not has_version:
-                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                        with open(eu_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
-                        eu_action = "Header Added (Script)"
-                    elif current_ver_in_file != CURRENT_VERSION:
-                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                        with open(eu_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
-                        eu_action = "Header Updated (Script)"
-                
-                # --- FROZEN EXE MODE ---
-                else:
-                    internal_eu = get_internal_path(os.path.join("list", "eu.txt"))
-                    
-                    if not os.path.exists(eu_path):
-                        if os.path.exists(internal_eu):
-                            shutil.copy2(internal_eu, eu_path)
-                            eu_action = "Restored from Bundle (Missing)"
-                    
-                    elif not has_version or current_ver_in_file != CURRENT_VERSION:
-                         # Version Mismatch -> Smart Merge
-                         if os.path.exists(internal_eu):
-                             try:
-                                 # 1. Read Bundle Domains
-                                 bundle_domains = set()
-                                 with open(internal_eu, "r", encoding="utf-8") as f:
-                                     for line in f:
-                                         clean = line.split('#')[0].strip()
-                                         if clean and not line.strip().startswith("#"): bundle_domains.add(clean)
-
-                                 # 2. Read User Domains
-                                 user_domains = set()
-                                 with open(eu_path, "r", encoding="utf-8") as f:
-                                     for line in f:
-                                         clean = line.split('#')[0].strip()
-                                         if clean and not line.strip().startswith("#"): user_domains.add(clean)
-                                 
-                                 # 3. Merge
-                                 merged = sorted(list(user_domains.union(bundle_domains)))
-                                 new_count = len(merged) - len(user_domains)
-                                 
-                                 # 4. Write merged content
-                                 with open(eu_path, "w", encoding="utf-8") as f:
-                                     f.write(f"# version: {CURRENT_VERSION}\n")
-                                     for d in merged: f.write(f"{d}\n")
-                                 eu_action = f"Merged Update (v{current_ver_in_file}->v{CURRENT_VERSION}, +{new_count} new domains)"
-                             except:
-                                 shutil.copy2(internal_eu, eu_path)
-                                 eu_action = "Restored from Bundle (Merge Failed)"
-
-                if eu_action:
-                    logs.append(f"[Init] eu.txt: {eu_action}")
-            except Exception as e:
-                logs.append(f"[Init] Ошибка проверки версии eu.txt: {e}")
-
-            # === 1.5.6 RU List Version Management (Smart Merge) ===
-            try:
-                ru_path = os.path.join(base_dir, "list", "ru.txt")
-                is_frozen_exe = getattr(sys, 'frozen', False)
-                
-                # Check existing file
-                target_lines = []
-                has_version = False
-                current_ver_in_file = None
-                
-                if os.path.exists(ru_path):
-                    try:
-                        with open(ru_path, "r", encoding="utf-8") as f:
-                            target_lines = f.readlines()
-                        if target_lines and target_lines[0].strip().startswith("# version:"):
-                            has_version = True
-                            try: current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
-                            except: pass
-                    except: pass
-                
-                ru_action = ""
-                
-                # --- SCRIPT MODE (.pyw) ---
-                if not is_frozen_exe:
-                    if not os.path.exists(ru_path): pass
-                    elif not has_version:
-                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                        with open(ru_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
-                        ru_action = "Header Added (Script)"
-                    elif current_ver_in_file != CURRENT_VERSION:
-                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                        with open(ru_path, "w", encoding="utf-8") as f: f.writelines(target_lines)
-                        ru_action = "Header Updated (Script)"
-                
-                # --- FROZEN EXE MODE ---
-                else:
-                    internal_ru = get_internal_path(os.path.join("list", "ru.txt"))
-                    
-                    if not os.path.exists(ru_path):
-                        if os.path.exists(internal_ru):
-                            shutil.copy2(internal_ru, ru_path)
-                            ru_action = "Restored from Bundle (Missing)"
-                    
-                    elif not has_version or current_ver_in_file != CURRENT_VERSION:
-                         # Version Mismatch -> Smart Merge
-                         if os.path.exists(internal_ru):
-                             try:
-                                 # 1. Read Bundle Domains
-                                 bundle_domains = set()
-                                 with open(internal_ru, "r", encoding="utf-8") as f:
-                                     for line in f:
-                                         clean = line.split('#')[0].strip()
-                                         if clean and not line.strip().startswith("#"): bundle_domains.add(clean)
-
-                                 # 2. Read User Domains
-                                 user_domains = set()
-                                 with open(ru_path, "r", encoding="utf-8") as f:
-                                     for line in f:
-                                         clean = line.split('#')[0].strip()
-                                         if clean and not line.strip().startswith("#"): user_domains.add(clean)
-                                 
-                                 # 3. Merge
-                                 merged = sorted(list(user_domains.union(bundle_domains)))
-                                 new_count = len(merged) - len(user_domains)
-                                 
-                                 # 4. Write merged content
-                                 with open(ru_path, "w", encoding="utf-8") as f:
-                                     f.write(f"# version: {CURRENT_VERSION}\n")
-                                     for d in merged: f.write(f"{d}\n")
-                                 ru_action = f"Merged Update (v{current_ver_in_file}->v{CURRENT_VERSION}, +{new_count} new domains)"
-                             except:
-                                 shutil.copy2(internal_ru, ru_path)
-                                 ru_action = "Restored from Bundle (Merge Failed)"
-
-                if ru_action:
-                    logs.append(f"[Init] ru.txt: {ru_action}")
-            except Exception as e:
-                logs.append(f"[Init] Ошибка проверки версии ru.txt: {e}")
-
-            # === 1.5.7 WARP IP List Version Management (ip/warp.txt) ===
-            try:
-                warp_ip_path = os.path.join(base_dir, "ip", "warp.txt")
-                is_frozen_exe = getattr(sys, 'frozen', False)
-
-                target_lines = []
-                has_version = False
-                current_ver_in_file = None
-
-                if os.path.exists(warp_ip_path):
-                    try:
-                        with open(warp_ip_path, "r", encoding="utf-8") as f:
-                            target_lines = f.readlines()
-                        if target_lines and target_lines[0].strip().startswith("# version:"):
-                            has_version = True
-                            try:
-                                current_ver_in_file = target_lines[0].strip().split(":", 1)[1].strip()
-                            except:
-                                pass
-                    except:
-                        pass
-
-                w_action = ""
-
-                # --- SCRIPT MODE (.pyw): never replace from bundle, only header management ---
-                if not is_frozen_exe:
-                    if not os.path.exists(warp_ip_path):
-                        pass
-                    elif not target_lines:
-                        try:
-                            if os.path.getsize(warp_ip_path) == 0:
-                                with open(warp_ip_path, "w", encoding="utf-8") as f:
-                                    f.write(f"# version: {CURRENT_VERSION}\n")
-                                w_action = "Header Created (Script, Empty)"
-                            else:
-                                logs.append("[Init] ip/warp.txt read failed. Skipping header update to prevent data loss.")
-                        except:
-                            logs.append("[Init] ip/warp.txt read failed. Skipping header update to prevent data loss.")
-                    elif not has_version:
-                        target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                        with open(warp_ip_path, "w", encoding="utf-8") as f:
-                            f.writelines(target_lines)
-                        w_action = "Header Added (Script)"
-                    elif current_ver_in_file != CURRENT_VERSION:
-                        target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                        with open(warp_ip_path, "w", encoding="utf-8") as f:
-                            f.writelines(target_lines)
-                        w_action = "Header Updated (Script)"
-                # --- FROZEN EXE MODE ---
-                else:
-                    internal_warp_ip = get_internal_path(os.path.join("ip", "warp.txt"))
-
-                    if not os.path.exists(warp_ip_path):
-                        if os.path.exists(internal_warp_ip):
-                            shutil.copy2(internal_warp_ip, warp_ip_path)
-                            w_action = "Restored from Bundle (Missing)"
-                    elif not has_version:
-                        if os.path.exists(internal_warp_ip):
-                            shutil.copy2(internal_warp_ip, warp_ip_path)
-                            w_action = "Restored from Bundle (No Version)"
-                    elif current_ver_in_file != CURRENT_VERSION:
-                        if os.path.exists(internal_warp_ip):
-                            shutil.copy2(internal_warp_ip, warp_ip_path)
-                            w_action = f"Restored from Bundle (Version Mismatch {current_ver_in_file}->{CURRENT_VERSION})"
-
-                if w_action:
-                    logs.append(f"[Init] ip/warp.txt: {w_action}")
-
-            except Exception as e:
-                logs.append(f"[Init] Ошибка проверки версии ip/warp.txt: {e}")
-
-            # === 1.6 Standardized Strat JSON Versioning ===
-            try:
-                # Список ожидаемых JSON в папке strat
-                # Можно брать все, но strategies.json - особое исключение
-                strat_dir_internal = get_internal_path("strat")
-                expected_jsons = []
-                if os.path.exists(strat_dir_internal):
-                    expected_jsons = [f for f in os.listdir(strat_dir_internal) if f.endswith(".json")]
-                
-                # Добавим дефолтные, если вдруг internal не прочитался (для Script mode)
-                defaults = ["youtube.json", "discord.json", "general.json", "strategies.json"]
-                for d in defaults:
-                    if d not in expected_jsons: expected_jsons.append(d)
-                
-                is_frozen_exe = getattr(sys, 'frozen', False)
-                
-                for json_file in expected_jsons:
-                     target_path = os.path.join(base_dir, "strat", json_file)
-                     internal_path = get_internal_path(os.path.join("strat", json_file))
-                     
-                     j_action = ""
-                     
-                     try:
-                         # Load current
-                         current_data = {}
-                         has_ver_key = False
-                         cur_ver = None
-                         
-                         if os.path.exists(target_path):
-                             try:
-                                 with open(target_path, "r", encoding="utf-8") as f:
-                                     current_data = json.load(f)
-                                     if isinstance(current_data, dict):
-                                         cur_ver = current_data.get("version")
-                                         if "version" in current_data: has_ver_key = True
-                             except: pass # corrupted
-                         
-                         # === EXCEPTION: strategies.json ===
-                         if json_file == "strategies.json":
-                             # Special logic: Preserve content on update in EXE
-                             if not is_frozen_exe:
-                                 # SCRIPT: Update Header
-                                 if not os.path.exists(target_path): pass
-                                 elif cur_ver != CURRENT_VERSION:
-                                     current_data["version"] = CURRENT_VERSION
-                                     save_json_safe(target_path, current_data)
-                                     j_action = "Version Updated (Script)"
-                             else:
-                                 # EXE
-                                 if not os.path.exists(target_path):
-                                     if os.path.exists(internal_path):
-                                         shutil.copy2(internal_path, target_path)
-                                         j_action = "Restored from Bundle (Missing)"
-                                 elif not has_ver_key:
-                                      # No version -> Restore
-                                      if os.path.exists(internal_path):
-                                         shutil.copy2(internal_path, target_path)
-                                         j_action = "Restored from Bundle (No Version)"
-                                 elif cur_ver != CURRENT_VERSION:
-                                      # Version Mismatch -> Force Replace from Bundle (User Request: No Backup)
-                                      if os.path.exists(internal_path):
-                                         shutil.copy2(internal_path, target_path)
-                                         j_action = f"Restored from Bundle (Version Mismatch {cur_ver}->{CURRENT_VERSION})"
-                                      
-                         # === STANDARD JSON (youtube.json, etc.) ===
-                         else:
-                             if not is_frozen_exe:
-                                 # SCRIPT: Update Header
-                                 if not os.path.exists(target_path): pass
-                                 elif cur_ver != CURRENT_VERSION:
-                                     current_data["version"] = CURRENT_VERSION
-                                     save_json_safe(target_path, current_data)
-                                     j_action = "Version Updated (Script)"
-                             else:
-                                 # EXE: Force Replace
-                                 if not os.path.exists(target_path):
-                                     if os.path.exists(internal_path):
-                                         shutil.copy2(internal_path, target_path)
-                                         j_action = "Restored from Bundle (Missing)"
-                                 elif cur_ver != CURRENT_VERSION: # incl has_ver_key=False (cur_ver=None)
-                                      if os.path.exists(internal_path):
-                                         shutil.copy2(internal_path, target_path)
-                                         j_action = "Restored from Bundle (Version Mismatch)"
-                         
-                         if j_action:
-                             logs.append(f"[Init] {json_file}: {j_action}")
-                             
-                     except Exception as ex_j:
-                         logs.append(f"[Init] Error checking {json_file}: {ex_j}")
-
-            except Exception as e:
-                logs.append(f"[Init] Strat JSON check error: {e}")
-
-            
-            # Write if needed - REMOVED (Broken Legacy Code)
-            # if should_rewrite: ...
-            
-            # Cleanup old version file
-            try:
-                ov_path = os.path.join(base_dir, "list", "general.version")
-                if os.path.exists(ov_path): os.remove(ov_path)
-            except: pass
-
-
-            # === 1.1 Exclude List Version Management (list/exclude.txt) ===
-            try:
-                ex_path = os.path.join(base_dir, "list", "exclude.txt")
-                
-                # Check execution mode
-                is_frozen_exe = getattr(sys, 'frozen', False)
-
-                # --- Script Mode (.pyw) ---
-                if not is_frozen_exe:
-                    # Logic: Ensure Header is present and up-to-date
+                    # Читаем версию из файла пользователя
+                    target_has_version = False
+                    target_version = None
+                    target_data = None
                     target_lines = []
-                    if os.path.exists(ex_path):
-                        with open(ex_path, "r", encoding="utf-8") as f:
-                             target_lines = f.readlines()
                     
-                    msg = ""
-                    if not target_lines:
-                        # Case: Empty or Missing -> Create with Header
-                        target_lines = [f"# version: {CURRENT_VERSION}\n"]
-                        msg = "Create Header"
-                        # Ensure dir exists just in case
-                        os.makedirs(os.path.dirname(ex_path), exist_ok=True)
-                    elif target_lines[0].strip().startswith("# version:"):
-                         # Case: Header exists -> Check version
-                         v_str = target_lines[0].strip().split(":", 1)[1].strip()
-                         if v_str != CURRENT_VERSION:
-                             target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                             msg = "Update Header"
+                    if os.path.exists(target_path):
+                        if is_json:
+                            try:
+                                with open(target_path, "r", encoding="utf-8") as f:
+                                    target_data = json.load(f)
+                                if isinstance(target_data, dict) and "version" in target_data:
+                                    target_has_version = True
+                                    target_version = target_data["version"]
+                            except: pass
+                        else:
+                            try:
+                                with open(target_path, "r", encoding="utf-8") as f:
+                                    target_lines = f.readlines()
+                                if target_lines and target_lines[0].strip().startswith("# version:"):
+                                    target_has_version = True
+                                    target_version = target_lines[0].strip().split(":", 1)[1].strip()
+                            except: pass
+
+                    needs_replace_from_exe = False
+                    action = ""
+
+                    if is_frozen_exe:
+                        if not os.path.exists(internal_path):
+                            continue # В exe нет такого файла
+                        
+                        if not os.path.exists(target_path):
+                            needs_replace_from_exe = True
+                            action = "Missing -> Restored from Bundle"
+                        elif not target_has_version:
+                            needs_replace_from_exe = True
+                            action = "No Version -> Restored from Bundle"
+                        else:
+                            # Если текущая версия в программе выше чем в файле -> заменяем из EXE
+                            if compare_versions(CURRENT_VERSION, target_version):
+                                needs_replace_from_exe = True
+                                action = f"Outdated (v{target_version} < v{CURRENT_VERSION}) -> Restored from Bundle"
+
+                        if needs_replace_from_exe:
+                            try:
+                                shutil.copy2(internal_path, target_path)
+                                logs.append(f"[Init] {d}/{fname}: {action}")
+                            except Exception as e:
+                                logs.append(f"[Init] Ошибка перезаписи {d}/{fname}: {e}")
+                    
                     else:
-                         # Case: No Header -> Prepend
-                         target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                         msg = "Append Header"
-                    
-                    if msg:     
-                         with open(ex_path, "w", encoding="utf-8") as f:
-                             f.writelines(target_lines)
-
-                # --- Frozen EXE Mode ---
-                else:
-                    internal_ex = get_internal_path(os.path.join("list", "exclude.txt"))
-                    
-                    # 1. Read Target (User File)
-                    target_lines = []
-                    target_ver = None
-                    target_domains = set()
-                    
-                    if os.path.exists(ex_path):
-                        with open(ex_path, "r", encoding="utf-8") as f:
-                             target_lines = f.readlines()
+                        # Скрипт-режим: просто внедряем актуальную версию, не замещая содержимое
+                        if not os.path.exists(target_path):
+                            continue
                         
-                        # Parse
-                        if target_lines and target_lines[0].strip().startswith("# version:"):
-                            try: target_ver = target_lines[0].strip().split(":", 1)[1].strip()
-                            except: pass
-                        
-                        for line in target_lines:
-                             # Clean up null bytes from UTF-16 corruption 
-                             if '\x00' in line: line = line.replace('\x00', '')
-                             c = line.split('#')[0].strip()
-                             c = ''.join(c.split())
-                             if c: target_domains.add(c)
-                    
-                    # 2. Decision
-                    needs_update = False
-                    
-                    if not os.path.exists(ex_path):
-                        # Case A: Missing -> Full Copy from Bundle
-                        if os.path.exists(internal_ex):
-                            shutil.copy2(internal_ex, ex_path)
-                            logs.append(f"Создан exclude.txt (v{CURRENT_VERSION})")
-                    
-                    elif not target_ver:
-                        # Case B: No Version -> Replace with Bundle (as requested)
-                        if os.path.exists(internal_ex):
-                            shutil.copy2(internal_ex, ex_path)
-                            logs.append(f"Пересоздан exclude.txt (нет версии) -> v{CURRENT_VERSION}")
-                            
-                    elif target_ver != CURRENT_VERSION:
-                        # Case C: Old/Diff Version -> Fix Header + Supplement List
-                        # Read Source Bundle
-                        source_lines = []
-                        if os.path.exists(internal_ex):
-                             with open(internal_ex, "r", encoding="utf-8") as f:
-                                 source_lines = f.readlines()
-                        
-                        # Prepare new content
-                        new_lines = []
-                        # 1. New Header
-                        new_lines.append(f"# version: {CURRENT_VERSION}\n")
-                        
-                        # 2. Existing User Content (skip old header if present)
-                        for i, line in enumerate(target_lines):
-                             if '\x00' in line: line = line.replace('\x00', '')
-                             if i == 0 and line.strip().startswith("# version:"): continue
-                             
-                             # Remove completely broken lines like "c l o u d c o d e"
-                             c = line.split('#')[0].strip()
-                             if c != ''.join(c.split()):
-                                 line = line.replace(c, ''.join(c.split()))
-                                 
-                             new_lines.append(line)
-                        
-                        # 3. Append Missing from Bundle
-                        # Iterate source lines to find missing domains
-                        added_count = 0
-                        first_add = True
-                        
-                        for line in source_lines:
-                             if '\x00' in line: line = line.replace('\x00', '')
-                             c = line.split('#')[0].strip()
-                             c = ''.join(c.split())
-                             # Ignore source comments/empty lines for the purpose of "missing domain" check
-                             if c and c not in target_domains:
-                                 # It's a new domain!
-                                 if first_add:
-                                     new_lines.append(f"\n# --- New from v{CURRENT_VERSION} ---\n")
-                                     first_add = False
-                                 
-                                 # We append the original line from source (formatting preserved) 
-                                 # OR just the clean domain? 
-                                 # Source line might be "doubleclick.net # ad tracker"
-                                 # Ideally preserve source comment.
-                                 new_lines.append(line)
-                                 
-                                 target_domains.add(c) # Prevent duplicates
-                                 added_count += 1
-                        
-                        # Write
-                        with open(ex_path, "w", encoding="utf-8") as f:
-                             f.writelines(new_lines)
-                        
-                        if added_count > 0:
-                             logs.append(f"exclude.txt обновлен (v{target_ver}->v{CURRENT_VERSION}): добавлено {added_count} записей")
+                        updated = False
+                        if is_json:
+                            if isinstance(target_data, dict):
+                                if not target_has_version:
+                                    target_data["version"] = CURRENT_VERSION
+                                    updated = True
+                                    action = "Version Added (Script)"
+                                elif compare_versions(CURRENT_VERSION, target_version) or target_version != CURRENT_VERSION:
+                                    target_data["version"] = CURRENT_VERSION
+                                    updated = True
+                                    action = f"Version Updated to v{CURRENT_VERSION} (Script)"
+                                
+                                if updated:
+                                    try:
+                                        with open(target_path, "w", encoding="utf-8") as f:
+                                            json.dump(target_data, f, indent=4, ensure_ascii=False)
+                                    except: pass
                         else:
-                             logs.append(f"exclude.txt обновлена версия (v{target_ver}->v{CURRENT_VERSION})")
+                            if not target_has_version:
+                                target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
+                                updated = True
+                                action = "Version Added (Script)"
+                            elif compare_versions(CURRENT_VERSION, target_version) or target_version != CURRENT_VERSION:
+                                target_lines[0] = f"# version: {CURRENT_VERSION}\n"
+                                updated = True
+                                action = f"Version Updated to v{CURRENT_VERSION} (Script)"
+                                
+                            if updated:
+                                try:
+                                    with open(target_path, "w", encoding="utf-8") as f:
+                                        f.writelines(target_lines)
+                                except: pass
+                                
+                        if updated:
+                            logs.append(f"[Init] {d}/{fname}: {action}")
 
-            except Exception as e:
-                logs.append(f"Ошибка обновления exclude.txt: {e}")
-
-
-            # === 2. JSON Version Injection & Hard Reset Logic (v0.997) ===
-            
-            # Special logic for 0.997: Force Reset to clean up old mess
-            # If we detect files WITHOUT version or Old Version, and we are 0.997, we DELETE them.
-            # This ensures they are recreated from the Bundle later.
-            # For 0.998+, we will just update the version.
-
-            json_files_to_check = []
-            strat_files = []
-            
-            for fname in os.listdir(strat_dir):
-                if fname.lower().endswith(".json"):
-                    fpath = os.path.join(strat_dir, fname)
-                    json_files_to_check.append(fpath)
-                    strat_files.append(fpath)
-            
-            temp_dir = os.path.join(base_dir, "temp")
-            # FIX: Do NOT check/update temp state files (strategies_evolution, learning_data) here.
-            # They should manage themselves. Checking them forces "updated version" logs on every launch.
-            
-            for fpath in json_files_to_check:
-                try:
-                    data = load_json_robust(fpath, None)
-                    if not isinstance(data, dict):
-                        if os.path.exists(fpath): os.remove(fpath)
-                        continue
-                    
-                    ver = data.get("version")
-                    
-                    # === STANDARD UPDATE LOGIC (Future) ===
-                    
-                    fname = os.path.basename(fpath)
-                    
-                    # Файлы, которые используют НОВЫЙ формат (сервисные)
-                    # Требуют структуру: {"version": "...", "strategies": [...]}
-                    service_files = ["youtube.json", "discord.json", "cloudflare.json", 
-                                    "whatsapp.json", "warp.json", "general.json"]
-                    
-                    # Файлы, которые используют СТАРЫЙ формат (не требуют миграции)
-                    # Структура: {"service": [...args...], "hard_1": [...], ...}
-                    legacy_format_files = ["strategies.json", "boost.json"]
-                    
-                    if not ver:
-                        # Если версии нет, сохраняем файл, добавив версию (для 0.998+)
-                        data["version"] = CURRENT_VERSION
-                        save_json_safe(fpath, data)
-                        logs.append(f"Файл {fname} обновлен до v{CURRENT_VERSION}")
-                        continue
-                    
-                    if ver != CURRENT_VERSION:
-                        # === FORCE REPLACE: Критические файлы полностью заменяем при обновлении ===
-                        force_replace_files = ["discord.json"]
-                        
-                        if fname in force_replace_files:
-                            try:
-                                bundled_file = get_internal_path(os.path.join("strat", fname))
-                                if os.path.exists(bundled_file):
-                                    shutil.copy2(bundled_file, fpath)
-                                    logs.append(f"Заменён конфиг {fname} (v{ver} -> v{CURRENT_VERSION})")
-                                    continue  # Skip to next file
-                            except Exception as e:
-                                logs.append(f"Ошибка замены {fname}: {e}")
-                        
-                        # Проверяем, требуется ли миграция формата
-                        needs_format_migration = False
-                        
-                        if fname in service_files:
-                            # Проверяем формат: новый формат должен иметь ключ "strategies"
-                            if "strategies" not in data:
-                                needs_format_migration = True
-                                logs.append(f"Обнаружен устаревший формат {fname}, требуется миграция")
-                        
-                        if needs_format_migration:
-                            # Заменяем файл из bundle (внутренних ресурсов EXE)
-                            try:
-                                bundled_file = get_internal_path(os.path.join("strat", fname))
-                                if os.path.exists(bundled_file):
-                                    shutil.copy2(bundled_file, fpath)
-                                    logs.append(f"Обновлен формат конфига {fname} (v{CURRENT_VERSION})")
-                                else:
-                                    # Если bundle не найден, просто обновляем версию
-                                    data["version"] = CURRENT_VERSION
-                                    save_json_safe(fpath, data)
-                                    logs.append(f"Обновлена версия конфига {fname} (bundle не найден)")
-                            except Exception as e:
-                                logs.append(f"Ошибка миграции {fname}: {e}")
-                        else:
-                            # Формат актуален, просто обновляем номер версии
-                            data["version"] = CURRENT_VERSION
-                            save_json_safe(fpath, data)
-                            # Не логируем для файлов со старым форматом (strategies.json, boost.json)
-                            if fname not in legacy_format_files:
-                                logs.append(f"Обновлена версия конфига {fname}")
-                except: pass
-            
-            # === 3. Restore Default Strategies (Standard Logic for strategies.json) ===
-            # Dynamically load defaults from BUNDLED strategies.json inside EXE
-            try:
-                bundled_strat_path = get_internal_path(os.path.join("strat", "strategies.json"))
-                if os.path.exists(bundled_strat_path):
-                     snap = load_json_robust(bundled_strat_path, {})
-                     if isinstance(snap, dict):
-                         # Normalize snapshot if needed
-                         for k, v in snap.items():
-                             if isinstance(v, dict) and "args" in v: snap[k] = v["args"]
-                         DEFAULT_STRATEGIES.update(snap)
-                else:
-                     logs.append(f"Debug: Bundle not found at {bundled_strat_path}")
-            except Exception as e:
-                logs.append(f"Bundle Load Error: {e}")
-
-            strat_path = os.path.join(strat_dir, "strategies.json")
-            data = load_json_robust(strat_path, {})
-            
-            modified = False
-            restored_keys = []
-            
-            def restore_missing_strategies(strat_path):
-                # FIX: No restoration in script mode
-                if not getattr(sys, 'frozen', False):
-                    return []
-
-                updated = []
-                # If no strategies file, create empty one to prevent crashes (or handle in _start_nova_service)
-                if not os.path.exists(strat_path):
-                     try:
-                         with open(strat_path, "w", encoding="utf-8") as f: json.dump({}, f)
-                     except: pass
-
-                # OLD Restore logic removed/restricted
-                # Only restore if completely empty/missing in EXE mode if needed
-                # For now, relying on deploy_infrastructure which should ideally copy embedded strategies.json
-                
-                return updated
-            
-            # Call the new function
-            restored_keys = restore_missing_strategies(strat_path)
-            if restored_keys:
-                logs.append(f"Восстановлены стратегии (из EXE): {', '.join(restored_keys)}")
-            
             return logs
 
         except Exception as e:
-            print(f"[Init] Ошибка восстановления стратегий: {e}")
+            print(f"[Init] Ошибка проверки файлов: {e}")
             return logs
 
     def get_base_dir():
@@ -3001,12 +2360,18 @@ try:
 
                 # === Routing rules ===
                 # Discord: NOT in TUN, goes direct through network (winws handles DPI).
+                # Exception: Discord Update.exe → WARP TCP (CDN often blocked by DPI).
                 # Telegram/WhatsApp: captured by TUN, routed via WARP for speed.
+                dc_updater_path_re = "(?i)^.*\\\\\\\\discord\\\\\\\\update\\.exe$"
+                
                 route_rules = [
                     # 1. Infra bypass: prevent loops
                     {"process_name": infra_bypass, "action": "route", "outbound": "direct"},
                     
-                    # === DISCORD → direct (NOT through TUN/WARP, winws handles it) ===
+                    # === DISCORD UPDATER → WARP (Update.exe needs CDN access) ===
+                    {"process_path_regex": [dc_updater_path_re], "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
+                    
+                    # === DISCORD (main app) → direct (winws handles DPI) ===
                     {"process_name": dc_procs, "action": "route", "outbound": "direct"},
                     {"process_path_regex": [dc_path_re], "action": "route", "outbound": "direct"},
                     
@@ -7008,8 +6373,13 @@ try:
             pass
 
     def get_autostart_cmd():
-        """Проверяет наличие записи автозапуска в реестре"""
+        """Проверяет состояние автозапуска (через Task Scheduler)"""
         try:
+            result = subprocess.run(["schtasks", "/query", "/tn", "NovaAutoStart"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW, text=True)
+            if "NovaAutoStart" in result.stdout:
+                return "schtasks_auto"
+            
+            # Fallback backward compatibility: check registry
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
             try:
                 cmd, _ = winreg.QueryValueEx(key, "NovaApplication")
@@ -7022,65 +6392,63 @@ try:
             return None
 
     def toggle_startup(log_func=None):
-        """Переключает состояние автозапуска"""
+        """Переключает состояние автозапуска (используя Task Scheduler для прав Админа)"""
         try:
-            start_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            exe_path = os.path.abspath(sys.executable)
+            cmd_to_add = f'"{exe_path}"'
             
-            # Определяем пути
-            base_dir = get_base_dir()
-            potential_exe = os.path.join(base_dir, "Nova.exe")
-            if not os.path.exists(potential_exe):
-                potential_exe = os.path.join(base_dir, "nova.exe")
-            
-            if getattr(sys, 'frozen', False):
-                # Скомпилированная версия (EXE)
-                exe_path = os.path.abspath(sys.executable)
-                cmd_to_add = f'"{exe_path}"'  # Убрал --minimized, чтобы стартовало окно (или спрятано по умолчанию, но без флагов для Nuitka)
-                if "--minimized" not in cmd_to_add:
-                    cmd_to_add += " --minimized"
-            elif os.path.exists(potential_exe):
-                # Мы в режиме скрипта, но рядом есть Nova.exe - используем его для автозапуска
-                cmd_to_add = f'"{os.path.abspath(potential_exe)}" --minimized'
-                # Режим скрипта .pyw
-                exe_path = os.path.abspath(sys.executable)
-                script_path = os.path.abspath(__file__)
-                cmd_to_add = f'"{exe_path}" "{script_path}" --minimized'
-
-            # Проверяем текущее наличие
-            exists = False
             try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_READ)
-                try:
-                    current_cmd, _ = winreg.QueryValueEx(key, "NovaApplication")
-                    exists = True
-                except FileNotFoundError:
-                    exists = False
-                winreg.CloseKey(key)
-            except: 
-                exists = False
-
-            # Открываем для записи
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, start_key, 0, winreg.KEY_WRITE)
+                if getattr(sys, 'frozen', False):
+                    cmd_to_add = f'"{exe_path}" --minimized'
+                else:
+                    try:
+                        script_path = os.path.abspath(__file__)
+                        cmd_to_add = f'"{exe_path}" "{script_path}" --minimized'
+                    except NameError:
+                        # Fallback if __file__ is undefined
+                        cmd_to_add = f'"{exe_path}" --minimized'
+            except Exception as e:
+                if log_func: log_func(f"[Autostart] Ошибка формирования пути: {e}")
+                
+            status = get_startup_status()
             
-            if exists:
+            # Clean up old Registry entry if exists
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_WRITE)
+                winreg.DeleteValue(key, "NovaApplication")
+                winreg.CloseKey(key)
+            except: pass
+
+            if status:
+                # Включен -> Отключить
                 try:
-                    winreg.DeleteValue(key, "NovaApplication")
-                    if log_func: log_func("[Autostart] Автозапуск отключен (запись удалена)")
+                    subprocess.run(["schtasks", "/delete", "/tn", "NovaAutoStart", "/f"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                    if log_func: log_func("[Autostart] Автозапуск отключен")
                     else: print("[Autostart] Disabled")
                 except Exception as e:
-                    if log_func: log_func(f"[Autostart] Ошибка при удалении: {e}")
+                    if log_func: log_func(f"[Autostart] Ошибка при отключении: {e}")
             else:
+                # Отключен -> Включить (Создаём задачу с наивысшими правами)
                 try:
-                    winreg.SetValueEx(key, "NovaApplication", 0, winreg.REG_SZ, cmd_to_add)
-                    if log_func: log_func(f"[Autostart] Автозапуск включен: {cmd_to_add}")
-                    else: print(f"[Autostart] Enabled: {cmd_to_add}")
+                    res = subprocess.run([
+                        "schtasks", "/create", "/tn", "NovaAutoStart", 
+                        "/tr", str(cmd_to_add), 
+                        "/sc", "onlogon", 
+                        "/rl", "highest", 
+                        "/f"
+                    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW, text=True)
+                    
+                    if res.returncode == 0:
+                        if log_func: log_func(f"[Autostart] Автозапуск включен (с правами Администратора)")
+                        else: print(f"[Autostart] Enabled as Admin")
+                    else:
+                        err_msg = res.stderr.strip() or "schtasks failed"
+                        raise Exception(f"{err_msg}. Перезапустите Nova от имени Администратора для настройки автозапуска.")
                 except Exception as e:
                     if log_func: log_func(f"[Autostart] Ошибка при записи: {e}")
-            
-            winreg.CloseKey(key)
         except Exception as e:
-            if log_func: log_func(f"[Autostart] Ошибка реестра: {e}")
-            else: print(f"[Autostart] Registry Error: {e}")
+            if log_func: log_func(f"[Autostart] Ошибка системы: {e}")
+            else: print(f"[Autostart] Error: {e}")
 
     def ensure_log_window_created():
         global log_window, log_text_widget, cached_log_size
@@ -9158,9 +8526,9 @@ try:
                          log_func(f"[Warning] WinWS код {exit_code}: {hint}")
                      
                      # FIX: Auto-repair driver if service is disabled (Code 34 / 0x422) or missing (Code 177)
-                     if exit_code == 34 or exit_code == 177:
+                     if (exit_code == 34 or exit_code == 177) and not _windivert_broken:
                          log_func(f"[Check] Обнаружена проблема с драйвером (Code {exit_code}). Запуск восстановления...")
-                         try: repair_windivert_driver(log_func)
+                         try: repair_windivert_driver(log_func, exit_code=exit_code)
                          except: pass
                          time.sleep(2.0) # Give driver time to settle
 
@@ -9417,6 +8785,7 @@ try:
                         return res
 
                 def check_strat(strat_args, port_start, target_domains=None, rate_limiter=None, progress_tracker=None, run_id=None):
+                    global _windivert_broken
                     # Global Stop Check
                     if is_closing or not is_service_active: return None
                     
@@ -9446,6 +8815,12 @@ try:
                             except:
                                 pass
 
+                    # FIX: Filter strategies with known bad arguments
+                    for arg in strat_args:
+                        arg_key = arg.split('=')[0] # Get the key like --dpi-desync-fake-repeats
+                        if arg_key in _unsupported_winws_args:
+                            log_func(f"[Check] ❌ Пропуск стратегии (содержит недопустимый параметр {arg_key})")
+                            return 0
                     
                     if target_domains is None:
                         target_domains = domains
@@ -9574,23 +8949,36 @@ try:
                                 if hint:
                                     log_func(f"[Warning] WinWS код {proc.returncode}: {hint}")
                                 
+                                # FIX: Catch unsupported args to never use them again
+                                import re
+                                m_unknown = re.search(r"unknown option --\s*([a-zA-Z0-9_-]+)", err_msg)
+                                if m_unknown:
+                                    bad_arg = f"--{m_unknown.group(1)}"
+                                    _unsupported_winws_args.add(bad_arg)
+                                    log_func(f"[Check] ❌ Обнаружен неподдерживаемый параметр ядра: {bad_arg}. Он добавлен в черный список.")
+                                    return 0 # Не пытаемся снова, этот параметр сломан
+                                
                                 # FIX: Auto-repair driver if service is disabled (Code 34 / 0x422) or missing (Code 177)
                                 if proc.returncode in (34, 177) or \
                                    ("service cannot be started" in err_msg and "disabled" in err_msg) or \
                                    ("device which does not exist" in err_msg):
+                                    
+                                    # If driver is confirmed broken globally, skip immediately
+                                    if _windivert_broken:
+                                        return 0
                                     
                                     # Ограничиваем количество попыток ремонта
                                     repair_attempts = getattr(check_strat, '_repair_attempts', 0)
                                     if repair_attempts < 3:
                                         log_func(f"[Check] Обнаружена проблема с драйвером (Code {proc.returncode}). Запуск восстановления...")
                                         try: 
-                                            repair_windivert_driver(log_func)
+                                            repair_windivert_driver(log_func, exit_code=proc.returncode)
                                             check_strat._repair_attempts = repair_attempts + 1
                                         except: pass
                                     else:
+                                        _windivert_broken = True
                                         log_func(f"[Error] Не удалось восстановить драйвер WinDivert после 3 попыток. Проверьте 'Изоляцию ядра' в Windows.")
-                                        # Больше не пытаемся чинить в этой сессии
-                                        time.sleep(60) 
+                                        return 0  # Don't waste time, driver is broken
                                     
                                     time.sleep(1.0)
                                     continue # Retry immediately
@@ -9791,6 +9179,11 @@ try:
                             # FIX: Prevent malformed arguments like ^! or random binary garbage
                             # winws can fail on specific special characters if not escaped
                             if "^!" in a or "\x00" in a or "\\x" in a:
+                                return False
+                                
+                            # FIX: Prevent using known bad arguments
+                            arg_key = a.split("=")[0]
+                            if arg_key in _unsupported_winws_args:
                                 return False
                                 
                             # Запрет wssize
@@ -14311,84 +13704,142 @@ try:
                          udp_ports.add(f"udp.DstPort == {part}")
         return tcp_ports, udp_ports
 
-    def repair_windivert_driver(log_func=None):
+    _repair_lock = threading.Lock()
+    _repair_in_progress = False
+    _windivert_broken = False  # Global flag: driver confirmed broken, checkers should skip
+    _unsupported_winws_args = set()  # Global cache of unsupported winws options
+    _repair_advice_shown = False  # Prevent duplicate advice messages
+
+    def repair_windivert_driver(log_func=None, exit_code=None):
         """
         Attempts to repair broken WinDivert driver installation.
         Fixes Code 177, 577, and 0x422 (Disabled).
+        Thread-safe: only one repair runs at a time.
         """
-        try:
-            if log_func: log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
-        except: pass
+        global _repair_in_progress, _windivert_broken, _repair_advice_shown
         
-        # 1. Stop and Delete Service (Full reset)
+        # If another thread is already repairing, just wait for it
+        if _repair_in_progress:
+            if log_func:
+                try: log_func("[Repair] Восстановление уже выполняется другим потоком, ожидание...")
+                except: pass
+            # Wait for the other thread to finish (up to 10s)
+            for _ in range(20):
+                time.sleep(0.5)
+                if not _repair_in_progress:
+                    break
+            return
+        
+        if not _repair_lock.acquire(blocking=False):
+            # Another thread grabbed the lock just now
+            time.sleep(3)
+            return
+        
         try:
-            # Force enable first in case it was disabled (Fix for Code 34)
-            subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            _repair_in_progress = True
             
-            # Direct Registry Fix for Code 34
             try:
-                import winreg
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\WinDivert", 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3) # 3 = Manual
-                winreg.CloseKey(key)
+                if log_func: log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
             except: pass
-
-            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            subprocess.run(["sc", "delete", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-        except: pass
-        
-        # 1.1 Deeper Registry Cleanup (Fix for persistent 177 / zombie services)
-        try:
-            import winreg
-            reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
-            try:
-                # Need to open with all access to delete
-                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_ALL_ACCESS)
-                winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
-                winreg.CloseKey(key)
-                if IS_DEBUG_MODE: log_func("[Repair] Запись службы в реестре удалена.")
-            except: pass
-        except: pass
-
-        # 2. Kill any WinWS remnants that might be holding the driver
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
-
-        # 3. Clean system remnants (Drivers often stuck in system32/drivers)
-        try:
-            sys_driver = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'drivers', 'WinDivert64.sys')
-            if os.path.exists(sys_driver):
-                subprocess.run(["del", "/F", "/Q", sys_driver], shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        except: pass
-
-        # 4. Restore driver files from internal resources
-        try:
+            
+            # 0. Determine driver path
             base_dir = get_base_dir()
-            bin_path = os.path.join(base_dir, "bin")
+            driver_path = os.path.join(base_dir, "bin", "WinDivert64.sys")
             
-            required_files = ["WinDivert.dll", "WinDivert64.sys"]
-            missing = [f for f in required_files if not os.path.exists(os.path.join(bin_path, f))]
+            # 1. Kill any WinWS remnants that might be holding the driver
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except: pass
             
-            if missing and getattr(sys, 'frozen', False):
-                internal = get_internal_path("bin")
-                for f in required_files:
-                    src = os.path.join(internal, f)
-                    dst = os.path.join(bin_path, f)
-                    if os.path.exists(src):
-                        try: shutil.copy2(src, dst)
-                        except: pass
-                if log_func: log_func("[Repair] Файлы драйвера восстановлены из ресурсов.")
-        except Exception as e:
-            if log_func: log_func(f"[Repair] Ошибка при восстановлении файлов: {e}")
+            time.sleep(0.5)
+            
+            # 2. Stop service (but do NOT delete it!)
+            try:
+                subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            except: pass
 
-        # 5. Diagnostic Advice
-        if log_func:
-            log_func("[Repair] Совет: Если ошибка 177 повторяется, проверьте 'Изоляцию ядра' (Целостность памяти) в Защитнике Windows.")
+            # 3. Check if service exists
+            svc_check = subprocess.run(["sc", "query", "windivert"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW, text=True)
+            service_exists = svc_check.returncode == 0
+            
+            if service_exists:
+                # 3a. Service exists — just fix the Start type to DEMAND (Manual)
+                try:
+                    subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                except: pass
+                
+                # Also fix via registry directly (more reliable)
+                try:
+                    import winreg
+                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\WinDivert", 0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3)  # 3 = Manual/Demand
+                    # Also ensure the ImagePath points to correct driver
+                    winreg.SetValueEx(key, "ImagePath", 0, winreg.REG_EXPAND_SZ, f"\\??\\{driver_path}")
+                    winreg.CloseKey(key)
+                    if log_func: log_func("[Repair] Служба WinDivert восстановлена (Start=Manual).")
+                except: pass
+            else:
+                # 3b. Service doesn't exist — RECREATE it
+                if log_func: log_func("[Repair] Служба WinDivert не найдена. Пересоздание...")
+                try:
+                    result = subprocess.run(
+                        ["sc", "create", "windivert", "type=", "kernel", "start=", "demand", f"binPath=", driver_path],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                        creationflags=subprocess.CREATE_NO_WINDOW, text=True
+                    )
+                    if result.returncode == 0:
+                        if log_func: log_func("[Repair] Служба WinDivert успешно создана.")
+                    else:
+                        # Need admin — try via registry as fallback
+                        if log_func: log_func("[Repair] sc create не удался. Попытка через реестр...")
+                        try:
+                            import winreg
+                            reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
+                            key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE)
+                            winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3)
+                            winreg.SetValueEx(key, "Type", 0, winreg.REG_DWORD, 1)  # KERNEL_DRIVER
+                            winreg.SetValueEx(key, "ErrorControl", 0, winreg.REG_DWORD, 1)
+                            winreg.SetValueEx(key, "ImagePath", 0, winreg.REG_EXPAND_SZ, f"\\??\\{driver_path}")
+                            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "WinDivert")
+                            winreg.CloseKey(key)
+                            if log_func: log_func("[Repair] Служба WinDivert создана через реестр.")
+                        except Exception as e:
+                            if log_func: log_func(f"[Repair] Не удалось создать службу: {e}")
+                except Exception as e:
+                    if log_func: log_func(f"[Repair] Ошибка создания службы: {e}")
 
-        time.sleep(1.5)
-        if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
+            # 4. Restore driver files from internal resources (if missing)
+            try:
+                bin_path = os.path.join(base_dir, "bin")
+                required_files = ["WinDivert.dll", "WinDivert64.sys"]
+                missing = [f for f in required_files if not os.path.exists(os.path.join(bin_path, f))]
+                
+                if missing and getattr(sys, 'frozen', False):
+                    internal = get_internal_path("bin")
+                    for f in required_files:
+                        src = os.path.join(internal, f)
+                        dst = os.path.join(bin_path, f)
+                        if os.path.exists(src):
+                            try: shutil.copy2(src, dst)
+                            except: pass
+                    if log_func: log_func("[Repair] Файлы драйвера восстановлены из ресурсов.")
+            except Exception as e:
+                if log_func: log_func(f"[Repair] Ошибка при восстановлении файлов: {e}")
+
+            # 5. Diagnostic Advice (context-sensitive, show only once per session)
+            if log_func and not _repair_advice_shown:
+                _repair_advice_shown = True
+                if exit_code == 34:
+                    log_func("[Repair] Совет: Код 34 — драйвер заблокирован. Проверьте: 1) антивирус (добавьте папку Nova в исключения), 2) 'Изоляцию ядра' (Целостность памяти) в Защитнике Windows.")
+                else:
+                    log_func("[Repair] Совет: Если ошибка повторяется, проверьте: 1) антивирус (исключения), 2) 'Изоляцию ядра' (Целостность памяти) в Защитнике Windows.")
+
+            time.sleep(1.5)
+            if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
+        finally:
+            _repair_in_progress = False
+            _repair_lock.release()
 
     def start_nova_service(silent=False, restart_mode=False):
         threading.Thread(target=_start_nova_service_impl, args=(silent, restart_mode), daemon=True).start()
@@ -16013,7 +15464,7 @@ try:
             return
         
         # EARLY CLEANUP: Stop old driver + kill old processes. All calls have short timeouts.
-        # If any call times out, windivert is in a bad state → auto-recover with sc delete.
+        # If any call times out, windivert is in a bad state → auto-recover via config update.
         _windivert_stuck = False
         
         # sc stop: if driver was actually running, we MUST wait for full unload before winws starts.
@@ -16053,14 +15504,13 @@ try:
         except: pass
         
         # AUTO-RECOVERY: If windivert driver is stuck (commands timed out),
-        # force-delete the service registration. The driver will be re-installed
-        # automatically when winws.exe starts next time.
+        # force config update instead of deleting (since we lack admin rights to recreate).
         if _windivert_stuck:
-            logger("[Init] WinDivert драйвер завис. Автоматическое лечение (sc delete)...")
+            logger("[Init] WinDivert драйвер завис. Попытка сброса состояния...")
             try:
-                subprocess.run(["sc", "delete", "windivert"],
+                subprocess.run(["sc", "config", "windivert", "start=", "demand"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=3)
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
             except: pass
             time.sleep(0.5)
             logger("[Init] WinDivert сброшен. Драйвер будет переустановлен при запуске ядра.")
@@ -16522,14 +15972,14 @@ try:
         
                             if "cannot be started" in combined_output and "disabled" in combined_output:
                                  if not silent: log_print(f"[Error] Служба WinDivert отключена. Попытка включения...")
-                                 repair_windivert_driver(log_print if not silent else None)
+                                 repair_windivert_driver(log_print if not silent else None, exit_code=34)
                                  time.sleep(1.0)
                                  continue
 
                              # FIX: Special handling for Code 177 (Driver Missing/Corrupt)
                             if exit_code == 177:
                                 if not silent: log_print(f"[Error] Сбой драйвера (Код 177). Попытка лечения #{attempt+1}...")
-                                repair_windivert_driver(log_print if not silent else None)
+                                repair_windivert_driver(log_print if not silent else None, exit_code=177)
                                 # Increase delay for driver to settle
                                 time.sleep(1.0)
                                 continue
@@ -16537,7 +15987,7 @@ try:
                             # FIX: Handling for Code 34 (Service Disabled)
                             if exit_code == 34:
                                 if not silent: log_print(f"[Error] Драйвер отключен (Код 34). Включение...")
-                                repair_windivert_driver(log_print if not silent else None)
+                                repair_windivert_driver(log_print if not silent else None, exit_code=34)
                                 time.sleep(1.0)
                                 continue
 
@@ -16573,7 +16023,7 @@ try:
                             time.sleep(retry_delay)
                             continue
                         else:
-                            # CRITICAL: If we failed 3 times, we MUST show the logs to know WHY.
+                            # CRITICAL: If we failed all retries, we MUST show the logs to know WHY.
                             # Capture output from the dead process
                             failed_out = []
                             try:
@@ -16581,11 +16031,44 @@ try:
                                     failed_out.append(line.strip())
                             except: pass
                             
-                            print(f"\n[Error] WinWS не смог запуститься после {max_retries} попыток (код {exit_code}).")
-                            print("Лог падения:")
-                            for l in failed_out: print(f"  > {l}")
-                                
-                            raise Exception(f"WinWS failed to start (Exit Code {exit_code})")
+                            print(f"\n[Error] WinWS не смог запуститься после {max_retries+1} попыток (код {exit_code}).")
+                            if failed_out:
+                                print("Лог падения:")
+                                for l in failed_out: print(f"  > {l}")
+                            
+                            # === GRACEFUL DEGRADATION ===
+                            # Instead of crashing, start WARP/sing-box anyway.
+                            # DPI bypass (winws) will be unavailable, but WARP tunnel
+                            # still provides connectivity for Telegram/WhatsApp/Discord.
+                            print("[Init] WinWS недоступен. Запуск в деградированном режиме (только WARP)...")
+                            nova_service_status = "Degraded"
+                            is_restarting = False
+                            
+                            if not silent and root:
+                                root.after(0, lambda: status_label.config(text="АКТИВНО : БЕЗ DPI (WARP)", fg="#FFA500"))
+                                root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
+                            
+                            # Start WARP even without winws
+                            if not restart_mode:
+                                try:
+                                    wm = globals().get("warp_manager")
+                                    if wm:
+                                        if not silent:
+                                            log_print("[Init] Запуск WARP (деградированный режим, без DPI-обхода)...")
+                                        threading.Thread(target=wm.start, daemon=True).start()
+                                except Exception as _e:
+                                    if IS_DEBUG_MODE and not silent:
+                                        log_print(f"[Init] Ошибка запуска WARP: {_e}")
+                            
+                            # Start checker anyway (it will detect driver issues)
+                            if not is_restarting:
+                                threading.Thread(target=lambda: init_checker_system(log_print), daemon=True).start()
+                            
+                            # Don't return — keep the thread alive for monitoring
+                            # but skip the main output loop since there's no process
+                            while not is_closing and is_service_active:
+                                time.sleep(5)
+                            return
                     else:
                          # Process is stable -> NOW we expose it to the system
                          process = proc 
@@ -16623,6 +16106,13 @@ try:
                          continue
                      else:
                          if not is_closing: print(f"\nCRASH: {e}\n")
+                         # Even on crash, try to start WARP for basic connectivity
+                         try:
+                             wm = globals().get("warp_manager")
+                             if wm:
+                                 print("[Init] Попытка запуска WARP после сбоя ядра...")
+                                 threading.Thread(target=wm.start, daemon=True).start()
+                         except: pass
                          return
 
             # Main Output Loop
@@ -16693,9 +16183,9 @@ try:
                             run_process._crash_times.append(now)
                             
                             # Auto-repair driver for known codes
-                            if exit_code in (34, 177):
+                            if exit_code in (34, 177) and not _windivert_broken:
                                 print(f"[Recovery] Обнаружена проблема с драйвером (код {exit_code}). Лечение...")
-                                try: repair_windivert_driver(log_print)
+                                try: repair_windivert_driver(log_print, exit_code=exit_code)
                                 except: pass
                             
                             delay = 3.0
