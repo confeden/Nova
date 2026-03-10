@@ -8,7 +8,7 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.15.3"
+CURRENT_VERSION = "1.15.4"
 import sys
 import os
 import ctypes
@@ -4029,9 +4029,11 @@ try:
                 pass
 
             if is_closing:
-                # When closing the app, just disconnect. 
-                # We LEAVE the service running intentionally to speed up next launch.
-                try: self.run_warp_cli("disconnect")
+                # When closing the app, disconnect and fully stop services to release bin/ folder locks
+                try: 
+                    self.run_warp_cli("disconnect")
+                    subprocess.run(["sc", "stop", self.SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                    subprocess.run(["taskkill", "/F", "/IM", "warp-svc.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
                 except: pass
                 self.is_connected = False
                 return
@@ -8727,7 +8729,7 @@ try:
                         
                         isolation_filter = f"outbound and !loopback and ({' or '.join(proto_parts)})"
                         
-                        test_args.append(f'--wf-raw={isolation_filter}')
+                        test_args.extend(['--wf-raw', isolation_filter])
                         
                         exe_path = os.path.join(get_base_dir(), "bin", WINWS_FILENAME)
                         # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
@@ -8910,12 +8912,12 @@ try:
                         
                         final_args = [final_exe]
                         final_args.extend(test_args)
-                        final_args.append(f'--wf-raw={isolation_filter}')
+                        final_args.extend(['--wf-raw', isolation_filter])
                         
                         # Попытка запуска с ретраем для надежности (исправляет падения с кодом 1)
                         for attempt in range(2):
                             # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
-                            proc = subprocess.Popen(final_args, cwd=get_base_dir(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, 
+                            proc = subprocess.Popen(final_args, cwd=get_base_dir(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                                    text=True, encoding='utf-8', errors='replace', 
                                                    creationflags=subprocess.CREATE_NO_WINDOW | 0x00004000)
                             
@@ -8928,7 +8930,7 @@ try:
                             
                             start_time = time.time()
                             try:
-                                _, stderr_out = proc.communicate(timeout=1003) # Hard cap 1000s + buffer
+                                combined_out, _ = proc.communicate(timeout=1003) # Hard cap 1000s + buffer
                             except subprocess.TimeoutExpired:
                                 log_func(f"[Check] WinWS завис ( > 1000сек). Принудительное завершение.")
                                 try: subprocess.run(["taskkill", "/F", "/PID", str(proc.pid)], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -8939,11 +8941,18 @@ try:
                             if elapsed > 1000:
                                 log_func(f"[Check] ВНИМАНИЕ: Стратегия проверялась {elapsed:.1f} сек!")
                             
-                            # Логируем только если это не штатная остановка
-                            if proc.returncode != 0:
+                            # Идентифицируем проблемы с драйвером (Code 34 / 177)
+                            err_msg = combined_out.strip() if combined_out else ""
+                            is_driver_issue = (proc.returncode in (34, 177) or 
+                                              ("service cannot be started" in err_msg and "disabled" in err_msg) or 
+                                              ("device which does not exist" in err_msg))
+                                              
+                            is_first_driver_fail = is_driver_issue and attempt == 0
+                            
+                            # Логируем только если это не штатная остановка и не первая (тихая) починка драйвера
+                            if proc.returncode != 0 and not is_first_driver_fail:
                                 log_func(f"[Check] WinWS упал (код {proc.returncode}). Порт: {port_start}. Попытка {attempt+1}/2")
                                 
-                                err_msg = stderr_out.strip() if stderr_out else ""
                                 if err_msg: log_func(f"[Check] Ошибка WinWS: {err_msg}")
                                 hint = explain_winws_exit_code(proc.returncode, err_msg)
                                 if hint:
@@ -8958,30 +8967,29 @@ try:
                                     log_func(f"[Check] ❌ Обнаружен неподдерживаемый параметр ядра: {bad_arg}. Он добавлен в черный список.")
                                     return 0 # Не пытаемся снова, этот параметр сломан
                                 
-                                # FIX: Auto-repair driver if service is disabled (Code 34 / 0x422) or missing (Code 177)
-                                if proc.returncode in (34, 177) or \
-                                   ("service cannot be started" in err_msg and "disabled" in err_msg) or \
-                                   ("device which does not exist" in err_msg):
-                                    
-                                    # If driver is confirmed broken globally, skip immediately
-                                    if _windivert_broken:
-                                        return 0
-                                    
-                                    # Ограничиваем количество попыток ремонта
-                                    repair_attempts = getattr(check_strat, '_repair_attempts', 0)
-                                    if repair_attempts < 3:
+                            # FIX: Auto-repair driver
+                            if is_driver_issue:
+                                # If driver is confirmed broken globally, skip immediately
+                                if _windivert_broken:
+                                    return 0
+                                
+                                # Ограничиваем количество попыток ремонта
+                                repair_attempts = getattr(check_strat, '_repair_attempts', 0)
+                                if repair_attempts < 3:
+                                    if not is_first_driver_fail:
                                         log_func(f"[Check] Обнаружена проблема с драйвером (Code {proc.returncode}). Запуск восстановления...")
-                                        try: 
-                                            repair_windivert_driver(log_func, exit_code=proc.returncode)
-                                            check_strat._repair_attempts = repair_attempts + 1
-                                        except: pass
-                                    else:
-                                        _windivert_broken = True
+                                    try: 
+                                        repair_windivert_driver(log_func if not is_first_driver_fail else None, exit_code=proc.returncode)
+                                        check_strat._repair_attempts = repair_attempts + 1
+                                    except: pass
+                                else:
+                                    _windivert_broken = True
+                                    if not is_first_driver_fail:
                                         log_func(f"[Error] Не удалось восстановить драйвер WinDivert после 3 попыток. Проверьте 'Изоляцию ядра' в Windows.")
-                                        return 0  # Don't waste time, driver is broken
-                                    
-                                    time.sleep(1.0)
-                                    continue # Retry immediately
+                                    return 0  # Don't waste time, driver is broken
+                                
+                                time.sleep(1.0)
+                                continue # Retry immediately
                                 
                                 if attempt == 1:
                                     log_func(f"[Check] Стратегия вызывает сбой процесса. Пропускаем.")
@@ -10344,6 +10352,11 @@ try:
                                     break
                                 
                                 svc, strat, doms, path = task
+                                
+                                # FIX: skip if perfect score was achieved for this service
+                                if svc in perfect_services:
+                                    continue
+                                
                                 line_id = id(task)
                                 
                                 # Progress Tracker Logic
@@ -12103,10 +12116,16 @@ try:
     
     class RobustHTTPSConnection(http.client.HTTPSConnection):
         """HTTPSConnection с поддержкой SO_REUSEADDR для быстрого повторного использования портов."""
+        def __init__(self, host, port=None, target_ip=None, **kwargs):
+            self.target_ip = target_ip
+            super().__init__(host, port, **kwargs)
+
         def connect(self):
             err = None
-            # Пытаемся подключиться по всем адресам (IPv4/IPv6)
-            for res in socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM):
+            # Если указан target_ip, используем его для socket соединения (обход DNS/VPN),
+            # но оставляем self.host (домен) для SNI и Host-заголовка.
+            connect_host = self.target_ip if self.target_ip else self.host
+            for res in socket.getaddrinfo(connect_host, self.port, 0, socket.SOCK_STREAM):
                 af, socktype, proto, canonname, sa = res
                 sock = None
                 try:
@@ -12166,17 +12185,19 @@ try:
             source_addr = ("0.0.0.0", port) if port > 0 else None
             
             conn = RobustHTTPSConnection(
-                domain, 443, timeout=5, context=context,
+                domain, 443, target_ip=ip, timeout=5, context=context,
                 source_address=source_addr
             )
             
-            # Если приоритет высокий (экстренная разблокировка), игнорируем семафор
+            headers = BROWSER_HEADERS.copy()
+            headers["Host"] = domain
+            
             if priority:
-                conn.request("GET", "/", headers=BROWSER_HEADERS)
+                conn.request("GET", "/", headers=headers)
                 resp = conn.getresponse()
             else:
                 with background_connection_semaphore:
-                    conn.request("GET", "/", headers=BROWSER_HEADERS)
+                    conn.request("GET", "/", headers=headers)
                     resp = conn.getresponse()
             
             # Проверка HTTP статуса
@@ -13337,7 +13358,7 @@ try:
                 exe_name = "winws_test.exe"
 
             exe_path = os.path.join(base_dir, "bin", exe_name)
-            final_args = [exe_path] + test_args + [f'--wf-raw={isolation_filter}']
+            final_args = [exe_path] + test_args + ['--wf-raw', isolation_filter]
             
             # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
             proc = subprocess.Popen(final_args, cwd=base_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
@@ -14792,19 +14813,16 @@ try:
                         # Shell.Run path, 1 (SW_SHOWNORMAL), False (Don't wait)
                         # We pass --updated and --cleanup-old-exe
                         
-                        vbs_content = f'''
-                        WScript.Sleep 3000
-                        Set objShell = CreateObject("WScript.Shell")
-                        strCmd = """{current_exe}"" --updated --cleanup-old-exe ""{old_exe}""{updated_args_str}"
-                        objShell.Run strCmd, 1, False
-                        Set objFSO = CreateObject("Scripting.FileSystemObject")
-                        ' Self-delete the script after a short delay (best effort)
-                        ' objFSO.DeleteFile WScript.ScriptFullName
-                        '''
+                        # VBScript content
+                        vbs_content = f'''WScript.Sleep 3000
+Set objShell = CreateObject("WScript.Shell")
+strCmd = """{current_exe}"" --updated --cleanup-old-exe ""{old_exe}""{updated_args_str}"
+objShell.Run strCmd, 1, False
+'''
                         
                         try:
-                            # FIX: Use utf-8-sig (with BOM) so wscript.exe correctly parses paths with non-ASCII characters
-                            with open(vbs_script, "w", encoding="utf-8-sig") as f:
+                            # FIX: WScript requires UTF-16 LE (with BOM) for non-ASCII paths, utf-8-sig causes Invalid Character error
+                            with open(vbs_script, "w", encoding="utf-16") as f:
                                 f.write(vbs_content)
                                 
                             # Execute VBScript detached
@@ -16332,6 +16350,7 @@ try:
             # FIX: Force Driver Stop to release resources (but do not delete, to avoid startup delay/lock)
             try:
                 if not restart_mode:
+                    time.sleep(0.2)  # Даём ОС время закрыть дескрипторы файла после taskkill winws
                     subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             except: pass
             
@@ -16513,16 +16532,15 @@ try:
                                    creationflags=subprocess.CREATE_NO_WINDOW,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
                 except: pass
-            try:
-                subprocess.run(["sc", "stop", "CloudflareWARP"],
-                               creationflags=subprocess.CREATE_NO_WINDOW,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            except: pass
-            try:
-                subprocess.run(["sc", "stop", "windivert"],
-                               creationflags=subprocess.CREATE_NO_WINDOW,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            except: pass
+            
+            time.sleep(0.2) # Даём ОС время закрыть дескрипторы файла после taskkill winws/warp
+            
+            for svc_name in ["CloudflareWARP", "windivert"]:
+                try:
+                    subprocess.run(["sc", "stop", svc_name],
+                                   creationflags=subprocess.CREATE_NO_WINDOW,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                except: pass
             if process:
                 try:
                     subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
