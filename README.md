@@ -3,6 +3,7 @@
 
 # <img width="362" height="302" alt="image" src="https://github.com/user-attachments/assets/59ec654b-0448-4624-9b32-1ef901b95b22" />
 
+[Скачать Nova.exe из Releases](https://github.com/confeden/Nova/releases)
 
 Все нейросети должны открываться и работать, как и Spotify/Soundcloud и многие другие сайты. Если есть пожелания, говорите и добавлю ваши сайты для всех.
 
