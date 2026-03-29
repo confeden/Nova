@@ -8,10 +8,14 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.15.4"
+CURRENT_VERSION = "1.15.5"
 import sys
 import os
 import ctypes
+from ctypes import wintypes
+import locale
+import unicodedata
+import urllib.request
 import shutil
 import subprocess
 import collections
@@ -5097,7 +5101,7 @@ try:
             "youtube": [],
             "discord": [],
             "warp": [],
-            "voice": ["--wf-udp=443,1024-65535", "--dpi-desync=fake", "--dpi-desync-fooling=badsum"],
+            "voice": [],
             "cloudflare": [],
             "telegram": [],
             "whatsapp": [],
@@ -6025,6 +6029,8 @@ try:
             code = None
         err = str(stderr_text or "").lower()
 
+        if _is_windivert_pending_delete_text(err):
+            return "примерная причина: служба WinDivert помечена на удаление и ещё не освобождена системой."
         if code == 34:
             return "примерная причина: служба WinDivert отключена или не может стартовать (часто из-за политики/безопасности Windows)."
         if code == 177:
@@ -6392,6 +6398,9 @@ try:
                 return None
         except Exception:
             return None
+
+    def get_startup_status():
+        return get_autostart_cmd() is not None
 
     def toggle_startup(log_func=None):
         """Переключает состояние автозапуска (используя Task Scheduler для прав Админа)"""
@@ -8941,10 +8950,11 @@ try:
                             if elapsed > 1000:
                                 log_func(f"[Check] ВНИМАНИЕ: Стратегия проверялась {elapsed:.1f} сек!")
                             
-                            # Идентифицируем проблемы с драйвером (Code 34 / 177)
+                            # Идентифицируем проблемы с драйвером (Code 34 / 177 / pending delete)
                             err_msg = combined_out.strip() if combined_out else ""
                             is_driver_issue = (proc.returncode in (34, 177) or 
-                                              ("service cannot be started" in err_msg and "disabled" in err_msg) or 
+                                              _is_windivert_pending_delete_text(err_msg) or
+                                              _is_windivert_disabled_text(err_msg) or
                                               ("device which does not exist" in err_msg))
                                               
                             is_first_driver_fail = is_driver_issue and attempt == 0
@@ -13728,17 +13738,367 @@ try:
     _repair_lock = threading.Lock()
     _repair_in_progress = False
     _windivert_broken = False  # Global flag: driver confirmed broken, checkers should skip
+    _windivert_unrecoverable_reason = ""
+    _windivert_unrecoverable_detail = ""
     _unsupported_winws_args = set()  # Global cache of unsupported winws options
     _repair_advice_shown = False  # Prevent duplicate advice messages
+    def _decode_console_bytes(data):
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data
+
+        encodings = []
+        try:
+            oem_cp = ctypes.windll.kernel32.GetOEMCP()
+            if oem_cp:
+                encodings.append(f"cp{oem_cp}")
+        except Exception:
+            pass
+
+        for enc in [locale.getpreferredencoding(False), "utf-8", "mbcs", "cp1251"]:
+            if enc and enc not in encodings:
+                encodings.append(enc)
+
+        for enc in encodings:
+            try:
+                text = data.decode(enc)
+                break
+            except Exception:
+                pass
+        else:
+            text = data.decode("utf-8", errors="replace")
+
+        text = text.replace("\x00", "").replace("\ufeff", "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        for ch in ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"]:
+            text = text.replace(ch, "")
+        text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) not in ("Cc", "Cf"))
+        return text
+
+    def _run_hidden_sc(*args, timeout=4):
+        try:
+            result = subprocess.run(
+                ["sc", *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=timeout
+            )
+            return result.returncode, _decode_console_bytes(result.stdout), _decode_console_bytes(result.stderr)
+        except subprocess.TimeoutExpired as e:
+            stderr_text = _decode_console_bytes(e.stderr)
+            if not stderr_text:
+                stderr_text = f"timeout after {timeout}s"
+            return -1, _decode_console_bytes(e.stdout), stderr_text
+        except Exception as e:
+            return -1, "", str(e)
+
+    def _open_windivert_service_handle(desired_access):
+        try:
+            advapi32 = ctypes.windll.advapi32
+            kernel32 = ctypes.windll.kernel32
+
+            SC_MANAGER_CONNECT = 0x0001
+
+            advapi32.OpenSCManagerW.restype = wintypes.HANDLE
+            advapi32.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+            advapi32.OpenServiceW.restype = wintypes.HANDLE
+            advapi32.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+            advapi32.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+            advapi32.CloseServiceHandle.restype = wintypes.BOOL
+
+            scm_handle = advapi32.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+            if not scm_handle:
+                return None, None, kernel32.GetLastError()
+
+            try:
+                svc_handle = advapi32.OpenServiceW(scm_handle, "WinDivert", desired_access)
+                if not svc_handle:
+                    return scm_handle, None, kernel32.GetLastError()
+                return scm_handle, svc_handle, 0
+            except Exception:
+                advapi32.CloseServiceHandle(scm_handle)
+                raise
+        except Exception:
+            return None, None, None
+
+    def _close_service_handles(*handles):
+        try:
+            advapi32 = ctypes.windll.advapi32
+            advapi32.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+            advapi32.CloseServiceHandle.restype = wintypes.BOOL
+        except Exception:
+            advapi32 = None
+
+        if not advapi32:
+            return
+
+        for handle in handles:
+            try:
+                if handle:
+                    advapi32.CloseServiceHandle(handle)
+            except Exception:
+                pass
+
+    def _probe_windivert_service_access():
+        SERVICE_CHANGE_CONFIG = 0x0002
+        SERVICE_QUERY_CONFIG = 0x0001
+        SERVICE_QUERY_STATUS = 0x0004
+
+        scm_handle = None
+        svc_handle = None
+        try:
+            scm_handle, svc_handle, err = _open_windivert_service_handle(
+                SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS
+            )
+            if svc_handle:
+                return {
+                    "accessible": True,
+                    "missing": False,
+                    "pending_delete": False,
+                    "access_denied": False,
+                    "error_code": 0,
+                    "message": "",
+                }
+
+            err = int(err or 0)
+            return {
+                "accessible": False,
+                "missing": err == 1060,
+                "pending_delete": err == 1072,
+                "access_denied": err == 5,
+                "error_code": err,
+                "message": f"OpenService error {err}" if err else "",
+            }
+        finally:
+            _close_service_handles(svc_handle, scm_handle)
+
+    def _is_sc_service_missing_text(text):
+        text_lower = str(text or "").lower()
+        return (
+            "1060" in text_lower or
+            "does not exist" in text_lower or
+            "не существует" in text_lower
+        )
+
+    def _is_sc_service_exists_text(text):
+        text_lower = str(text or "").lower()
+        return (
+            "1073" in text_lower or
+            "already exists" in text_lower or
+            "уже существует" in text_lower
+        )
+
+    def _is_windivert_pending_delete_text(text):
+        text_lower = str(text or "").lower()
+        if not text_lower:
+            return False
+        return (
+            "1072" in text_lower or
+            "marked for deletion" in text_lower or
+            ("помеч" in text_lower and "удален" in text_lower)
+        )
+
+    def _is_windivert_disabled_text(text):
+        text_lower = str(text or "").lower()
+        return (
+            ("cannot be started" in text_lower and ("disabled" in text_lower or "no enabled devices" in text_lower)) or
+            ("service cannot be started" in text_lower and ("disabled" in text_lower or "no enabled devices" in text_lower)) or
+            ("служб" in text_lower and "отключ" in text_lower)
+        )
+
+    def _query_windivert_service_state():
+        state = {
+            "exists": False,
+            "missing": False,
+            "pending_delete": False,
+            "disabled": False,
+            "running": False,
+            "stopped": False,
+            "registry_exists": False,
+            "start": None,
+            "delete_flag": False,
+            "text": "",
+            "sc_returncode": None,
+        }
+
+        rc, out, err = _run_hidden_sc("query", "windivert")
+        msg = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+        state["sc_returncode"] = rc
+        state["text"] = msg
+        state["pending_delete"] = _is_windivert_pending_delete_text(msg)
+        state["missing"] = (rc != 0 and _is_sc_service_missing_text(msg))
+        state["exists"] = (rc == 0) or state["pending_delete"]
+
+        msg_lower = msg.lower()
+        if "running" in msg_lower:
+            state["running"] = True
+        if "stopped" in msg_lower:
+            state["stopped"] = True
+
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services\WinDivert",
+                0,
+                winreg.KEY_READ
+            )
+            state["registry_exists"] = True
+            try:
+                state["start"] = winreg.QueryValueEx(key, "Start")[0]
+            except OSError:
+                pass
+            winreg.CloseKey(key)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services\WinDivert",
+                0,
+                winreg.KEY_READ
+            )
+            try:
+                delete_flag_val = winreg.QueryValueEx(key, "DeleteFlag")[0]
+                state["delete_flag"] = bool(delete_flag_val)
+            except OSError:
+                pass
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+        if state["start"] == 4 or _is_windivert_disabled_text(msg):
+            state["disabled"] = True
+        if state["delete_flag"]:
+            state["pending_delete"] = True
+
+        if not state["pending_delete"] and not state["missing"]:
+            probe = _probe_windivert_service_access()
+            if probe["pending_delete"]:
+                state["pending_delete"] = True
+                state["exists"] = True
+            if probe["missing"]:
+                state["missing"] = True
+                state["exists"] = False
+            if probe["access_denied"] and "5" not in state["text"]:
+                extra = "OpenService error 5"
+                state["text"] = f"{state['text']}\n{extra}".strip()
+
+        return state
+
+    def _probe_windivert_config_state(driver_image_path, timeout=4):
+        rc, out, err = _run_hidden_sc(
+            "config", "windivert",
+            "type=", "kernel",
+            "start=", "demand",
+            "binPath=", driver_image_path,
+            timeout=timeout
+        )
+        msg = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+        return {
+            "configurable": rc == 0,
+            "missing": _is_sc_service_missing_text(msg),
+            "pending_delete": _is_windivert_pending_delete_text(msg),
+            "access_denied": ("5" in msg and "access is denied" in msg.lower()) or ("отказано" in msg.lower()),
+            "returncode": rc,
+            "message": msg,
+        }
+
+    def _wait_for_windivert_pending_delete_clear(driver_image_path, timeout=45.0, poll_interval=1.0):
+        deadline = time.time() + timeout
+        last_probe = _probe_windivert_config_state(driver_image_path)
+        last_state = {
+            "exists": True,
+            "missing": False,
+            "pending_delete": True,
+            "disabled": False,
+            "running": False,
+            "stopped": False,
+            "registry_exists": False,
+            "start": None,
+            "delete_flag": False,
+            "text": last_probe.get("message", ""),
+            "sc_returncode": last_probe.get("returncode"),
+        }
+
+        wait_slices = [8.0, 12.0, 25.0]
+        for wait_time in wait_slices:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(wait_time, remaining))
+            last_probe = _probe_windivert_config_state(driver_image_path)
+            if not last_probe["pending_delete"]:
+                last_state = _query_windivert_service_state()
+                if last_probe["missing"]:
+                    last_state["missing"] = True
+                    last_state["exists"] = False
+                if last_probe["configurable"]:
+                    last_state["exists"] = True
+                return True, last_probe, last_state
+
+        return False, last_probe, last_state
+
+    def _write_windivert_registry(driver_image_path):
+        import winreg
+
+        reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
+        key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE)
+        try:
+            winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3)
+            winreg.SetValueEx(key, "Type", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "ErrorControl", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "ImagePath", 0, winreg.REG_EXPAND_SZ, driver_image_path)
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "WinDivert")
+        finally:
+            winreg.CloseKey(key)
+
+    def _clear_windivert_delete_flag(log_func=None):
+        try:
+            import winreg
+
+            reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                reg_path,
+                0,
+                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE
+            )
+            try:
+                try:
+                    delete_flag_val = winreg.QueryValueEx(key, "DeleteFlag")[0]
+                except OSError:
+                    return False
+
+                if int(delete_flag_val or 0) != 0:
+                    winreg.DeleteValue(key, "DeleteFlag")
+                    if log_func:
+                        log_func("[Repair] Удалён реестровый DeleteFlag для WinDivert.")
+                    return True
+                return False
+            finally:
+                winreg.CloseKey(key)
+        except Exception as e:
+            if log_func:
+                log_func(f"[Repair] Не удалось снять DeleteFlag: {e}")
+            return False
+            return False
 
     def repair_windivert_driver(log_func=None, exit_code=None):
         """
         Attempts to repair broken WinDivert driver installation.
-        Fixes Code 177, 577, and 0x422 (Disabled).
+        Fixes Code 34/177, disabled service state, and "service marked for deletion".
         Thread-safe: only one repair runs at a time.
         """
         global _repair_in_progress, _windivert_broken, _repair_advice_shown
-        
+        global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
+
         # If another thread is already repairing, just wait for it
         if _repair_in_progress:
             if log_func:
@@ -13749,107 +14109,194 @@ try:
                 time.sleep(0.5)
                 if not _repair_in_progress:
                     break
-            return
-        
+            return False
+
         if not _repair_lock.acquire(blocking=False):
             # Another thread grabbed the lock just now
             time.sleep(3)
-            return
-        
+            return False
+
         try:
             _repair_in_progress = True
-            
+            repair_success = False
+
             try:
-                if log_func: log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
+                if log_func:
+                    if exit_code == 1060:
+                        log_func("[Repair] Служба WinDivert отсутствует. Выполняем штатное создание...")
+                    else:
+                        log_func("[Repair] Запуск процедуры восстановления драйвера WinDivert...")
             except: pass
-            
+
             # 0. Determine driver path
             base_dir = get_base_dir()
             driver_path = os.path.join(base_dir, "bin", "WinDivert64.sys")
-            
-            # 1. Kill any WinWS remnants that might be holding the driver
-            try:
-                subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except: pass
-            
-            time.sleep(0.5)
-            
-            # 2. Stop service (but do NOT delete it!)
-            try:
-                subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            except: pass
+            driver_image_path = f"\\??\\{driver_path}"
 
-            # 3. Check if service exists
-            svc_check = subprocess.run(["sc", "query", "windivert"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW, text=True)
-            service_exists = svc_check.returncode == 0
-            
-            if service_exists:
-                # 3a. Service exists — just fix the Start type to DEMAND (Manual)
-                try:
-                    subprocess.run(["sc", "config", "windivert", "start=", "demand"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-                except: pass
-                
-                # Also fix via registry directly (more reliable)
-                try:
-                    import winreg
-                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\WinDivert", 0, winreg.KEY_SET_VALUE)
-                    winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3)  # 3 = Manual/Demand
-                    # Also ensure the ImagePath points to correct driver
-                    winreg.SetValueEx(key, "ImagePath", 0, winreg.REG_EXPAND_SZ, f"\\??\\{driver_path}")
-                    winreg.CloseKey(key)
-                    if log_func: log_func("[Repair] Служба WinDivert восстановлена (Start=Manual).")
-                except: pass
-            else:
-                # 3b. Service doesn't exist — RECREATE it
-                if log_func: log_func("[Repair] Служба WinDivert не найдена. Пересоздание...")
-                try:
-                    result = subprocess.run(
-                        ["sc", "create", "windivert", "type=", "kernel", "start=", "demand", f"binPath=", driver_path],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                        creationflags=subprocess.CREATE_NO_WINDOW, text=True
-                    )
-                    if result.returncode == 0:
-                        if log_func: log_func("[Repair] Служба WinDivert успешно создана.")
-                    else:
-                        # Need admin — try via registry as fallback
-                        if log_func: log_func("[Repair] sc create не удался. Попытка через реестр...")
-                        try:
-                            import winreg
-                            reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
-                            key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE)
-                            winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3)
-                            winreg.SetValueEx(key, "Type", 0, winreg.REG_DWORD, 1)  # KERNEL_DRIVER
-                            winreg.SetValueEx(key, "ErrorControl", 0, winreg.REG_DWORD, 1)
-                            winreg.SetValueEx(key, "ImagePath", 0, winreg.REG_EXPAND_SZ, f"\\??\\{driver_path}")
-                            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "WinDivert")
-                            winreg.CloseKey(key)
-                            if log_func: log_func("[Repair] Служба WinDivert создана через реестр.")
-                        except Exception as e:
-                            if log_func: log_func(f"[Repair] Не удалось создать службу: {e}")
-                except Exception as e:
-                    if log_func: log_func(f"[Repair] Ошибка создания службы: {e}")
+            initial_state = _query_windivert_service_state()
+            if _windivert_unrecoverable_reason == "pending_delete_stuck":
+                if initial_state["pending_delete"]:
+                    if log_func:
+                        log_func("[Repair] WinDivert всё ещё застрял в SCM state 'marked for deletion'. Повторный глубокий ремонт пропущен.")
+                    return False
+                _windivert_unrecoverable_reason = ""
+                _windivert_unrecoverable_detail = ""
+                _windivert_broken = False
 
-            # 4. Restore driver files from internal resources (if missing)
+            # 0a. Restore driver files from internal resources (if missing)
             try:
                 bin_path = os.path.join(base_dir, "bin")
                 required_files = ["WinDivert.dll", "WinDivert64.sys"]
                 missing = [f for f in required_files if not os.path.exists(os.path.join(bin_path, f))]
-                
+
                 if missing and getattr(sys, 'frozen', False):
                     internal = get_internal_path("bin")
                     for f in required_files:
                         src = os.path.join(internal, f)
                         dst = os.path.join(bin_path, f)
                         if os.path.exists(src):
-                            try: shutil.copy2(src, dst)
-                            except: pass
-                    if log_func: log_func("[Repair] Файлы драйвера восстановлены из ресурсов.")
+                            try:
+                                shutil.copy2(src, dst)
+                            except:
+                                pass
+                    if log_func:
+                        log_func("[Repair] Файлы драйвера восстановлены из ресурсов.")
             except Exception as e:
-                if log_func: log_func(f"[Repair] Ошибка при восстановлении файлов: {e}")
+                if log_func:
+                    log_func(f"[Repair] Ошибка при восстановлении файлов: {e}")
 
-            # 5. Diagnostic Advice (context-sensitive, show only once per session)
-            if log_func and not _repair_advice_shown:
+            # 1. Kill any WinWS remnants that might be holding the driver
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except:
+                pass
+
+            time.sleep(0.5)
+
+            # 2. Stop service and let the SCM finish any pending delete
+            try:
+                _run_hidden_sc("stop", "windivert", timeout=4)
+            except:
+                pass
+
+            svc_state = initial_state
+            config_probe = _probe_windivert_config_state(driver_image_path)
+            if svc_state["pending_delete"] or config_probe["pending_delete"]:
+                delete_flag_cleared = _clear_windivert_delete_flag(log_func)
+                if delete_flag_cleared:
+                    time.sleep(1.0)
+                    svc_state = _query_windivert_service_state()
+                    config_probe = _probe_windivert_config_state(driver_image_path)
+                    if not config_probe["pending_delete"]:
+                        if log_func:
+                            log_func("[Repair] DeleteFlag снят. Служба снова доступна для конфигурации.")
+                if config_probe["pending_delete"] or svc_state["pending_delete"]:
+                    if log_func:
+                        log_func("[Repair] Служба WinDivert помечена на удаление. Ждём до 45с освобождения SCM без перезагрузки...")
+                    released, config_probe, svc_state = _wait_for_windivert_pending_delete_clear(driver_image_path, timeout=45.0)
+                    if released:
+                        if log_func:
+                            log_func("[Repair] Пометка удаления снята. Продолжаем восстановление службы.")
+                    else:
+                        if log_func:
+                            log_func("[Repair] Служба WinDivert всё ещё помечена на удаление после ожидания.")
+
+            if config_probe["configurable"]:
+                try:
+                    _write_windivert_registry(driver_image_path)
+                    repair_success = True
+                    if log_func:
+                        log_func("[Repair] Служба WinDivert восстановлена (Start=Manual).")
+                except Exception as e:
+                    if log_func:
+                        log_func(f"[Repair] Ошибка конфигурации службы: {e}")
+            elif config_probe["pending_delete"]:
+                if log_func and config_probe["message"]:
+                    log_func(f"[Repair] sc config вернул: {config_probe['message']}")
+            elif config_probe["missing"] or svc_state["missing"] or not svc_state["exists"]:
+                # Service does not exist — recreate it.
+                if log_func:
+                    log_func("[Repair] Служба WinDivert не найдена. Пересоздание...")
+                try:
+                    rc, out, err = _run_hidden_sc(
+                        "create", "windivert",
+                        "type=", "kernel",
+                        "start=", "demand",
+                        "binPath=", driver_image_path,
+                        timeout=4
+                    )
+                    sc_msg = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+                    if rc == 0:
+                        _write_windivert_registry(driver_image_path)
+                        repair_success = True
+                        if log_func:
+                            log_func("[Repair] Служба WinDivert успешно создана.")
+                    else:
+                        if _is_windivert_pending_delete_text(sc_msg):
+                            if log_func:
+                                log_func("[Repair] sc create вернул pending-delete. Ждём полного удаления службы и пробуем ещё раз.")
+                            released, config_probe, svc_state = _wait_for_windivert_pending_delete_clear(driver_image_path, timeout=45.0)
+                            if released:
+                                rc, out, err = _run_hidden_sc(
+                                    "create", "windivert",
+                                    "type=", "kernel",
+                                    "start=", "demand",
+                                    "binPath=", driver_image_path,
+                                    timeout=4
+                                )
+                                sc_msg = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+                                if rc == 0:
+                                    _write_windivert_registry(driver_image_path)
+                                    repair_success = True
+                                    if log_func:
+                                        log_func("[Repair] Служба WinDivert успешно создана после ожидания.")
+                        elif _is_sc_service_exists_text(sc_msg):
+                            rc, out, err = _run_hidden_sc(
+                                "config", "windivert",
+                                "type=", "kernel",
+                                "start=", "demand",
+                                "binPath=", driver_image_path,
+                                timeout=4
+                            )
+                            sc_msg = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+                            if rc == 0:
+                                _write_windivert_registry(driver_image_path)
+                                repair_success = True
+                                if log_func:
+                                    log_func("[Repair] Служба WinDivert уже существовала и была переконфигурирована.")
+                        if not repair_success:
+                            if log_func:
+                                log_func("[Repair] sc create не удался. Попытка через реестр...")
+                            if not _is_windivert_pending_delete_text(sc_msg):
+                                try:
+                                    _write_windivert_registry(driver_image_path)
+                                    repair_success = True
+                                    if log_func:
+                                        log_func("[Repair] Конфигурация WinDivert записана через реестр.")
+                                except Exception as e:
+                                    if log_func:
+                                        log_func(f"[Repair] Не удалось создать службу: {e}")
+                except Exception as e:
+                    if log_func:
+                        log_func(f"[Repair] Ошибка создания службы: {e}")
+            else:
+                if log_func and config_probe["message"]:
+                    log_func(f"[Repair] WinDivert не готов к конфигурации: {config_probe['message']}")
+
+            if repair_success:
+                _windivert_broken = False
+                _windivert_unrecoverable_reason = ""
+                _windivert_unrecoverable_detail = ""
+            elif config_probe["pending_delete"] or svc_state["pending_delete"]:
+                _windivert_broken = True
+                _windivert_unrecoverable_reason = "pending_delete_stuck"
+                _windivert_unrecoverable_detail = config_probe.get("message") or svc_state.get("text") or ""
+                if log_func:
+                    log_func("[Repair] WinDivert застрял в состоянии SCM 'marked for deletion'. Без перезагрузки или завершения внешнего процесса, который держит service handle, Windows может не освободить службу.")
+
+            # Diagnostic advice (context-sensitive, show only once per session).
+            if log_func and exit_code not in (None, 1060) and not _repair_advice_shown:
                 _repair_advice_shown = True
                 if exit_code == 34:
                     log_func("[Repair] Совет: Код 34 — драйвер заблокирован. Проверьте: 1) антивирус (добавьте папку Nova в исключения), 2) 'Изоляцию ядра' (Целостность памяти) в Защитнике Windows.")
@@ -13857,7 +14304,14 @@ try:
                     log_func("[Repair] Совет: Если ошибка повторяется, проверьте: 1) антивирус (исключения), 2) 'Изоляцию ядра' (Целостность памяти) в Защитнике Windows.")
 
             time.sleep(1.5)
-            if log_func: log_func("[Repair] Процедура завершена. Ожидание запуска...")
+            if log_func:
+                if repair_success:
+                    log_func("[Repair] Процедура завершена. Ожидание запуска...")
+                elif _windivert_unrecoverable_reason == "pending_delete_stuck":
+                    log_func("[Repair] Процедура завершена. Повторные глубокие ретраи отключены до смены состояния WinDivert.")
+                else:
+                    log_func("[Repair] Процедура завершена, но драйвер ещё не готов. Nova повторит восстановление автоматически.")
+            return repair_success
         finally:
             _repair_in_progress = False
             _repair_lock.release()
@@ -15459,9 +15913,13 @@ objShell.Run strCmd, 1, False
 
 
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
-        global is_service_active, process, is_closing
+        global is_service_active, process, is_closing, _windivert_broken
+        global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
         
         logger = globals().get('log_print', print)
+        _windivert_broken = False
+        _windivert_unrecoverable_reason = ""
+        _windivert_unrecoverable_detail = ""
         
         # TRACE LOGGING
         if restart_mode and not silent:
@@ -15497,6 +15955,15 @@ objShell.Run strCmd, 1, False
             _windivert_stuck = True
             _driver_was_running = True
         except: pass
+
+        try:
+            _windivert_state = _query_windivert_service_state()
+            if _windivert_state["pending_delete"] or _windivert_state["disabled"]:
+                _windivert_reason = "pending delete" if _windivert_state["pending_delete"] else "disabled"
+                logger(f"[Init] Обнаружено проблемное состояние WinDivert ({_windivert_reason}). Пытаемся восстановить без перезагрузки...")
+                repair_windivert_driver(logger if not silent else None, exit_code=34 if _windivert_state["pending_delete"] or _windivert_state["disabled"] else 177)
+        except:
+            pass
 
         sync_hard_domains_to_strategies(log_print if not silent else None)
         # Wait for WinDivert driver to fully unload before winws.exe tries to re-attach.
@@ -15587,7 +16054,7 @@ objShell.Run strCmd, 1, False
             strategies["voice"] = list(
                 DEFAULT_STRATEGIES.get(
                     "voice",
-                    ["--wf-udp=443,1024-65535", "--dpi-desync=fake", "--dpi-desync-fooling=badsum"]
+                    []
                 )
             )
             if not silent:
@@ -15752,23 +16219,39 @@ objShell.Run strCmd, 1, False
                     if has_list and not user_defined_hostlist: 
                         context_args.append(f"--hostlist={list_file_path}")
             
-            args.extend(context_args)
-            
             current_strategy_args = strategies.get(strat_name, [])
+            
+            blocks = []
+            curr_block = []
             for arg in current_strategy_args:
-                if not isinstance(arg, str): continue # FIX: Prevent corrupted/nested list args from crashing
-                if "=" in arg and ".bin" in arg:
-                    k, v = arg.split("=", 1)
-                    fname = os.path.basename(v)
-                    if os.path.exists(os.path.join(get_base_dir(), "fake", fname)):
-                        arg = f"{k}={os.path.join(get_base_dir(), 'fake', fname)}"
-                
+                if not isinstance(arg, str): continue
                 if arg == "--new":
-                    args.append(arg)
-                    args.extend(context_args) 
-                elif arg.startswith("--wf-tcp"): args.append(arg.replace("--wf-tcp", "--filter-tcp"))
-                elif arg.startswith("--wf-udp"): args.append(arg.replace("--wf-udp", "--filter-udp"))
-                else: args.append(arg)
+                    blocks.append(curr_block)
+                    curr_block = []
+                else:
+                    curr_block.append(arg)
+            if curr_block:
+                blocks.append(curr_block)
+                
+            for i, block in enumerate(blocks):
+                if i > 0:
+                    args.append("--new")
+                
+                # FIX: Do not attach hostlists to STUN/voice blocks because they use IPs, not SNI.
+                is_voice_block = any(("--filter-l7=discord,stun" in a or "--filter-l7=stun" in a) for a in block)
+                if not is_voice_block:
+                    args.extend(context_args)
+                    
+                for arg in block:
+                    if "=" in arg and ".bin" in arg:
+                        k, v = arg.split("=", 1)
+                        fname = os.path.basename(v)
+                        if os.path.exists(os.path.join(get_base_dir(), "fake", fname)):
+                            arg = f"{k}={os.path.join(get_base_dir(), 'fake', fname)}"
+                            
+                    if arg.startswith("--wf-tcp"): args.append(arg.replace("--wf-tcp", "--filter-tcp"))
+                    elif arg.startswith("--wf-udp"): args.append(arg.replace("--wf-udp", "--filter-udp"))
+                    else: args.append(arg)
 
         target_gen_list = paths['list_general']
         # Removed "Smart Clean" logic as per user request (restore v0.996 behavior)
@@ -15932,9 +16415,101 @@ objShell.Run strCmd, 1, False
             # --- Smart Startup Retry Loop ---
             max_retries = 3
             retry_delay = 0.5
+
+            def _start_degraded_mode(exit_code, failed_lines=None):
+                global nova_service_status, is_restarting
+                print(f"\n[Error] WinWS не смог запуститься (код {exit_code}).")
+                if failed_lines:
+                    print("Лог падения:")
+                    for line in failed_lines:
+                        text = str(line).strip()
+                        if text:
+                            print(f"  > {text}")
+
+                if _windivert_unrecoverable_reason == "pending_delete_stuck":
+                    detail = _windivert_unrecoverable_detail.strip()
+                    print("[Init] WinDivert застрял в SCM state 'marked for deletion'. Повторные попытки запуска winws остановлены.")
+                    if not silent:
+                        log_print("[Init] WinDivert застрял в SCM state 'marked for deletion'. Nova прекращает повторные попытки и переключается в режим только EU.")
+                        if detail:
+                            log_print(f"[Init] [Diag] Последний ответ SCM: {detail}")
+
+                print("[Init] WinWS недоступен. Переход в режим 'только EU'...")
+                nova_service_status = "Degraded"
+                is_restarting = False
+
+                try:
+                    wm = globals().get("warp_manager")
+                    if wm:
+                        wm.is_connected = False
+                        try:
+                            wm._set_service_proxy_environment(enable_proxy=False)
+                        except:
+                            pass
+                        try:
+                            wm.run_warp_cli("disconnect", timeout=4)
+                        except:
+                            pass
+                        try:
+                            subprocess.run(
+                                ["sc", "stop", getattr(wm, "SERVICE_NAME", "CloudflareWARP")],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW,
+                                timeout=4
+                            )
+                        except:
+                            pass
+                        try:
+                            subprocess.run(
+                                ["taskkill", "/F", "/IM", "warp-svc.exe", "/T"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW,
+                                timeout=3
+                            )
+                        except:
+                            pass
+                except Exception as _e:
+                    if IS_DEBUG_MODE and not silent:
+                        log_print(f"[Init] [Diag] Не удалось полностью остановить WARP: {_e}")
+
+                try:
+                    pm = globals().get("pac_manager")
+                    if pm:
+                        pm.generate_pac(warp_override=False)
+                        pm.refresh_system_options()
+                except Exception as _e:
+                    if IS_DEBUG_MODE and not silent:
+                        log_print(f"[Init] [Diag] Не удалось сразу обновить PAC для режима EU-only: {_e}")
+
+                if not silent and root:
+                    root.after(0, lambda: status_label.config(text="АКТИВНО : ТОЛЬКО EU", fg="#FFA500"))
+                    root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
+
+                if not silent:
+                    log_print("[Init] WARP не запускается: нет активного ядра winws. RU-маршрут временно переведен на Opera.")
+
+                if not is_restarting:
+                    threading.Thread(target=lambda: init_checker_system(log_print), daemon=True).start()
+
+                while not is_closing and is_service_active:
+                    time.sleep(5)
+                return
+
+            def _repair_windivert_or_degrade(repair_code, failed_lines=None):
+                repair_windivert_driver(log_print if not silent else None, exit_code=repair_code)
+                if _windivert_unrecoverable_reason == "pending_delete_stuck":
+                    _start_degraded_mode(repair_code, failed_lines=failed_lines)
+                    return False
+                return True
             
             for attempt in range(max_retries + 1):
                 try:
+                    if _windivert_unrecoverable_reason == "pending_delete_stuck":
+                        _start_degraded_mode(34)
+                        return
+
                     # Debug logging (Only if --debug flag is present)
                     if IS_DEBUG_MODE and attempt == 0:
                         try:
@@ -15987,25 +16562,43 @@ objShell.Run strCmd, 1, False
                                 for line in proc.stdout: captured_output.append(line)
                             except: pass
                             combined_output = "".join(captured_output)
+                            current_windivert_state = _query_windivert_service_state()
         
-                            if "cannot be started" in combined_output and "disabled" in combined_output:
-                                 if not silent: log_print(f"[Error] Служба WinDivert отключена. Попытка включения...")
-                                 repair_windivert_driver(log_print if not silent else None, exit_code=34)
+                            if current_windivert_state["pending_delete"] or _is_windivert_pending_delete_text(combined_output):
+                                 if not silent: log_print("[Error] Служба WinDivert помечена на удаление. Пытаемся восстановить без перезагрузки...")
+                                 if not _repair_windivert_or_degrade(34, failed_lines=captured_output):
+                                     return
+                                 time.sleep(4.0)
+                                 continue
+
+                            if current_windivert_state["disabled"] or _is_windivert_disabled_text(combined_output):
+                                 if not silent: log_print("[Error] WinDivert недоступен. Пытаемся восстановить службу/драйвер...")
+                                 if not _repair_windivert_or_degrade(34, failed_lines=captured_output):
+                                     return
                                  time.sleep(1.0)
                                  continue
 
                              # FIX: Special handling for Code 177 (Driver Missing/Corrupt)
                             if exit_code == 177:
                                 if not silent: log_print(f"[Error] Сбой драйвера (Код 177). Попытка лечения #{attempt+1}...")
-                                repair_windivert_driver(log_print if not silent else None, exit_code=177)
+                                if not _repair_windivert_or_degrade(177, failed_lines=captured_output):
+                                    return
                                 # Increase delay for driver to settle
                                 time.sleep(1.0)
                                 continue
 
                             # FIX: Handling for Code 34 (Service Disabled)
                             if exit_code == 34:
-                                if not silent: log_print(f"[Error] Драйвер отключен (Код 34). Включение...")
-                                repair_windivert_driver(log_print if not silent else None, exit_code=34)
+                                current_windivert_state = _query_windivert_service_state()
+                                if current_windivert_state["pending_delete"]:
+                                    if not silent: log_print("[Error] Драйвер WinDivert всё ещё помечен на удаление. Ждём освобождения SCM...")
+                                    if not _repair_windivert_or_degrade(34, failed_lines=captured_output):
+                                        return
+                                    time.sleep(4.0)
+                                    continue
+                                if not silent: log_print("[Error] WinDivert вернул код 34. Пытаемся восстановить службу/драйвер...")
+                                if not _repair_windivert_or_degrade(34, failed_lines=captured_output):
+                                    return
                                 time.sleep(1.0)
                                 continue
 
@@ -16049,43 +16642,7 @@ objShell.Run strCmd, 1, False
                                     failed_out.append(line.strip())
                             except: pass
                             
-                            print(f"\n[Error] WinWS не смог запуститься после {max_retries+1} попыток (код {exit_code}).")
-                            if failed_out:
-                                print("Лог падения:")
-                                for l in failed_out: print(f"  > {l}")
-                            
-                            # === GRACEFUL DEGRADATION ===
-                            # Instead of crashing, start WARP/sing-box anyway.
-                            # DPI bypass (winws) will be unavailable, but WARP tunnel
-                            # still provides connectivity for Telegram/WhatsApp/Discord.
-                            print("[Init] WinWS недоступен. Запуск в деградированном режиме (только WARP)...")
-                            nova_service_status = "Degraded"
-                            is_restarting = False
-                            
-                            if not silent and root:
-                                root.after(0, lambda: status_label.config(text="АКТИВНО : БЕЗ DPI (WARP)", fg="#FFA500"))
-                                root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
-                            
-                            # Start WARP even without winws
-                            if not restart_mode:
-                                try:
-                                    wm = globals().get("warp_manager")
-                                    if wm:
-                                        if not silent:
-                                            log_print("[Init] Запуск WARP (деградированный режим, без DPI-обхода)...")
-                                        threading.Thread(target=wm.start, daemon=True).start()
-                                except Exception as _e:
-                                    if IS_DEBUG_MODE and not silent:
-                                        log_print(f"[Init] Ошибка запуска WARP: {_e}")
-                            
-                            # Start checker anyway (it will detect driver issues)
-                            if not is_restarting:
-                                threading.Thread(target=lambda: init_checker_system(log_print), daemon=True).start()
-                            
-                            # Don't return — keep the thread alive for monitoring
-                            # but skip the main output loop since there's no process
-                            while not is_closing and is_service_active:
-                                time.sleep(5)
+                            _start_degraded_mode(exit_code, failed_lines=failed_out)
                             return
                     else:
                          # Process is stable -> NOW we expose it to the system
@@ -16119,19 +16676,13 @@ objShell.Run strCmd, 1, False
                          break
 
                 except Exception as e:
-                     if attempt < max_retries:
-                         time.sleep(retry_delay)
-                         continue
-                     else:
-                         if not is_closing: print(f"\nCRASH: {e}\n")
-                         # Even on crash, try to start WARP for basic connectivity
-                         try:
-                             wm = globals().get("warp_manager")
-                             if wm:
-                                 print("[Init] Попытка запуска WARP после сбоя ядра...")
-                                 threading.Thread(target=wm.start, daemon=True).start()
-                         except: pass
-                         return
+                    if attempt < max_retries:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        if not is_closing: print(f"\nCRASH: {e}\n")
+                        _start_degraded_mode(-1, failed_lines=[f"CRASH: {e}"])
+                        return
 
             # Main Output Loop
             try:
@@ -17499,3 +18050,4 @@ except Exception as e:
     except: pass
     messagebox.showerror("Критическая ошибка", traceback.format_exc())
     sys.exit(1)
+
