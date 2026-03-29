@@ -19,4 +19,4 @@ Twitch также будет работать в качестве 1080p (а дл
 
 🙋 Группа в ТГ: https://t.me/nova_txt
 
-благодарность (не обязательна!): [https://telegra.ph/](https://telegra.ph/donaty-ne-obyazatelno-03-29)
+благодарность (не обязательна!): https://confeden.github.io/Nova-donations/
