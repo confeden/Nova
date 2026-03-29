@@ -17,5 +17,6 @@ Twitch также будет работать в качестве 1080p (а дл
 
 # Создано с ❤️
 
-🙋 [Канал в ТГ](https://t.me/app_nova)
-группа: https://t.me/nova_txt
+🙋 Группа в ТГ: https://t.me/nova_txt
+
+донаты (не обязательно!): [https://telegra.ph/](https://telegra.ph/donaty-ne-obyazatelno-03-29)
