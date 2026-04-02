@@ -1,0 +1,97 @@
+{
+    "version": "1.15.5",
+    "strategies": [
+        {
+            "name": "boost_1",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4"
+            ]
+        },
+        {
+            "name": "boost_2",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=badseq"
+            ]
+        },
+        {
+            "name": "boost_3",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=md5sig"
+            ]
+        },
+        {
+            "name": "boost_4",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4"
+            ]
+        },
+        {
+            "name": "boost_5",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=badseq"
+            ]
+        },
+        {
+            "name": "boost_6",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=md5sig"
+            ]
+        },
+        {
+            "name": "boost_7",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4"
+            ]
+        },
+        {
+            "name": "boost_8",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=badseq"
+            ]
+        },
+        {
+            "name": "boost_9",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=md5sig"
+            ]
+        },
+        {
+            "name": "boost_10",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4"
+            ]
+        },
+        {
+            "name": "boost_11",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=badseq"
+            ]
+        },
+        {
+            "name": "boost_12",
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fooling=md5sig"
+            ]
+        }
+    ]
+}

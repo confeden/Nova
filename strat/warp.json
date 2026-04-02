@@ -1,0 +1,14 @@
+{
+    "version": "1.15.5",
+    "strategies": [
+        {
+            "name": "warp",
+            "args": [
+                "--filter-udp=443",
+                "--dpi-desync=fake,disorder2",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        }
+    ]
+}

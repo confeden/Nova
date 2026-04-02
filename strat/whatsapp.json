@@ -1,0 +1,203 @@
+{
+    "version": "1.15.5",
+    "strategies": [
+        {
+            "name": "whatsapp_1",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake,hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_2",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-split-tls=sniext",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync=fake,split2",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_3",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake,hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com_2.bin",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_4",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake,fakedsplit",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-fakedsplit-pattern=0x00",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_5",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-split-pos=midsld",
+                "--dpi-desync-hostfakesplit-mod=host=www.google.com",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-repeats=6",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_6",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=disorder",
+                "--dpi-desync-split-pos=host",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-repeats=6",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_7",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake",
+                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-badseq-increment=2",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_8",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake,multisplit",
+                "--dpi-desync-split-seqovl=681",
+                "--dpi-desync-split-pos=1",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-badseq-increment=10000000",
+                "--dpi-desync-repeats=8",
+                "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_9",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake,multidisorder",
+                "--dpi-desync-split-pos=1,midsld",
+                "--dpi-desync-repeats=11",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_10",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=fake",
+                "--dpi-desync-fake-tls-mod=padencap",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-repeats=6",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_11",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-hostfakesplit-mod=host=www.google.com",
+                "--dpi-desync-autottl=1",
+                "--dup=2",
+                "--dup-fooling=badseq",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-repeats=6",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "whatsapp_12",
+            "args": [
+                "--filter-tcp=80,443,4244,5223,5228,5242",
+                "--dpi-desync-fake-http=0x0F0F0F0F",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-split-pos=1,midsld",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync=fake,multisplit",
+                "--dup-cutoff=n3",
+                "--dup-fooling=badseq",
+                "--dup=2",
+                "--new",
+                "--filter-udp=3478,3480,3484,3486,45395,50318,59234",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        }
+    ]
+}
