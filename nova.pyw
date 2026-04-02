@@ -7289,7 +7289,7 @@ try:
                 return False
 
             # Расширенный список ключевых слов для обнаружения VPN
-            keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "hamachi", "amnezia", "warp", "cloudflare", "privado", "mullvad", "nord", "proton", "happ-tun"]
+            keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "amnezia", "warp", "cloudflare", "privado", "mullvad", "nord", "proton", "happ-tun"]
             
             # Exclusions (white list)
             # Nova's own TUN adapters (NovaVoice / CloudflareWARP) must not trigger VPN auto-pause.
