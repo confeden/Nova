@@ -481,8 +481,6 @@ try:
         return os.path.join(get_base_dir(), "bin")
 
     def get_fake_dir():
-        if is_compiled_build():
-            return os.path.join(get_resources_dir(), "fake")
         return os.path.join(get_base_dir(), "fake")
 
     def _load_embedded_pil_image(asset_name):
@@ -986,6 +984,10 @@ try:
             
             # Если внутренней папки нет (например, при запуске скрипта без сборки), пропускаем
             if not os.path.exists(internal_source):
+                # Installer layout keeps list/strat/ip next to Nova.exe, not inside resources.
+                # In that case there is nothing to deploy from an internal payload, and this is not an error.
+                if os.path.exists(target_folder_path):
+                    continue
                 if folder == "bin": 
                     # Показываем окно с ошибкой, чтобы видеть путь даже без консоли
                     try:
@@ -17604,7 +17606,7 @@ try:
             exe_name = os.path.basename(sys.executable)
             
             # RULE 1: Infrastructure exists -> Clean
-            core_folders = ["resources", "ip", "list", "strat"]
+            core_folders = ["resources", "ip", "list", "strat", "fake"]
             has_infrastructure = any(os.path.isdir(os.path.join(base_dir, f)) for f in core_folders)
             
             if not has_infrastructure:

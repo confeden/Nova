@@ -28,8 +28,8 @@ PYI_WORK_DIR = TEMP_ROOT / "work"
 PYI_SPEC_DIR = TEMP_ROOT / "spec"
 PYI_ASSET_DIR = TEMP_ROOT / "embedded_assets"
 
-TOP_LEVEL_DIRS = ("ip", "list", "strat")
-RESOURCE_DIRS = ("bin", "fake")
+TOP_LEVEL_DIRS = ("ip", "list", "strat", "fake")
+RESOURCE_DIRS = ("bin",)
 IGNORED_PATTERNS = ("*.old", "*.tmp", "__pycache__")
 
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000

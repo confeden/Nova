@@ -48,6 +48,10 @@ Name: "{app}\temp"
 [Files]
 Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+Type: files; Name: "{app}\nova_deploy_debug.txt"
+Type: filesandordirs; Name: "{app}\resources\fake"
+
 [Icons]
 Name: "{autoprograms}\Nova"; Filename: "{app}\Nova.exe"
 Name: "{autodesktop}\Nova"; Filename: "{app}\Nova.exe"; Tasks: desktopicon
