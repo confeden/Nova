@@ -18,21 +18,21 @@ jobs:
           CLEAN_VERSION=${TAG_NAME#v} 
           echo "VERSION=$CLEAN_VERSION" >> $GITHUB_ENV
           
-          # Формируем ссылку на скачивание (GitHub стандартно делает такие ссылки)
-          # ВАЖНО: Имя файла должно быть всегда одинаковым, например Nova.exe
-          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/Nova.exe"
+          # Формируем ссылку на скачивание установщика
+          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/NovaSetup.exe"
           echo "ASSET_URL=$ASSET_URL" >> $GITHUB_ENV
+          echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG_NAME}" >> $GITHUB_ENV
 
       # 2. Скачиваем EXE файл, чтобы посчитать хеш
       - name: Download Asset
         run: |
-          wget "${{ env.ASSET_URL }}" -O Nova.exe
+          wget "${{ env.ASSET_URL }}" -O NovaSetup.exe
 
       # 3. Считаем SHA256
       - name: Calculate SHA256
         id: shasum
         run: |
-          HASH=$(sha256sum Nova.exe | awk '{print $1}')
+          HASH=$(sha256sum NovaSetup.exe | awk '{print $1}')
           echo "SHA256=$HASH" >> $GITHUB_ENV
           echo "Calculated Hash: $HASH"
 
@@ -53,7 +53,8 @@ jobs:
           echo '{
             "version": "${{ env.VERSION }}",
             "url": "${{ env.ASSET_URL }}",
-            "sha256": "${{ env.SHA256 }}"
+            "sha256": "${{ env.SHA256 }}",
+            "release_url": "${{ env.RELEASE_URL }}"
           }' > version.json
           
           # Настраиваем Git (чтобы коммит был от имени бота)

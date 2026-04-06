@@ -1,4 +1,4 @@
-# version: 1.15.5
+# version: 1.15.6
 1337x.to
 adobe.com
 adobe.io
@@ -95,6 +95,7 @@ sndcdn.com
 soundcloud.com
 sourceforge.io
 speedtest.net
+symantecliveupdate.com
 systeminformer.com
 t.me
 tapeop.dev
@@ -117,5 +118,6 @@ whatsapp.com
 whatsapp.net
 x.com
 xv-ru.com
+zendesk.com
 zetflix-online.skin
 zo.computer

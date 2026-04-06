@@ -8,9 +8,10 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.15.5"
+CURRENT_VERSION = "1.15.6"
 import sys
 import os
+import io
 import ctypes
 from ctypes import wintypes
 import locale
@@ -444,13 +445,83 @@ try:
     from tkinter import font as tkfont
     import winreg
     import glob
+    try:
+        import embedded_assets
+    except Exception:
+        embedded_assets = None
 
     # === HELPER: Path Resolution ===
+    def is_compiled_build():
+        return bool(getattr(sys, 'frozen', False) or "__compiled__" in globals())
+
     def get_base_dir():
         """Returns the absolute path to the application directory."""
         if getattr(sys, 'frozen', False):
             return os.path.dirname(os.path.abspath(sys.executable))
         return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    def get_resources_dir():
+        base_dir = get_base_dir()
+        candidates = []
+        if is_compiled_build():
+            candidates.append(os.path.join(base_dir, "resources"))
+            if hasattr(sys, "_MEIPASS"):
+                candidates.append(sys._MEIPASS)
+        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+        candidates.append(base_dir)
+
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return candidates[0]
+
+    def get_bin_dir():
+        if is_compiled_build():
+            return os.path.join(get_resources_dir(), "bin")
+        return os.path.join(get_base_dir(), "bin")
+
+    def get_fake_dir():
+        if is_compiled_build():
+            return os.path.join(get_resources_dir(), "fake")
+        return os.path.join(get_base_dir(), "fake")
+
+    def _load_embedded_pil_image(asset_name):
+        if not embedded_assets:
+            return None
+        try:
+            from PIL import Image
+            if asset_name == "icon":
+                data = embedded_assets.get_icon_ico_bytes()
+            elif asset_name == "background":
+                data = embedded_assets.get_background_png_bytes()
+            else:
+                return None
+            return Image.open(io.BytesIO(data)).copy()
+        except Exception:
+            return None
+
+    def apply_window_icon(window):
+        try:
+            from PIL import ImageTk
+            pil_image = _load_embedded_pil_image("icon")
+            if pil_image is not None:
+                tk_image = ImageTk.PhotoImage(pil_image, master=window)
+                refs = getattr(window, "_nova_icon_refs", [])
+                refs.append(tk_image)
+                window._nova_icon_refs = refs
+                window.iconphoto(True, tk_image)
+                return True
+        except Exception:
+            pass
+
+        try:
+            icon_path = get_internal_path("icon.ico")
+            if os.path.exists(icon_path):
+                window.iconbitmap(icon_path)
+                return True
+        except Exception:
+            pass
+        return False
 
     def mask_ip(ip_str):
         """
@@ -797,14 +868,25 @@ try:
         return os.path.dirname(os.path.abspath(sys.argv[0]))
 
     def get_internal_path(filename_or_folder):
-        """Возвращает путь к ресурсу ВНУТРИ временной папки распакованного EXE."""
-        if getattr(sys, 'frozen', False):
-            # PyInstaller uses _MEIPASS
-            if hasattr(sys, '_MEIPASS'):
-                 return os.path.join(sys._MEIPASS, filename_or_folder)
-            # Nuitka uses __file__ directory
-            return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename_or_folder)
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename_or_folder)
+        """Возвращает путь к ресурсу во внутренних ресурсах сборки или рядом со скриптом."""
+        candidates = []
+        try:
+            candidates.append(os.path.join(get_resources_dir(), filename_or_folder))
+        except:
+            pass
+        if hasattr(sys, '_MEIPASS'):
+            candidates.append(os.path.join(sys._MEIPASS, filename_or_folder))
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), filename_or_folder))
+        candidates.append(os.path.join(get_base_dir(), filename_or_folder))
+
+        seen = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.exists(candidate):
+                return candidate
+        return candidates[0]
 
     def calculate_file_hash(filepath, algorithm="sha256"):
         """Вычисляет хэш файла."""
@@ -840,10 +922,14 @@ try:
         
         real_bin_dir = None
         
-        # 1. Check standard path
-        p1 = os.path.join(internal_root, "bin", WINWS_FILENAME)
-        if os.path.exists(p1): 
-            real_bin_dir = os.path.join(internal_root, "bin") # Standard
+        # 1. Check standard paths
+        p1 = os.path.join(internal_root, "resources", "bin", WINWS_FILENAME)
+        if os.path.exists(p1):
+            real_bin_dir = os.path.join(internal_root, "resources", "bin")
+        else:
+            p1 = os.path.join(internal_root, "bin", WINWS_FILENAME)
+            if os.path.exists(p1):
+                real_bin_dir = os.path.join(internal_root, "bin") # Legacy
             
         # 2. Recursive search if missing
         if not real_bin_dir:
@@ -868,7 +954,7 @@ try:
         # === STARTUP OPTIMIZATION: Check Version Marker ===
         # If version matches and winws.exe exists, skip heavy file scanning
         marker_path = os.path.join(base_dir, "temp", ".nova_infra_version")
-        winws_path = os.path.join(base_dir, "bin", WINWS_FILENAME)
+        winws_path = os.path.join(get_bin_dir(), WINWS_FILENAME)
         
         needs_deploy = True
         try:
@@ -890,7 +976,7 @@ try:
 
         # 2. Список папок (img исключена, она остается внутри)
         # FIX: Removed 'bin' because it is downloaded at runtime
-        folders_to_deploy = ["fake", "list", "strat", "ip"] # img removed per request
+        folders_to_deploy = ["list", "strat", "ip"]
         
         for folder in folders_to_deploy:
             target_folder_path = os.path.join(base_dir, folder)
@@ -1119,7 +1205,7 @@ try:
             
         # FIX: Create winws_test.exe for background checks (Process Isolation)
         try:
-             winws_test_path = os.path.join(base_dir, "bin", "winws_test.exe")
+             winws_test_path = os.path.join(get_bin_dir(), "winws_test.exe")
              if os.path.exists(winws_path):
                  # FIX: Sync version! If sizes differ (update happened), delete test exe
                  if os.path.exists(winws_test_path):
@@ -1215,7 +1301,7 @@ try:
         """Manages sing-box for surgical routing of specific apps (Voice/UDP) into WARP."""
         def __init__(self, log_func=None):
             self.log_func = log_func or print
-            self.bin_dir = os.path.join(get_base_dir(), "bin")
+            self.bin_dir = get_bin_dir()
             self.temp_dir = os.path.join(get_base_dir(), "temp")
             self.exe_path = os.path.join(self.bin_dir, "sing-box.exe")
             self.config_path = os.path.join(self.temp_dir, "sing-box-conf.json")
@@ -2736,7 +2822,7 @@ try:
 
         def __init__(self, log_func=None):
             self.log_func = log_func or print
-            self.bin_dir = os.path.join(get_base_dir(), "bin")
+            self.bin_dir = get_bin_dir()
             self.warp_cli_path = os.path.join(self.bin_dir, "warp-cli.exe")
             self.warp_svc_path = os.path.join(self.bin_dir, "warp-svc.exe")
             self.temp_dir = os.path.join(get_base_dir(), "temp")
@@ -3679,6 +3765,55 @@ try:
                     return True
                 time.sleep(0.4)
             return False
+
+        def recover_connection(self, reason=""):
+            """Best-effort runtime recovery for stuck/disconnected WARP sessions."""
+            if is_closing:
+                return False
+            if getattr(self, "_is_starting_now", False) or getattr(self, "_is_recovering_now", False):
+                return False
+
+            self._is_recovering_now = True
+            try:
+                reason_txt = str(reason or "").strip()
+                if reason_txt:
+                    self.log_func(f"[RU] [Watchdog] Восстановление WARP: {reason_txt}.")
+                else:
+                    self.log_func("[RU] [Watchdog] Восстановление WARP...")
+
+                try:
+                    global sing_box_manager
+                    if sing_box_manager:
+                        sing_box_manager.stop()
+                except:
+                    pass
+
+                # Cheap repair first: local SOCKS settings may desync while daemon is still alive.
+                try:
+                    self.set_proxy_port(self.port)
+                    self.set_proxy_mode()
+                    if self.wait_for_connection(timeout=8):
+                        return True
+                except:
+                    pass
+
+                try:
+                    self.run_warp_cli("disconnect", timeout=8)
+                except:
+                    pass
+                time.sleep(1.0)
+
+                self.is_connected = False
+                self.start()
+
+                try:
+                    if self.is_connected:
+                        return bool(self.wait_for_connection(timeout=8))
+                except:
+                    pass
+                return bool(self.is_connected and self.is_port_open(self.port))
+            finally:
+                self._is_recovering_now = False
         
         def start(self):
             """Connect to WARP using MASQUE protocol (Stable Version)."""
@@ -3791,22 +3926,23 @@ try:
 
                 # Check if already connected
                 if "Connected" in status:
-                    connected_now = False
-                    if self.is_port_open(self.port):
-                        self.log_func(f"[RU] {self.port} готов{self._bootstrap_1371_suffix()}")
-                        connected_now = True
-                    else:
-                        connected_now = self.wait_for_connection(timeout=10)
+                    self.log_func("[RU] [Diag] WARP уже сообщает Connected. Проверяем рабочий SOCKS/трафик...")
+                    connected_now = self.wait_for_connection(timeout=12)
 
                     self.is_connected = bool(connected_now)
 
                     # Start Voice Tunnel even when WARP was already connected before this run.
                     if connected_now:
                         self._start_voice_tunnel()
-                    else:
-                        self.log_func(f"[RU] [Warning] WARP статус Connected, но порт {self.port} недоступен.")
-                    return
-                
+                        return
+
+                    self.log_func(f"[RU] [Warning] WARP статус Connected, но соединение нерабочее. Перезапуск профиля...")
+                    try:
+                        self.run_warp_cli("disconnect", timeout=8)
+                    except:
+                        pass
+                    time.sleep(1.0)
+                 
                 # --- CONNECT ATTEMPTS ---
                 for attempt_cfg in self._build_connect_attempts(preferred_profile):
                     if is_closing or SERVICE_RUN_ID != my_run_id:
@@ -4765,7 +4901,7 @@ try:
             self.f_log = None
             self.owns_process = False
             self.using_external = False
-            self.exe_path = os.path.join(get_base_dir(), "bin", "opera-proxy.windows-amd64.exe")
+            self.exe_path = os.path.join(get_bin_dir(), "opera-proxy.windows-amd64.exe")
             self._last_pac_sync_state = None
             # Grace window for slow proxy bootstrap (registration/retries).
             self._startup_grace_deadline = 0.0
@@ -5081,9 +5217,12 @@ try:
 
     def ensure_structure():
         base_dir = get_base_dir()
-        for folder in ["bin", "list", "ip", "strat", "temp", "img", "fake"]:
+        for folder in ["list", "ip", "strat", "temp"]:
             path = os.path.join(base_dir, folder)
             if not os.path.exists(path): os.makedirs(path)
+        for path in [get_resources_dir(), get_bin_dir(), get_fake_dir()]:
+            if path and not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
 
         files = {
             "youtube.txt": "youtube.com\ngooglevideo.com\n",
@@ -5267,10 +5406,10 @@ try:
         if not os.path.exists(res["strat_boost"]):
              with open(res["strat_boost"], "w", encoding="utf-8") as f: f.write("{}")
         
-        res["bin_yt"] = os.path.join(base_dir, "fake", "4.bin")
+        res["bin_yt"] = os.path.join(get_fake_dir(), "4.bin")
         res["bin_yt_ok"] = os.path.exists(res["bin_yt"])
-        res["bin_quic"] = os.path.join(base_dir, "fake", "quic_initial_www_google_com.bin")
-        res["bin_dc"] = os.path.join(base_dir, "fake", "tls_clienthello_5.bin")
+        res["bin_quic"] = os.path.join(get_fake_dir(), "quic_initial_www_google_com.bin")
+        res["bin_dc"] = os.path.join(get_fake_dir(), "tls_clienthello_5.bin")
         res["bin_dc_ok"] = os.path.exists(res["bin_dc"])
         
         res["list_hard"] = os.path.join(base_dir, "temp", HARD_LIST_FILENAME)
@@ -6147,7 +6286,7 @@ try:
         time.sleep(5)
         
         paths = ensure_structure()
-        bin_dir = os.path.join(get_base_dir(), "fake")
+        bin_dir = get_fake_dir()
         exclude_file = paths['list_exclude']
         
         while not is_closing:
@@ -6190,6 +6329,22 @@ try:
     early_log_buffer = []  # Buffer for logs before log_window is created
     cached_log_size = "700x450"
     btn_logs = None
+    btn_update = None
+    region_indicator_pill = None
+    update_button_default_fg = COLOR_TEXT_NORMAL
+    update_button_available_fg = COLOR_TEXT_NORMAL
+    update_state_lock = threading.Lock()
+    update_state = {
+        "available": False,
+        "version": None,
+        "url": None,
+        "sha256": None,
+        "release_url": None,
+        "checked_at": 0.0,
+        "checking": False,
+        "installing": False,
+        "announced_version": None,
+    }
     
     BROWSER_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
@@ -6206,6 +6361,15 @@ try:
         "Cache-Control": "max-age=0",
         "Connection": "keep-alive"
     }
+
+    def is_local_port_open_quick(port, timeout=0.25):
+        try:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                return s.connect_ex(("127.0.0.1", int(port))) == 0
+        except:
+            return False
 
     # ================= GUI УТИЛИТЫ =================
 
@@ -6363,11 +6527,7 @@ try:
             # Применение
             log_window.geometry(f"{lw}x{lh}+{new_x}+{new_y}")
             
-            # Обновление UI элементов (кнопка, грип)
-            if btn_logs:
-                if side == "right": btn_logs.move_to(mw - 10, mh - 10, "se")
-                else: btn_logs.move_to(10, mh - 10, "sw")
-            
+            # Обновление UI элементов окна лога
             if hasattr(log_window, "sizegrip"):
                 if side == "right":
                     log_window.sizegrip.set_side("right")
@@ -6483,9 +6643,7 @@ try:
         log_window.withdraw() # Скрываем сразу после создания, чтобы избежать белого мерцания
         log_window.title("Лог событий")
         try:
-            icon_path = get_internal_path("icon.ico")
-            if os.path.exists(icon_path):
-                log_window.iconbitmap(icon_path)
+            apply_window_icon(log_window)
         except: pass
         log_window.configure(bg="#000000")
         log_window.transient(root)
@@ -6651,18 +6809,10 @@ try:
         def open_telegram_chat():
             """Открывает чат Telegram"""
             try:
-                # Проверяем наличие обработчика tg:// в реестре
-                import winreg
-                winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"tg\shell\open\command")
-                # Если ключ существует - открываем в приложении
-                os.startfile("tg://resolve?domain=nova_txt")
-            except (FileNotFoundError, OSError):
-                # Если обработчика нет - открываем в браузере
-                try:
-                    import webbrowser
-                    webbrowser.open("https://t.me/nova_txt")
-                except Exception as e:
-                    print(f"[Log] Ошибка открытия ссылки: {e}")
+                import webbrowser
+                webbrowser.open("https://t.me/nova_txt")
+            except Exception as e:
+                print(f"[Log] Ошибка открытия ссылки: {e}")
         
         # Кнопка-текст "Перейти в чат"
         chat_button = tk.Label(bottom_frame, text="→ Telegram чат", fg=COLOR_BLUEBERRY_YOGURT, bg="#1a1a1a", 
@@ -6672,132 +6822,6 @@ try:
         chat_button.bind("<Enter>", lambda e: chat_button.config(fg="white", bg="#2a2a2a"))
         chat_button.bind("<Leave>", lambda e: chat_button.config(fg=COLOR_BLUEBERRY_YOGURT, bg="#1a1a1a"))
 
-        # Bottom status indicators (left side, opposite Telegram chat):
-        # RU (WARP) and EU (Opera) - hollow circles become filled when active.
-        indicator_wrap = tk.Frame(bottom_frame, bg="#1a1a1a")
-        indicator_wrap.pack(side=tk.LEFT, padx=8, pady=0)
-
-        INDICATOR_SAPPHIRE = "#0F52BA"
-        INDICATOR_YOGURT = "#FFB6C1"
-        _ind_bg = "#1a1a1a"
-
-        _dot_cache = {}
-
-        def _make_dot_icon(color_hex, is_on, size=14):
-            try:
-                from PIL import Image, ImageDraw, ImageTk
-                key = (color_hex, bool(is_on), int(size))
-                if key in _dot_cache:
-                    return _dot_cache[key]
-
-                scale = 8
-                s2 = int(size) * scale
-                img = Image.new("RGBA", (s2, s2), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(img)
-
-                try:
-                    rgb = root.winfo_rgb(color_hex)
-                    ring_rgb = (rgb[0] // 256, rgb[1] // 256, rgb[2] // 256)
-                except:
-                    ring_rgb = (200, 200, 200)
-
-                pad = int(1.5 * scale)
-                ring_w = max(1, int(1.05 * scale))
-                bbox = (pad, pad, s2 - pad - 1, s2 - pad - 1)
-                fill_rgba = ring_rgb + (228,) if is_on else (0, 0, 0, 0)
-                draw.ellipse(bbox, outline=ring_rgb + (245,), width=ring_w, fill=fill_rgba)
-
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except:
-                    resample = Image.LANCZOS
-                img = img.resize((int(size), int(size)), resample)
-                tk_img = ImageTk.PhotoImage(img)
-                _dot_cache[key] = tk_img
-                return tk_img
-            except:
-                return None
-
-        ru_block = tk.Frame(indicator_wrap, bg=_ind_bg)
-        # ru_block.pack(side=tk.LEFT, padx=(0, 10)) # Handled by refresh
-        ru_dot = tk.Label(ru_block, bg=_ind_bg, bd=0, highlightthickness=0)
-        ru_dot.pack(side=tk.LEFT, padx=(0, 4))
-        ru_lbl = tk.Label(ru_block, text="RU", fg=INDICATOR_SAPPHIRE, bg=_ind_bg, font=("Segoe UI", 8, "bold"))
-        ru_lbl.pack(side=tk.LEFT)
-
-        eu_block = tk.Frame(indicator_wrap, bg=_ind_bg)
-        # eu_block.pack(side=tk.LEFT, padx=(0, 4)) # Handled by refresh
-        eu_dot = tk.Label(eu_block, bg=_ind_bg, bd=0, highlightthickness=0)
-        eu_dot.pack(side=tk.LEFT, padx=(0, 4))
-        eu_lbl = tk.Label(eu_block, text="EU", fg=INDICATOR_YOGURT, bg=_ind_bg, font=("Segoe UI", 8, "bold"))
-        eu_lbl.pack(side=tk.LEFT)
-
-        def _set_ind(label_widget, ring_color, is_on):
-            try:
-                img = _make_dot_icon(ring_color, bool(is_on), size=14)
-                if img is not None:
-                    label_widget.configure(image=img)
-                    label_widget.image = img
-            except:
-                pass
-
-        _last_ind_state = {"warp": None, "opera": None}
-
-        def _is_port_open_local(port, timeout=0.25):
-            try:
-                import socket
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(timeout)
-                    return s.connect_ex(("127.0.0.1", int(port))) == 0
-            except:
-                return False
-
-        def _refresh_bottom_indicators():
-            try:
-                if (not log_window) or (not tk.Toplevel.winfo_exists(log_window)):
-                    return
-            except:
-                return
-
-            warp_ok = False
-            opera_ok = False
-            try:
-                wm = globals().get("warp_manager")
-                warp_connected = bool(getattr(wm, "is_connected", False)) if wm else False
-                warp_port = int(globals().get("WARP_PORT", 1370))
-                warp_ok = bool(warp_connected and _is_port_open_local(warp_port, timeout=0.25))
-            except:
-                warp_ok = False
-
-            try:
-                opm = globals().get("opera_proxy_manager")
-                opera_port = int(getattr(opm, "port", 1371)) if opm else 1371
-                opera_ok = bool(is_local_http_proxy_responsive(port=opera_port, timeout=0.45))
-            except:
-                opera_ok = False
-
-            if _last_ind_state["warp"] != warp_ok or _last_ind_state["opera"] != opera_ok:
-                _last_ind_state["warp"] = warp_ok
-                _last_ind_state["opera"] = opera_ok
-                
-                # Unpack everything to re-order correctly
-                ru_block.pack_forget()
-                eu_block.pack_forget()
-                
-                if warp_ok:
-                    ru_block.pack(side=tk.LEFT, padx=(0, 10))
-                    _set_ind(ru_dot, INDICATOR_SAPPHIRE, True)
-                if opera_ok:
-                    eu_block.pack(side=tk.LEFT, padx=(0, 4))
-                    _set_ind(eu_dot, INDICATOR_YOGURT, True)
-
-            try:
-                log_window.after(1200, _refresh_bottom_indicators)
-            except:
-                pass
-
-        _refresh_bottom_indicators()
-        
         # Используем Frame для компоновки текста и кастомного скроллбара
         content_frame = tk.Frame(log_window, bg="#000000")
         content_frame.pack(fill=tk.BOTH, expand=True)
@@ -7453,15 +7477,12 @@ try:
     def init_tray_icon():
         global TRAY_ICON
         try:
-            image_path = get_internal_path(os.path.join("img", "icon.ico"))
-            # Fallback if specific icon not found, try bin or use default
-            if not os.path.exists(image_path):
-                 image_path = get_internal_path("icon.ico")
-            
-            if os.path.exists(image_path):
-                image = Image.open(image_path)
-            else:
-                # Create simple colored rectangle if no icon
+            image = _load_embedded_pil_image("icon")
+            if image is None:
+                image_path = get_internal_path("icon.ico")
+                if os.path.exists(image_path):
+                    image = Image.open(image_path)
+            if image is None:
                 image = Image.new('RGB', (64, 64), color = (73, 109, 137))
 
             menu = (pystray.MenuItem('Открыть', on_tray_open, default=True), pystray.MenuItem('Выход', on_tray_quit))
@@ -8516,8 +8537,8 @@ try:
                 try:
                     exe_name = WINWS_FILENAME
                     test_exe_name = "winws_test.exe"
-                    exe_path = os.path.join(get_base_dir(), "bin", exe_name)
-                    test_exe_path = os.path.join(get_base_dir(), "bin", test_exe_name)
+                    exe_path = os.path.join(get_bin_dir(), exe_name)
+                    test_exe_path = os.path.join(get_bin_dir(), test_exe_name)
                     
                     # FIX: Don't overwrite if exists to avoid race conditions
                     if os.path.exists(exe_path) and not os.path.exists(test_exe_path):
@@ -8563,7 +8584,7 @@ try:
                 warp_strat_path = os.path.join(base_dir, "strat", "warp.json")
                 cloudflare_strat_path = os.path.join(base_dir, "strat", "cloudflare.json")
                 whatsapp_strat_path = os.path.join(base_dir, "strat", "whatsapp.json")
-                bin_dir = os.path.join(base_dir, "fake")
+                bin_dir = get_fake_dir()
                 state_path = os.path.join(base_dir, "temp", "checker_state.json")
                 
                 # Глобальный лимит фоновых задач и управление ресурсами (Max 32 total)
@@ -8740,7 +8761,7 @@ try:
                         
                         test_args.extend(['--wf-raw', isolation_filter])
                         
-                        exe_path = os.path.join(get_base_dir(), "bin", WINWS_FILENAME)
+                        exe_path = os.path.join(get_bin_dir(), WINWS_FILENAME)
                         # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
                         proc = subprocess.Popen([exe_path] + test_args, cwd=get_base_dir(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
                                                creationflags=subprocess.CREATE_NO_WINDOW | 0x00004000)
@@ -8817,7 +8838,7 @@ try:
                                     continue
                                 # Если нет, проверяем в папке fake (авто-коррекция сработает позже)
                                 fname = os.path.basename(val)
-                                if os.path.exists(os.path.join(base_dir, "fake", fname)):
+                                if os.path.exists(os.path.join(get_fake_dir(), fname)):
                                     continue
                                     
                                 # FIX: More informative error message
@@ -8904,8 +8925,8 @@ try:
                         
                         exe_name = WINWS_FILENAME
                         test_exe_name = "winws_test.exe"
-                        exe_path = os.path.join(get_base_dir(), "bin", exe_name)
-                        test_exe_path = os.path.join(get_base_dir(), "bin", test_exe_name)
+                        exe_path = os.path.join(get_bin_dir(), exe_name)
+                        test_exe_path = os.path.join(get_bin_dir(), test_exe_name)
                         
                         # STRICT: Always use test exe. If missing, try to restore.
                         if not os.path.exists(test_exe_path):
@@ -9495,7 +9516,7 @@ try:
                                 if "tls" in b.lower() or "clienthello" in b.lower():
                                     # Verify file exists
                                     fname = os.path.basename(b)
-                                    full_path = os.path.join(get_base_dir(), "fake", fname)
+                                    full_path = os.path.join(get_fake_dir(), fname)
                                     if os.path.exists(full_path):
                                         tls_bins.append(b)
                             
@@ -13346,7 +13367,7 @@ try:
                 if "=" in arg and ".bin" in arg:
                     k, v = arg.split("=", 1)
                     fname = os.path.basename(v)
-                    if os.path.exists(os.path.join(base_dir, "fake", fname)):
+                    if os.path.exists(os.path.join(get_fake_dir(), fname)):
                         test_args[i] = f"{k}={os.path.join(base_dir, 'fake', fname)}"
 
             p_end = port + 1
@@ -13363,11 +13384,11 @@ try:
             
             exe_name = WINWS_FILENAME
             # Use Test Process for checks if available
-            test_exe = os.path.join(base_dir, "bin", "winws_test.exe")
+            test_exe = os.path.join(get_bin_dir(), "winws_test.exe")
             if os.path.exists(test_exe):
                 exe_name = "winws_test.exe"
 
-            exe_path = os.path.join(base_dir, "bin", exe_name)
+            exe_path = os.path.join(get_bin_dir(), exe_name)
             final_args = [exe_path] + test_args + ['--wf-raw', isolation_filter]
             
             # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
@@ -14130,7 +14151,7 @@ try:
 
             # 0. Determine driver path
             base_dir = get_base_dir()
-            driver_path = os.path.join(base_dir, "bin", "WinDivert64.sys")
+            driver_path = os.path.join(get_bin_dir(), "WinDivert64.sys")
             driver_image_path = f"\\??\\{driver_path}"
 
             initial_state = _query_windivert_service_state()
@@ -14145,7 +14166,7 @@ try:
 
             # 0a. Restore driver files from internal resources (if missing)
             try:
-                bin_path = os.path.join(base_dir, "bin")
+                bin_path = get_bin_dir()
                 required_files = ["WinDivert.dll", "WinDivert64.sys"]
                 missing = [f for f in required_files if not os.path.exists(os.path.join(bin_path, f))]
 
@@ -14452,6 +14473,279 @@ try:
             for byte_block in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
+
+    def native_message_box(text, title="Nova", flags=0):
+        try:
+            return ctypes.windll.user32.MessageBoxW(0, text, title, flags | 0x40000)
+        except:
+            return 0
+
+    def get_update_state():
+        with update_state_lock:
+            return dict(update_state)
+
+    def refresh_update_button(snapshot=None):
+        try:
+            if snapshot is None:
+                snapshot = get_update_state()
+        except:
+            snapshot = {}
+
+        try:
+            if root:
+                root.after(0, lambda s=dict(snapshot): _apply_update_button_state(s))
+        except:
+            pass
+
+    def _apply_update_button_state(snapshot):
+        if not btn_update:
+            return
+
+        text = "Обновить Nova"
+        fg = update_button_available_fg
+        visible = bool(snapshot.get("installing") or snapshot.get("available"))
+
+        if snapshot.get("installing"):
+            text = "Загрузка Nova..."
+        elif snapshot.get("checking"):
+            if not snapshot.get("available"):
+                visible = False
+            else:
+                text = "Проверка Nova..."
+        elif snapshot.get("available") and snapshot.get("version"):
+            text = f"Обновить Nova {snapshot['version']}"
+        else:
+            visible = False
+
+        try:
+            btn_update.config(text=text, fg=fg, visible=visible)
+        except:
+            pass
+
+    def set_update_state(**kwargs):
+        with update_state_lock:
+            update_state.update(kwargs)
+            snapshot = dict(update_state)
+        refresh_update_button(snapshot)
+        return snapshot
+
+    def fetch_update_manifest():
+        try:
+            import requests
+        except ImportError as e:
+            return None, f"Ошибка импорта requests: {e}"
+
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+        })
+
+        try:
+            response = session.get(UPDATE_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            return None, str(e)
+
+        latest_version = str(data.get("version") or "").strip()
+        download_url = str(data.get("url") or data.get("installer_url") or "").strip()
+        expected_hash = data.get("sha256") or data.get("hash") or data.get("checksum")
+        release_url = str(data.get("release_url") or data.get("page_url") or "").strip()
+
+        if expected_hash and ":" in expected_hash:
+            expected_hash = expected_hash.split(":", 1)[1]
+
+        if not latest_version or not download_url:
+            return None, "version.json не содержит version/url"
+
+        manifest = {
+            "version": latest_version,
+            "url": download_url,
+            "sha256": expected_hash,
+            "release_url": release_url,
+            "available": compare_versions(latest_version, CURRENT_VERSION),
+        }
+
+        set_update_state(
+            available=manifest["available"],
+            version=latest_version,
+            url=download_url,
+            sha256=expected_hash,
+            release_url=release_url,
+            checked_at=time.time(),
+            checking=False,
+        )
+        return manifest, None
+
+    def _download_and_launch_update_installer(manifest, log_func):
+        version = manifest.get("version") or "unknown"
+        download_url = manifest.get("url")
+        expected_hash = manifest.get("sha256")
+
+        if not download_url:
+            native_message_box("В manifest обновления отсутствует ссылка на установщик.", "Nova - Обновление", 0x10)
+            return
+
+        try:
+            import requests
+        except ImportError as e:
+            native_message_box(f"Не удалось импортировать requests.\n\n{e}", "Nova - Обновление", 0x10)
+            return
+
+        temp_dir = os.path.join(get_base_dir(), "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        installer_path = os.path.join(temp_dir, f"NovaSetup-{version}.exe")
+        partial_path = installer_path + ".part"
+
+        try:
+            if os.path.exists(partial_path):
+                os.remove(partial_path)
+        except:
+            pass
+
+        set_update_state(installing=True, checking=False)
+        if log_func:
+            log_func(f"[Update] Скачивание установщика Nova {version}...")
+
+        try:
+            session = requests.Session()
+            session.trust_env = False
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+                "Accept-Encoding": "identity",
+            })
+
+            with session.get(download_url, stream=True, timeout=180) as response:
+                response.raise_for_status()
+                total_size = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                last_log_time = 0.0
+
+                with open(partial_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=131072):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        now = time.time()
+                        if log_func and total_size > 0 and (now - last_log_time) > 2.0:
+                            percent = (downloaded / total_size) * 100.0
+                            log_func(f"[Update] Скачано {downloaded/1024/1024:.1f} MB / {total_size/1024/1024:.1f} MB ({percent:.0f}%)")
+                            last_log_time = now
+
+            os.replace(partial_path, installer_path)
+        except Exception as e:
+            set_update_state(installing=False)
+            try:
+                if os.path.exists(partial_path):
+                    os.remove(partial_path)
+            except:
+                pass
+            if log_func:
+                log_func(f"[Update] Не удалось скачать установщик: {e}")
+            native_message_box(f"Не удалось скачать установщик обновления.\n\n{e}", "Nova - Обновление", 0x10)
+            return
+
+        if expected_hash:
+            downloaded_hash = calculate_file_hash(installer_path)
+            if downloaded_hash.lower() != str(expected_hash).lower():
+                set_update_state(installing=False)
+                try:
+                    os.remove(installer_path)
+                except:
+                    pass
+                if log_func:
+                    log_func("[Update] ОШИБКА: контрольная сумма установщика не совпала.")
+                native_message_box(
+                    "Контрольная сумма установщика не совпала.\n\nОбновление отменено.",
+                    "Nova - Обновление",
+                    0x10,
+                )
+                return
+
+        if log_func:
+            log_func("[Update] Установщик загружен. Запускаю мастер обновления...")
+
+        try:
+            subprocess.Popen([installer_path], cwd=os.path.dirname(installer_path))
+        except Exception as e:
+            set_update_state(installing=False)
+            if log_func:
+                log_func(f"[Update] Не удалось запустить установщик: {e}")
+            native_message_box(f"Не удалось запустить установщик.\n\n{e}", "Nova - Обновление", 0x10)
+            return
+
+        if log_func:
+            log_func("[Update] Мастер установки запущен. Nova будет закрыта для обновления.")
+
+        try:
+            stop_nova_service(silent=True)
+        except:
+            pass
+
+        try:
+            root.after(0, on_closing)
+        except:
+            os._exit(0)
+
+    def request_installer_update():
+        state = get_update_state()
+        if state.get("installing") or state.get("checking"):
+            native_message_box("Проверка или загрузка обновления уже выполняется.", "Nova - Обновление", 0x40)
+            return
+
+        def _worker():
+            set_update_state(checking=True)
+            manifest, error = fetch_update_manifest()
+            if error:
+                set_update_state(checking=False)
+                native_message_box(f"Не удалось проверить обновление.\n\n{error}", "Nova - Обновление", 0x10)
+                return
+
+            if not manifest.get("available"):
+                native_message_box(f"У вас уже актуальная версия Nova ({CURRENT_VERSION}).", "Nova - Обновление", 0x40)
+                return
+
+            is_compiled = getattr(sys, "frozen", False) or sys.argv[0].lower().endswith(".exe")
+            if not is_compiled:
+                release_url = manifest.get("release_url")
+                if release_url:
+                    answer = native_message_box(
+                        f"Доступна новая версия Nova {manifest['version']}.\n\nВы запущены из nova.pyw, поэтому установщик не будет запущен автоматически.\n\nОткрыть страницу релиза?",
+                        "Nova - Режим разработки",
+                        0x24,
+                    )
+                    if answer == 6:
+                        try:
+                            import webbrowser
+                            webbrowser.open(release_url)
+                        except Exception as e:
+                            native_message_box(f"Не удалось открыть страницу релиза.\n\n{e}", "Nova - Обновление", 0x10)
+                else:
+                    native_message_box(
+                        f"Доступна новая версия Nova {manifest['version']}.\n\nВы запущены из nova.pyw, поэтому установщик не будет запущен автоматически.",
+                        "Nova - Режим разработки",
+                        0x40,
+                    )
+                return
+
+            answer = native_message_box(
+                f"Доступна новая версия Nova {manifest['version']}.\n\nСкачать установщик и запустить обновление?",
+                "Nova - Обновление",
+                0x24,
+            )
+            if answer != 6:
+                return
+
+            _download_and_launch_update_installer(manifest, globals().get("log_print", print))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def pac_updater_worker(log_func):
         """
@@ -14805,11 +15099,15 @@ try:
         last_opera_port_state = None
         last_warp_port_state = None
         last_opera_issue_state = None
+        last_warp_issue_state = None
         last_pac_server_state = None
         pac_fail_streak = 0
         opera_bad_proxy_streak = 0
         opera_last_good_ts = 0.0
         opera_next_restart_ts = 0.0
+        warp_bad_proxy_streak = 0
+        warp_last_good_ts = 0.0
+        warp_next_recovery_ts = 0.0
         singbox_next_restart_ts = 0.0
         
         # Keep first PAC/1371 refresh close to startup to minimize DIRECT window for EU domains.
@@ -14824,6 +15122,10 @@ try:
                 if not is_service_active:
                     last_opera_port_state = None
                     last_warp_port_state = None
+                    last_warp_issue_state = None
+                    warp_bad_proxy_streak = 0
+                    warp_last_good_ts = 0.0
+                    warp_next_recovery_ts = 0.0
                     continue
 
                 now = time.time()
@@ -14833,21 +15135,79 @@ try:
                 if len(retry_timestamps) >= MAX_RETRIES:
                     continue  # Rate limit reached, skip
                 
-                # Check WARP (only if it was ever connected successfully)
+                # Check WARP runtime health and recover from dead/stuck sessions.
                 if warp_manager:
-                    if getattr(warp_manager, 'is_connected', False):
-                        status = warp_manager.get_status()
-                        if status and "Disconnected" in status:
-                            log_func("[RU] Обнаружено отключение. Переподключение...")
+                    warp_port = int(getattr(warp_manager, "port", 1370))
+                    warp_status = str(warp_manager.get_status() or "Unknown").strip()
+                    warp_status_low = warp_status.lower()
+                    warp_starting = bool(getattr(warp_manager, "_is_starting_now", False))
+                    warp_recovering = bool(getattr(warp_manager, "_is_recovering_now", False))
+                    warp_connected_flag = bool(getattr(warp_manager, "is_connected", False))
+                    warp_port_open = is_local_port_open(warp_port)
+                    warp_socks_ok = False
+
+                    if warp_port_open:
+                        try:
+                            warp_socks_ok = bool(warp_manager._test_socks5_internet(warp_port, timeout=1.8))
+                        except:
+                            warp_socks_ok = False
+
+                    if warp_port_open and warp_socks_ok:
+                        warp_bad_proxy_streak = 0
+                        warp_last_good_ts = now
+                        warp_next_recovery_ts = 0.0
+                        last_warp_issue_state = None
+                    elif warp_port_open and not warp_socks_ok:
+                        warp_bad_proxy_streak += 1
+                    else:
+                        warp_bad_proxy_streak = 0
+
+                    recover_reason = None
+                    issue_state = None
+                    enough_time_since_good = (now - warp_last_good_ts) >= 10.0 if warp_last_good_ts else True
+
+                    if not warp_starting and not warp_recovering:
+                        if ("disconnected" in warp_status_low) and warp_connected_flag:
+                            recover_reason = f"warp-cli сообщает Disconnected ({warp_status})"
+                            issue_state = "disconnected"
+                        elif ("unable" in warp_status_low or "unknown" in warp_status_low) and warp_connected_flag and enough_time_since_good:
+                            recover_reason = f"нестабильный статус WARP: {warp_status}"
+                            issue_state = "status_bad"
+                        elif not warp_connected_flag and enough_time_since_good:
+                            recover_reason = "WARP помечен как отключенный"
+                            issue_state = "flag_disconnected"
+                        elif warp_connected_flag and not warp_port_open and enough_time_since_good:
+                            recover_reason = f"локальный SOCKS порт {warp_port} закрыт"
+                            issue_state = "port_down"
+                        elif warp_connected_flag and warp_port_open and not warp_socks_ok and warp_bad_proxy_streak >= 2 and enough_time_since_good:
+                            recover_reason = f"порт {warp_port} открыт, но трафик через WARP не проходит"
+                            issue_state = "traffic_dead"
+
+                    if recover_reason and len(retry_timestamps) < MAX_RETRIES:
+                        if last_warp_issue_state != issue_state:
+                            log_func(f"[RU] Обнаружена проблема WARP: {recover_reason}. Запуск восстановления...")
+                        last_warp_issue_state = issue_state
+
+                        if now >= warp_next_recovery_ts:
                             retry_timestamps.append(now)
                             time.sleep(RETRY_PAUSE)
-                            warp_manager.run_warp_cli("connect")
-                            time.sleep(5)
-                            new_status = warp_manager.get_status()
-                            if new_status and "Connected" in new_status:
+                            recovered = False
+                            try:
+                                recovered = bool(warp_manager.recover_connection(reason=recover_reason))
+                            except Exception as e:
+                                if IS_DEBUG_MODE:
+                                    log_func(f"[RU] [Diag] Ошибка восстановления WARP: {e}")
+
+                            if recovered:
+                                warp_bad_proxy_streak = 0
+                                warp_last_good_ts = time.time()
+                                warp_next_recovery_ts = 0.0
+                                last_warp_issue_state = None
                                 log_func("[RU] Соединение восстановлено.")
                             else:
-                                log_func(f"[RU] Не удалось восстановить: {new_status}")
+                                warp_next_recovery_ts = time.time() + 20.0
+                                last_warp_issue_state = "recover_failed"
+                                log_func(f"[RU] Не удалось восстановить WARP автоматически. Последний статус: {warp_status}")
                 
                 # Check Opera Proxy availability (process can be None on failed start).
                 if opera_proxy_manager:
@@ -15075,28 +15435,14 @@ try:
 
     def check_and_update_worker(log_func):
         """Фоновая проверка обновлений."""
-        # Обновление работает только в скомпилированном виде (.exe)
-        # FIX: Debug log to verify start
-        
         if "--no-update" in sys.argv:
             log_func("[Update] Автообновление отключено пользователем (--no-update).")
             return
 
-        log_func("[Update] Запуск потока обновлений...") 
-        
-        # FIX: Robust frozen check for Nuitka onefile
-        is_frozen = getattr(sys, 'frozen', False) or sys.argv[0].lower().endswith(".exe")
-        
-        if not is_frozen:
-            log_func(f"[Update] Не скомпилировано (frozen={getattr(sys, 'frozen', False)}). Режим отладки: только проверка версии.")
-            # return  <-- FIX: Don't return, allow checking
-
-        try:
-            # FIX: Import requests here to ensure it's available in this thread
-            import requests
-        except ImportError as e:
-            log_func(f"[Update] CRITICAL: Ошибка импорта requests: {e}")
-            return
+        log_func("[Update] Запуск проверки обновлений установщика...")
+        is_compiled = getattr(sys, "frozen", False) or sys.argv[0].lower().endswith(".exe")
+        if not is_compiled:
+            log_func("[Update] Режим разработки: nova.pyw только проверяет новую версию, без запуска установщика.")
 
         # Capture Run ID to die if Service restarts
         my_run_id = SERVICE_RUN_ID
@@ -15109,202 +15455,22 @@ try:
                 break
             
             try:
-                # 1. Проверка версии
-                latest_version = None
-                download_url = None
-                expected_hash = None
-                
-                try:
-                    session = requests.Session()
-                    session.trust_env = False
-                    # FIX: Add browser-like headers to prevent throttling and improve stability
-                    session.headers.update({
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Accept': '*/*',
-                        'Accept-Encoding': 'identity',  # Prevent unintended compression for already compressed binaries
-                    })
-                    r = session.get(UPDATE_URL, timeout=10)
-                    
-                    if r.status_code == 200:
-                        data = r.json()
-                        latest_version = data.get("version")
-                        download_url = data.get("url")
-                        # Поддержка разных ключей для хеша
-                        expected_hash = data.get("sha256") or data.get("hash") or data.get("checksum")
-                        # Если формат ключа "algo:hash", убираем префикс
-                        if expected_hash and ":" in expected_hash:
-                            expected_hash = expected_hash.split(":", 1)[1]
-                    else:
-                        # Сервер ответил ошибкой (404 и т.д.)
-                        if first_run: log_func("[Update] Новая версия программы готовится (Status != 200)")
-                        
-                except Exception as e:
-                    # Ошибка сети/парсинга -> считаем что обновления нет/готовится
-                    # FIX: Show error for debug
+                set_update_state(checking=True)
+                manifest, error = fetch_update_manifest()
+                if error:
+                    set_update_state(checking=False)
                     if first_run:
-                        log_func(f"[Update] Ошибка получения данных: {e}") 
-                        log_func("[Update] Новая версия программы готовится")
-                    # Пауза 8 часов
-                    first_run = False
-                    for _ in range(28800):
-                        if is_closing: return
-                        time.sleep(1)
-                    continue
-
-                if not latest_version or not download_url:
-                     # JSON некорректен или нет URL
-                    if first_run: log_func("[Update] Новая версия программы готовится (No Data)")
-                    first_run = False
-                    for _ in range(28800):
-                        if is_closing: return
-                        time.sleep(1)
-                    continue
-
-                # Debug version comparison
-                should_update = compare_versions(latest_version, CURRENT_VERSION)
-                if first_run and IS_DEBUG_MODE:
-                    log_func(f"[Update-Debug] Server: {latest_version}, Local: {CURRENT_VERSION}, Update: {should_update}, Frozen: {is_frozen}")
-
-                if should_update:
-                    
-                    # FIX: Check frozen status BEFORE downloading
-                    if not is_frozen and not sys.argv[0].lower().endswith(".exe"):
-                         if first_run: log_func(f"[Update] Найдено обновление: {latest_version}. (Скачивание пропущено: запуск из исходника)")
-                         first_run = False
-                         for _ in range(28800):
-                            if is_closing: return
-                            time.sleep(1)
-                         continue
-
-                    log_func(f"[Update] Происходит обновление программы до v{latest_version}. Ожидайте.")
-                    
-                    # 2. Скачивание
-                    # FIX: In Nuitka OneFile, sys.executable is the temp python.exe
-                    # sys.argv[0] is the actual path to the launched .exe
-                    current_exe = sys.argv[0]
-                    # На всякий случай нормализуем путь
-                    current_exe = os.path.abspath(current_exe)
-                    
-                    new_exe = current_exe + ".new"
-                    
-                    log_func(f"[Update] Начало загрузки файла: {download_url}")
-                    try:
-                        with session.get(download_url, stream=True, timeout=120) as r:
-                            r.raise_for_status()
-                            total_size = int(r.headers.get('content-length', 0))
-                            downloaded = 0
-                            last_log_time = 0
-                            
-                            with open(new_exe, 'wb') as f:
-                                # FIX: Increased chunk_size from 8KB to 128KB for significantly better download performance
-                                for chunk in r.iter_content(chunk_size=131072):
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    
-                                    # Логируем прогресс каждые 2 секунды или каждые 10MB
-                                    cur_time = time.time()
-                                    if cur_time - last_log_time > 2 and total_size > 0:
-                                        percent = (downloaded / total_size) * 100
-                                        log_func(f"[Update] Скачано {downloaded/1024/1024:.1f} MB / {total_size/1024/1024:.1f} MB ({percent:.0f}%)")
-                                        last_log_time = cur_time
-
-                    except Exception as e:
-                        log_func(f"[Update] FAIL: Не удалось скачать файл обновления: {e}")
-                        # Пауза 8 часов
-                        first_run = False
-                        for _ in range(28800):
-                            if is_closing: return
-                            time.sleep(1)
-                        continue
-
-                    log_func("[Update] Загрузка завершена. Проверка целостности...")
-
-                    # 3. Проверка хеша (если есть)
-                    if expected_hash:
-                        downloaded_hash = calculate_file_hash(new_exe)
-                        if not downloaded_hash or downloaded_hash.lower() != expected_hash.lower():
-                            log_func(f"[Update] ОШИБКА: Несовпадение контрольной суммы!")
-                            log_func(f"[Update] Ожидалось: {expected_hash}")
-                            log_func(f"[Update] Получено:  {downloaded_hash}")
-                            try: os.remove(new_exe)
-                            except: pass
-                            # Пауза перед следующей попыткой
-                            for _ in range(3600):
-                                if is_closing: return
-                                time.sleep(1)
-                            continue
-                        else:
-                            log_func("[Update] Контрольная сумма совпала.")
-
-                    # 4. Установка
-                    log_func("[Update] Остановка служб перед обновлением...")
-                    
-                    # Остановка процессов
-                    stop_nova_service(silent=True)
-                    # time.sleep(3) # Removed artificial delay for seamless update
-                    log_func("[Update] Службы остановлены. Замена файлов...")
-                    
-                    # Подмена файлов
-                    old_exe = current_exe + ".old"
-                    try:
-                        if os.path.exists(old_exe): os.remove(old_exe)
-                        os.rename(current_exe, old_exe)
-                        os.rename(new_exe, current_exe)
-                        
-                        # FIX: Using VBScript for reliable DELAYED restart without console windows
-                        # This allows the main process to exit completely before the new one starts
-                        
-                        vbs_script = os.path.join(get_base_dir(), "temp", "restart_helper.vbs")
-                        os.makedirs(os.path.dirname(vbs_script), exist_ok=True)
-                        
-                        # Arguments for the new process
-                        # escaping quotes for VBScript can be tricky, so we keep it simple
-                        updated_args_str = " ".join([f'"{a}"' for a in sys.argv[1:] if a != "--updated"])
-                        if updated_args_str: updated_args_str = " " + updated_args_str
-                        
-                        # VBScript content
-                        # WScript.Sleep 3000 (3 seconds)
-                        # Shell.Run path, 1 (SW_SHOWNORMAL), False (Don't wait)
-                        # We pass --updated and --cleanup-old-exe
-                        
-                        # VBScript content
-                        vbs_content = f'''WScript.Sleep 3000
-Set objShell = CreateObject("WScript.Shell")
-strCmd = """{current_exe}"" --updated --cleanup-old-exe ""{old_exe}""{updated_args_str}"
-objShell.Run strCmd, 1, False
-'''
-                        
-                        try:
-                            # FIX: WScript requires UTF-16 LE (with BOM) for non-ASCII paths, utf-8-sig causes Invalid Character error
-                            with open(vbs_script, "w", encoding="utf-16") as f:
-                                f.write(vbs_content)
-                                
-                            # Execute VBScript detached
-                            ctypes.windll.shell32.ShellExecuteW(
-                                None, 
-                                "open", 
-                                "wscript.exe", 
-                                f'"{vbs_script}"', 
-                                None, 
-                                0 # SW_HIDE (for wscript, but the app it launches will be normal)
-                            )
-                        except Exception as e:
-                            log_func(f"[Update] VBScript launch failed: {e}. Fallback to direct.")
-                             # Last resort fallback
-                            subprocess.Popen([current_exe, "--updated", "--cleanup-old-exe", old_exe] + [a for a in sys.argv[1:] if a != "--updated"])
-                        
-                        os._exit(0)
-                        
-                    except Exception as e:
-                        log_func(f"[Update] Критическая ошибка при замене файла: {e}")
-                        # Откат
-                        if os.path.exists(old_exe) and not os.path.exists(current_exe):
-                            try: os.rename(old_exe, current_exe)
-                            except: pass
-                        
-                        log_func("Обновление программы невозможно автоматически. Перезапустите Nova для установки обновления вручную")
+                        log_func(f"[Update] Не удалось получить данные обновления: {error}")
+                elif manifest.get("available"):
+                    current_state = get_update_state()
+                    if current_state.get("announced_version") != manifest["version"]:
+                        set_update_state(announced_version=manifest["version"])
+                        log_func(f"[Update] Доступна новая версия Nova {manifest['version']}. Нажмите кнопку 'Обновить Nova'.")
                 else:
-                    if first_run: log_func("Версия программы актуальна")
+                    if first_run:
+                        log_func("Версия программы актуальна")
+                    if get_update_state().get("announced_version"):
+                        set_update_state(announced_version=None)
 
             except Exception as e:
                 log_func(f"[Update] Ошибка: {e}")
@@ -15322,22 +15488,12 @@ objShell.Run strCmd, 1, False
 
     # ================= DEPENDENCY DOWNLOADER =================
     def download_dependencies(log_func, status_callback=None):
-        """Downloads required binaries if missing."""
-        # Allow download in script mode too (for debugging/first run)
-        # if not getattr(sys, 'frozen', False): return
+        """Verifies packaged local binaries in resources/bin without downloading anything."""
+        bin_dir = get_bin_dir()
+        temp_dir = os.path.join(get_base_dir(), "temp")
+        os.makedirs(bin_dir, exist_ok=True)
+        os.makedirs(temp_dir, exist_ok=True)
 
-        base = get_base_dir()
-        bin_dir = os.path.join(base, "bin")
-        temp_dir = os.path.join(base, "temp")
-        if not os.path.exists(bin_dir):
-            os.makedirs(bin_dir)
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-
-        # Base URL (Direct GitHub with browser headers - User Request)
-        BASE_URL = "https://github.com/confeden/nova_updates/raw/main/bin/"
-        
-        # Files to check/download
         files = [
             "winws.exe",
             "WinDivert.dll",
@@ -15352,382 +15508,35 @@ objShell.Run strCmd, 1, False
             "wintun.dll",
             "libcronet.dll",
             "sing-box.exe",
-            "winws_test.exe"
         ]
 
-        BIN_CHECK_FILE = os.path.join(temp_dir, "bin_check.json")
-        
-        def _load_bin_check():
-            try:
-                with open(BIN_CHECK_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except:
-                return {}
-        
-        def _save_bin_check(data):
-            try:
-                with open(BIN_CHECK_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data, f)
-            except:
-                pass
-        
-        bin_check = _load_bin_check()
-        already_verified = (
-            bin_check.get("version") == CURRENT_VERSION
-            and isinstance(bin_check.get("ok"), list)
-            and set(bin_check["ok"]) >= set(files)
-        )
-
         missing_files = []
-        for f in files:
-            path = os.path.join(bin_dir, f)
+        for name in files:
+            path = os.path.join(bin_dir, name)
             if not os.path.exists(path) or os.path.getsize(path) == 0:
-                missing_files.append(f)
+                missing_files.append(name)
 
-        if not missing_files and not already_verified:
-            # Все файлы есть локально, но ещё не проверяли размеры для этой версии.
-            # Делаем асинхронную проверку размеров к GitHub, чтобы не блочить UI
-            log_func("[Init] Проверка актуальности компонентов запланирована (в фоне)...")
-            
-            def check_sizes_async():
-                size_mismatch = []
-                try:
-                    import requests
-                    sess = requests.Session()
-                    sess.trust_env = False
-                    for f in files:
-                        url = "https://raw.githubusercontent.com/confeden/nova_updates/main/bin/{}".format(f)
-                        try:
-                            r = sess.head(url, timeout=4)
-                            if r.status_code == 200:
-                                remote_size = int(r.headers.get("content-length", 0))
-                                local_size = os.path.getsize(os.path.join(bin_dir, f))
-                                if remote_size > 0 and local_size != remote_size:
-                                    log_func(f"[Init] Размер файла {f} ({local_size}) ≠ GitHub ({remote_size}). При следующем запуске он будет обновлён.")
-                                    try: os.remove(os.path.join(bin_dir, f))
-                                    except: pass
-                                    size_mismatch.append(f)
-                        except:
-                            pass
-                except:
-                    pass
-                
-                if not size_mismatch:
-                    # Все совпало → записываем в кеш, чтобы не проверять повторно
-                    _save_bin_check({"version": CURRENT_VERSION, "ok": files})
-                    log_func("[Init] Все компоненты актуальны. Проверка сохранена в кеш.")
-                    
-            import threading
-            threading.Thread(target=check_sizes_async, daemon=True).start()
-        
-        if not missing_files:
-            return True
-
-        # Сбрасываем кеш — что-то надо скачать
-        _save_bin_check({})
-
-
-        # FIX: Force cleanup processes before attempting to update files (WinError 32 fix)
         try:
-            log_func("[Init] Остановка процессов перед обновлением компонентов...")
-            subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            subprocess.run(["taskkill", "/F", "/IM", "warp-cli.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            subprocess.run(["taskkill", "/F", "/IM", "opera-proxy.windows-amd64.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            
-            # Force stop driver service
-            subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
-            time.sleep(1.0) # Wait for release
-        except: pass
-
-        # ZIP Strategy (User Request: Single connection, faster)
-        ZIP_URL = "https://github.com/confeden/nova_updates/archive/refs/heads/main.zip"
-        zip_path = os.path.join(temp_dir, "update_temp.zip")
-
-        estimated_total_size = 30 * 1024 * 1024
-
-        def _status_progress(percent):
-            try:
-                pct = int(percent)
-            except:
-                pct = 0
-            if pct < 0:
-                pct = 0
-            if pct > 100:
-                pct = 100
-            if status_callback:
-                status_callback(f"Загрузка с GitHub {pct}% . . .")
-
-        def _detect_total_size():
-            try:
-                import requests as _requests
-                head_resp = _requests.head(
-                    ZIP_URL,
-                    allow_redirects=True,
-                    timeout=10,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                if head_resp and getattr(head_resp, "ok", False):
-                    return int(head_resp.headers.get("content-length", 0) or 0)
-            except:
-                pass
-            return 0
-
-        def _percent_from_file_size(size_bytes, max_cap=99):
-            total_ref = known_total_size if known_total_size > 0 else estimated_total_size
-            if size_bytes <= 0:
-                return 1
-            try:
-                pct = int((size_bytes / total_ref) * 100)
-            except:
-                pct = 1
-            if pct < 1:
-                pct = 1
-            if pct > max_cap:
-                pct = max_cap
-            return pct
-
-        def _monitor_download_process(proc):
-            last_pct = -1
-            while proc.poll() is None:
-                try:
-                    current_size = os.path.getsize(zip_path) if os.path.exists(zip_path) else 0
-                except:
-                    current_size = 0
-                pct = _percent_from_file_size(current_size, max_cap=99)
-                if pct > last_pct:
-                    _status_progress(pct)
-                    last_pct = pct
-                time.sleep(0.2)
-
-            # Final size probe after process exit.
-            try:
-                current_size = os.path.getsize(zip_path) if os.path.exists(zip_path) else 0
-            except:
-                current_size = 0
-            pct = _percent_from_file_size(current_size, max_cap=99)
-            if pct > last_pct:
-                _status_progress(pct)
-                last_pct = pct
-            return last_pct
-
-        known_total_size = _detect_total_size()
-        _status_progress(1)
-        log_func(f"[Init] Обнаружено отсутствие {len(missing_files)} компонентов. Скачивание ZIP-архива...")
-        
-        import requests
-        from requests.adapters import HTTPAdapter
-        import zipfile
-        import shutil
-
-        # Optimize connection
-        session = requests.Session()
-        retries = HTTPAdapter(max_retries=3, pool_connections=1, pool_maxsize=1)
-        session.mount('https://', retries)
-        
-        # PowerShell Masking
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.22621; en-US) PowerShell/7.4.0",
-        })
-
-        download_success = False
-
-        # --- METHOD 1: System Curl (HTTP/2, Faster) ---
-        if not download_success:
-            curl_path = shutil.which("curl")
-            if curl_path:
-                log_func(f"[Download] Использование System Curl (HTTP/2) для скорости...")
-                try:
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    
-                    process = subprocess.Popen(
-                        [curl_path, "-L", "-o", zip_path, ZIP_URL],
-                        stdout=subprocess.DEVNULL, 
-                        stderr=subprocess.DEVNULL,
-                        startupinfo=startupinfo,
-                    )
-                    _monitor_download_process(process)
-                    if process.returncode == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
-                         log_func("[Download] Curl успешно скачал файл.")
-                         _status_progress(100)
-                         download_success = True
-                    else:
-                        log_func(f"[Download] Curl завершился с кодом {process.returncode}")
-                except Exception as e:
-                    log_func(f"[Download] Curl Error: {e}. Пробуем следующий метод...")
-
-        # --- METHOD 2: PowerShell (Native Windows) ---
-        if not download_success and shutil.which("powershell"):
-            log_func("[Download] Использование PowerShell (Invoke-WebRequest)...")
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                
-                # Use Invoke-WebRequest
-                ps_cmd = f"Invoke-WebRequest -Uri '{ZIP_URL}' -OutFile '{zip_path}' -UseBasicParsing"
-
-                process = subprocess.Popen(
-                    ["powershell", "-NoProfile", "-Command", ps_cmd],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    startupinfo=startupinfo
-                )
-                _monitor_download_process(process)
-                
-                if process.returncode == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
-                    log_func("[Download] PowerShell успешно скачал файл.")
-                    _status_progress(100)
-                    download_success = True
-                else:
-                    log_func("[Download] PowerShell Error.")
-            except Exception as e:
-                 log_func(f"[Download] PowerShell Exception: {e}")
-
-        # --- METHOD 3: CertUtil (Native Windows Legacy) ---
-        if not download_success and shutil.which("certutil"):
-            log_func("[Download] Использование CertUtil...")
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-                # -urlcache -split -f "url" "file"
-                process = subprocess.Popen(
-                    ["certutil", "-urlcache", "-split", "-f", ZIP_URL, zip_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    startupinfo=startupinfo
-                )
-                _monitor_download_process(process)
-                
-                if process.returncode == 0 and os.path.exists(zip_path) and os.path.getsize(zip_path) > 0:
-                    log_func("[Download] CertUtil успешно скачал файл.")
-                    _status_progress(100)
-                    download_success = True
-                else:
-                    log_func(f"[Download] CertUtil Error.")
-            except Exception as e:
-                 log_func(f"[Download] CertUtil Exception: {e}")
-
-        # --- METHOD 4: Python Requests (Fallback) ---
-        if not download_success:
-                # FALLBACK: Requests
-                log_func("[Download] Использование Requests (HTTP/1.1)...")
-                with session.get(ZIP_URL, stream=True, timeout=(10, 300)) as r:
-                    r.raise_for_status()
-                    total_size = int(r.headers.get('content-length', 0))
-                    if total_size > 0:
-                        known_total_size = total_size
-                    downloaded = 0
-                    
-                    with open(zip_path, 'wb') as f:
-                        last_percent = -1
-                        for chunk in r.iter_content(chunk_size=256*1024):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                percent = _percent_from_file_size(downloaded, max_cap=99)
-                                if percent > last_percent:
-                                    _status_progress(percent)
-                                    last_percent = percent
-                
-                download_success = True # If no exception raised
-                _status_progress(100)
-
-        if not download_success:
-             raise Exception("Все методы загрузки не удались.")
-            
-        try:
-            log_func("[Init] Архивы загружен. Распаковка...")
-            if status_callback: status_callback("РАСПАКОВКА . . .")
-
-            # Extract BIN folder
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                # GitHub zip structure: nova_updates-main/bin/file.exe
-                # We need to find the prefix
-                root_folder = zip_ref.namelist()[0].split('/')[0] # usually repo-branch
-                
-                for member in zip_ref.namelist():
-                    if member.startswith(f"{root_folder}/bin/") and not member.endswith("/"):
-                        filename = os.path.basename(member)
-                        if not filename: continue
-                        
-                        # Extract to temp first to avoid AV locks/partial writes in bin
-                        temp_extract_path = os.path.join(temp_dir, filename)
-                        
-                        source = zip_ref.open(member)
-                        target = open(temp_extract_path, "wb")
-                        with source, target:
-                            shutil.copyfileobj(source, target)
-                            
-                        # Move to bin
-                        final_path = os.path.join(bin_dir, filename)
-                        if os.path.exists(final_path):
-                            try: os.remove(final_path)
-                            except: pass
-                        
-                        try:
-                            # Retry loop for moving files (robust against antivirus/driver locks)
-                            moved = False
-                            for attempt in range(3):
-                                try:
-                                    shutil.move(temp_extract_path, final_path)
-                                    moved = True
-                                    break
-                                except Exception as move_err:
-                                    if attempt < 2: 
-                                        time.sleep(1.0)
-                                        # Emergency kill again
-                                        subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-                                    else:
-                                        raise move_err
-                            
-                            if not moved: raise Exception("Move failed after retries")
-
-                        except Exception as e:
-                            log_func(f"[Init] Ошибка перемещения {filename}: {e}")
-                            
-            log_func("[Init] Распаковка завершена.")
-            
-            # Verify missing files again
-            still_missing = []
-            for f in missing_files:
-                 if not os.path.exists(os.path.join(bin_dir, f)) or os.path.getsize(os.path.join(bin_dir, f)) == 0:
-                     still_missing.append(f)
-            
-            if still_missing:
-                log_func(f"[Init] Ошибка: Не удалось извлечь {len(still_missing)} файлов из архива!")
-                if os.path.exists(zip_path): 
-                    try: os.remove(zip_path) 
-                    except: pass
-                return False
-                
-            if os.path.exists(zip_path): 
-                try: os.remove(zip_path) 
-                except: pass
-                
-            log_func("[Init] Все компоненты успешно загружены.")
-            # Сохраняем кеш — файлы свежие, следующий запуск не будет делать HEAD-запросы
-            _save_bin_check({"version": CURRENT_VERSION, "ok": files})
-            
-            # Create winws_test.exe for process isolation
-            try:
-                w_src = os.path.join(bin_dir, "winws.exe")
-                w_dst = os.path.join(bin_dir, "winws_test.exe")
-                if os.path.exists(w_src):
-                    # FIX: Only copy if missing to avoid locking active test process
-                    if not os.path.exists(w_dst):
-                        shutil.copy2(w_src, w_dst)
-            except: pass
-            
-            return True
+            winws_path = os.path.join(bin_dir, "winws.exe")
+            winws_test_path = os.path.join(bin_dir, "winws_test.exe")
+            if os.path.exists(winws_path):
+                need_copy = not os.path.exists(winws_test_path)
+                if (not need_copy) and os.path.exists(winws_test_path):
+                    need_copy = os.path.getsize(winws_test_path) != os.path.getsize(winws_path)
+                if need_copy:
+                    shutil.copy2(winws_path, winws_test_path)
         except Exception as e:
-            log_func(f"[Init] Ошибка распаковки: {e}")
-            if os.path.exists(zip_path): 
-                try: os.remove(zip_path) 
-                except: pass
+            log_func(f"[Init] Не удалось подготовить winws_test.exe: {e}")
+
+        if missing_files:
+            log_func("[Init] Ошибка: в локальной сборке отсутствуют обязательные bin-компоненты.")
+            for name in missing_files:
+                log_func(f"[Init] Missing: {name}")
             return False
 
+        if status_callback:
+            status_callback("Локальные компоненты готовы . . .")
+        return True
 
 
 
@@ -15903,9 +15712,23 @@ objShell.Run strCmd, 1, False
         if not restart_mode:
             start_bg_services()
 
+        def kernel_start_entry():
+            try:
+                _start_nova_service_logic(silent, restart_mode)
+            except Exception as e:
+                try:
+                    logger = globals().get('log_print', safe_trace)
+                    logger(f"[Init] Критическая ошибка потока запуска ядра: {e}")
+                except:
+                    pass
+                try:
+                    safe_trace(f"[KernelStart] Fatal: {e}")
+                except:
+                    pass
+
         # 2. Kernel Start
         try:
-            threading.Thread(target=lambda: _start_nova_service_logic(silent, restart_mode), daemon=True).start()
+            threading.Thread(target=kernel_start_entry, daemon=True).start()
         except: pass
 
         # 2. Start Background Services (Async)
@@ -15933,8 +15756,7 @@ objShell.Run strCmd, 1, False
             root.after(0, lambda: messagebox.showerror("Ошибка", "Нужны права Администратора!"))
             return
 
-        
-        exe_path = os.path.join(get_base_dir(), "bin", WINWS_FILENAME)
+        exe_path = os.path.join(get_bin_dir(), WINWS_FILENAME)
         if not os.path.exists(exe_path): 
             root.after(0, lambda: messagebox.showerror("Ошибка", f"Файл {WINWS_FILENAME} не найден!"))
             return
@@ -16246,7 +16068,7 @@ objShell.Run strCmd, 1, False
                     if "=" in arg and ".bin" in arg:
                         k, v = arg.split("=", 1)
                         fname = os.path.basename(v)
-                        if os.path.exists(os.path.join(get_base_dir(), "fake", fname)):
+                        if os.path.exists(os.path.join(get_fake_dir(), fname)):
                             arg = f"{k}={os.path.join(get_base_dir(), 'fake', fname)}"
                             
                     if arg.startswith("--wf-tcp"): args.append(arg.replace("--wf-tcp", "--filter-tcp"))
@@ -16294,7 +16116,7 @@ objShell.Run strCmd, 1, False
                 if "=" in arg and ".bin" in arg:
                     k, v = arg.split("=", 1)
                     fname = os.path.basename(v)
-                    if os.path.exists(os.path.join(get_base_dir(), "fake", fname)):
+                    if os.path.exists(os.path.join(get_fake_dir(), fname)):
                         arg = f"{k}={os.path.join(get_base_dir(), 'fake', fname)}"
 
                 if arg == "--new":
@@ -17346,6 +17168,8 @@ objShell.Run strCmd, 1, False
         def __init__(self, canvas, x, y, text, font, fg="black", anchor="center", bg_color=None, spacing=2, outline_color="black", outline_width=1):
             self.canvas = canvas
             self.fg = fg
+            self.bg_color = bg_color
+            self.visible = True
             self.padding_x = 10
             self.padding_y = 4
             self.spacing = spacing
@@ -17421,8 +17245,9 @@ objShell.Run strCmd, 1, False
             h = (y2 - y1) + self.padding_y * 2
             r = h / 2
             
-            # Генерируем градиентный фон на основе цвета текста
-            self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(self.fg), center_alpha=128)
+            # Генерируем фон "пилюли" на основе явного цвета или цвета текста
+            bg_source = self.bg_color if self.bg_color is not None else self.fg
+            self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(bg_source), center_alpha=128)
             
             # Центрируем изображение относительно текста
             cx = x1 + (x2 - x1) / 2
@@ -17447,6 +17272,10 @@ objShell.Run strCmd, 1, False
             if redraw:
                 self._draw_text()
                 self._draw_bg()
+                self.set_visible(self.visible)
+
+            if "visible" in kwargs:
+                self.set_visible(bool(kwargs["visible"]))
 
         def bind(self, seq, func):
             self.bindings.append((seq, func))
@@ -17458,6 +17287,152 @@ objShell.Run strCmd, 1, False
                 for item in self.text_items:
                     self.canvas.tag_bind(item, seq, func)
 
+        def move_to(self, x, y, anchor=None):
+            self.x = x
+            self.y = y
+            if anchor:
+                self.anchor = anchor
+            self._draw_text()
+            self._draw_bg()
+            self.set_visible(self.visible)
+
+        def set_visible(self, visible=True):
+            self.visible = bool(visible)
+            state = "normal" if visible else "hidden"
+            try:
+                self.canvas.itemconfig(self.bg_id, state=state)
+            except:
+                pass
+            for item in self.text_items:
+                try:
+                    self.canvas.itemconfig(item, state=state)
+                except:
+                    pass
+
+        def pack(self, **kwargs): pass
+
+    class CanvasRegionPill:
+        def __init__(self, canvas, x, y, font, anchor="sw", bg_color="#E0E0E0", gap=12):
+            self.canvas = canvas
+            self.x = x
+            self.y = y
+            self.anchor = anchor
+            self.bg_color = bg_color
+            self.gap = gap
+            self.padding_x = 10
+            self.padding_y = 4
+            self.visible = True
+            self.segments = []
+            self.text_items = []
+            self.bg_id = canvas.create_image(x, y, anchor="center")
+            self.bg_image = None
+            self.font_spec = font
+
+            f_family = font[0]
+            f_size = font[1]
+            f_weight = "bold" if "bold" in font else "normal"
+            self.tk_font = tkfont.Font(family=f_family, size=f_size, weight=f_weight)
+
+        def _clear_text(self):
+            for item in self.text_items:
+                try:
+                    self.canvas.delete(item)
+                except:
+                    pass
+            self.text_items = []
+
+        def _draw_bg(self):
+            if not self.text_items:
+                self.canvas.itemconfig(self.bg_id, state="hidden")
+                return
+
+            x1, y1, x2, y2 = self.canvas.bbox(self.text_items[0])
+            for item in self.text_items[1:]:
+                bx1, by1, bx2, by2 = self.canvas.bbox(item)
+                x1 = min(x1, bx1)
+                y1 = min(y1, by1)
+                x2 = max(x2, bx2)
+                y2 = max(y2, by2)
+
+            w = max(1, int(round((x2 - x1) + self.padding_x * 2)))
+            h = max(1, int(round((y2 - y1) + self.padding_y * 2)))
+            r = max(1, int(round(h / 2)))
+            self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(self.bg_color), center_alpha=128)
+
+            cx = x1 + (x2 - x1) / 2
+            cy = y1 + (y2 - y1) / 2
+            self.canvas.coords(self.bg_id, cx, cy)
+            self.canvas.itemconfig(self.bg_id, image=self.bg_image, state="normal")
+            self.canvas.tag_lower(self.bg_id, self.text_items[0])
+
+        def _redraw(self):
+            self._clear_text()
+            if not self.segments:
+                self.canvas.itemconfig(self.bg_id, state="hidden")
+                return
+
+            widths = [self.tk_font.measure(text) for text, _ in self.segments]
+            total_width = sum(widths) + self.gap * max(0, len(widths) - 1)
+
+            if self.anchor == "center":
+                cur_x = self.x - total_width / 2
+            elif self.anchor in ["e", "se", "ne"]:
+                cur_x = self.x - total_width
+            else:
+                cur_x = self.x
+
+            for index, (text, color) in enumerate(self.segments):
+                seg_width = widths[index]
+                center_x = cur_x + seg_width / 2
+                item_id = self.canvas.create_text(
+                    center_x,
+                    self.y,
+                    text=text,
+                    font=self.font_spec,
+                    fill=color,
+                    anchor="center",
+                )
+                self.text_items.append(item_id)
+                cur_x += seg_width + self.gap
+
+            self._draw_bg()
+            self.set_visible(self.visible)
+
+        def set_regions(self, segments):
+            normalized = []
+            for text, color in segments or []:
+                text_s = str(text or "").strip()
+                color_s = str(color or "").strip()
+                if text_s and color_s:
+                    normalized.append((text_s, color_s))
+            target_visible = bool(normalized)
+            if normalized == self.segments:
+                self.set_visible(target_visible)
+                return
+            self.segments = normalized
+            self.visible = target_visible
+            self._redraw()
+
+        def move_to(self, x, y, anchor=None):
+            self.x = x
+            self.y = y
+            if anchor:
+                self.anchor = anchor
+            self._redraw()
+
+        def set_visible(self, visible=True):
+            self.visible = bool(visible)
+            state = "normal" if self.visible and self.text_items else "hidden"
+            try:
+                self.canvas.itemconfig(self.bg_id, state=state)
+            except:
+                pass
+            for item in self.text_items:
+                try:
+                    self.canvas.itemconfig(item, state=state)
+                except:
+                    pass
+
         def pack(self, **kwargs): pass
 
     class CanvasButton:
@@ -17465,6 +17440,7 @@ objShell.Run strCmd, 1, False
             self.canvas = canvas
             self.command = command
             self.fg = fg
+            self.bg_color = bg_color
             self.padding_x = 10
             self.padding_y = 4
             self.text_id = canvas.create_text(x, y, text=text, font=font, fill=fg, anchor=anchor)
@@ -17486,7 +17462,8 @@ objShell.Run strCmd, 1, False
             r = h / 2
             
             # Генерируем градиентный фон
-            self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(self.fg), center_alpha=128)
+            bg_source = self.bg_color if self.bg_color is not None else self.fg
+            self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(bg_source), center_alpha=128)
             
             cx = x1 + (x2 - x1) / 2
             cy = y1 + (y2 - y1) / 2
@@ -17512,6 +17489,9 @@ objShell.Run strCmd, 1, False
             if "fg" in kwargs:
                 self.fg = kwargs["fg"]
                 self.canvas.itemconfig(self.text_id, fill=self.fg)
+                self._draw_bg()
+            if "bg" in kwargs:
+                self.bg_color = kwargs["bg"]
                 self._draw_bg()
         def place(self, **kwargs): pass
 
@@ -17624,8 +17604,7 @@ objShell.Run strCmd, 1, False
             exe_name = os.path.basename(sys.executable)
             
             # RULE 1: Infrastructure exists -> Clean
-            # "в папке где запускается Nova.exe есть любая из папок (bin ip list strat fake list)"
-            core_folders = ["bin", "ip", "list", "strat", "fake"]
+            core_folders = ["resources", "ip", "list", "strat"]
             has_infrastructure = any(os.path.isdir(os.path.join(base_dir, f)) for f in core_folders)
             
             if not has_infrastructure:
@@ -17720,46 +17699,39 @@ objShell.Run strCmd, 1, False
         # dns_manager инициализируется в launch_background_tasks
 
         # === INFRASTRUCTURE DEPLOY ===
-        # Теперь безопасно распаковываем файлы (мы либо в чистой папке, либо переехали)
-        
-        # Check First Run Condition BEFORE deploy (if strat folder missing, it's a fresh install)
-        is_first_run_condition = not os.path.exists(os.path.join(get_base_dir(), "strat"))
-        
-        try:
-            dep_logs = deploy_infrastructure()
-        except Exception as e:
-            print(f"Deploy failed: {e}")
-            dep_logs = []
-        
-        # Исправляем стратегии синхронно перед запуском GUI, чтобы избежать гонок
-        try:
-            rest_logs = restore_missing_strategies()
-        except Exception as e:
-            print(f"Restore failed: {e}")
-            rest_logs = []
-        
-        # Show Update Report
-        total_logs = (dep_logs or []) + (rest_logs or [])
-        
-        # FIX: Check if this is a fresh install (folders created)
-        # If so, suppress "Restored/Updated" spam
-        is_fresh_install = is_first_run_condition or any("Создана папка" in l for l in total_logs)
-        
-        if is_fresh_install:
-             # Filter out "Restored" messages, keep only Errors
-             total_logs = [l for l in total_logs if "Err" in l or "Crit" in l]
-        
-        # Filter logs: Show Message Box ONLY if there are REAL updates/fixes.
-        # Ignore "Created folder", "Created file" (Fresh Install events).
-        important_keywords = ["обновлен", "пересоздан", "сброс", "восстановлен", "update", "reset", "restore"]
-        
-        display_logs = [log for log in total_logs if any(k in log.lower() for k in important_keywords)]
+        # For script mode, do not block first paint with maintenance checks.
+        total_logs = []
+        display_logs = []
+        deferred_startup_repairs = not is_compiled_build()
 
-        # Update Report Popup removed by user request (Silent Mode)
-        if display_logs and IS_DEBUG_MODE:
-             # Only print to stdout in debug mode
-             print(f"[Init] Update Report ({len(display_logs)} items):")
-             for l in display_logs: print(f" - {l}")
+        if is_compiled_build():
+            # Теперь безопасно распаковываем файлы (мы либо в чистой папке, либо переехали)
+            is_first_run_condition = not os.path.exists(os.path.join(get_base_dir(), "strat"))
+
+            try:
+                dep_logs = deploy_infrastructure()
+            except Exception as e:
+                print(f"Deploy failed: {e}")
+                dep_logs = []
+
+            try:
+                rest_logs = restore_missing_strategies()
+            except Exception as e:
+                print(f"Restore failed: {e}")
+                rest_logs = []
+
+            total_logs = (dep_logs or []) + (rest_logs or [])
+            is_fresh_install = is_first_run_condition or any("Создана папка" in l for l in total_logs)
+
+            if is_fresh_install:
+                 total_logs = [l for l in total_logs if "Err" in l or "Crit" in l]
+
+            important_keywords = ["обновлен", "пересоздан", "сброс", "восстановлен", "update", "reset", "restore"]
+            display_logs = [log for log in total_logs if any(k in log.lower() for k in important_keywords)]
+
+            if display_logs and IS_DEBUG_MODE:
+                 print(f"[Init] Update Report ({len(display_logs)} items):")
+                 for l in display_logs: print(f" - {l}")
 
         import struct # Импорт struct для работы с IP
         
@@ -17796,11 +17768,7 @@ objShell.Run strCmd, 1, False
         root = tk.Tk()
         root.withdraw()
         root.title(f"Nova v{CURRENT_VERSION}")
-        try:
-            # FIX: Load icon from internal resources
-            icon_path = get_internal_path("icon.ico")
-            if os.path.exists(icon_path):
-                root.iconbitmap(icon_path)
+        try: apply_window_icon(root)
         except: pass
         root.resizable(False, False)
         root.configure(bg=COLOR_BG)
@@ -17899,16 +17867,25 @@ objShell.Run strCmd, 1, False
         # Beta Mode Flag
         is_beta_mode = False
         try:
-            img_path = get_internal_path(os.path.join("img", "background.png"))
-            # Проверка на частую ошибку с JPG
-            if os.path.exists(os.path.join(get_base_dir(), "img", "background.jpg")):
-                print("[UI] Внимание: найден background.jpg, но программа поддерживает только PNG!")
+            bg_image = None
+            if not getattr(sys, 'frozen', False):
+                img_path = get_internal_path(os.path.join("img", "background.png"))
+                if os.path.exists(os.path.join(get_base_dir(), "img", "background.jpg")):
+                    print("[UI] Внимание: найден background.jpg, но программа поддерживает только PNG!")
+                if os.path.exists(img_path):
+                    bg_image = tk.PhotoImage(file=img_path, master=root)
+            if bg_image is None:
+                try:
+                    from PIL import ImageTk
+                    embedded_bg = _load_embedded_pil_image("background")
+                    if embedded_bg is not None:
+                        bg_image = ImageTk.PhotoImage(embedded_bg, master=root)
+                except:
+                    pass
 
-            if os.path.exists(img_path):
-                bg_image = tk.PhotoImage(file=img_path, master=root)
-                main_canvas.bg_image = bg_image # Сохраняем ссылку, чтобы сборщик мусора не удалил картинку
+            if bg_image is not None:
+                main_canvas.bg_image = bg_image
                 main_canvas.create_image(0, 0, image=bg_image, anchor="nw")
-                # print(f"[UI] Фон успешно загружен: {img_path}")
             else:
                 # Fallback: Gradient Background (Sapphire -> Yogurt)
                 # Only if running as script (.pyw)
@@ -17952,7 +17929,7 @@ objShell.Run strCmd, 1, False
         except Exception as e:
             print(f"[UI] Ошибка загрузки фона: {e}")
 
-        status_label = CanvasLabel(main_canvas, w/2, h/2 - 45, "Запуск...", ("Segoe UI Semibold", 10), "grey", bg_color="#E0E0E0", outline_color="#DFF07E", outline_width=2)
+        status_label = CanvasLabel(main_canvas, w/2, h/2 - 45, "Запуск...", ("Segoe UI Semibold", 10), "grey", outline_color="#DFF07E", outline_width=2)
         status_label.bind("<Button-1>", start_move)
         status_label.bind("<B1-Motion>", do_move)
         
@@ -17965,7 +17942,93 @@ objShell.Run strCmd, 1, False
              log_fg = "#FFFFFF"     # White Text
              log_bg = "#0F52BA"     # Sapphire Background
              
+        update_button_default_fg = COLOR_TEXT_NORMAL
+        update_button_available_fg = COLOR_TEXT_NORMAL
+        btn_update = CanvasLabel(
+            main_canvas,
+            w - 10,
+            h - 34,
+            "Обновить Nova",
+            ("Segoe UI Semibold", 9),
+            fg=update_button_available_fg,
+            anchor="se",
+            outline_color="#DFF07E",
+            outline_width=2,
+        )
+        btn_update.bind("<Button-1>", lambda e: request_installer_update())
+        btn_update.bind("<Enter>", lambda e: main_canvas.config(cursor="hand2"))
+        btn_update.bind("<Leave>", lambda e: main_canvas.config(cursor=""))
+        btn_update.set_visible(False)
         btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, fg=log_fg, bg_color=log_bg)
+        refresh_update_button()
+
+        INDICATOR_RU = "#8FD8FF"
+        INDICATOR_EU = "#D8B6BF"
+
+        region_indicator_pill = CanvasRegionPill(
+            main_canvas,
+            10,
+            h - 10,
+            ("Segoe UI", 9, "bold"),
+            anchor="sw",
+            bg_color=log_bg,
+        )
+        region_indicator_pill.set_regions([])
+
+        def apply_main_connection_indicator_state(warp_ok, opera_ok):
+            regions = []
+            if warp_ok:
+                regions.append(("RU", INDICATOR_RU))
+            if opera_ok:
+                regions.append(("EU", INDICATOR_EU))
+            try:
+                region_indicator_pill.set_regions(regions)
+            except:
+                pass
+
+        def refresh_main_connection_indicators():
+            apply_main_connection_indicator_state(False, False)
+
+            def _worker():
+                last_state = None
+                while not is_closing:
+                    warp_ok = False
+                    opera_ok = False
+                    try:
+                        wm = globals().get("warp_manager")
+                        warp_connected = bool(getattr(wm, "is_connected", False)) if wm else False
+                        warp_port = int(globals().get("WARP_PORT", 1370))
+                        warp_ok = bool(warp_connected and is_local_port_open_quick(warp_port, timeout=0.2))
+                    except:
+                        warp_ok = False
+
+                    try:
+                        opm = globals().get("opera_proxy_manager")
+                        opera_port = int(getattr(opm, "port", 1371)) if opm else 1371
+                        opera_ok = bool(is_local_http_proxy_responsive(port=opera_port, timeout=0.25))
+                    except:
+                        opera_ok = False
+
+                    current_state = (warp_ok, opera_ok)
+                    if current_state != last_state:
+                        try:
+                            if root:
+                                root.after(
+                                    0,
+                                    lambda state=current_state: apply_main_connection_indicator_state(state[0], state[1]),
+                                )
+                        except:
+                            pass
+                        last_state = current_state
+
+                    for _ in range(6):
+                        if is_closing:
+                            return
+                        time.sleep(0.25)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        refresh_main_connection_indicators()
 
         # === Autostart Context Menu (Main Window) ===
         main_context_menu = tk.Menu(root, tearoff=0)
@@ -18009,7 +18072,6 @@ objShell.Run strCmd, 1, False
 
 
         root.update()
-        ensure_log_window_created()
         
         # Auto-open log window if --show-log argument is present (restart)
         if ARGS_PARSED.get('show_log', False):
@@ -18028,6 +18090,29 @@ objShell.Run strCmd, 1, False
             root.focus_force()
             root.update() # Принудительная отрисовка GUI
             root.after(100, lambda: root.attributes("-topmost", False))
+
+        def run_deferred_startup_repairs():
+            if not deferred_startup_repairs:
+                return
+
+            def _worker():
+                try:
+                    deferred_logs = restore_missing_strategies()
+                    important_keywords = ["обновлен", "пересоздан", "сброс", "восстановлен", "update", "reset", "restore"]
+                    deferred_display = [log for log in (deferred_logs or []) if any(k in log.lower() for k in important_keywords)]
+                    if deferred_display and IS_DEBUG_MODE:
+                        print(f"[Init] Deferred Update Report ({len(deferred_display)} items):")
+                        for item in deferred_display:
+                            print(f" - {item}")
+                except Exception as e:
+                    try:
+                        safe_trace(f"[Init] Deferred restore failed: {e}")
+                    except:
+                        pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        run_deferred_startup_repairs()
 
         # Запуск основного ядра С НЕБОЛЬШОЙ ЗАДЕРЖКОЙ (дает UI продышаться)
         root.after(100, lambda: start_nova_service())
