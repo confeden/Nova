@@ -1,4 +1,4 @@
-# version: 1.15.6
+# version: 1.16
 4pda.to
 alkalimakersuite-pa.clients6.google.com
 anthropic.com
@@ -22,10 +22,13 @@ google.nl
 gql.twitch.tv
 grizzlysms.com
 grok.com
+habr.com
 hex-rays.com
 invideo.io
 jules.google.com
+kilo.ai
 kodikplayer.com
+meta.ai
 msys2.org
 mtraf.io
 notebooklm.google.com
@@ -40,6 +43,7 @@ ru-board.com
 rutracker.org
 rutrk.org
 sagernet.org
+skcrtxr.com
 smspva.com
 sora.com
 spotify.com

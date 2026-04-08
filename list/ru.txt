@@ -1,4 +1,4 @@
-# version: 1.15.6
+# version: 1.16
 1337x.to
 adobe.com
 adobe.io
@@ -8,6 +8,7 @@ amnezia.org
 anydesk.com
 arena.ai
 arkoselabs.com
+azure.com
 bbc-reporting-api.app
 bbc.com
 cdninstagram.com
@@ -15,7 +16,6 @@ chartbeat.com
 chess.com
 chesscomfiles.com
 clawbot.ai
-cloudapp.azure.com
 cloudflare-ech.com
 cloudflare.com
 cloudflare.net
@@ -57,13 +57,14 @@ hexed.it
 ibb.co
 instagram.com
 island-of-pleasure.site
-kilo.ai
 kinozal.tv
-login.microsoft.com
+live.com
 lostfilm.tv
+lumalabs.ai
 mangamirai.com
 mcpmarket.com
 meet.google.com
+microsoft.com
 mmcdn.com
 modrinth.com
 myanimelist.net
@@ -116,6 +117,7 @@ warp.dev
 warp.plus
 whatsapp.com
 whatsapp.net
+workos.com
 x.com
 xv-ru.com
 zendesk.com

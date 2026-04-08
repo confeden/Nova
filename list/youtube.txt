@@ -1,8 +1,8 @@
-# version: 1.15.6
-googleusercontent.com
+# version: 1.16
+yt3.ggpht.com
+yt4.ggpht.com
+yt3.googleusercontent.com
 googlevideo.com
-gstatic.com
-ggpht.com
 jnn-pa.googleapis.com
 wide-youtube.l.google.com
 youtube-nocookie.com

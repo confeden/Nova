@@ -1,24 +1,32 @@
-# version: 1.15.6
+# version: 1.16
 akamaihd.net
 apteka-april.ru
 apteka.ru
 cdn-tinkoff.ru
 cdnflow.ru
 cdnwb.ru
+chrome.cloudflare-dns.com
 cloud.ru
 cloudcode-pa.googleapis.com
+cloudflare-dns.com
 dev-tcsgroup.io
+dns.google
+dns.google.com
 domclick.ru
 dzen.ru
 eapteka.ru
 g.co
 github.com
 github.io
+google.com
+googleusercontent.com
 gosuslugi.ru
 gov.ru
+gstatic.com
 gu-st.ru
 imgsmail.ru
 kaspersky.com
+mozilla.cloudflare-dns.com
 nvidia.com
 ok.me
 ok.ru
@@ -34,6 +42,7 @@ s.team
 sber.ru
 sberbank.ru
 sberdevices.ru
+security.cloudflare-dns.com
 steam-chat.com
 steam.tv
 steamcommunity.com

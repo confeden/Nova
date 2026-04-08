@@ -1,4 +1,4 @@
-# version: 1.15.6
+# version: 1.16
 1337x.to
 3dn.ru
 7tv.app
@@ -2470,7 +2470,6 @@ apt-petrovsky.com
 apt1.ru
 apte4ka.com
 aptechniimir.ru
-apteka-april.ru
 aptekistolichki.ru
 aptinance.com
 aptoide.com
@@ -10113,7 +10112,6 @@ closermoney.ru
 cloudbet.com
 cloudbuddy.online
 cloudfall.com.ua
-cloudflareclient.com
 cloudhdwallpapers.com
 cloudlinks.ru
 cloudns.info
@@ -12924,7 +12922,6 @@ dirultra.com
 dirupload.com
 dirzfinance.com
 dis-course.net
-dis.gd
 disabilityworks.org
 disartive.art
 disbalancer.com
@@ -12935,19 +12932,6 @@ disclosures.ru
 disco-riedl.at
 discohustle.ru
 discont24.biz
-discord.co
-discord.com
-discord.design
-discord.dev
-discord.gg
-discord.gift
-discord.gifts
-discord.new
-discordactivities.com
-discordapp.com
-discordapp.net
-discordsays.com
-discordsez.com
 discountcannabisseeds.co.uk
 discountordie.org
 discountseeds.com
@@ -22158,10 +22142,8 @@ goodwin.am
 goodwine.com.ua
 goodzips.com
 googas.ru
-google.com
 google.dev
 googleadservices.com
-googleapis.com
 googleclass.ru
 googlesyndication.com
 googletagmanager.com
@@ -23128,7 +23110,9 @@ habdd.com
 habedieeh.re
 haber100.com
 habitek.ru
+habr.com
 habragay.tech
+habrastorage.org
 hack-forum.ru
 hackedfreegames.com
 hackercat.ru
@@ -40788,7 +40772,6 @@ nv77pokerdom.com
 nv77pokerdom.xyz
 nv7pokerdom.com
 nvddt.ru
-nvidia.com
 nvip.com.ua
 nvkholding.ru
 nvkonline.ru
@@ -42492,7 +42475,6 @@ ozodlik.mobi
 ozodlik.org
 ozon-obninsk.ru
 ozon-rc.biz
-ozone.ru
 ozozo.ru
 ozpp.ru
 ozppou.ru
@@ -50200,7 +50182,6 @@ rstno.ru
 rstoolss.info
 rsukraine.org
 rt-pornhub.com
-rt.ru
 rt12dec.ru
 rte-expo.ru
 rtek24.ru
@@ -54226,6 +54207,7 @@ skb-kiparis.ru
 skb-russia.ru
 skbic.ru
 skbparus.ru
+skcrtxr.com
 skdiamant.ru
 skedem.ru
 skelet.info
@@ -56465,7 +56447,6 @@ stealthy.co
 stealthypost.org
 stealthyseeds.com
 steamnetwork.ru
-steampowered.com
 steamystyle.homes
 stedmood.ru
 steel-guide.ru
@@ -58064,8 +58045,6 @@ telegram-politics.com
 telegram-porn.com
 telegram-store.com
 telegram.cc
-telegram.dog
-telegram.me
 telegram.org.ru
 telegram.space
 telegramcatalog.com
@@ -58080,7 +58059,6 @@ teleportal.ua
 teleporthq.app
 teleprogramma-film.site
 telerga.ph
-telesco.pe
 teleskopov.net
 teleskopow.net
 teleskopu.com.ua
@@ -63272,7 +63250,6 @@ vk-intim.com
 vk-kp.info
 vk-m.ru
 vk-photo.xyz
-vk-portal.net
 vk-public.ru
 vk-save.com
 vk.watch
@@ -64629,7 +64606,6 @@ wild.io
 wildbandito-slot.com
 wildbanditos.com
 wildberries-analytics.ru
-wildberries.ru
 wildblasteraffiliates.com
 wildbonus.ru
 wildcoins.io

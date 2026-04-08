@@ -8,7 +8,7 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.15.6"
+CURRENT_VERSION = "1.16"
 import sys
 import os
 import io
@@ -436,10 +436,13 @@ try:
     import socket
     import concurrent.futures
     import math
+    import csv
     from tkinter import scrolledtext
     import random
     import requests  # FIX: Ensure requests is included in Nuitka build
     import hashlib
+    import tempfile
+    import xml.etree.ElementTree as ET
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from collections import deque
     from tkinter import font as tkfont
@@ -1241,6 +1244,7 @@ try:
     # Lock for serializing WinWS startup (Driver Init Race Condition Fix)
     winws_startup_lock = threading.Lock()
     is_scanning = False # Флаг выполнения сканирования/подбора
+    hotswap_pause_event = threading.Event() # Пауза checker/evolution на время hot-restart ядра
     last_strategy_check_time = 0.0  # Время последней проверки стратегий (для изоляции DNS-проверок)
     is_service_active = False # Флаг активности сервиса (STOP/START)
     is_restarting = False # Флаг перезапуска (Hot Swap)
@@ -1310,9 +1314,11 @@ try:
             self.log_path = os.path.join(self.temp_dir, "sing-box.log")
             self.stderr_path = os.path.join(self.temp_dir, "sing-box.stderr.log")
             self.warp_native_profile_path = os.path.join(self.temp_dir, "warp-native-profile.json")
+            self.warp_native_refresh_state_path = os.path.join(self.temp_dir, "warp-native-refresh-state.json")
             self.process = None
             self.max_log_size = 8 * 1024 * 1024
             self._warp_udp_diag_done = False
+            self._warp_udp_supported = False
             self._app_proxy_hint_done = False
             self._using_wireguard_outbound = False
             self._wg_socks_mode_logged = False
@@ -1338,6 +1344,8 @@ try:
             self._force_disable_native_wg = False
             self._wg_disable_notice_logged = False
             self._wg_exit_timestamps = []
+            self._wg_profile_refresh_lock = threading.Lock()
+            self._wg_profile_refresh_in_progress = False
             # Performance knobs (defaults tuned for lower CPU on average desktops).
             def _env_bool(name, default):
                 raw = os.environ.get(name, None)
@@ -2027,9 +2035,71 @@ try:
             except:
                 return False
 
+        def _load_warp_native_refresh_state(self):
+            try:
+                if not os.path.exists(self.warp_native_refresh_state_path):
+                    return {}
+                with open(self.warp_native_refresh_state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+            except:
+                return {}
+
+        def _save_warp_native_refresh_state(self, state):
+            try:
+                os.makedirs(self.temp_dir, exist_ok=True)
+                with open(self.warp_native_refresh_state_path, "w", encoding="utf-8") as f:
+                    json.dump(state if isinstance(state, dict) else {}, f, indent=2, ensure_ascii=False)
+                return True
+            except:
+                return False
+
+        def _refresh_warp_native_profile_async(self):
+            try:
+                with self._wg_profile_refresh_lock:
+                    if self._wg_profile_refresh_in_progress:
+                        return False
+                    force_refresh = str(os.environ.get("NOVA_WG_PROFILE_REFRESH", "")).strip().lower() in ("1", "true", "yes", "on")
+                    if not force_refresh:
+                        refresh_state = self._load_warp_native_refresh_state()
+                        last_error_ts = float(refresh_state.get("last_error_ts", 0) or 0)
+                        if last_error_ts and (time.time() - last_error_ts) < 12 * 3600:
+                            return False
+                    self._wg_profile_refresh_in_progress = True
+            except:
+                return False
+
+            def _worker():
+                try:
+                    self.log_func("[SingBox] [WG] Обновление native профиля WARP...")
+                    fresh = self._register_warp_native_profile()
+                    if fresh:
+                        self._save_warp_native_refresh_state({
+                            "last_success_ts": int(time.time()),
+                            "last_error_ts": 0,
+                            "last_error": ""
+                        })
+                        self.log_func("[SingBox] [WG] Native профиль WARP обновлён в фоне.")
+                    else:
+                        refresh_state = self._load_warp_native_refresh_state()
+                        refresh_state["last_error_ts"] = int(time.time())
+                        if not refresh_state.get("last_success_ts"):
+                            refresh_state["last_success_ts"] = 0
+                        self._save_warp_native_refresh_state(refresh_state)
+                        self.log_func("[SingBox] [WG] Фоновое обновление native профиля не удалось. Используем сохранённый.")
+                finally:
+                    try:
+                        with self._wg_profile_refresh_lock:
+                            self._wg_profile_refresh_in_progress = False
+                    except:
+                        self._wg_profile_refresh_in_progress = False
+
+            threading.Thread(target=_worker, daemon=True).start()
+            return True
+
         def _get_warp_bin_signature(self):
             try:
-                p = os.path.join(self.bin_dir, "warp-svc.exe")
+                p = self.warp_svc_path
                 st = os.stat(p)
                 return {
                     "path": os.path.abspath(p),
@@ -2048,9 +2118,10 @@ try:
                 if not isinstance(profile, dict):
                     return True
 
-                # Safety TTL: refresh daily to avoid stale/broken registrations after client reinstalls.
+                # Safety TTL: refresh much less aggressively; cached profile is preferred
+                # unless the local WARP runtime changed or the user explicitly forced refresh.
                 created_at = int(profile.get("created_at") or 0)
-                if created_at <= 0 or (time.time() - created_at) > 24 * 3600:
+                if created_at <= 0 or (time.time() - created_at) > 30 * 24 * 3600:
                     return True
 
                 old_sig = profile.get("warp_bin_sig")
@@ -2159,26 +2230,43 @@ try:
                     "https://api.cloudflareclient.com/v0/reg",
                     "https://api.cloudflareclient.com./v0/reg",
                 ]
+                request_plans = [("strategy", {"http": None, "https": None})]
+                try:
+                    if self._is_local_http_proxy_stable(1371):
+                        request_plans.append(("opera-1371", {"http": "http://127.0.0.1:1371", "https": "http://127.0.0.1:1371"}))
+                except:
+                    pass
                 response = None
                 last_error = ""
-                # Strategy-only mode: no Opera proxy fallback for Cloudflare registration.
-                for url in endpoints:
-                    try:
-                        response = requests.post(
-                            url,
-                            json=payload,
-                            headers=headers,
-                            timeout=20,
-                            proxies={"http": None, "https": None},
-                        )
-                        if response.status_code == 200:
-                            break
-                        last_error = f"strategy:{response.status_code}"
-                    except Exception as e:
-                        last_error = f"strategy:{e}"
-                        response = None
+                for plan_name, plan_proxies in request_plans:
+                    for url in endpoints:
+                        try:
+                            response = requests.post(
+                                url,
+                                json=payload,
+                                headers=headers,
+                                timeout=20,
+                                proxies=plan_proxies,
+                            )
+                            if response.status_code == 200:
+                                break
+                            last_error = f"{plan_name}:{response.status_code}"
+                        except Exception as e:
+                            last_error = f"{plan_name}:{e}"
+                            response = None
+                    if response and response.status_code == 200:
+                        break
 
                 if not response or response.status_code != 200:
+                    try:
+                        refresh_state = self._load_warp_native_refresh_state()
+                        refresh_state["last_error_ts"] = int(time.time())
+                        refresh_state["last_error"] = str(last_error or "unknown error")
+                        if not refresh_state.get("last_success_ts"):
+                            refresh_state["last_success_ts"] = 0
+                        self._save_warp_native_refresh_state(refresh_state)
+                    except:
+                        pass
                     self.log_func(f"[SingBox] [WG] Не удалось зарегистрировать native профиль: {last_error or 'unknown error'}")
                     return None
 
@@ -2263,6 +2351,14 @@ try:
                 }
 
                 if self._save_warp_native_profile(profile):
+                    try:
+                        self._save_warp_native_refresh_state({
+                            "last_success_ts": int(time.time()),
+                            "last_error_ts": 0,
+                            "last_error": ""
+                        })
+                    except:
+                        pass
                     self.log_func(f"[SingBox] [WG] Создан native профиль WARP (портов: {len(ports)}).")
                 return profile
             except Exception as e:
@@ -2273,11 +2369,7 @@ try:
             profile = self._load_warp_native_profile()
             if profile:
                 if self._should_refresh_warp_native_profile(profile):
-                    self.log_func("[SingBox] [WG] Обновление native профиля WARP...")
-                    fresh = self._register_warp_native_profile()
-                    if fresh:
-                        return fresh
-                    self.log_func("[SingBox] [WG] Не удалось обновить профиль, используем сохранённый.")
+                    self._refresh_warp_native_profile_async()
                 return profile
             return self._register_warp_native_profile()
 
@@ -2325,28 +2417,86 @@ try:
         def _build_warp_outbounds(self, warp_port, opera_port):
             self._using_wireguard_outbound = False
             outbounds = []
+            endpoints = []
             target_udp = "direct"
-            # WireGuard отключён: ISP блокирует WG-протокол (UDP).
-            # winws обходит DPI только для TCP (TLS fragmentation).
-            # WARP работает через MASQUE (QUIC), что winws поддерживает, но WireGuard — нет.
-            # Для голосовых звонков нужен WARP в tunnel mode (MASQUE оборачивает UDP).
-            profile = None  # self._get_warp_native_profile() — отключено
+            profile = None
+            if self._force_disable_native_wg:
+                if not self._wg_disable_notice_logged:
+                    self.log_func("[SingBox] [WG] Native WARP UDP временно отключён после частых падений. Используем direct/winws.")
+                    self._wg_disable_notice_logged = True
+            else:
+                profile = self._get_warp_native_profile()
             if profile:
                 try:
                     server, p_key, pub_key = str(profile.get("server","")), str(profile.get("private_key","")), str(profile.get("peer_public_key",""))
                     addr = [str(x) for x in (profile.get("local_addresses") or []) if str(x)]
-                    port = int(profile.get("last_good_port") or 443)
-                    if server and addr and p_key and pub_key:
-                        self._using_wireguard_outbound = True
-                        wg_tag = f"warp-wg-udp-{port}"
-                        outbounds.append({"type": "wireguard", "tag": wg_tag, "local_address": addr, "private_key": p_key, "peers": [{"server": server, "server_port": port, "public_key": pub_key, "allowed_ips": ["0.0.0.0/0", "::/0"]}], "mtu": 1420})
-                        target_udp = wg_tag
-                        self.log_func(f"[SingBox] WireGuard UDP туннель (порт {port}).")
-                except: pass
-            outbounds.append({"type": "socks", "tag": "warp-socks", "server": "127.0.0.1", "server_port": int(warp_port), "version": "4", "domain_strategy": "ipv4_only"})
+                    ports = []
+                    for p in (profile.get("ports") or []):
+                        try:
+                            p = int(p)
+                            if 1 <= p <= 65535:
+                                ports.append(p)
+                        except:
+                            continue
+                    preferred_port = int(profile.get("last_good_port") or 443)
+                    preferred_ports = []
+                    for p in [preferred_port, 443, 500, 1701, 4500]:
+                        if 1 <= int(p) <= 65535 and int(p) not in preferred_ports:
+                            preferred_ports.append(int(p))
+                    for p in ports:
+                        if p not in preferred_ports:
+                            preferred_ports.append(p)
+                    preferred_ports = preferred_ports[:4]
+                    reserved = profile.get("reserved")
+                    if server and addr and p_key and pub_key and preferred_ports:
+                        wg_tags = []
+                        for port in preferred_ports:
+                            peer = {
+                                "address": server,
+                                "port": int(port),
+                                "public_key": pub_key,
+                                "allowed_ips": ["0.0.0.0/0", "::/0"],
+                                "persistent_keepalive_interval": 30,
+                            }
+                            if isinstance(reserved, list) and len(reserved) >= 3:
+                                try:
+                                    peer["reserved"] = [int(reserved[0]), int(reserved[1]), int(reserved[2])]
+                                except:
+                                    pass
+                            wg_tag = f"warp-wg-udp-{int(port)}"
+                            endpoints.append({
+                                "type": "wireguard",
+                                "tag": wg_tag,
+                                "system": False,
+                                "name": f"NovaWARP-{int(port)}",
+                                "mtu": 1408,
+                                "address": addr,
+                                "private_key": p_key,
+                                "peers": [peer]
+                            })
+                            wg_tags.append(wg_tag)
+                        if wg_tags:
+                            self._using_wireguard_outbound = True
+                            self._wg_disable_notice_logged = False
+                            target_udp = wg_tags[0]
+                            target_udp_candidates = list(wg_tags)
+                            self.log_func(f"[SingBox] Native WARP UDP endpoint: {', '.join(str(x.split('-')[-1]) for x in wg_tags)}.")
+                        else:
+                            target_udp_candidates = []
+                    else:
+                        target_udp_candidates = []
+                except Exception as e:
+                    target_udp_candidates = []
+                    self.log_func(f"[SingBox] [WG] Ошибка подготовки native UDP endpoint: {e}")
+            else:
+                target_udp_candidates = []
+            outbounds.append({"type": "socks", "tag": "warp-socks", "server": "127.0.0.1", "server_port": int(warp_port), "version": "5", "domain_strategy": "ipv4_only"})
+            if getattr(self, "_warp_udp_supported", False):
+                target_udp = "warp-socks"
+                target_udp_candidates = ["warp-socks"]
             if opera_port: outbounds.append({"type": "http", "tag": "opera-socks", "server": "127.0.0.1", "server_port": int(opera_port)})
             outbounds.append({"type": "direct", "tag": "direct"})
-            return outbounds, target_udp, "warp-socks"
+            return outbounds, endpoints, target_udp, list(target_udp_candidates), "warp-socks"
 
         def create_config(self):
             """Generates sing-box config securely from scratch on every run."""
@@ -2356,7 +2506,7 @@ try:
 
                 warp_port = int(globals().get('WARP_PORT', 1370))
                 opera_port = 1371 if self._is_local_http_proxy_stable() else None
-                outbounds, target_udp, target_tcp = self._build_warp_outbounds(warp_port, opera_port)
+                outbounds, endpoints, target_udp, target_udp_candidates, target_tcp = self._build_warp_outbounds(warp_port, opera_port)
                 import glob
                 base_dir = get_base_dir()
                 def _load(f, p):
@@ -2369,33 +2519,71 @@ try:
                     return sorted(list(res))
 
                 dc_cidrs, tg_cidrs, wa_cidrs = _load("ip", "discord*.txt"), _load("ip", "telegram*.txt"), _load("ip", "whatsapp*.txt")
-                dc_doms, tg_doms, wa_doms = _load("list", "discord*.txt"), _load("list", "telegram*.txt"), _load("list", "whatsapp*.txt")
-
-                # DNS warmup: resolve key domains to actual IPs for TUN route_address
-                import socket as _sock
-                warmup_domains = [
+                dc_doms, tg_doms, wa_doms = get_discord_runtime_domains(), get_telegram_runtime_domains(), _load("list", "whatsapp*.txt")
+                discord_warmup_domains = sorted(set([
                     "discord.com", "discordapp.com", "dl.discordapp.net",
                     "updates.discord.com", "cdn.discordapp.com", "gateway.discord.gg",
                     "media.discordapp.net", "status.discord.com",
-                    "web.telegram.org", "t.me",
-                    "web.whatsapp.com", "whatsapp.com",
-                ]
-                warmup_cidrs = set()
-                for domain in warmup_domains:
+                    "stable.dl2.discordapp.net", "ptb.dl2.discordapp.net", "canary.dl2.discordapp.net",
+                ] + discover_discord_update_hosts()))
+                telegram_warmup_domains = sorted(set([
+                    "telegram.org", "t.me", "telegra.ph",
+                    "tdesktop.com", "updates.tdesktop.com", "desktop.telegram.org",
+                    "api.telegram.org", "core.telegram.org", "web.telegram.org",
+                    "telegram.me", "telesco.pe", "telegram-cdn.org",
+                ]))
+
+                # DNS warmup: resolve key domains to actual IPs for TUN route_address
+                import socket as _sock
+                def _resolve_ipv4_cidrs(domains):
+                    out = set()
+                    for domain in domains:
+                        try:
+                            _, _, ips = _sock.gethostbyname_ex(domain)
+                            for ip in (ips or []):
+                                ip_s = str(ip).strip()
+                                if "." in ip_s and ":" not in ip_s:
+                                    out.add(f"{ip_s}/32")
+                        except:
+                            pass
+                    return out
+
+                def _collapse_cidrs(cidrs):
                     try:
-                        _, _, ips = _sock.gethostbyname_ex(domain)
-                        for ip in (ips or []):
-                            ip_s = str(ip).strip()
-                            if "." in ip_s and ":" not in ip_s:
-                                warmup_cidrs.add(f"{ip_s}/32")
+                        import ipaddress
+                        nets = []
+                        for item in (cidrs or []):
+                            try:
+                                nets.append(ipaddress.ip_network(str(item).strip(), strict=False))
+                            except:
+                                continue
+                        return [str(net) for net in ipaddress.collapse_addresses(nets)]
                     except:
-                        pass
-                if warmup_cidrs:
-                    dc_cidrs = sorted(set(dc_cidrs) | warmup_cidrs)
-                    self.log_func(f"[SingBox] DNS warmup: +{len(warmup_cidrs)} IP добавлено.")
+                        return sorted(list(dict.fromkeys([str(x).strip() for x in (cidrs or []) if str(x).strip()])))
+
+                discord_warmup_cidrs = _resolve_ipv4_cidrs(discord_warmup_domains)
+                telegram_warmup_cidrs = _resolve_ipv4_cidrs(telegram_warmup_domains)
+                whatsapp_warmup_cidrs = _resolve_ipv4_cidrs(["web.whatsapp.com", "whatsapp.com"])
+
+                added_warmup = len(discord_warmup_cidrs | telegram_warmup_cidrs | whatsapp_warmup_cidrs)
+                if discord_warmup_cidrs:
+                    dc_cidrs = sorted(set(dc_cidrs) | discord_warmup_cidrs)
+                if telegram_warmup_cidrs:
+                    tg_cidrs = sorted(set(tg_cidrs) | telegram_warmup_cidrs)
+                if whatsapp_warmup_cidrs:
+                    wa_cidrs = sorted(set(wa_cidrs) | whatsapp_warmup_cidrs)
+                dc_cidrs = _collapse_cidrs(dc_cidrs)
+                tg_cidrs = _collapse_cidrs(tg_cidrs)
+                wa_cidrs = _collapse_cidrs(wa_cidrs)
+                if added_warmup:
+                    self.log_func(f"[SingBox] DNS warmup: +{added_warmup} IP добавлено.")
+                if discord_warmup_domains:
+                    self.log_func(f"[SingBox] Discord runtime domains: {', '.join(discord_warmup_domains[:6])}{' ...' if len(discord_warmup_domains) > 6 else ''}")
+                if telegram_warmup_domains:
+                    self.log_func(f"[SingBox] Telegram runtime domains: {', '.join(telegram_warmup_domains[:6])}{' ...' if len(telegram_warmup_domains) > 6 else ''}")
 
                 # === Build urltest failover outbound groups ===
-                # TCP chain: WARP SOCKS → Opera HTTP → Direct
+                # Generic TCP chain: WARP SOCKS → Opera HTTP → Direct
                 tcp_chain = ["warp-socks"]
                 has_opera = any(o.get("tag") == "opera-socks" for o in outbounds)
                 if has_opera:
@@ -2405,84 +2593,117 @@ try:
                     "type": "urltest", "tag": "msg-tcp",
                     "outbounds": tcp_chain,
                     "url": "https://www.gstatic.com/generate_204",
-                    "interval": "15s", "tolerance": 5000
+                    "interval": "45s", "tolerance": 5000
+                })
+
+                # Discord updater/startup should never prefer direct here:
+                # direct path often hangs on dl2/stable.dl2 while WARP/Opera are fine.
+                discord_tcp_chain = ["warp-socks"]
+                if has_opera:
+                    discord_tcp_chain.append("opera-socks")
+                outbounds.append({
+                    "type": "urltest", "tag": "discord-tcp",
+                    "outbounds": discord_tcp_chain,
+                    "url": "https://stable.dl2.discordapp.net/",
+                    "interval": "45s", "tolerance": 4000
                 })
 
                 # UDP chain: WireGuard → Direct (для голосовых звонков)
                 udp_chain = []
-                if target_udp != "direct":
-                    udp_chain.append(target_udp)
+                for udp_tag in (target_udp_candidates or []):
+                    if udp_tag and udp_tag != "direct" and udp_tag not in udp_chain:
+                        udp_chain.append(udp_tag)
                 udp_chain.append("direct")
                 if len(udp_chain) > 1:
                     outbounds.append({
                         "type": "urltest", "tag": "msg-udp",
                         "outbounds": udp_chain,
                         "url": "https://www.gstatic.com/generate_204",
-                        "interval": "15s", "tolerance": 5000
+                        "interval": "45s", "tolerance": 5000
                     })
                     udp_target = "msg-udp"
                 else:
                     udp_target = "direct"
 
                 self.log_func(f"[SingBox] TCP: {' → '.join(tcp_chain)}")
+                self.log_func(f"[SingBox] Discord TCP: {' → '.join(discord_tcp_chain)}")
                 self.log_func(f"[SingBox] UDP: {' → '.join(udp_chain)}")
 
                 # === Process lists ===
                 infra_bypass = ["winws.exe", "winws", "winws_test.exe", "winws_test", "sing-box.exe", "sing-box", "warp-svc.exe", "warp-svc", "warp-cli.exe", "warp-cli", "opera-proxy.exe", "opera-proxy"]
-                dc_procs = ["Discord.exe", "Discord", "discord.exe", "discord", "DiscordCanary.exe", "DiscordCanary", "discordcanary.exe", "discordcanary", "DiscordPTB.exe", "DiscordPTB", "discordptb.exe", "discordptb", "Update.exe", "updater.exe"]
+                dc_procs = ["Discord.exe", "Discord", "discord.exe", "discord", "DiscordCanary.exe", "DiscordCanary", "discordcanary.exe", "discordcanary", "DiscordPTB.exe", "DiscordPTB", "discordptb.exe", "discordptb"]
                 tg_procs = ["Telegram.exe", "Telegram", "telegram.exe", "telegram", "AyuGram.exe", "AyuGram", "ayugram.exe", "ayugram", "telegram desktop.exe", "telegram desktop"]
-                wa_procs = ["WhatsApp.exe", "WhatsApp", "whatsapp.exe", "whatsapp", "msedgewebview2.exe"]
+                wa_procs = ["WhatsApp.exe", "WhatsApp", "whatsapp.exe", "whatsapp"]
                 all_msg_procs = dc_procs + tg_procs + wa_procs
                 tgwa_procs = tg_procs + wa_procs
                 all_msg_doms = sorted(set(dc_doms + tg_doms + wa_doms))
                 tgwa_doms = sorted(set(tg_doms + wa_doms))
                 all_cidrs = sorted(list(set(dc_cidrs + tg_cidrs + wa_cidrs)))
-                
-                # TUN only captures Telegram + WhatsApp traffic.
-                # Discord is EXCLUDED from TUN — it goes directly through the
-                # network where winws handles DPI bypass (same as Flowseal).
-                tun_cidrs = sorted(list(set(tg_cidrs + wa_cidrs)))
+
+                # Capture Discord/TG/WA inside TUN so per-process routing can
+                # consistently apply WARP/Opera/direct chains instead of relying
+                # on host-level direct traffic only.
+                tun_cidrs = _collapse_cidrs(all_cidrs)
 
                 # Path regexes: ловят Update.exe и другие процессы по пути, а не только по имени
-                dc_path_re = "(?i).*[\\\\/]discord[\\\\/].*"
+                dc_path_re = "(?i).*[\\\\/](discord|discordcanary|discordptb)[\\\\/].*"
                 tg_path_re = "(?i).*[\\\\/](telegram|ayugram|telegram desktop)[\\\\/].*"
                 wa_path_re = "(?i).*[\\\\/](whatsapp|msedgewebview2)[\\\\/].*"
                 tgwa_path_re = "(?i).*[\\\\/](telegram|ayugram|telegram desktop|whatsapp)[\\\\/].*"
                 all_msg_path_re = f"(?i).*[\\\\/](discord|telegram|ayugram|telegram desktop|whatsapp)[\\\\/].*"
 
                 # === Routing rules ===
-                # Discord: NOT in TUN, goes direct through network (winws handles DPI).
-                # Exception: Discord Update.exe → WARP TCP (CDN often blocked by DPI).
-                # Telegram/WhatsApp: captured by TUN, routed via WARP for speed.
-                dc_updater_path_re = "(?i)^.*\\\\\\\\discord\\\\\\\\update\\.exe$"
+                # Discord TCP should stay on WARP/Opera only: direct path often hangs updater/CDN.
+                # Telegram/WhatsApp keep the same msg-tcp / UDP logic.
+                dc_updater_path_re = "(?i).*[\\\\/](discord|discordcanary|discordptb)[\\\\/]update\\.exe$"
+                tg_updater_path_re = "(?i).*[\\\\/](telegram|ayugram|telegram desktop)[\\\\/]updater\\.exe$"
+                dc_udp_outbound = "direct" if self._discord_udp_direct else udp_target
+                tg_udp_outbound = "warp-socks" if getattr(self, "_warp_udp_supported", False) else "direct"
                 
                 route_rules = [
                     # 1. Infra bypass: prevent loops
                     {"process_name": infra_bypass, "action": "route", "outbound": "direct"},
                     
                     # === DISCORD UPDATER → WARP (Update.exe needs CDN access) ===
-                    {"process_path_regex": [dc_updater_path_re], "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
+                    {"process_path_regex": [dc_updater_path_re], "network": ["tcp"], "action": "route", "outbound": "discord-tcp"},
+                    {"process_path_regex": [tg_updater_path_re], "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
                     
-                    # === DISCORD (main app) → direct (winws handles DPI) ===
-                    {"process_name": dc_procs, "action": "route", "outbound": "direct"},
-                    {"process_path_regex": [dc_path_re], "action": "route", "outbound": "direct"},
+                    # === DISCORD TCP → WARP → Opera → direct/winws ===
+                    {"process_name": dc_procs, "network": ["tcp"], "action": "route", "outbound": "discord-tcp"},
+                    {"process_path_regex": [dc_path_re], "network": ["tcp"], "action": "route", "outbound": "discord-tcp"},
+
+                    # === DISCORD UDP → WARP WG/TUN when available, otherwise direct/winws ===
+                    {"process_name": dc_procs, "network": ["udp"], "action": "route", "outbound": dc_udp_outbound},
+                    {"process_path_regex": [dc_path_re], "network": ["udp"], "action": "route", "outbound": dc_udp_outbound},
                     
                     # === TELEGRAM / WHATSAPP TCP → WARP ===
                     {"process_name": tgwa_procs, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
                     {"process_path_regex": [tgwa_path_re], "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
                     
                     # === TELEGRAM / WHATSAPP UDP → direct (winws handles DPI) ===
-                    {"process_name": tgwa_procs, "network": ["udp"], "action": "route", "outbound": udp_target},
-                    {"process_path_regex": [tgwa_path_re], "network": ["udp"], "action": "route", "outbound": udp_target},
+                    {"process_name": tg_procs, "network": ["udp"], "action": "route", "outbound": tg_udp_outbound},
+                    {"process_path_regex": [tg_path_re], "network": ["udp"], "action": "route", "outbound": tg_udp_outbound},
+                    {"process_name": wa_procs, "network": ["udp"], "action": "route", "outbound": udp_target},
+                    {"process_path_regex": [wa_path_re], "network": ["udp"], "action": "route", "outbound": udp_target},
                     
                     # === DOMAIN FALLBACK ===
-                    {"domain_suffix": tgwa_doms, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
-                    {"domain_suffix": tgwa_doms, "network": ["udp"], "action": "route", "outbound": udp_target},
+                    {"domain_suffix": dc_doms, "network": ["tcp"], "action": "route", "outbound": "discord-tcp"},
+                    {"domain_suffix": dc_doms, "network": ["udp"], "action": "route", "outbound": dc_udp_outbound},
+                    {"domain_suffix": tg_doms, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
+                    {"domain_suffix": tg_doms, "network": ["udp"], "action": "route", "outbound": tg_udp_outbound},
+                    {"domain_suffix": wa_doms, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
+                    {"domain_suffix": wa_doms, "network": ["udp"], "action": "route", "outbound": udp_target},
                     
                     # === Browser proxy traffic (ru.txt via PAC → port 1372) ===
                     {"inbound": ["mixed-in"], "action": "route", "outbound": target_tcp},
                     
-                    # === IP CIDR routing (only TG/WA CIDRs, not Discord) ===
+                    # === IP CIDR routing ===
+                    {"ip_cidr": dc_cidrs, "network": ["tcp"], "action": "route", "outbound": "discord-tcp"},
+                    {"ip_cidr": dc_cidrs, "network": ["udp"], "action": "route", "outbound": dc_udp_outbound},
+                    {"ip_cidr": tg_cidrs, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
+                    {"ip_cidr": tg_cidrs, "network": ["udp"], "action": "route", "outbound": tg_udp_outbound},
+                    {"ip_cidr": wa_cidrs, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
+                    {"ip_cidr": wa_cidrs, "network": ["udp"], "action": "route", "outbound": udp_target},
                     {"ip_cidr": tun_cidrs, "network": ["tcp"], "action": "route", "outbound": "msg-tcp"},
                     {"ip_cidr": tun_cidrs, "network": ["udp"], "action": "route", "outbound": udp_target},
                     
@@ -2494,22 +2715,23 @@ try:
                     "log": {"level": "warn" if IS_DEBUG_MODE else "error", "timestamp": True},
                     "dns": {
                         "servers": [
-                            {"type": "tcp", "tag": "dns-remote", "server": "8.8.8.8", "detour": target_tcp},
-                            {"type": "udp", "tag": "dns-local", "server": "8.8.8.8"}
+                            {"type": "tcp", "tag": "dns-remote", "server": "8.8.8.8", "server_port": 53, "detour": "msg-tcp"},
+                            {"type": "local", "tag": "dns-local"}
                         ],
                         "rules": [{"domain": ["engage.cloudflareclient.com", "api.cloudflareclient.com"], "server": "dns-local"}],
                         "strategy": "prefer_ipv4", "final": "dns-remote"
                     },
                     "inbounds": [
-                        {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 1372, "sniff": True},
-                        {"type": "tun", "tag": "tun-in", "interface_name": "NovaVoice", "address": ["172.19.0.1/30"], "auto_route": True, "strict_route": False, "stack": "system", "mtu": 1500, "sniff": True, "route_address": tun_cidrs, "exclude_interface": ["VMware Network Adapter VMnet1", "VMware Network Adapter VMnet8", "VMnet1", "VMnet8", "VirtualBox Host-Only Network", "vEthernet (WSL)", "vEthernet (Default Switch)"]}
+                        {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 1372},
+                        {"type": "tun", "tag": "tun-in", "interface_name": "NovaVoice", "address": ["172.19.0.1/30"], "auto_route": True, "strict_route": False, "stack": "system", "mtu": 1500, "route_address": tun_cidrs, "exclude_interface": ["VMware Network Adapter VMnet1", "VMware Network Adapter VMnet8", "VMnet1", "VMnet8", "VirtualBox Host-Only Network", "vEthernet (WSL)", "vEthernet (Default Switch)"]}
                     ],
+                    "endpoints": endpoints,
                     "outbounds": outbounds,
-                    "route": {"rules": route_rules, "final": "direct", "auto_detect_interface": True}
+                    "route": {"rules": route_rules, "final": "direct", "auto_detect_interface": True, "default_domain_resolver": "dns-local"}
                 }
                 import json
                 with open(self.config_path, "w", encoding="utf-8") as f: json.dump(config, f, indent=4)
-                self.log_func("[SingBox] Конфигурация обновлена (1.13.0 standard).")
+                self.log_func("[SingBox] Конфигурация обновлена (1.13 modern).")
             except Exception as e: self.log_func(f"[SingBox] Ошибка создания конфига: {e}")
 
         def _probe_warp_socks_udp_support(self):
@@ -2567,6 +2789,7 @@ try:
                 if not self._warp_udp_diag_done:
                     self._warp_udp_diag_done = True
                     udp_ok, udp_msg = self._probe_warp_socks_udp_support()
+                    self._warp_udp_supported = bool(udp_ok)
                     if udp_ok:
                         self.log_func("[SingBox] [Diag] WARP SOCKS: UDP ASSOCIATE поддерживается.")
                     else:
@@ -2686,11 +2909,26 @@ try:
             except: pass
     
     class WarpManager:
-        """WARP Manager using official warp-cli with MASQUE protocol.
+        """WARP Manager using local bundled warp-cli with MASQUE protocol.
         Supports portable service installation if WARP is not installed system-wide.
         """
         
         SERVICE_NAME = "CloudflareWARP"
+
+        def _warp_process_names(self):
+            names = [
+                os.path.basename(getattr(self, "warp_svc_path", "") or "warp-svc.exe"),
+                "warp-taskbar.exe",
+                "Cloudflare WARP.exe",
+                os.path.basename(getattr(self, "warp_cli_path", "") or "warp-cli.exe"),
+                "warp-svc.exe",
+                "warp-cli.exe",
+            ]
+            result = []
+            for name in names:
+                if name and name not in result:
+                    result.append(name)
+            return result
         
         def decode_output(self, binary_data):
             """Decodes Windows CMD output (CP866 usually) safely."""
@@ -2773,7 +3011,7 @@ try:
                     pass
 
                 self.stop_service()
-                for proc_name in ["warp-svc.exe", "warp-taskbar.exe", "Cloudflare WARP.exe", "warp-cli.exe"]:
+                for proc_name in self._warp_process_names():
                     try:
                         subprocess.run(
                             ["taskkill", "/F", "/IM", proc_name, "/T"],
@@ -3292,7 +3530,7 @@ try:
                     return False
 
                 # Keep WARP helper GUI processes away from service bootstrap.
-                for proc_name in ["warp-taskbar.exe", "Cloudflare WARP.exe", "warp-cli.exe", "warp-svc.exe"]:
+                for proc_name in self._warp_process_names():
                     subprocess.run(
                         ["taskkill", "/F", "/IM", proc_name, "/T"],
                         capture_output=True,
@@ -3499,6 +3737,34 @@ try:
             if result and result.returncode == 0:
                 return result.stdout.strip()
             return "Unknown"
+
+        def _warp_cli_result_text(self, result):
+            try:
+                if not result:
+                    return ""
+                parts = []
+                out = self.decode_output(getattr(result, "stdout", ""))
+                err = self.decode_output(getattr(result, "stderr", ""))
+                if out:
+                    parts.append(out.strip())
+                if err:
+                    parts.append(err.strip())
+                return "\n".join(part for part in parts if part).strip()
+            except:
+                return ""
+
+        def _is_warp_daemon_unreachable_text(self, text):
+            low = str(text or "").strip().lower()
+            if not low:
+                return False
+            markers = [
+                "unable to connect to the cloudflarewarp daemon",
+                "maybe the daemon is not running",
+                "os error 2",
+                "не удается найти указанный файл",
+                "error communicating with daemon",
+            ]
+            return any(marker in low for marker in markers)
         
         def ensure_masque(self):
             """Ensure MASQUE protocol is enabled."""
@@ -3790,20 +4056,40 @@ try:
                 except:
                     pass
 
-                # Cheap repair first: local SOCKS settings may desync while daemon is still alive.
+                daemon_probe = None
+                daemon_text = ""
+                daemon_restart_needed = False
                 try:
-                    self.set_proxy_port(self.port)
-                    self.set_proxy_mode()
-                    if self.wait_for_connection(timeout=8):
-                        return True
+                    daemon_probe = self.run_warp_cli("status", timeout=8)
+                    daemon_text = self._warp_cli_result_text(daemon_probe)
+                    daemon_restart_needed = (not self.is_service_running()) or self._is_warp_daemon_unreachable_text(daemon_text)
                 except:
-                    pass
+                    daemon_restart_needed = not self.is_service_running()
 
-                try:
-                    self.run_warp_cli("disconnect", timeout=8)
-                except:
-                    pass
-                time.sleep(1.0)
+                if daemon_restart_needed:
+                    self.log_func("[RU] [Diag] Daemon WARP недоступен. Перезапускаем службу перед восстановлением...")
+                    try:
+                        self._set_service_proxy_environment(enable_proxy=False)
+                    except:
+                        pass
+                    if not self.start_service():
+                        self.is_connected = False
+                        return False
+                else:
+                    # Cheap repair first: local SOCKS settings may desync while daemon is still alive.
+                    try:
+                        self.set_proxy_port(self.port)
+                        self.set_proxy_mode()
+                        if self.wait_for_connection(timeout=8):
+                            return True
+                    except:
+                        pass
+
+                    try:
+                        self.run_warp_cli("disconnect", timeout=8)
+                    except:
+                        pass
+                    time.sleep(1.0)
 
                 self.is_connected = False
                 self.start()
@@ -4175,7 +4461,8 @@ try:
                 try: 
                     self.run_warp_cli("disconnect")
                     subprocess.run(["sc", "stop", self.SERVICE_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-                    subprocess.run(["taskkill", "/F", "/IM", "warp-svc.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                    for proc_name in self._warp_process_names():
+                        subprocess.run(["taskkill", "/F", "/IM", proc_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
                 except: pass
                 self.is_connected = False
                 return
@@ -4371,8 +4658,8 @@ try:
                 ru_domains = self._load_domain_list(os.path.join(base, "list", "ru.txt"))
                 eu_domains = self._load_domain_list(os.path.join(base, "list", "eu.txt"))
                 exclude_domains = self._load_domain_list(os.path.join(base, "list", "exclude.txt"))
-                discord_domains = self._load_domain_list(os.path.join(base, "list", "discord.txt"))
-                telegram_domains = self._load_domain_list(os.path.join(base, "list", "telegram.txt"))
+                discord_domains = get_discord_runtime_domains()
+                telegram_domains = get_telegram_runtime_domains()
                 whatsapp_domains = self._load_domain_list(os.path.join(base, "list", "whatsapp.txt"))
                 ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
                 discord_ips = self._load_ip_list(os.path.join(base, "ip", "discord.txt"))
@@ -4396,6 +4683,17 @@ try:
                     except:
                         warp_connected = bool(warp_port_open)
                     warp_active = bool(warp_port_open and warp_connected)
+
+                singbox_port_open = self.is_port_open(1372)
+                singbox_active = False
+                try:
+                    sbm = globals().get("sing_box_manager")
+                    sb_proc = getattr(sbm, "process", None) if sbm else None
+                    singbox_active = bool(
+                        warp_active and sb_proc and sb_proc.poll() is None and singbox_port_open
+                    )
+                except:
+                    singbox_active = bool(warp_active and singbox_port_open)
                 
                 if opera_override is not None:
                     opera_active = bool(opera_override)
@@ -4434,10 +4732,10 @@ try:
 
                 # Routing strings for RU domains: Try WARP, then Opera.
                 if warp_active:
-                    ru_route_parts = [
-                        f"PROXY 127.0.0.1:1372", # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
-                        f"SOCKS5 127.0.0.1:{self.warp_port}" # Direct WARP SOCKS fallback
-                    ]
+                    ru_route_parts = []
+                    if singbox_active:
+                        ru_route_parts.append("PROXY 127.0.0.1:1372") # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
+                    ru_route_parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}") # Direct WARP SOCKS fallback
                     if opera_active:
                         ru_route_parts.append("PROXY 127.0.0.1:1371")
                     # NO DIRECT fallback for RU to prevent IP leak. Use a blackhole proxy.
@@ -4450,7 +4748,9 @@ try:
                 # Discord bootstrap is sensitive to DNS/first-hop behavior.
                 # Prefer SingBox HTTP proxy (DoH-friendly), then direct WARP SOCKS, then Opera.
                 if warp_active:
-                    discord_route_parts = ["PROXY 127.0.0.1:1372"]
+                    discord_route_parts = []
+                    if singbox_active:
+                        discord_route_parts.append("PROXY 127.0.0.1:1372")
                     discord_route_parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
                     if opera_active:
                         discord_route_parts.append("PROXY 127.0.0.1:1371")
@@ -4550,13 +4850,20 @@ try:
                         self.log_func("[PAC] EU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Opera недоступна)")
 
                 # Define RU route state for logging (includes RU + Discord)
-                ru_route_state = "warp+opera" if warp_active and opera_active else ("warp" if warp_active else ("opera" if opera_active else "down"))
+                ru_route_state = ("warp+sb+opera" if singbox_active and warp_active and opera_active else
+                                  "warp+sb" if singbox_active and warp_active else
+                                  "warp+opera" if warp_active and opera_active else
+                                  ("warp" if warp_active else ("opera" if opera_active else "down")))
                 if ru_route_state != getattr(self, "_last_ru_route_state", None):
                     self._last_ru_route_state = ru_route_state
-                    if ru_route_state == "warp+opera":
+                    if ru_route_state == "warp+sb+opera":
                         self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority); PROXY 127.0.0.1:1371")
+                    elif ru_route_state == "warp+sb":
+                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority)")
+                    elif ru_route_state == "warp+opera":
+                        self.log_func(f"[PAC] RU маршрут: SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority); PROXY 127.0.0.1:1371")
                     elif ru_route_state == "warp":
-                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Only)")
+                        self.log_func(f"[PAC] RU маршрут: SOCKS5 127.0.0.1:{self.warp_port} (Warp Only)")
                     elif ru_route_state == "opera":
                         self.log_func("[PAC] RU маршрут: PROXY 127.0.0.1:1371 (Opera VPN fallback)")
                     else:
@@ -5227,11 +5534,11 @@ try:
                 os.makedirs(path, exist_ok=True)
 
         files = {
-            "youtube.txt": "youtube.com\ngooglevideo.com\n",
-            "discord.txt": "discord.com\ndiscord.gg\n",
-            "telegram.txt": "telegram.org\ntelegram.me\n",
-            "whatsapp.txt": "whatsapp.com\nwa.me\n",
-            "cloudflare.txt": "cloudflare.com\n",
+            "youtube.txt": "yt3.ggpht.com\nyt4.ggpht.com\nyt3.googleusercontent.com\ngooglevideo.com\njnn-pa.googleapis.com\nwide-youtube.l.google.com\nyoutube-nocookie.com\nyoutube-ui.l.google.com\nyoutube.com\nyoutubeembeddedplayer.googleapis.com\nyoutubekids.com\nyoutubei.googleapis.com\nyoutu.be\nyt-video-upload.l.google.com\nytimg.com\nytimg.l.google.com\n",
+            "discord.txt": "discord.media\n",
+            "telegram.txt": "telegram.org\nt.me\ntelegra.ph\ntdesktop.com\n",
+            "whatsapp.txt": "whatsapp.com\nwhatsapp.net\nwa.me\n",
+            "cloudflare.txt": "",
             "general.txt": "twitter.com\ninstagram.com\n",
             "exclude.txt": ""
         }
@@ -5263,6 +5570,41 @@ try:
                     content = f"# version: {CURRENT_VERSION}\n" + content
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
+
+        def _core_list_entries_from_text(text):
+            return [line.strip().lower() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+        def _core_list_entries_from_file(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    return [line.split("#")[0].strip().lower() for line in f if line.split("#")[0].strip()]
+            except:
+                return []
+
+        core_list_rules = {
+            "youtube.txt": {"required": {"youtube.com", "googlevideo.com", "ytimg.com"}, "min_count": 10},
+            "discord.txt": {"required": {"discord.media"}, "min_count": 1},
+            "telegram.txt": {"required": {"telegram.org", "t.me", "telegra.ph", "tdesktop.com"}, "min_count": 4},
+            "whatsapp.txt": {"required": {"whatsapp.com", "whatsapp.net", "wa.me"}, "min_count": 3},
+            "cloudflare.txt": {"required": set(), "min_count": 0},
+        }
+
+        for name, rule in core_list_rules.items():
+            path = os.path.join(base_dir, "list", name)
+            entries = set(_core_list_entries_from_file(path))
+            default_entries = _core_list_entries_from_text(files.get(name, ""))
+            if not default_entries and rule["min_count"] <= 0 and not rule["required"]:
+                continue
+            missing_required = not rule["required"].issubset(entries)
+            too_short = len(entries) < rule["min_count"]
+            if missing_required or too_short:
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(f"# version: {CURRENT_VERSION}\n")
+                        for item in default_entries:
+                            f.write(f"{item}\n")
+                except:
+                    pass
             
         # PROACTIVE HEADER INJECTION: force # version: {CURRENT_VERSION} on ALL .txt lists
         list_dir_path = os.path.join(base_dir, "list")
@@ -5630,6 +5972,19 @@ try:
             return ".".join(parts[-2:])
             
         return ".".join(parts[-2:])
+
+    def file_has_noncomment_entries(path):
+        try:
+            if not path or not os.path.exists(path):
+                return False
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    raw = line.split('#')[0].strip()
+                    if raw:
+                        return True
+        except:
+            return False
+        return False
 
     def load_config():
         default_conf = {"main_geometry": None, "log_size": None, "last_exclude_check_time": 0, "last_exclude_mtime": 0}
@@ -6026,11 +6381,21 @@ try:
                 version_header = current_lines[0]  # Preserve existing header
             
             unique_domains = set()
+            filtered_service_domains = 0
             for line in current_lines:
                 raw = line.split('#')[0].strip() # Skip comments
                 if not raw:
                     continue
-                unique_domains.add(get_registered_domain(raw))
+                clean_current = get_registered_domain(raw)
+                if not clean_current:
+                    continue
+                if is_domain_excluded(raw) or is_domain_excluded(clean_current):
+                    filtered_service_domains += 1
+                    continue
+                if is_service_domain_only(raw) or is_service_domain_only(clean_current):
+                    filtered_service_domains += 1
+                    continue
+                unique_domains.add(clean_current)
                 
             if new_domains_list:
                 for d in new_domains_list:
@@ -6038,8 +6403,15 @@ try:
                     if not raw_new:
                         continue
                     clean_new = get_registered_domain(raw_new)
-                    if clean_new:
-                        unique_domains.add(clean_new)
+                    if not clean_new:
+                        continue
+                    if is_domain_excluded(raw_new) or is_domain_excluded(clean_new):
+                        filtered_service_domains += 1
+                        continue
+                    if is_service_domain_only(raw_new) or is_service_domain_only(clean_new):
+                        filtered_service_domains += 1
+                        continue
+                    unique_domains.add(clean_new)
             
             sorted_list = sorted(list(unique_domains))
             
@@ -6063,6 +6435,8 @@ try:
                     print(f"[General] Добавлен(ы) новый(е) домен(ы). Файл general.txt ОБНОВЛЕН.")
                 else:
                     print(f"[General] Файл general.txt ОБНОВЛЕН (сортировка/удаление дубликатов).")
+                if filtered_service_domains:
+                    print(f"[General] Удалено сервисных доменов/корней из general.txt: {filtered_service_domains}")
                 return True
             except Exception as e: 
                 print(f"ERR: Не удалось сохранить general.txt: {e}")
@@ -6364,6 +6738,441 @@ try:
         "Connection": "keep-alive"
     }
 
+    YOUTUBE_REFERENCE_VIDEO_ID = "2idtoxMSyAY"
+    CANONICAL_YOUTUBE_DOMAINS = [
+        "yt3.ggpht.com",
+        "yt4.ggpht.com",
+        "yt3.googleusercontent.com",
+        "googlevideo.com",
+        "jnn-pa.googleapis.com",
+        "wide-youtube.l.google.com",
+        "youtube-nocookie.com",
+        "youtube-ui.l.google.com",
+        "youtube.com",
+        "youtubeembeddedplayer.googleapis.com",
+        "youtubekids.com",
+        "youtubei.googleapis.com",
+        "youtu.be",
+        "yt-video-upload.l.google.com",
+        "ytimg.com",
+        "ytimg.l.google.com",
+    ]
+
+    def _split_strategy_segments_portable(arg_list):
+        segments = []
+        current_seg = []
+        for arg in arg_list or []:
+            if arg == "--new":
+                if current_seg:
+                    segments.append(current_seg)
+                    current_seg = []
+                continue
+            current_seg.append(arg)
+        if current_seg:
+            segments.append(current_seg)
+        return segments
+
+    def build_youtube_strategy_args(tcp_repeats=4, tcp_ttl=4, tcp_fooling="badsum"):
+        if tcp_repeats not in (3, 4, 5):
+            tcp_repeats = 4
+        if tcp_ttl not in (4, 5, 6):
+            tcp_ttl = 4
+        tcp_fooling = "badsum"
+
+        return [
+            "--filter-tcp=443",
+            "--dpi-desync=split2",
+            f"--dpi-desync-repeats={tcp_repeats}",
+            f"--dpi-desync-fooling={tcp_fooling}",
+            "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+            "--dpi-desync-split-seqovl=1",
+            f"--dpi-desync-ttl={tcp_ttl}",
+            "--dpi-desync-autottl=5",
+            "--new",
+            "--filter-udp=443",
+            "--dpi-desync=fake",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+        ]
+
+    def sanitize_youtube_strategy_args(args):
+        default_args = build_youtube_strategy_args()
+        if not isinstance(args, list):
+            return list(default_args)
+
+        segments = _split_strategy_segments_portable([a for a in args if isinstance(a, str)])
+        tcp_seg = next((seg for seg in segments if any(x.startswith("--filter-tcp") for x in seg)), [])
+
+        tcp_repeats = 4
+        tcp_ttl = 4
+        tcp_fooling = "badsum"
+
+        for arg in tcp_seg:
+            if arg.startswith("--dpi-desync-repeats="):
+                try:
+                    val = int(arg.split("=", 1)[1])
+                    if 3 <= val <= 5:
+                        tcp_repeats = val
+                except:
+                    pass
+            elif arg.startswith("--dpi-desync-ttl="):
+                try:
+                    val = int(arg.split("=", 1)[1])
+                    if 4 <= val <= 6:
+                        tcp_ttl = val
+                except:
+                    pass
+            elif arg.startswith("--dpi-desync-fooling="):
+                fooling = arg.split("=", 1)[1].strip().lower()
+                if fooling == "badsum":
+                    tcp_fooling = fooling
+
+        return build_youtube_strategy_args(
+            tcp_repeats=tcp_repeats,
+            tcp_ttl=tcp_ttl,
+            tcp_fooling=tcp_fooling
+        )
+
+    def generate_safe_youtube_mutations(base_args, count=None):
+        base = sanitize_youtube_strategy_args(base_args)
+        candidates = []
+        seen = {tuple(base)}
+
+        for repeats, ttl, fooling in [
+            (4, 4, "badsum"),
+            (3, 4, "badsum"),
+            (5, 4, "badsum"),
+            (4, 5, "badsum"),
+            (4, 6, "badsum"),
+            (5, 5, "badsum"),
+        ]:
+            candidate = build_youtube_strategy_args(repeats, ttl, fooling)
+            key = tuple(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+
+        if count and len(candidates) > count:
+            random.shuffle(candidates)
+            return candidates[:count]
+        return candidates
+
+    def sanitize_service_strategy_args(service_name, args):
+        if str(service_name).lower() == "youtube":
+            return sanitize_youtube_strategy_args(args)
+        return [a for a in args if isinstance(a, str)] if isinstance(args, list) else args
+
+    def normalize_service_strategy_entry(service_name, strategy):
+        if not isinstance(strategy, dict):
+            return None
+        normalized = dict(strategy)
+        normalized["args"] = sanitize_service_strategy_args(service_name, normalized.get("args", []))
+        return normalized
+
+    def sanitize_youtube_domain_list(domains):
+        seen = set()
+        sanitized = []
+
+        def add(domain):
+            d = str(domain or "").strip().lower()
+            if not d or d.startswith("#") or d in seen:
+                return
+            seen.add(d)
+            sanitized.append(d)
+
+        original = [str(d or "").strip().lower() for d in (domains or []) if str(d or "").strip()]
+        for domain in original:
+            if domain in ("googleusercontent.com", "ggpht.com", "gstatic.com", "www.youtube.com", "i.ytimg.com", "redirector.googlevideo.com"):
+                continue
+            add(domain)
+
+        for domain in CANONICAL_YOUTUBE_DOMAINS:
+            add(domain)
+
+        return sanitized
+
+    CANONICAL_DISCORD_DOMAINS = [
+        "discord.media",
+        "discord.com",
+        "discord.gg",
+        "gateway.discord.gg",
+        "discordapp.com",
+        "discordapp.net",
+        "cdn.discordapp.com",
+        "media.discordapp.net",
+        "updates.discord.com",
+        "dl.discordapp.net",
+        "dl2.discordapp.net",
+        "stable.dl2.discordapp.net",
+        "ptb.dl2.discordapp.net",
+        "canary.dl2.discordapp.net",
+        "status.discord.com",
+    ]
+
+    def discover_discord_update_hosts():
+        hosts = set()
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        if not local_appdata:
+            return []
+
+        try:
+            import sqlite3
+            from urllib.parse import urlparse
+        except:
+            return []
+
+        candidate_dbs = [
+            os.path.join(local_appdata, "Discord", "installer.db"),
+            os.path.join(local_appdata, "DiscordPTB", "installer.db"),
+            os.path.join(local_appdata, "DiscordCanary", "installer.db"),
+        ]
+
+        for db_path in candidate_dbs:
+            if not os.path.exists(db_path):
+                continue
+            try:
+                con = sqlite3.connect(db_path)
+                cur = con.cursor()
+                rows = cur.execute("SELECT key, value FROM key_values").fetchall()
+                con.close()
+            except:
+                continue
+
+            for key, value in rows:
+                if "latest/host/app/" not in str(key or ""):
+                    continue
+                try:
+                    payload = json.loads(value)
+                except:
+                    continue
+
+                urls = []
+                full_info = payload.get("full")
+                if isinstance(full_info, dict):
+                    full_url = str(full_info.get("url") or "").strip()
+                    if full_url:
+                        urls.append(full_url)
+
+                for module_info in (payload.get("modules") or {}).values():
+                    if not isinstance(module_info, dict):
+                        continue
+                    for pkg_info in module_info.values():
+                        if not isinstance(pkg_info, dict):
+                            continue
+                        full_pkg = pkg_info.get("full")
+                        if isinstance(full_pkg, dict):
+                            full_url = str(full_pkg.get("url") or "").strip()
+                            if full_url:
+                                urls.append(full_url)
+                        for delta_pkg in (pkg_info.get("deltas") or []):
+                            if not isinstance(delta_pkg, dict):
+                                continue
+                            delta_url = str(delta_pkg.get("url") or "").strip()
+                            if delta_url:
+                                urls.append(delta_url)
+
+                for raw_url in urls:
+                    try:
+                        host = (urlparse(raw_url).hostname or "").strip().lower()
+                    except:
+                        host = ""
+                    if host and "discord" in host:
+                        hosts.add(host)
+                        if host.endswith(".dl2.discordapp.net"):
+                            hosts.add("dl2.discordapp.net")
+
+        return sorted(hosts)
+
+    def get_discord_runtime_domains():
+        source_domains = []
+        source_path = os.path.join(get_base_dir(), "list", "discord.txt")
+        if os.path.exists(source_path):
+            try:
+                with open(source_path, "r", encoding="utf-8") as f:
+                    source_domains = [
+                        line.strip().split('#')[0].strip()
+                        for line in f
+                        if line.strip() and not line.strip().startswith("#")
+                    ]
+            except:
+                source_domains = []
+
+        seen = set()
+        merged = []
+
+        def add(domain):
+            d = str(domain or "").strip().lower()
+            if not d or d.startswith("#") or d in seen:
+                return
+            seen.add(d)
+            merged.append(d)
+
+        for domain in source_domains:
+            add(domain)
+        for domain in CANONICAL_DISCORD_DOMAINS:
+            add(domain)
+        for domain in discover_discord_update_hosts():
+            add(domain)
+
+        return merged
+
+    def prepare_discord_runtime_hostlist():
+        try:
+            runtime_path = os.path.join(get_base_dir(), "temp", "discord_runtime.txt")
+            final_domains = get_discord_runtime_domains()
+            os.makedirs(os.path.dirname(runtime_path), exist_ok=True)
+            with open(runtime_path, "w", encoding="utf-8") as f:
+                f.write(f"# generated from runtime discord hostlist v{CURRENT_VERSION}\n")
+                for domain in final_domains:
+                    f.write(f"{domain}\n")
+            return runtime_path
+        except:
+            return os.path.join(get_base_dir(), "list", "discord.txt")
+
+    CANONICAL_TELEGRAM_DOMAINS = [
+        "telegram.org",
+        "t.me",
+        "telegra.ph",
+        "tdesktop.com",
+        "updates.tdesktop.com",
+        "desktop.telegram.org",
+        "api.telegram.org",
+        "core.telegram.org",
+        "web.telegram.org",
+        "telegram.me",
+        "telesco.pe",
+        "telegram-cdn.org",
+        "dns.google",
+        "dns.google.com",
+        "cloudflare-dns.com",
+        "one.one.one.one",
+        "1dot1dot1dot1.cloudflare-dns.com",
+        "dns.adguard-dns.com",
+        "doh.opendns.com",
+    ]
+
+    def get_telegram_runtime_domains():
+        source_domains = []
+        source_path = os.path.join(get_base_dir(), "list", "telegram.txt")
+        if os.path.exists(source_path):
+            try:
+                with open(source_path, "r", encoding="utf-8") as f:
+                    source_domains = [
+                        line.strip().split('#')[0].strip()
+                        for line in f
+                        if line.strip() and not line.strip().startswith("#")
+                    ]
+            except:
+                source_domains = []
+
+        seen = set()
+        merged = []
+
+        def add(domain):
+            d = str(domain or "").strip().lower()
+            if not d or d.startswith("#") or d in seen:
+                return
+            seen.add(d)
+            merged.append(d)
+
+        for domain in source_domains:
+            add(domain)
+        for domain in CANONICAL_TELEGRAM_DOMAINS:
+            add(domain)
+
+        return merged
+
+    def prepare_telegram_runtime_hostlist():
+        try:
+            runtime_path = os.path.join(get_base_dir(), "temp", "telegram_runtime.txt")
+            final_domains = get_telegram_runtime_domains()
+            os.makedirs(os.path.dirname(runtime_path), exist_ok=True)
+            with open(runtime_path, "w", encoding="utf-8") as f:
+                f.write(f"# generated from runtime telegram hostlist v{CURRENT_VERSION}\n")
+                for domain in final_domains:
+                    f.write(f"{domain}\n")
+            return runtime_path
+        except:
+            return os.path.join(get_base_dir(), "list", "telegram.txt")
+
+    def prepare_youtube_runtime_hostlist():
+        try:
+            runtime_path = os.path.join(get_base_dir(), "temp", "youtube_runtime.txt")
+            source_path = os.path.join(get_base_dir(), "list", "youtube.txt")
+            source_domains = []
+            if os.path.exists(source_path):
+                try:
+                    with open(source_path, "r", encoding="utf-8") as f:
+                        source_domains = [
+                            line.strip().split('#')[0].strip()
+                            for line in f
+                            if line.strip() and not line.strip().startswith("#")
+                        ]
+                except:
+                    source_domains = []
+
+            final_domains = sanitize_youtube_domain_list(source_domains)
+            os.makedirs(os.path.dirname(runtime_path), exist_ok=True)
+            with open(runtime_path, "w", encoding="utf-8") as f:
+                f.write(f"# generated from canonical youtube hostlist v{CURRENT_VERSION}\n")
+                for domain in final_domains:
+                    f.write(f"{domain}\n")
+            return runtime_path
+        except:
+            return os.path.join(get_base_dir(), "list", "youtube.txt")
+
+    def is_youtube_probe_domain(domain):
+        d = (domain or "").strip().lower()
+        return (
+            d == "youtube.com" or d == "www.youtube.com" or d.endswith(".youtube.com") or
+            d == "youtu.be" or d.endswith(".youtu.be") or
+            d == "youtube-nocookie.com" or d.endswith(".youtube-nocookie.com") or
+            d == "ytimg.com" or d.endswith(".ytimg.com") or
+            d == "ggpht.com" or d.endswith(".ggpht.com") or
+            d == "googleusercontent.com" or d.endswith(".googleusercontent.com")
+        )
+
+    def get_domain_probe_profile(domain):
+        d = (domain or "").strip().lower()
+        profile = {
+            "path": "/",
+            "min_speed": 512,
+            "min_success_bytes": 0,
+            "http_error_is_success": True,
+        }
+
+        if d == "youtu.be" or d.endswith(".youtu.be"):
+            profile.update({
+                "path": f"/{YOUTUBE_REFERENCE_VIDEO_ID}",
+                "min_speed": 8192,
+                "min_success_bytes": 65536,
+                "http_error_is_success": False,
+            })
+        elif (
+            d == "youtube.com" or d == "www.youtube.com" or d.endswith(".youtube.com") or
+            d == "youtube-nocookie.com" or d.endswith(".youtube-nocookie.com")
+        ):
+            profile.update({
+                "path": f"/watch?v={YOUTUBE_REFERENCE_VIDEO_ID}&bpctr=9999999999&has_verified=1",
+                "min_speed": 8192,
+                "min_success_bytes": 65536,
+                "http_error_is_success": False,
+            })
+        elif (
+            d == "ytimg.com" or d.endswith(".ytimg.com") or
+            d == "ggpht.com" or d.endswith(".ggpht.com") or
+            d == "googleusercontent.com" or d.endswith(".googleusercontent.com")
+        ):
+            profile.update({
+                "path": f"/vi/{YOUTUBE_REFERENCE_VIDEO_ID}/hqdefault.jpg",
+                "min_speed": 4096,
+                "min_success_bytes": 8192,
+                "http_error_is_success": False,
+            })
+
+        return profile
+
     def is_local_port_open_quick(port, timeout=0.25):
         try:
             import socket
@@ -6542,83 +7351,329 @@ try:
             # print(f"Align error: {e}")
             pass
 
-    def get_autostart_cmd():
-        """Проверяет состояние автозапуска (через Task Scheduler)"""
+    AUTOSTART_TASK_BASE_NAME = "NovaAutoStart"
+    AUTOSTART_REG_VALUE_NAME = "NovaApplication"
+
+    def _normalize_autostart_path(path):
         try:
-            result = subprocess.run(["schtasks", "/query", "/tn", "NovaAutoStart"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW, text=True)
-            if "NovaAutoStart" in result.stdout:
-                return "schtasks_auto"
-            
-            # Fallback backward compatibility: check registry
+            value = str(path or "").strip().strip('"')
+            if not value:
+                return ""
+            return os.path.normcase(os.path.abspath(os.path.expandvars(os.path.expanduser(value))))
+        except:
+            return ""
+
+    def _get_current_user_identity():
+        try:
+            result = subprocess.run(
+                ["whoami", "/user", "/fo", "csv", "/nh"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                text=True
+            )
+            if result.returncode != 0:
+                return None, None
+            line = str(result.stdout or "").strip().splitlines()
+            if not line:
+                return None, None
+            row = next(csv.reader([line[-1]]), [])
+            if len(row) >= 2:
+                account = row[0].strip()
+                sid = row[1].strip()
+                return account or None, sid or None
+        except:
+            pass
+        return None, None
+
+    def _build_autostart_launch_spec():
+        exe_path = os.path.abspath(sys.executable)
+        working_dir = os.path.dirname(exe_path)
+
+        if getattr(sys, 'frozen', False):
+            arguments = "--minimized"
+            registry_cmd = subprocess.list2cmdline([exe_path, "--minimized"])
+        else:
+            try:
+                script_path = os.path.abspath(__file__)
+            except NameError:
+                script_path = os.path.abspath(sys.argv[0])
+            working_dir = os.path.dirname(script_path)
+            arguments = subprocess.list2cmdline([script_path, "--minimized"])
+            registry_cmd = subprocess.list2cmdline([exe_path, script_path, "--minimized"])
+
+        account, sid = _get_current_user_identity()
+        task_name = f"{AUTOSTART_TASK_BASE_NAME}-{sid}" if sid else AUTOSTART_TASK_BASE_NAME
+        return {
+            "command": exe_path,
+            "arguments": arguments,
+            "working_dir": working_dir,
+            "registry_cmd": registry_cmd,
+            "account": account,
+            "sid": sid,
+            "task_name": task_name,
+        }
+
+    def _get_autostart_task_names():
+        spec = _build_autostart_launch_spec()
+        names = [spec.get("task_name"), AUTOSTART_TASK_BASE_NAME]
+        unique = []
+        for name in names:
+            if name and name not in unique:
+                unique.append(name)
+        return unique
+
+    def _read_registry_autostart_cmd():
+        try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
             try:
-                cmd, _ = winreg.QueryValueEx(key, "NovaApplication")
+                cmd, _ = winreg.QueryValueEx(key, AUTOSTART_REG_VALUE_NAME)
+                return str(cmd or "").strip() or None
+            finally:
                 winreg.CloseKey(key)
-                return cmd
-            except FileNotFoundError:
-                winreg.CloseKey(key)
-                return None
-        except Exception:
+        except FileNotFoundError:
             return None
+        except OSError:
+            return None
+
+    def _write_registry_autostart_cmd(cmd_value):
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run")
+            try:
+                winreg.SetValueEx(key, AUTOSTART_REG_VALUE_NAME, 0, winreg.REG_SZ, str(cmd_value))
+            finally:
+                winreg.CloseKey(key)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def _delete_registry_autostart_cmd():
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_WRITE)
+            try:
+                winreg.DeleteValue(key, AUTOSTART_REG_VALUE_NAME)
+            finally:
+                winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    def _registry_autostart_matches_spec(cmd_value, spec):
+        try:
+            current = str(cmd_value or "").strip().lower()
+            expected = str(spec.get("registry_cmd") or "").strip().lower()
+            return bool(current and expected and current == expected)
+        except:
+            return False
+
+    def _query_scheduled_task_xml(task_name):
+        try:
+            result = subprocess.run(
+                ["schtasks", "/query", "/tn", task_name, "/xml"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                text=True
+            )
+            if result.returncode == 0 and str(result.stdout or "").strip():
+                return result.stdout
+        except:
+            pass
+        return None
+
+    def _parse_scheduled_task_exec(xml_text):
+        try:
+            root = ET.fromstring(xml_text)
+            ns_uri = ""
+            if isinstance(root.tag, str) and root.tag.startswith("{"):
+                ns_uri = root.tag.split("}", 1)[0][1:]
+            ns = {"t": ns_uri} if ns_uri else {}
+            prefix = "t:" if ns_uri else ""
+
+            def _findtext(path):
+                node = root.find(path, ns)
+                if node is None or node.text is None:
+                    return ""
+                return node.text.strip()
+
+            return {
+                "command": _findtext(f".//{prefix}Exec/{prefix}Command"),
+                "arguments": _findtext(f".//{prefix}Exec/{prefix}Arguments"),
+                "working_dir": _findtext(f".//{prefix}Exec/{prefix}WorkingDirectory"),
+                "run_level": _findtext(f".//{prefix}Principal/{prefix}RunLevel"),
+                "user_id": _findtext(f".//{prefix}Principal/{prefix}UserId"),
+            }
+        except:
+            return None
+
+    def _scheduled_task_matches_spec(xml_text, spec):
+        task_info = _parse_scheduled_task_exec(xml_text)
+        if not task_info:
+            return False
+
+        if _normalize_autostart_path(task_info.get("command")) != _normalize_autostart_path(spec.get("command")):
+            return False
+        if str(task_info.get("arguments") or "").strip() != str(spec.get("arguments") or "").strip():
+            return False
+        if _normalize_autostart_path(task_info.get("working_dir")) != _normalize_autostart_path(spec.get("working_dir")):
+            return False
+
+        run_level = str(task_info.get("run_level") or "").strip().lower()
+        if run_level not in ("highestavailable", "highest"):
+            return False
+        return True
+
+    def _delete_scheduled_autostart_task(task_name):
+        try:
+            result = subprocess.run(
+                ["schtasks", "/delete", "/tn", task_name, "/f"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                text=True
+            )
+            if result.returncode == 0:
+                return True
+            err_text = f"{result.stdout}\n{result.stderr}".lower()
+            if "cannot find the file specified" in err_text or "не удается найти указанный файл" in err_text:
+                return False
+        except:
+            pass
+        return False
+
+    def _create_scheduled_autostart_task(spec):
+        task = ET.Element("Task", attrib={"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
+        reg_info = ET.SubElement(task, "RegistrationInfo")
+        ET.SubElement(reg_info, "Author").text = spec.get("account") or "Nova"
+        ET.SubElement(reg_info, "Description").text = "Nova autostart entry"
+
+        triggers = ET.SubElement(task, "Triggers")
+        logon_trigger = ET.SubElement(triggers, "LogonTrigger")
+        ET.SubElement(logon_trigger, "Enabled").text = "true"
+        if spec.get("sid"):
+            ET.SubElement(logon_trigger, "UserId").text = spec["sid"]
+
+        principals = ET.SubElement(task, "Principals")
+        principal = ET.SubElement(principals, "Principal", attrib={"id": "Author"})
+        if spec.get("sid"):
+            ET.SubElement(principal, "UserId").text = spec["sid"]
+        ET.SubElement(principal, "LogonType").text = "InteractiveToken"
+        ET.SubElement(principal, "RunLevel").text = "HighestAvailable"
+
+        settings = ET.SubElement(task, "Settings")
+        ET.SubElement(settings, "MultipleInstancesPolicy").text = "IgnoreNew"
+        ET.SubElement(settings, "DisallowStartIfOnBatteries").text = "false"
+        ET.SubElement(settings, "StopIfGoingOnBatteries").text = "false"
+        ET.SubElement(settings, "AllowHardTerminate").text = "false"
+        ET.SubElement(settings, "StartWhenAvailable").text = "true"
+        ET.SubElement(settings, "RunOnlyIfNetworkAvailable").text = "false"
+        idle_settings = ET.SubElement(settings, "IdleSettings")
+        ET.SubElement(idle_settings, "StopOnIdleEnd").text = "false"
+        ET.SubElement(idle_settings, "RestartOnIdle").text = "false"
+        ET.SubElement(settings, "AllowStartOnDemand").text = "true"
+        ET.SubElement(settings, "Enabled").text = "true"
+        ET.SubElement(settings, "Hidden").text = "false"
+        ET.SubElement(settings, "RunOnlyIfIdle").text = "false"
+        ET.SubElement(settings, "WakeToRun").text = "false"
+        ET.SubElement(settings, "ExecutionTimeLimit").text = "PT0S"
+        ET.SubElement(settings, "Priority").text = "7"
+
+        actions = ET.SubElement(task, "Actions", attrib={"Context": "Author"})
+        exec_node = ET.SubElement(actions, "Exec")
+        ET.SubElement(exec_node, "Command").text = spec.get("command") or ""
+        if spec.get("arguments"):
+            ET.SubElement(exec_node, "Arguments").text = spec["arguments"]
+        if spec.get("working_dir"):
+            ET.SubElement(exec_node, "WorkingDirectory").text = spec["working_dir"]
+
+        temp_dir = os.path.join(get_base_dir(), "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        fd, xml_path = tempfile.mkstemp(prefix="nova_autostart_", suffix=".xml", dir=temp_dir)
+        os.close(fd)
+        try:
+            ET.ElementTree(task).write(xml_path, encoding="utf-16", xml_declaration=True)
+            result = subprocess.run(
+                ["schtasks", "/create", "/tn", spec["task_name"], "/xml", xml_path, "/f"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                text=True
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or f"code {result.returncode}").strip()
+                return False, err or "schtasks create failed"
+
+            xml_after = _query_scheduled_task_xml(spec["task_name"])
+            if not xml_after or not _scheduled_task_matches_spec(xml_after, spec):
+                return False, "Task Scheduler created an unexpected autostart action"
+            return True, spec["task_name"]
+        finally:
+            try:
+                os.remove(xml_path)
+            except:
+                pass
+
+    def get_autostart_cmd():
+        """Проверяет состояние автозапуска (Task Scheduler preferred, registry fallback)."""
+        spec = _build_autostart_launch_spec()
+        for task_name in _get_autostart_task_names():
+            xml_text = _query_scheduled_task_xml(task_name)
+            if xml_text and _scheduled_task_matches_spec(xml_text, spec):
+                return f"schtasks:{task_name}"
+
+        reg_cmd = _read_registry_autostart_cmd()
+        if reg_cmd and _registry_autostart_matches_spec(reg_cmd, spec):
+            return reg_cmd
+        return None
 
     def get_startup_status():
         return get_autostart_cmd() is not None
 
     def toggle_startup(log_func=None):
-        """Переключает состояние автозапуска (используя Task Scheduler для прав Админа)"""
+        """Переключает состояние автозапуска (Task Scheduler with registry fallback)."""
         try:
-            exe_path = os.path.abspath(sys.executable)
-            cmd_to_add = f'"{exe_path}"'
-            
-            try:
-                if getattr(sys, 'frozen', False):
-                    cmd_to_add = f'"{exe_path}" --minimized'
-                else:
-                    try:
-                        script_path = os.path.abspath(__file__)
-                        cmd_to_add = f'"{exe_path}" "{script_path}" --minimized'
-                    except NameError:
-                        # Fallback if __file__ is undefined
-                        cmd_to_add = f'"{exe_path}" --minimized'
-            except Exception as e:
-                if log_func: log_func(f"[Autostart] Ошибка формирования пути: {e}")
-                
+            spec = _build_autostart_launch_spec()
             status = get_startup_status()
-            
-            # Clean up old Registry entry if exists
-            try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_WRITE)
-                winreg.DeleteValue(key, "NovaApplication")
-                winreg.CloseKey(key)
-            except: pass
 
             if status:
-                # Включен -> Отключить
-                try:
-                    subprocess.run(["schtasks", "/delete", "/tn", "NovaAutoStart", "/f"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-                    if log_func: log_func("[Autostart] Автозапуск отключен")
-                    else: print("[Autostart] Disabled")
-                except Exception as e:
-                    if log_func: log_func(f"[Autostart] Ошибка при отключении: {e}")
-            else:
-                # Отключен -> Включить (Создаём задачу с наивысшими правами)
-                try:
-                    res = subprocess.run([
-                        "schtasks", "/create", "/tn", "NovaAutoStart", 
-                        "/tr", str(cmd_to_add), 
-                        "/sc", "onlogon", 
-                        "/rl", "highest", 
-                        "/f"
-                    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW, text=True)
-                    
-                    if res.returncode == 0:
-                        if log_func: log_func(f"[Autostart] Автозапуск включен (с правами Администратора)")
-                        else: print(f"[Autostart] Enabled as Admin")
+                removed_any = False
+                for task_name in _get_autostart_task_names():
+                    removed_any = _delete_scheduled_autostart_task(task_name) or removed_any
+                removed_any = _delete_registry_autostart_cmd() or removed_any
+                if log_func:
+                    if removed_any:
+                        log_func("[Autostart] Автозапуск отключен")
                     else:
-                        err_msg = res.stderr.strip() or "schtasks failed"
-                        raise Exception(f"{err_msg}. Перезапустите Nova от имени Администратора для настройки автозапуска.")
-                except Exception as e:
-                    if log_func: log_func(f"[Autostart] Ошибка при записи: {e}")
+                        log_func("[Autostart] Автозапуск уже был отключен")
+                else:
+                    print("[Autostart] Disabled")
+            else:
+                for task_name in _get_autostart_task_names():
+                    _delete_scheduled_autostart_task(task_name)
+                _delete_registry_autostart_cmd()
+
+                task_ok, task_msg = _create_scheduled_autostart_task(spec)
+                if task_ok:
+                    if log_func:
+                        log_func("[Autostart] Автозапуск включен (Task Scheduler, HighestAvailable)")
+                    else:
+                        print("[Autostart] Enabled via Task Scheduler")
+                else:
+                    reg_ok, reg_err = _write_registry_autostart_cmd(spec["registry_cmd"])
+                    if reg_ok:
+                        if log_func:
+                            log_func(f"[Autostart] Планировщик задач недоступен: {task_msg}")
+                            log_func("[Autostart] Включен fallback через HKCU\\Run.")
+                        else:
+                            print("[Autostart] Enabled via registry fallback")
+                    else:
+                        err_text = task_msg
+                        if reg_err:
+                            err_text = f"{task_msg}; registry: {reg_err}" if err_text else reg_err
+                        if log_func:
+                            log_func(f"[Autostart] Ошибка при записи: {err_text}")
         except Exception as e:
             if log_func: log_func(f"[Autostart] Ошибка системы: {e}")
             else: print(f"[Autostart] Error: {e}")
@@ -7391,6 +8446,7 @@ try:
     auto_excluded_domains = set()
     special_strategy_domains = set()
     service_strategy_domains = set()
+    service_strategy_root_domains = set()
     exclude_file_lock = threading.Lock() 
     CHECK_CACHE_FILE = os.path.join(get_base_dir(), "temp", "direct_check_cache.json")
     PENDING_CHECKS_FILE = os.path.join(get_base_dir(), "temp", "pending_checks.json")
@@ -7705,6 +8761,8 @@ try:
     def is_service_domain_only(domain):
         """Проверяет, принадлежит ли домен к сервисным стратегиям (youtube, discord и т.д.)."""
         if domain in service_strategy_domains: return True
+        reg_domain = get_registered_domain(domain)
+        if reg_domain in service_strategy_root_domains: return True
         parts = domain.split('.')
         for i in range(1, len(parts)):
             parent = ".".join(parts[i:])
@@ -7770,9 +8828,10 @@ try:
              log_func(f"[Init] Загружено {len(new_set)} доменов из исключений.")
 
     def load_special_strategy_domains(log_func=None):
-        global special_strategy_domains, service_strategy_domains
+        global special_strategy_domains, service_strategy_domains, service_strategy_root_domains
         special_strategy_domains = set()
         service_strategy_domains = set()
+        service_strategy_root_domains = set()
         protected_strategies = ["youtube", "discord", "whatsapp", "telegram", "cloudflare", "warp", "voice", "games"]
         base_dir = get_base_dir()
         count = 0
@@ -7788,6 +8847,9 @@ try:
                             if d:
                                 special_strategy_domains.add(d)
                                 service_strategy_domains.add(d)
+                                root_domain = get_registered_domain(d)
+                                if root_domain:
+                                    service_strategy_root_domains.add(root_domain)
                                 count += 1
                 except: pass
         
@@ -8420,12 +9482,16 @@ try:
                     # 1. Check Modern Format {"strategies": [...]}
                     if isinstance(existing_strategies, dict) and "strategies" in existing_strategies:
                         for s in existing_strategies["strategies"]:
-                            existing_map[tuple(s['args'])] = s
+                            normalized = normalize_service_strategy_entry(svc, s)
+                            if normalized:
+                                existing_map[tuple(normalized['args'])] = normalized
                     
                     # 2. Check (My Previous) List Format
                     elif isinstance(existing_strategies, list):
                         for s in existing_strategies:
-                            existing_map[tuple(s['args'])] = s
+                            normalized = normalize_service_strategy_entry(svc, s)
+                            if normalized:
+                                existing_map[tuple(normalized['args'])] = normalized
                             
                     # 3. Check Legacy Dict Format
                     elif isinstance(existing_strategies, dict):
@@ -8434,7 +9500,9 @@ try:
                         for k, v in existing_strategies.items():
                             if k == "version": continue
                             if isinstance(v, list):
-                                existing_map[tuple(v)] = {"name": k, "args": v}
+                                normalized = normalize_service_strategy_entry(svc, {"name": k, "args": v})
+                                if normalized:
+                                    existing_map[tuple(normalized["args"])] = normalized
 
                     # We expect a list of dicts: [{"name":..., "args":...}, ...]
                     # We will reconstruct this list based on sorted results
@@ -8443,9 +9511,12 @@ try:
                     
                     # 1. Add successfully tested strategies (Sorted by Score)
                     for score, strat in s_results:
-                         t_args = tuple(strat['args'])
+                         normalized = normalize_service_strategy_entry(svc, strat)
+                         if not normalized:
+                             continue
+                         t_args = tuple(normalized['args'])
                          if t_args not in seen_args:
-                             new_list.append(strat) # Keep original name/struct
+                             new_list.append(normalized) # Keep original name/struct
                              seen_args.add(t_args)
                     
                     # 2. Add remaining strategies from file that were NOT in results (e.g. crashed/skipped)
@@ -8527,12 +9598,36 @@ try:
                     continue
 
                 if not is_service_active:
+                    was_active = False
                     # debug_file_log("Service Inactive, sleep 1")
                     time_sys.sleep(1)
                     continue
+
+                if not was_active:
+                    was_active = True
+                    advanced_strategy_checker_worker._warp_grace_until = time_sys.time() + 35.0
+                    advanced_strategy_checker_worker._warp_wait_logged = False
                 
                 # log_func(f"[Trace] Cycle Start. RunID={SERVICE_RUN_ID}")
                 current_run_id = SERVICE_RUN_ID
+
+                try:
+                    wm = globals().get("warp_manager")
+                    warp_grace_until = float(getattr(advanced_strategy_checker_worker, "_warp_grace_until", 0.0) or 0.0)
+                    if wm and time_sys.time() < warp_grace_until:
+                        warp_starting = bool(getattr(wm, "_is_starting_now", False))
+                        warp_connected = bool(getattr(wm, "is_connected", False))
+                        warp_port = int(getattr(wm, "port", 1370))
+                        warp_port_open = is_local_port_open(warp_port)
+                        if warp_starting or (not warp_connected and not warp_port_open):
+                            if not getattr(advanced_strategy_checker_worker, "_warp_wait_logged", False):
+                                log_func("[Check] Ожидание готовности WARP перед стартом проверки...")
+                                advanced_strategy_checker_worker._warp_wait_logged = True
+                            time_sys.sleep(2)
+                            continue
+                    advanced_strategy_checker_worker._warp_wait_logged = False
+                except:
+                    pass
 
                 
                 # === Init: Prepare isolated test executable ===
@@ -8828,6 +9923,7 @@ try:
                         return None
                     # Если запрошен перезапуск или экстренная операция - прерываем
                     if restart_requested_event.is_set(): return None
+                    if hotswap_pause_event.is_set(): return None
                     if not urgent_analysis_queue.empty(): return None
                     
                     # Проверяем наличие .bin файлов перед запуском, чтобы избежать падений
@@ -9040,11 +10136,13 @@ try:
                         def check_task(d):
                             # Zombie Check inside loop (The most effective kill switch)
                             if run_id is not None and run_id != SERVICE_RUN_ID: return None
+                            if hotswap_pause_event.is_set(): return None
 
                             # Notify Start
                             if progress_tracker: progress_tracker(event="start")
 
                             if rate_limiter: rate_limiter.acquire()
+                            if hotswap_pause_event.is_set(): return None
                             p = local_ports.get()
                             try:
                                 res = check_domain_safe(d, p)
@@ -9059,7 +10157,7 @@ try:
                             futures = {executor.submit(check_task, d): d for d in domains_to_check}
                             checks_done = 0
                             for f in concurrent.futures.as_completed(futures):
-                                if is_closing or not is_service_active: 
+                                if is_closing or not is_service_active or hotswap_pause_event.is_set():
                                     executor.shutdown(wait=False, cancel_futures=True)
                                     return None # FIX: Return None on detailed abort to prevent saving partial score
                                 try:
@@ -9084,6 +10182,7 @@ try:
 
                 def check_strat_threaded(strat_args, target_domains=None, progress_tracker=None, run_id=None):
                     if is_closing or not is_service_active: return None
+                    if hotswap_pause_event.is_set(): return None
                     
                     # Zombie Check
                     if run_id is not None and run_id != SERVICE_RUN_ID: return None
@@ -9156,7 +10255,7 @@ try:
                         _domain_offset_counter["value"] = 0
 
                 # === РАСШИРЕННАЯ ФУНКЦИЯ МУТАЦИИ СТРАТЕГИЙ (с обучением) ===
-                def mutate_strategy(args, bin_files, count=None, learning_data=None):
+                def mutate_strategy(args, bin_files, count=None, learning_data=None, service_name=None):
                     """
                     Генерирует мутации стратегии с учётом статистики обучения.
                     50% проверенных успешных мутаций + 50% экспериментальных.
@@ -9170,7 +10269,9 @@ try:
                     """
                     if not args: return []
                     # FIX: Sanitize args
-                    args = [a for a in args if isinstance(a, str)]
+                    args = sanitize_service_strategy_args(service_name, args)
+                    if str(service_name).lower() == "youtube":
+                        return generate_safe_youtube_mutations(args, count=count)
                     
                     if learning_data is None:
                         learning_data = load_learning_data()
@@ -9574,6 +10675,7 @@ try:
                     "whatsapp_checked": False,
                     "last_wave_count": 0,
                     "evolution_stage": 0,
+                    "resume_pending": False,
                     "app_version": CURRENT_VERSION # FIX: Default to current version to prevent false reset on fresh start
                 }
 
@@ -9590,6 +10692,20 @@ try:
                 else:
                     # Final attempt if loop failed
                     state.update(load_json_robust(state_path, {}))
+
+                state_normalized = False
+                if state.get("evolution_stage", 0) > 0 and state.get("completed", False):
+                    state["completed"] = False
+                    state_normalized = True
+                if state.get("resume_pending", False) and state.get("completed", False):
+                    state["completed"] = False
+                    state_normalized = True
+                if state_normalized:
+                    try:
+                        with open(state_path, "w", encoding="utf-8") as f:
+                            json.dump(state, f, indent=2)
+                    except:
+                        pass
                 
                 # DEBUG (CLI only): print loaded-state snapshot only when it changes.
                 if IS_DEBUG_CLI:
@@ -9625,6 +10741,7 @@ try:
                     state["cloudflare_checked"] = False
                     state["whatsapp_checked"] = False
                     state["app_version"] = CURRENT_VERSION
+                    state["resume_pending"] = False
                     # Не сбрасываем bin_performance, чтобы не терять статистику
                     try:
                         with open(state_path, "w", encoding="utf-8") as f:
@@ -9651,6 +10768,130 @@ try:
                             json.dump(state, f, indent=2)
                     except Exception as e:
                         if IS_DEBUG_MODE: log_func(f"[Check-Error] Failed to save state: {e}")
+
+                hotswap_scan_pause_state = {"active": False}
+
+                def pause_background_checks(pending_queue, active_map=None, progress_file=None, completed_names=None,
+                                            phase_label="Фоновые проверки", mark_checks_incomplete=False):
+                    unfinished_tasks = []
+                    if active_map:
+                        for fut, info in list(active_map.items()):
+                            task_meta = None
+                            try:
+                                if isinstance(info, tuple):
+                                    task_meta = info[0]
+                                else:
+                                    task_meta = info
+                            except:
+                                task_meta = None
+                            if task_meta is not None:
+                                unfinished_tasks.append(task_meta)
+                            try:
+                                fut.cancel()
+                            except:
+                                pass
+                        active_map.clear()
+
+                    if unfinished_tasks:
+                        pending_queue[:0] = unfinished_tasks
+
+                    if progress_file and completed_names is not None:
+                        try:
+                            progress_payload = {
+                                "completed": sorted(list(completed_names)),
+                                "timestamp": time.time(),
+                                "ip": current_ip
+                            }
+                            save_json_safe(progress_file, progress_payload)
+                        except:
+                            pass
+
+                        try:
+                            scores_temp_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+                            partial_scores = {}
+                            for (svc_k, name_k), val_pair in check_phase_scores.items():
+                                val_s, val_t = val_pair if isinstance(val_pair, tuple) else (val_pair, 0)
+                                if svc_k not in partial_scores:
+                                    partial_scores[svc_k] = {}
+                                partial_scores[svc_k][name_k] = {
+                                    "score": val_s,
+                                    "total": val_t,
+                                    "timestamp": int(time.time())
+                                }
+                            if partial_scores:
+                                existing_partials = load_json_robust(scores_temp_path, {})
+                                for k_svc, v_dict in partial_scores.items():
+                                    if k_svc not in existing_partials:
+                                        existing_partials[k_svc] = {}
+                                    existing_partials[k_svc].update(v_dict)
+                                save_json_safe(scores_temp_path, existing_partials)
+                        except:
+                            pass
+
+                    if mark_checks_incomplete:
+                        state["checks_completed"] = False
+                    save_state()
+
+                    if not hotswap_scan_pause_state["active"]:
+                        reason_txt = _hot_swap_pause_reason[0] or "Идёт перезапуск ядра"
+                        log_func(f"[HotSwap] {reason_txt}. {phase_label} поставлены на паузу, прогресс сохранён.")
+                        hotswap_scan_pause_state["active"] = True
+
+                    while hotswap_pause_event.is_set() and not is_closing and is_service_active:
+                        time.sleep(0.5)
+
+                    if hotswap_scan_pause_state["active"] and is_service_active and not is_closing:
+                        log_func(f"[HotSwap] Ядро восстановлено. {phase_label} продолжены с сохранённого места.")
+                    hotswap_scan_pause_state["active"] = False
+
+                def normalize_stale_evolution_resume(current_ip):
+                    if IS_EVO_MODE:
+                        return False
+                    if not state.get("checks_completed", False):
+                        return False
+                    if state.get("completed", False):
+                        return False
+                    if state.get("evolution_stage", 0) <= 0:
+                        return False
+                    saved_ip = state.get("last_checked_ip")
+                    if saved_ip and current_ip and saved_ip != current_ip:
+                        return False
+                    if state.get("app_version") not in (None, "", CURRENT_VERSION):
+                        stale_reason = "версия приложения изменилась"
+                    else:
+                        progress_path = os.path.join(get_base_dir(), "temp", "checker_progress.json")
+                        progress_age = None
+                        try:
+                            if os.path.exists(progress_path):
+                                progress_data = load_json_robust(progress_path, {})
+                                progress_ts = float(progress_data.get("timestamp", 0) or 0)
+                                if progress_ts > 0:
+                                    progress_age = time.time() - progress_ts
+                        except:
+                            progress_age = None
+
+                        if progress_age is None:
+                            try:
+                                progress_age = time.time() - os.path.getmtime(state_path)
+                            except:
+                                progress_age = 999999
+
+                        if progress_age <= 300:
+                            return False
+                        stale_reason = f"незавершённая эволюция устарела ({int(progress_age // 60)} мин)"
+
+                    state["completed"] = True
+                    state["evolution_stage"] = 0
+                    state["checks_completed"] = True
+                    state["resume_pending"] = False
+                    state["app_version"] = CURRENT_VERSION
+                    if not state.get("last_check_time"):
+                        state["last_check_time"] = time.time()
+                    if not state.get("last_full_check_time"):
+                        state["last_full_check_time"] = time.time()
+                    save_state()
+                    log_func(f"[Check] Найдено зависшее состояние эволюции. Автовозобновление отменено: {stale_reason}.")
+                    return True
 
                 # --- Логика проверки IP и необходимости запуска ---
                 # Повторная проверка VPN непосредственно перед получением IP, чтобы избежать гонки состояний при запуске.
@@ -9693,9 +10934,15 @@ try:
                          needs_ip_recheck = True
 
                 # FIX: Chech loaded_ip and completion status BEFORE using them in debounce logic
-                loaded_completed = state.get("completed", False) or state.get("checks_completed", False)
+                pending_resume = bool(state.get("resume_pending", False))
+                loaded_completed = (state.get("completed", False) or state.get("checks_completed", False)) and not pending_resume
                 loaded_ip = state.get("last_checked_ip", None)
                 same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
+
+                if normalize_stale_evolution_resume(current_ip):
+                    loaded_completed = state.get("completed", False) or state.get("checks_completed", False)
+                    loaded_ip = state.get("last_checked_ip", None)
+                    same_ip_and_completed = loaded_completed and (loaded_ip == current_ip or loaded_ip is None)
 
                 # Extra Debounce: If IP just changed, wait a bit and re-verify before nuking state
                 if needs_ip_recheck and loaded_ip != current_ip:
@@ -9745,11 +10992,23 @@ try:
                         "whatsapp_checked": False,
                         "last_wave_count": 0,
                         "evolution_stage": 0,
+                        "resume_pending": False,
                         "checks_completed": False,
                         "last_checked_ip": current_ip,
                         "app_version": CURRENT_VERSION
                     })
                     save_state()
+
+                elif pending_resume:
+                    if state.get("completed", False):
+                        state["completed"] = False
+                    state["resume_pending"] = False
+                    save_state()
+                    need_check = True
+                    if state.get("evolution_stage", 0) > 0:
+                        log_func(f"[Check] Возобновление эволюции после перезапуска (этап {state.get('evolution_stage') + 1}/3).")
+                    else:
+                        log_func(f"[Check] Возобновление проверки после перезапуска (IP прежний: {mask_ip(current_ip)}).")
                 
                 elif not same_ip_and_completed:
                     # FIX: RESUME LOGIC (IP same, but NOT completed)
@@ -9865,7 +11124,7 @@ try:
                                 return []
                             
                             if service_key in main_data:
-                                args = main_data[service_key]
+                                args = sanitize_service_strategy_args(service_key, main_data[service_key])
                                 # FIX: Respect DISABLED/OFF status (including null/false)
                                 if args is None or (isinstance(args, bool) and not args) or \
                                    (isinstance(args, str) and args.strip().upper() in ["DISABLED", "OFF", "FALSE", "NONE"]):
@@ -9896,13 +11155,16 @@ try:
                             for s in file_strats:
                                 # Start with type check
                                 if not isinstance(s, dict): continue
+                                normalized = normalize_service_strategy_entry(service_key, s)
+                                if not normalized:
+                                    continue
 
                                 # We want to check ALL strategies. 
                                 # But if "Current" is identical to "youtube_5", we don't need to check "youtube_5" twice?
                                 # Actually, checking twice is waste.
                                 # Let's skip if args match exactly.
-                                if str(s.get("args")) != current_args_str:
-                                    service_strategies.append(s)
+                                if str(normalized.get("args")) != current_args_str:
+                                    service_strategies.append(normalized)
                                 else:
                                     # If it matches current, we might want to know WHICH strategy matches current.
                                     # But for checking purposes, "Current" covers it.
@@ -9923,6 +11185,8 @@ try:
                                 lines = f.read().splitlines()
                                 domains = [l.strip().split('#')[0].strip() for l in lines if l.strip() and not l.startswith("#")]
                         except: pass
+                    if os.path.basename(str(filepath or "")).lower() == "youtube.txt":
+                        domains = sanitize_youtube_domain_list(domains)
                     return domains
 
                 # --- Запуск фонового прогрева DNS (сразу) ---
@@ -10144,14 +11408,15 @@ try:
                     try:
                         s_path = os.path.join(base_dir, "strat", "strategies.json")
                         c_data = load_json_robust(s_path, {})
+                        sanitized_args = sanitize_service_strategy_args(succ_svc, succ_args)
                         
                         updated = False
                         if succ_svc == "general":
-                            c_data["general"] = succ_args
+                            c_data["general"] = sanitized_args
                             updated = True
                         else:
                             # Update specific service key
-                            c_data[succ_svc] = succ_args
+                            c_data[succ_svc] = sanitized_args
                             updated = True
                         
                         if updated:
@@ -10377,8 +11642,24 @@ try:
                         pending_hotswap = []  # Стратегии, ожидающие Hot Swap (если baseline ещё не установлен)
                         
                         while (task_queue or active_futures) and is_service_active and not is_closing:
+                            if hotswap_pause_event.is_set():
+                                pause_background_checks(
+                                    task_queue,
+                                    active_map=active_futures,
+                                    progress_file=PROGRESS_FILE,
+                                    completed_names=completed_tasks,
+                                    phase_label="Проверки стратегий",
+                                    mark_checks_incomplete=True
+                                )
+                                if not is_service_active or is_closing:
+                                    aborted_by_service = True
+                                    break
+                                continue
+
                             # 1. Fill slots (Заполнение потоков)
                             while len(active_futures) < STRATEGY_THREADS and task_queue and is_service_active and not is_closing:
+                                if hotswap_pause_event.is_set():
+                                    break
                                 task = task_queue.pop(0)
                                 if not is_service_active or is_closing:
                                     task_queue.insert(0, task)
@@ -10434,13 +11715,21 @@ try:
                             if not active_futures: break
                             
                             while audit_running_event.is_set():
+                                 if hotswap_pause_event.is_set():
+                                     break
                                  time.sleep(1)
-                                 
+
+                            if hotswap_pause_event.is_set():
+                                continue
+
                             done, _ = concurrent.futures.wait(active_futures.keys(), timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
                             
                             if aborted_by_service or is_closing:
                                 for f in active_futures.keys(): f.cancel()
                                 break
+
+                            if hotswap_pause_event.is_set():
+                                continue
                             
                             # 3. Process Results
                             for fut in done:
@@ -11310,7 +12599,7 @@ try:
                                         if svc in d and isinstance(d[svc], list):
                                              strategies_to_evolve.append(({
                                                  "name": f"Current {svc}",
-                                                 "args": d[svc]
+                                                 "args": sanitize_service_strategy_args(svc, d[svc])
                                              }, svc))
                                         
                                         sp = os.path.join(base_dir, "strat", f"{svc}.json")
@@ -11333,6 +12622,9 @@ try:
                                             filtered_count = 0  # Debug counter
                                             for s in s_spec_list:
                                                 if isinstance(s, dict) and "args" in s:
+                                                    s = normalize_service_strategy_entry(svc, s)
+                                                    if not s:
+                                                        continue
                                                     name = s.get("name", "")
                                                     score = strategy_scores.get((svc, name), 0)
                                                     
@@ -11407,11 +12699,11 @@ try:
                                     
                                     if deficit > 0 and svc in d_fill and isinstance(d_fill[svc], list):
                                         # Генерируем мутации Current стратегии
-                                        current_args = d_fill[svc]
+                                        current_args = sanitize_service_strategy_args(svc, d_fill[svc])
                                         # log_func(f"[Evo-Fill] {svc}: {current}/{target}. Генерирую {deficit} мутаций Current.")
                                         
                                         for i in range(deficit):
-                                            mutations = mutate_strategy(current_args, bin_files, count=1, learning_data=learning_data_prefill)
+                                            mutations = mutate_strategy(current_args, bin_files, count=1, learning_data=learning_data_prefill, service_name=svc)
                                             if mutations:
                                                 m_args = mutations[0]
                                                 # Generate unique name
@@ -11465,7 +12757,7 @@ try:
                                 
                                 # Генерируем мутации с учётом статистики обучения
                                 # FIX: Строго по 1 мутации на стратегию, чтобы не раздувать очередь (10 стратегий -> 10 задач)
-                                mutations = mutate_strategy(strat['args'], bin_files, count=1, learning_data=learning_data)
+                                mutations = mutate_strategy(strat['args'], bin_files, count=1, learning_data=learning_data, service_name=svc)
                                 
                                 for i, m_args in enumerate(mutations):
                                     base_name = strat['name'].split('_M')[0] # Reset suffix
@@ -11519,7 +12811,20 @@ try:
                             better_found = False
 
                             while (q_evo or active_evo) and is_service_active and not is_closing:
+                                if hotswap_pause_event.is_set():
+                                    pause_background_checks(
+                                        q_evo,
+                                        active_map=active_evo,
+                                        phase_label=f"Эволюция {stage_idx + 1}/3",
+                                        mark_checks_incomplete=False
+                                    )
+                                    if not is_service_active or is_closing:
+                                        break
+                                    continue
+
                                 while len(active_evo) < STRATEGY_THREADS and q_evo and is_service_active and not is_closing:
+                                    if hotswap_pause_event.is_set():
+                                        break
                                     t = q_evo.pop(0)
                                     
                                     # Double-check service status before creating UI line (race condition protection)
@@ -11574,7 +12879,11 @@ try:
                                     active_evo[fut] = (t, line_id)
                                 
                                 if not active_evo: break
+                                if hotswap_pause_event.is_set():
+                                    continue
                                 done, _ = concurrent.futures.wait(active_evo.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                                if hotswap_pause_event.is_set():
+                                    continue
                                 
                                 for f in done:
                                     task_info = active_evo.pop(f)
@@ -11647,13 +12956,17 @@ try:
                                              # HOT SWAP: Only apply if this is REALLY better than current winws strategy
                                              # Load current strategy from strategies.json to compare
                                              try:
-                                                 strat_main_path = os.path.join(base_dir, "strat", "strategies.json")
-                                                 current_config = load_json_robust(strat_main_path, {})
-                                                 current_args = current_config.get(svc_t if svc_t != "general" else "general", [])
-                                                 
-                                                 # Only trigger Hot Swap if args are actually different
-                                                 if strat_t["args"] != current_args:
-                                                     update_active_config_immediate(svc_t, strat_t["args"], f"{prefix} Применена лучшая стратегия {strat_t['name']}")
+                                                strat_main_path = os.path.join(base_dir, "strat", "strategies.json")
+                                                current_config = load_json_robust(strat_main_path, {})
+                                                current_args = sanitize_service_strategy_args(
+                                                    svc_t if svc_t != "general" else "general",
+                                                    current_config.get(svc_t if svc_t != "general" else "general", [])
+                                                )
+                                                candidate_args = sanitize_service_strategy_args(svc_t, strat_t["args"])
+                                                
+                                                # Only trigger Hot Swap if args are actually different
+                                                if candidate_args != current_args:
+                                                    update_active_config_immediate(svc_t, candidate_args, f"{prefix} Применена лучшая стратегия {strat_t['name']}")
                                              except Exception as hs_err:
                                                  if IS_DEBUG_MODE: log_func(f"[Evo-HotSwap] Error: {hs_err}")
                                         
@@ -11694,12 +13007,19 @@ try:
                     if is_service_active and not is_closing and current_stage_check >= len(stages):
                         # FINISH
                         log_func("[Check] Подбор полностью завершен.")
+                        try:
+                            progress_path = os.path.join(get_base_dir(), "temp", "checker_progress.json")
+                            if os.path.exists(progress_path):
+                                os.remove(progress_path)
+                        except:
+                            pass
                         
                         # Sync keys to match reading logic
                         state["last_check_time"] = time.time()
                         state["last_full_check_time"] = time.time() 
                         state["completed"] = True
                         state["evolution_stage"] = 0
+                        state["resume_pending"] = False
                         state["last_checked_ip"] = current_ip  # NEW: Save IP for restart detection
                         state["app_version"] = CURRENT_VERSION # FIX: Ensure version persists
                         save_state()
@@ -12199,6 +13519,10 @@ try:
         """
         global last_strategy_check_time
         last_strategy_check_time = time.time()  # Update timestamp for DNS cleaner isolation
+        probe_profile = get_domain_probe_profile(domain)
+        probe_path = probe_profile["path"]
+        min_speed = probe_profile["min_speed"]
+        min_success_bytes = probe_profile["min_success_bytes"]
         
         try:
             # Используем DNSManager для разрешения домена.
@@ -12226,11 +13550,11 @@ try:
             headers["Host"] = domain
             
             if priority:
-                conn.request("GET", "/", headers=headers)
+                conn.request("GET", probe_path, headers=headers)
                 resp = conn.getresponse()
             else:
                 with background_connection_semaphore:
-                    conn.request("GET", "/", headers=headers)
+                    conn.request("GET", probe_path, headers=headers)
                     resp = conn.getresponse()
             
             # Проверка HTTP статуса
@@ -12253,13 +13577,15 @@ try:
             accumulated = b''
             start_time = time.time()
             last_chunk_time = start_time
-            MIN_SPEED = 512
 
             while True:
                 try:
                     chunk = resp.read(4096)
                     
                     if not chunk:
+                        if min_success_bytes > 0 and len(accumulated) < min_success_bytes:
+                            conn.close()
+                            return "blocked", f"short_response_{len(accumulated)//1024}kb"
                         conn.close()
                         return "ok", "ok"
                     
@@ -12269,11 +13595,15 @@ try:
                     
                     if time_delta > 0.01:
                         read_speed = len(chunk) / time_delta
-                        if read_speed < MIN_SPEED and len(accumulated) > 1000:
+                        if read_speed < min_speed and len(accumulated) > 1000:
                             conn.close()
                             return "blocked", f"slow_speed_{read_speed:.0f}"
                     
                     last_chunk_time = current_time
+
+                    if min_success_bytes > 0 and len(accumulated) >= min_success_bytes:
+                        conn.close()
+                        return "ok", f"ok_{len(accumulated)//1024}kb"
                     
                     if 16000 < len(accumulated) < 20000:
                         try:
@@ -12377,11 +13707,16 @@ try:
         Проверяет доступность домена и отслеживает замедления.
         Возвращает True, если статус "ok" ИЛИ "error" с кодом HTTP (старая логика).
         """
+        probe_profile = get_domain_probe_profile(domain)
         for attempt in range(2):
             status, diag = detect_throttled_load(domain, port, priority)
             
             # Логика старой версии: если дошли до ответа сервера (даже с ошибкой 4xx/5xx) - это успех.
-            is_http_error_success = (status == "error" and diag.startswith("http_"))
+            is_http_error_success = (
+                status == "error" and
+                diag.startswith("http_") and
+                probe_profile.get("http_error_is_success", True)
+            )
             
             if status == "ok" or is_http_error_success:
                 unmark_domain_throttled(domain)
@@ -15490,34 +16825,11 @@ try:
 
     # ================= DEPENDENCY DOWNLOADER =================
     def download_dependencies(log_func, status_callback=None):
-        """Verifies packaged local binaries in resources/bin without downloading anything."""
+        """Prepare local helper layout without validating bundled binaries."""
         bin_dir = get_bin_dir()
         temp_dir = os.path.join(get_base_dir(), "temp")
         os.makedirs(bin_dir, exist_ok=True)
         os.makedirs(temp_dir, exist_ok=True)
-
-        files = [
-            "winws.exe",
-            "WinDivert.dll",
-            "WinDivert64.sys",
-            "cygwin1.dll",
-            "warp-cli.exe",
-            "warp-svc.exe",
-            "opera-proxy.windows-amd64.exe",
-            "aws_lc_fips_0_13_7_crypto.dll",
-            "aws_lc_fips_0_13_7_rust_wrapper.dll",
-            "warp_ipc.dll",
-            "wintun.dll",
-            "libcronet.dll",
-            "sing-box.exe",
-        ]
-
-        missing_files = []
-        for name in files:
-            path = os.path.join(bin_dir, name)
-            if not os.path.exists(path) or os.path.getsize(path) == 0:
-                missing_files.append(name)
-
         try:
             winws_path = os.path.join(bin_dir, "winws.exe")
             winws_test_path = os.path.join(bin_dir, "winws_test.exe")
@@ -15529,12 +16841,6 @@ try:
                     shutil.copy2(winws_path, winws_test_path)
         except Exception as e:
             log_func(f"[Init] Не удалось подготовить winws_test.exe: {e}")
-
-        if missing_files:
-            log_func("[Init] Ошибка: в локальной сборке отсутствуют обязательные bin-компоненты.")
-            for name in missing_files:
-                log_func(f"[Init] Missing: {name}")
-            return False
 
         if status_callback:
             status_callback("Локальные компоненты готовы . . .")
@@ -15738,7 +17044,7 @@ try:
 
 
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
-        global is_service_active, process, is_closing, _windivert_broken
+        global is_service_active, process, is_closing, _windivert_broken, is_restarting
         global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
         
         logger = globals().get('log_print', print)
@@ -15753,6 +17059,9 @@ try:
 
         # Сбрасываем флаг завершения при перезапуске, чтобы фоновые проверки возобновились
         is_closing = False
+        if not restart_mode:
+            try: clear_hotswap_checker_pause(log_resume=False)
+            except: pass
         
         if not is_admin(): 
             root.after(0, lambda: messagebox.showerror("Ошибка", "Нужны права Администратора!"))
@@ -15762,6 +17071,14 @@ try:
         if not os.path.exists(exe_path): 
             root.after(0, lambda: messagebox.showerror("Ошибка", f"Файл {WINWS_FILENAME} не найден!"))
             return
+
+        try:
+            load_auto_exclude(log_print if (not silent and 'log_print' in globals()) else None)
+            load_special_strategy_domains(log_print if (not silent and 'log_print' in globals()) else None)
+            smart_update_general()
+        except Exception as _e:
+            if IS_DEBUG_MODE and not silent:
+                print(f"[Init] [Diag] Не удалось рано очистить general.txt: {_e}")
         
         # EARLY CLEANUP: Stop old driver + kill old processes. All calls have short timeouts.
         # If any call times out, windivert is in a bad state → auto-recover via config update.
@@ -15782,6 +17099,14 @@ try:
 
         try:
             _windivert_state = _query_windivert_service_state()
+            if restart_mode and _windivert_state["pending_delete"]:
+                logger("[Init] Hot-Restart отложен: WinDivert ещё освобождается. Текущий WARP не трогаем.")
+                try:
+                    schedule_hot_restart_retry(20.0, "WinDivert ещё освобождается после hot-restart")
+                except:
+                    pass
+                is_restarting = False
+                return
             if _windivert_state["pending_delete"] or _windivert_state["disabled"]:
                 _windivert_reason = "pending delete" if _windivert_state["pending_delete"] else "disabled"
                 logger(f"[Init] Обнаружено проблемное состояние WinDivert ({_windivert_reason}). Пытаемся восстановить без перезагрузки...")
@@ -15804,13 +17129,14 @@ try:
             _windivert_stuck = True
         except: pass
         
-        try:
-            subprocess.run(["sc", "stop", "windivert"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
-        except subprocess.TimeoutExpired:
-            _windivert_stuck = True
-        except: pass
+        if not restart_mode:
+            try:
+                subprocess.run(["sc", "stop", "windivert"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
+            except subprocess.TimeoutExpired:
+                _windivert_stuck = True
+            except: pass
         
         # AUTO-RECOVERY: If windivert driver is stuck (commands timed out),
         # force config update instead of deleting (since we lack admin rights to recreate).
@@ -15862,28 +17188,16 @@ try:
             if isinstance(v, dict):
                 strategies[k] = v.get("args", [])
 
-        # Backward-compat: some user configs keep "_voice" only.
-        if "voice" not in strategies and isinstance(strategies.get("_voice"), list):
-            strategies["voice"] = list(strategies.get("_voice") or [])
+        # Runtime alias: older/user configs keep generic voice fallback under "_voice",
+        # but WinWS builder expects "voice". Preserve the user file as-is and expose
+        # a runtime "voice" block so Telegram/AyuGram calls can still use UDP fallback.
+        if ("voice" not in strategies or not isinstance(strategies.get("voice"), list) or not strategies.get("voice")):
+            legacy_voice = strategies.get("_voice")
+            if isinstance(legacy_voice, list) and legacy_voice:
+                strategies["voice"] = list(legacy_voice)
+                if not silent:
+                    print("[Init] Runtime voice fallback enabled from _voice.")
 
-        # Ensure Discord TCP includes 443 for bootstrap/update compatibility.
-        # Some strategy snapshots keep only alt ports (2053/2083/...), which can stall startup.
-        # DISABLED: User wants specific discord strategy matched to bat file without forcing 443 here
-        voice_args = strategies.get("voice", [])
-        has_voice_udp = isinstance(voice_args, list) and any(
-            isinstance(a, str) and ("--filter-udp=" in a or "--wf-udp=" in a)
-            for a in voice_args
-        )
-        if not has_voice_udp:
-            strategies["voice"] = list(
-                DEFAULT_STRATEGIES.get(
-                    "voice",
-                    []
-                )
-            )
-            if not silent:
-                print("[Init] [Diag] Стратегия voice отсутствует/пустая. Применён встроенный UDP fallback.")
-        
         # FAILSAFE: If strategies are still empty (file read error/race condition), load Defaults
         if not strategies:
              if not silent: print("[Init] Внимание: Стратегии не загружены (0). Используем встроенные настройки по умолчанию.")
@@ -15892,6 +17206,9 @@ try:
         if not silent: print(f"Загружено стратегий: {len(strategies)}")
         
         args = [exe_path] 
+        youtube_runtime_list_path = prepare_youtube_runtime_hostlist()
+        discord_runtime_list_path = prepare_discord_runtime_hostlist()
+        telegram_runtime_list_path = prepare_telegram_runtime_hostlist()
         
         exclusions = []
         # Always exclude localhost IPC from WinWS interception.
@@ -15913,7 +17230,7 @@ try:
                         ("--ipset-exclude", IP_CACHE_FILE),
                         ("--hostlist-exclude", paths['list_exclude_auto']),
                         ("--hostlist-exclude", paths['list_exclude'])]:
-             if os.path.exists(arg_tpl[1]) and os.path.getsize(arg_tpl[1]) > 0:
+             if file_has_noncomment_entries(arg_tpl[1]):
                  exclusions.append(f"{arg_tpl[0]}={arg_tpl[1]}")
 
         try:
@@ -16007,14 +17324,15 @@ try:
             list_file_path = os.path.join(get_base_dir(), "list", f"{strat_name}.txt")
             list_file_rel = os.path.join("list", f"{strat_name}.txt")
             
-            if strat_name == "youtube": list_file_path = paths['list_youtube']; list_file_rel = os.path.relpath(paths['list_youtube'], get_base_dir())
-            if strat_name == "discord": list_file_path = paths['list_discord']; list_file_rel = os.path.relpath(paths['list_discord'], get_base_dir())
+            if strat_name == "youtube": list_file_path = youtube_runtime_list_path; list_file_rel = os.path.relpath(youtube_runtime_list_path, get_base_dir())
+            if strat_name == "discord": list_file_path = discord_runtime_list_path; list_file_rel = os.path.relpath(discord_runtime_list_path, get_base_dir())
+            if strat_name == "telegram": list_file_path = telegram_runtime_list_path; list_file_rel = os.path.relpath(telegram_runtime_list_path, get_base_dir())
             
             ip_file_path = os.path.join(get_base_dir(), "ip", f"{strat_name}.txt")
             ip_file_rel = os.path.join("ip", f"{strat_name}.txt")
             
-            has_list = os.path.exists(list_file_path) and os.path.getsize(list_file_path) > 0
-            has_ip = os.path.exists(ip_file_path) and os.path.getsize(ip_file_path) > 0
+            has_list = file_has_noncomment_entries(list_file_path)
+            has_ip = file_has_noncomment_entries(ip_file_path)
             if not has_list and not has_ip and strat_name != "voice": continue
 
             if num_specific_strats_added > 0:
@@ -16081,7 +17399,7 @@ try:
         # Removed "Smart Clean" logic as per user request (restore v0.996 behavior)
 
 
-        gen_list_exists = os.path.exists(target_gen_list) and os.path.getsize(target_gen_list) > 0
+        gen_list_exists = file_has_noncomment_entries(target_gen_list)
         
         # FIX: Check if General is blocked
         is_gen_blocked = False
@@ -16090,7 +17408,7 @@ try:
         
         if is_gen_blocked:
              if not silent: print("[Init] Пропуск General стратегии (сервис заблокирован)")
-        elif gen_list_exists or os.path.exists(paths['ip_general']):
+        elif gen_list_exists or file_has_noncomment_entries(paths['ip_general']):
             if num_specific_strats_added > 0:
                 args.append("--new")
             
@@ -16101,7 +17419,7 @@ try:
                  general_common_args.append(f"--hostlist={target_gen_list}")
             
             # Add ipset if exists
-            if os.path.exists(paths['ip_general']) and os.path.getsize(paths['ip_general']) > 0:
+            if file_has_noncomment_entries(paths['ip_general']):
                  general_common_args.append(f"--ipset={paths['ip_general']}")
 
             args.extend(general_common_args)
@@ -16152,6 +17470,14 @@ try:
                  abs_parts.append(part)
         
         full_command_abs = " ".join(abs_parts)
+        try:
+            cmd_dump_path = os.path.join(get_base_dir(), "temp", "winws_last_command.txt")
+            os.makedirs(os.path.dirname(cmd_dump_path), exist_ok=True)
+            with open(cmd_dump_path, "w", encoding="utf-8") as f:
+                f.write(full_command_abs)
+                f.write("\n")
+        except:
+            pass
         
         def insert_cmd_link():
             if not log_text_widget: return
@@ -16249,6 +17575,22 @@ try:
                         text = str(line).strip()
                         if text:
                             print(f"  > {text}")
+
+                if restart_mode:
+                    is_restarting = False
+                    if not silent:
+                        try:
+                            if _windivert_unrecoverable_reason == "pending_delete_stuck":
+                                log_print("[Init] Hot-Restart ядра отложен: WinDivert ещё занят. WARP/EU оставлены без изменений.")
+                            else:
+                                log_print("[Init] Hot-Restart ядра не завершился. WARP/EU оставлены без изменений, повтор будет позже.")
+                        except:
+                            pass
+                    try:
+                        schedule_hot_restart_retry(20.0, "Повтор hot-restart после неудачного запуска ядра")
+                    except:
+                        pass
+                    return
 
                 if _windivert_unrecoverable_reason == "pending_delete_stuck":
                     detail = _windivert_unrecoverable_detail.strip()
@@ -16474,6 +17816,10 @@ try:
                          nova_service_status = "Running"
                          # Reset Restart Flag
                          is_restarting = False
+                         try:
+                             clear_hotswap_checker_pause(log_resume=False)
+                         except:
+                             pass
                          
                          # Update UI Status
                          if not silent and root:
@@ -16625,6 +17971,20 @@ try:
     def stop_nova_service(silent=False, wait_for_cleanup=False, restart_mode=False):
         global is_service_active, process, is_closing, nova_service_status, SERVICES_RUNNING, SERVICE_RUN_ID
         managed_opera_owned = False
+        if not restart_mode:
+            try: clear_hotswap_checker_pause(log_resume=False)
+            except: pass
+            try:
+                if is_scanning:
+                    state_path = os.path.join(get_base_dir(), "temp", "checker_state.json")
+                    stop_state = load_json_robust(state_path, {})
+                    if isinstance(stop_state, dict):
+                        stop_state["resume_pending"] = True
+                        if stop_state.get("evolution_stage", 0) > 0:
+                            stop_state["completed"] = False
+                        save_json_safe(state_path, stop_state)
+            except:
+                pass
         
         # === НЕМЕДЛЕННОЕ обновление состояния ===
         if not restart_mode:
@@ -16674,6 +18034,8 @@ try:
         def cleanup_processes():
             """Завершает процессы в фоновом потоке без блокировки UI"""
             time.sleep(0.05)  # Minimize wait
+            kill_test_instances = (not restart_mode) or hotswap_pause_event.is_set()
+            force_driver_stop = (not restart_mode) or hotswap_pause_event.is_set()
             
             # Сохраняем статистику перед остановкой (чтобы не терять данные при рестарте)
             try: save_visited_domains()
@@ -16699,11 +18061,12 @@ try:
                 subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME], 
                              creationflags=subprocess.CREATE_NO_WINDOW, 
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # Cleanup test instances too (ONLY if not restart_mode)
-                if not restart_mode:
+                # При HotSwap-паузе тоже убиваем winws_test.exe, иначе он держит WinDivert занятым.
+                if kill_test_instances:
                     subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"],
                                  creationflags=subprocess.CREATE_NO_WINDOW,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if not restart_mode:
                     subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"],
                                  creationflags=subprocess.CREATE_NO_WINDOW,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -16724,7 +18087,7 @@ try:
             
             # FIX: Force Driver Stop to release resources (but do not delete, to avoid startup delay/lock)
             try:
-                if not restart_mode:
+                if force_driver_stop:
                     time.sleep(0.2)  # Даём ОС время закрыть дескрипторы файла после taskkill winws
                     subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
             except: pass
@@ -16940,6 +18303,75 @@ try:
     # === HOT SWAP COOLDOWN ===
     _hot_swap_last_call = [0]  # Mutable container for closure
     _hot_swap_cooldown = 5  # Seconds between restarts
+    _hot_swap_retry_scheduled = [False]
+    _hot_swap_pause_reason = [""]
+    _hot_swap_pause_log_shown = [False]
+
+    def pause_checker_for_hotswap(reason=""):
+        reason_txt = str(reason or "").strip() or "Идёт перезапуск ядра"
+        already_active = hotswap_pause_event.is_set()
+        reason_changed = (_hot_swap_pause_reason[0] != reason_txt)
+        _hot_swap_pause_reason[0] = reason_txt
+        hotswap_pause_event.set()
+        if not already_active or reason_changed:
+            _hot_swap_pause_log_shown[0] = False
+            return True
+        return False
+
+    def clear_hotswap_checker_pause(log_resume=False):
+        if not hotswap_pause_event.is_set():
+            _hot_swap_pause_reason[0] = ""
+            _hot_swap_pause_log_shown[0] = False
+            return False
+        hotswap_pause_event.clear()
+        _hot_swap_pause_reason[0] = ""
+        _hot_swap_pause_log_shown[0] = False
+        if log_resume and is_service_active and not is_closing:
+            try:
+                log_print("[HotSwap] Ядро восстановлено. Фоновые проверки продолжены с сохранённого места.")
+            except:
+                pass
+        return True
+
+    def schedule_hot_restart_retry(delay_seconds=20.0, reason=""):
+        if is_closing or not is_service_active:
+            return False
+        if _hot_swap_retry_scheduled[0]:
+            return False
+
+        try:
+            delay_ms = max(1000, int(float(delay_seconds) * 1000))
+        except:
+            delay_ms = 20000
+
+        _hot_swap_retry_scheduled[0] = True
+
+        try:
+            reason_txt = str(reason or "").strip()
+            should_log = pause_checker_for_hotswap(reason_txt or "Ожидание освобождения WinDivert")
+            if reason_txt and should_log:
+                log_print(f"[HotSwap] {reason_txt}. Повтор перезапуска ядра через {max(1, delay_ms // 1000)}с без остановки WARP.")
+        except:
+            pass
+
+        def _retry():
+            _hot_swap_retry_scheduled[0] = False
+            if is_closing or not is_service_active:
+                return
+            perform_hot_restart_backend()
+
+        try:
+            if root:
+                root.after(delay_ms, _retry)
+            else:
+                def _worker():
+                    time.sleep(delay_ms / 1000.0)
+                    _retry()
+                threading.Thread(target=_worker, daemon=True).start()
+            return True
+        except:
+            _hot_swap_retry_scheduled[0] = False
+            return False
     
     def perform_hot_restart_backend():
         """
@@ -16954,43 +18386,47 @@ try:
             if IS_DEBUG_MODE: print("[HotSwap] Пропуск (cooldown)")
             return
         _hot_swap_last_call[0] = now
+
+        if getattr(perform_hot_restart_backend, "_in_progress", False):
+            if IS_DEBUG_MODE:
+                print("[HotSwap] Пропуск (already in progress)")
+            return
+
+        try:
+            windivert_state = _query_windivert_service_state()
+        except:
+            windivert_state = {}
+
+        if windivert_state.get("pending_delete"):
+            pause_checker_for_hotswap("WinDivert ещё не освобождён (pending delete)")
+            schedule_hot_restart_retry(20.0, "WinDivert ещё не освобождён (pending delete)")
+            return
         
         # log_print("[HotSwap] Применение новых параметров (WinWS Reset)...")
         # Optimized log to avoid clutter, maybe just print to console or debug log?
         if IS_DEBUG_MODE: print("[HotSwap] Перезапуск ядра...")
-        
-        # 1. Kill backend
-        if process:
-            try:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], 
-                             creationflags=subprocess.CREATE_NO_WINDOW, 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                process = None
-            except: pass
-        
-        # Ensure dead
-        try:
-             subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME], 
-                          creationflags=subprocess.CREATE_NO_WINDOW, 
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
+        pause_checker_for_hotswap("Перезапуск ядра для применения новых стратегий")
 
-        time.sleep(2.0) # Increased breath for WinDivert to release resources
-        
-        # 2. Restart via start_nova_service (Global context)
-        # Flag restart to prevent old thread from reporting Crash
-        global is_restarting
-        is_restarting = True
-        
-        if is_service_active and not is_closing:
-             # Call start_nova_service which is Thread-Safe (uses root.after for UI)
-             # We use a lambda to pass arguments
-             if root:
-                 root.after(0, lambda: start_nova_service(silent=True, restart_mode=True))
-                 if IS_DEBUG_MODE: print("[HotSwap] Запрошен перезапуск через start_nova_service (Hot-Restart Mode).")
-             else:
-                 # Fallback
-                 threading.Thread(target=start_nova_service, args=(True, True), daemon=True).start()
+        perform_hot_restart_backend._in_progress = True
+
+        def _worker():
+            global is_restarting
+            try:
+                is_restarting = True
+                stop_nova_service(silent=True, restart_mode=True, wait_for_cleanup=True)
+                time.sleep(0.8)
+
+                if is_service_active and not is_closing:
+                    if root:
+                        root.after(0, lambda: start_nova_service(silent=True, restart_mode=True))
+                        if IS_DEBUG_MODE:
+                            print("[HotSwap] Запрошен мягкий перезапуск через start_nova_service (Hot-Restart Mode).")
+                    else:
+                        threading.Thread(target=start_nova_service, args=(True, True), daemon=True).start()
+            finally:
+                perform_hot_restart_backend._in_progress = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def launch_background_tasks():
         """Запуск тяжелых фоновых задач ПОСЛЕ отображения окна — в ФОНОВОМ ПОТОКЕ."""
@@ -17559,7 +18995,9 @@ try:
                 try:
                     with open(u_discord_txt, "r", encoding="utf-8", errors="ignore") as f:
                         raw_txt = f.read()
-                    if 'discord.media' not in raw_txt:
+                    discord_lines = [line.split("#")[0].strip().lower() for line in raw_txt.splitlines() if line.split("#")[0].strip()]
+                    discord_set = set(discord_lines)
+                    if "discord.media" not in discord_set:
                         if log_func: log_func("[Init] Удален устаревший discord.txt для обновления списка доменов.")
                         f.close()
                         os.remove(u_discord_txt)
@@ -17961,7 +19399,7 @@ try:
         btn_update.bind("<Enter>", lambda e: main_canvas.config(cursor="hand2"))
         btn_update.bind("<Leave>", lambda e: main_canvas.config(cursor=""))
         btn_update.set_visible(False)
-        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, fg=log_fg, bg_color=log_bg)
+        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
         refresh_update_button()
 
         INDICATOR_RU = "#8FD8FF"

@@ -1,17 +1,31 @@
 {
-    "version": "1.15.6",
+    "version": "1.16",
     "strategies": [
         {
-            "name": "discord",
+            "name": "discord_17",
+            "args": [
+                "--filter-tcp=2053,2083,2087,2096,8443",
+                "--dpi-desync=multisplit",
+                "--dpi-desync-split-pos=1",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-repeats=8",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
+                "--new",
+                "--filter-udp=19294-19344,50000-50100",
+                "--filter-l7=discord,stun",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6"
+            ]
+        },
+        {
+            "name": "discord_18",
             "args": [
                 "--filter-tcp=2053,2083,2087,2096,8443",
                 "--dpi-desync=fake,multisplit",
-                "--dpi-desync-split-seqovl=681",
                 "--dpi-desync-split-pos=1",
-                "--dpi-desync-fooling=ts",
+                "--dpi-desync-fooling=badseq",
                 "--dpi-desync-repeats=8",
-                "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
                 "--new",
                 "--filter-udp=19294-19344,50000-50100",
                 "--filter-l7=discord,stun",
@@ -38,16 +52,28 @@
             ]
         },
         {
-            "name": "discord_3",
+            "name": "discord",
             "args": [
                 "--filter-tcp=2053,2083,2087,2096,8443",
-                "--dpi-desync=fake,multisplit",
-                "--dpi-desync-split-seqovl=681",
-                "--dpi-desync-split-pos=1",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-repeats=4",
                 "--dpi-desync-fooling=ts",
-                "--dpi-desync-repeats=8",
-                "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-hostfakesplit-mod=host=www.google.com",
+                "--new",
+                "--filter-udp=19294-19344,50000-50100",
+                "--filter-l7=discord,stun",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6"
+            ]
+        },
+        {
+            "name": "discord_11",
+            "args": [
+                "--filter-tcp=2053,2083,2087,2096,8443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-repeats=4",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-hostfakesplit-mod=host=www.google.com",
                 "--new",
                 "--filter-udp=19294-19344,50000-50100",
                 "--filter-l7=discord,stun",
@@ -72,61 +98,16 @@
             ]
         },
         {
-            "name": "discord_17",
-            "args": [
-                "--filter-tcp=2053,2083,2087,2096,8443",
-                "--dpi-desync=multisplit",
-                "--dpi-desync-split-pos=1",
-                "--dpi-desync-fooling=badseq",
-                "--dpi-desync-repeats=8",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-                "--new",
-                "--filter-udp=19294-19344,50000-50100",
-                "--filter-l7=discord,stun",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6"
-            ]
-        },
-        {
-            "name": "discord_16",
-            "args": [
-                "--filter-tcp=2053,2083,2087,2096,8443",
-                "--dpi-desync=multisplit",
-                "--dpi-desync-split-pos=1",
-                "--dpi-desync-fooling=badseq",
-                "--dpi-desync-repeats=8",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
-                "--new",
-                "--filter-udp=19294-19344,50000-50100",
-                "--filter-l7=discord,stun",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6"
-            ]
-        },
-        {
-            "name": "discord_11",
-            "args": [
-                "--filter-tcp=2053,2083,2087,2096,8443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-repeats=4",
-                "--dpi-desync-fooling=ts",
-                "--dpi-desync-hostfakesplit-mod=host=www.google.com",
-                "--new",
-                "--filter-udp=19294-19344,50000-50100",
-                "--filter-l7=discord,stun",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6"
-            ]
-        },
-        {
-            "name": "discord_18",
+            "name": "discord_3",
             "args": [
                 "--filter-tcp=2053,2083,2087,2096,8443",
                 "--dpi-desync=fake,multisplit",
+                "--dpi-desync-split-seqovl=681",
                 "--dpi-desync-split-pos=1",
-                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-fooling=ts",
                 "--dpi-desync-repeats=8",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
+                "--dpi-desync-split-seqovl-pattern=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
                 "--new",
                 "--filter-udp=19294-19344,50000-50100",
                 "--filter-l7=discord,stun",
@@ -300,6 +281,22 @@
                 "--dpi-desync-fooling=badseq",
                 "--dpi-desync-badseq-increment=1000",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--new",
+                "--filter-udp=19294-19344,50000-50100",
+                "--filter-l7=discord,stun",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6"
+            ]
+        },
+        {
+            "name": "discord_16",
+            "args": [
+                "--filter-tcp=2053,2083,2087,2096,8443",
+                "--dpi-desync=multisplit",
+                "--dpi-desync-split-pos=1",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-repeats=8",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com",
                 "--new",
                 "--filter-udp=19294-19344,50000-50100",
                 "--filter-l7=discord,stun",
