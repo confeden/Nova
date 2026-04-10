@@ -19,5 +19,3 @@ Twitch также будет работать в качестве 1080p (а дл
 Благодаря https://github.com/Alexey71/opera-proxy у вас есть официальные сервера Opera. Низкий ему поклон!
 
 🙋 Группа в ТГ: https://t.me/nova_txt
-
-благодарность (не обязательна!): https://confeden.github.io/Nova-donations/
