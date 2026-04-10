@@ -1,4 +1,4 @@
-# version: 1.16
+# version: 1.17
 1337x.to
 3dn.ru
 7tv.app
@@ -19398,6 +19398,7 @@ gains-trade.online
 gaintrade.net
 gainwhealfundslimited.com
 gainwork.net
+gajim.org
 gako.name
 gala-xy-etalon.space
 gala18.ru
@@ -21236,6 +21237,7 @@ gitedeladameaulit.com
 gitedessagnes.com
 gitem.ru
 giters.com
+github.com
 gitlab.io
 gitmemories.com
 gitmood.com
@@ -58045,6 +58047,7 @@ telegram-politics.com
 telegram-porn.com
 telegram-store.com
 telegram.cc
+telegram.me
 telegram.org.ru
 telegram.space
 telegramcatalog.com
@@ -58059,6 +58062,7 @@ teleportal.ua
 teleporthq.app
 teleprogramma-film.site
 telerga.ph
+telesco.pe
 teleskopov.net
 teleskopow.net
 teleskopu.com.ua

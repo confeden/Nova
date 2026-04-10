@@ -1,4 +1,4 @@
-# version: 1.16
+# version: 1.17
 1337x.to
 adobe.com
 adobe.io
@@ -37,6 +37,7 @@ discord.gg
 discordapp.com
 dl.sourceforge.net
 ecosyste.ms
+element.io
 etoneya.su
 evolution-x.org
 facebook.com
@@ -44,24 +45,26 @@ fb.com
 fb.me
 fbcdn.net
 fbsbx.com
-files.oaiusercontent.com
 filterblade.xyz
 flagcdn.com
 flibusta.is
 fsdn.com
 funpay.com
 google.dev
+greasyfork.org
 grokusercontent.com
 groq.com
 hexed.it
 ibb.co
 instagram.com
 island-of-pleasure.site
+jabber.fr
 kinozal.tv
 live.com
 lostfilm.tv
 lumalabs.ai
 mangamirai.com
+matrix.org
 mcpmarket.com
 meet.google.com
 microsoft.com
@@ -99,17 +102,19 @@ speedtest.net
 symantecliveupdate.com
 systeminformer.com
 t.me
+tampermonkey.net
 tapeop.dev
 telegra.ph
 telegram.org
 telesco.pe
 thepiratebay.org
-thisismyip.com
 tiktokcdn-us.com
+timeanddate.com
 torrindex.net
 twimg.com
 twitter.com
 vecpea.com
+vector.im
 vercel-storage.com
 verisoul.ai
 vultrusercontent.com

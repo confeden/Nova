@@ -1,4 +1,4 @@
-# version: 1.16
+# version: 1.17
 4pda.to
 alkalimakersuite-pa.clients6.google.com
 anthropic.com
@@ -9,6 +9,7 @@ cerebras.ai
 chatgpt.com
 claude.ai
 claude.com
+clients6.google.com
 cloudcode-pa.googleapis.com
 cloudcode.googleapis.com
 cloudresourcemanager.googleapis.com
@@ -28,11 +29,14 @@ invideo.io
 jules.google.com
 kilo.ai
 kodikplayer.com
+lh3.googleusercontent.com
 meta.ai
 msys2.org
 mtraf.io
 notebooklm.google.com
+ntc.party
 oaistatic.com
+oaiusercontent.com
 oauth2.googleapis.com
 onlinesim.io
 openai.com
@@ -47,7 +51,9 @@ skcrtxr.com
 smspva.com
 sora.com
 spotify.com
+thisismyip.com
 usher.ttvnw.net
 withgoogle.com
+www.gstatic.com
 x.ai
 xdaforums.com

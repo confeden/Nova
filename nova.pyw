@@ -8,7 +8,7 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.16"
+CURRENT_VERSION = "1.17"
 import sys
 import os
 import io
@@ -666,6 +666,34 @@ try:
         except:
             return False
 
+    def is_local_http_proxy_tunnel_ready(port, timeout=1.5, connect_hosts=None):
+        """
+        Strong proxy readiness probe.
+        Requires both local parser responsiveness and at least one successful HTTP CONNECT tunnel.
+        """
+        if not is_local_http_proxy_responsive(port=port, timeout=min(float(timeout), 1.0)):
+            return False
+        hosts = list(connect_hosts or ("www.gstatic.com:443", "thisismyip.com:443"))
+        per_host_timeout = max(0.8, float(timeout) / max(1, len(hosts)))
+        for connect_host in hosts:
+            try:
+                import socket
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=per_host_timeout) as s:
+                    s.settimeout(per_host_timeout)
+                    req = (
+                        f"CONNECT {connect_host} HTTP/1.1\r\n"
+                        f"Host: {connect_host}\r\n"
+                        "Proxy-Connection: close\r\n\r\n"
+                    ).encode("ascii", errors="ignore")
+                    s.sendall(req)
+                    data = s.recv(192) or b""
+                    first_line = (data.splitlines() or [b""])[0].upper()
+                    if first_line.startswith(b"HTTP/") and b" 200" in first_line:
+                        return True
+            except:
+                continue
+        return False
+
     # === CLEANUP OLD EXE (SELF-DELETION HANDLER) ===
     # This replaces the vulnerable shell-based self-deletion.
     # The new process receives the path of the old executable and deletes it after a delay.
@@ -1274,6 +1302,7 @@ try:
     # Конфигурация
     CONFIG_FILENAME = "window_config.json"
     STRATEGIES_FILENAME = "strategies.json"
+    WARP_STRATEGIES_FILENAME = "warp.json"
     HARD_LIST_FILENAME = "hard.txt"
     BLOCKED_LIST_FILENAME = "list/ru.txt"
     VISITED_DOMAINS_FILE = "temp/visited_domains_stats.json"
@@ -2374,8 +2403,8 @@ try:
             return self._register_warp_native_profile()
 
         def _is_local_http_proxy_alive(self, port=1371, timeout=1.2):
-            """Lightweight local parser probe without upstream endpoint dials."""
-            return is_local_http_proxy_responsive(port=port, timeout=timeout)
+            """Strong readiness probe for local HTTP proxy."""
+            return is_local_http_proxy_tunnel_ready(port=port, timeout=timeout)
 
         def _is_local_http_proxy_upstream_ready(self, port=1371, timeout=2.0):
             """One-shot upstream probe used only for optional TCP fallback gating."""
@@ -2414,13 +2443,34 @@ try:
                 time.sleep(0.2)
             return upstream_ok >= 1
 
-        def _build_warp_outbounds(self, warp_port, opera_port):
+        def _is_warp_socks_ready(self, port=1370):
+            """Conservative readiness probe for local WARP SOCKS."""
+            try:
+                wm = globals().get("warp_manager")
+                if wm is not None:
+                    if not bool(getattr(wm, "is_connected", False)):
+                        return False
+                    tester = getattr(wm, "_test_socks5_internet", None)
+                    if callable(tester):
+                        try:
+                            return bool(tester(int(port), timeout=1.5))
+                        except:
+                            return False
+                import socket
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=1.0):
+                    return True
+            except:
+                return False
+
+        def _build_warp_outbounds(self, warp_port, opera_port, warp_tcp_ready=False):
             self._using_wireguard_outbound = False
             outbounds = []
             endpoints = []
             target_udp = "direct"
             profile = None
-            if self._force_disable_native_wg:
+            if not warp_tcp_ready:
+                target_udp_candidates = []
+            elif self._force_disable_native_wg:
                 if not self._wg_disable_notice_logged:
                     self.log_func("[SingBox] [WG] Native WARP UDP временно отключён после частых падений. Используем direct/winws.")
                     self._wg_disable_notice_logged = True
@@ -2490,13 +2540,20 @@ try:
                     self.log_func(f"[SingBox] [WG] Ошибка подготовки native UDP endpoint: {e}")
             else:
                 target_udp_candidates = []
-            outbounds.append({"type": "socks", "tag": "warp-socks", "server": "127.0.0.1", "server_port": int(warp_port), "version": "5", "domain_strategy": "ipv4_only"})
-            if getattr(self, "_warp_udp_supported", False):
-                target_udp = "warp-socks"
-                target_udp_candidates = ["warp-socks"]
+            if warp_tcp_ready:
+                outbounds.append({"type": "socks", "tag": "warp-socks", "server": "127.0.0.1", "server_port": int(warp_port), "version": "5", "domain_strategy": "ipv4_only"})
+                if getattr(self, "_warp_udp_supported", False):
+                    target_udp = "warp-socks"
+                    target_udp_candidates = ["warp-socks"]
             if opera_port: outbounds.append({"type": "http", "tag": "opera-socks", "server": "127.0.0.1", "server_port": int(opera_port)})
             outbounds.append({"type": "direct", "tag": "direct"})
-            return outbounds, endpoints, target_udp, list(target_udp_candidates), "warp-socks"
+            if warp_tcp_ready:
+                target_tcp = "warp-socks"
+            elif opera_port:
+                target_tcp = "opera-socks"
+            else:
+                target_tcp = "direct"
+            return outbounds, endpoints, target_udp, list(target_udp_candidates), target_tcp
 
         def create_config(self):
             """Generates sing-box config securely from scratch on every run."""
@@ -2506,7 +2563,8 @@ try:
 
                 warp_port = int(globals().get('WARP_PORT', 1370))
                 opera_port = 1371 if self._is_local_http_proxy_stable() else None
-                outbounds, endpoints, target_udp, target_udp_candidates, target_tcp = self._build_warp_outbounds(warp_port, opera_port)
+                warp_tcp_ready = self._is_warp_socks_ready(warp_port)
+                outbounds, endpoints, target_udp, target_udp_candidates, target_tcp = self._build_warp_outbounds(warp_port, opera_port, warp_tcp_ready=warp_tcp_ready)
                 import glob
                 base_dir = get_base_dir()
                 def _load(f, p):
@@ -2518,7 +2576,9 @@ try:
                                 if d: res.add(d)
                     return sorted(list(res))
 
-                dc_cidrs, tg_cidrs, wa_cidrs = _load("ip", "discord*.txt"), _load("ip", "telegram*.txt"), _load("ip", "whatsapp*.txt")
+                # Do not import broad Telegram netblocks into TUN capture.
+                # They also catch browser telegram.org traffic and cause timeouts.
+                dc_cidrs, tg_cidrs, wa_cidrs = _load("ip", "discord*.txt"), [], _load("ip", "whatsapp*.txt")
                 dc_doms, tg_doms, wa_doms = get_discord_runtime_domains(), get_telegram_runtime_domains(), _load("list", "whatsapp*.txt")
                 discord_warmup_domains = sorted(set([
                     "discord.com", "discordapp.com", "dl.discordapp.net",
@@ -2526,12 +2586,7 @@ try:
                     "media.discordapp.net", "status.discord.com",
                     "stable.dl2.discordapp.net", "ptb.dl2.discordapp.net", "canary.dl2.discordapp.net",
                 ] + discover_discord_update_hosts()))
-                telegram_warmup_domains = sorted(set([
-                    "telegram.org", "t.me", "telegra.ph",
-                    "tdesktop.com", "updates.tdesktop.com", "desktop.telegram.org",
-                    "api.telegram.org", "core.telegram.org", "web.telegram.org",
-                    "telegram.me", "telesco.pe", "telegram-cdn.org",
-                ]))
+                telegram_warmup_domains = sorted(set(get_telegram_runtime_domains()))
 
                 # DNS warmup: resolve key domains to actual IPs for TUN route_address
                 import socket as _sock
@@ -2584,11 +2639,16 @@ try:
 
                 # === Build urltest failover outbound groups ===
                 # Generic TCP chain: WARP SOCKS → Opera HTTP → Direct
-                tcp_chain = ["warp-socks"]
+                tcp_chain = []
                 has_opera = any(o.get("tag") == "opera-socks" for o in outbounds)
+                if warp_tcp_ready:
+                    tcp_chain.append("warp-socks")
                 if has_opera:
                     tcp_chain.append("opera-socks")
+                if not tcp_chain:
+                    tcp_chain.append("direct")
                 tcp_chain.append("direct")
+                tcp_chain = list(dict.fromkeys(tcp_chain))
                 outbounds.append({
                     "type": "urltest", "tag": "msg-tcp",
                     "outbounds": tcp_chain,
@@ -2598,9 +2658,13 @@ try:
 
                 # Discord updater/startup should never prefer direct here:
                 # direct path often hangs on dl2/stable.dl2 while WARP/Opera are fine.
-                discord_tcp_chain = ["warp-socks"]
+                discord_tcp_chain = []
+                if warp_tcp_ready:
+                    discord_tcp_chain.append("warp-socks")
                 if has_opera:
                     discord_tcp_chain.append("opera-socks")
+                if not discord_tcp_chain:
+                    discord_tcp_chain.append("direct")
                 outbounds.append({
                     "type": "urltest", "tag": "discord-tcp",
                     "outbounds": discord_tcp_chain,
@@ -2625,6 +2689,8 @@ try:
                 else:
                     udp_target = "direct"
 
+                if not warp_tcp_ready and has_opera:
+                    self.log_func("[SingBox] [Diag] WARP недоступен. TCP-маршруты приложений переведены на EU (Opera).")
                 self.log_func(f"[SingBox] TCP: {' → '.join(tcp_chain)}")
                 self.log_func(f"[SingBox] Discord TCP: {' → '.join(discord_tcp_chain)}")
                 self.log_func(f"[SingBox] UDP: {' → '.join(udp_chain)}")
@@ -2658,7 +2724,7 @@ try:
                 dc_updater_path_re = "(?i).*[\\\\/](discord|discordcanary|discordptb)[\\\\/]update\\.exe$"
                 tg_updater_path_re = "(?i).*[\\\\/](telegram|ayugram|telegram desktop)[\\\\/]updater\\.exe$"
                 dc_udp_outbound = "direct" if self._discord_udp_direct else udp_target
-                tg_udp_outbound = "warp-socks" if getattr(self, "_warp_udp_supported", False) else "direct"
+                tg_udp_outbound = "warp-socks" if (warp_tcp_ready and getattr(self, "_warp_udp_supported", False)) else "direct"
                 
                 route_rules = [
                     # 1. Infra bypass: prevent loops
@@ -3005,6 +3071,7 @@ try:
             """Resets local WARP runtime state and service registration."""
             try:
                 self.log_func("[RU] Сброс данных WARP...")
+                self._stop_warp_bootstrap_process()
                 try:
                     self.run_warp_cli("disconnect", timeout=8)
                 except:
@@ -3067,16 +3134,379 @@ try:
             self.warp_svc_path = os.path.join(self.bin_dir, "warp-svc.exe")
             self.temp_dir = os.path.join(get_base_dir(), "temp")
             self.warp_connect_profile_path = os.path.join(self.temp_dir, "warp-connect-profile.json")
+            self.warp_bootstrap_profiles_path = os.path.join(get_base_dir(), "strat", WARP_STRATEGIES_FILENAME)
+            self.warp_bootstrap_state_path = os.path.join(self.temp_dir, "warp-bootstrap-state.json")
             self.port = globals().get('WARP_PORT', 1370)
             self.port_legacy = globals().get('WARP_PORT_LEGACY', 1370)
             self.is_connected = False
             self.service_process = None
+            self.bootstrap_winws_process = None
+            self.bootstrap_winws_profile_name = ""
             self.bootstrap_event = threading.Event()
             self.bootstrap_ok = False
             # How daemon bootstrap reached Cloudflare control plane in current run.
             self.last_bootstrap_transport = "unknown"
             self._ip_mode_cmd_cache = {}
             self._ip_mode_unsupported_logged = False
+            self._deep_registration_reset_attempted = False
+            self._registration_backoff_until = 0.0
+            self._registration_backoff_reason = ""
+            self._registration_backoff_notice_ts = 0.0
+
+        def _normalize_warp_port_specs(self, ports_raw):
+            specs = []
+
+            def _add(spec):
+                spec = str(spec or "").strip()
+                if not spec:
+                    return
+                if "-" in spec:
+                    try:
+                        start_s, end_s = spec.split("-", 1)
+                        start_i = int(start_s)
+                        end_i = int(end_s)
+                        if start_i > end_i:
+                            start_i, end_i = end_i, start_i
+                        if 1 <= start_i <= 65535 and 1 <= end_i <= 65535:
+                            norm = f"{start_i}-{end_i}"
+                            if norm not in specs:
+                                specs.append(norm)
+                    except:
+                        return
+                else:
+                    try:
+                        port_i = int(spec)
+                    except:
+                        return
+                    if 1 <= port_i <= 65535:
+                        norm = str(port_i)
+                        if norm not in specs:
+                            specs.append(norm)
+
+            if isinstance(ports_raw, str):
+                for part in ports_raw.split(","):
+                    _add(part)
+            elif isinstance(ports_raw, (list, tuple, set)):
+                for part in ports_raw:
+                    _add(part)
+            return specs
+
+        def _collect_warp_port_specs_from_args(self, args_list):
+            specs = []
+            try:
+                for arg in list(args_list or []):
+                    if not isinstance(arg, str):
+                        continue
+                    arg = arg.strip()
+                    if not arg:
+                        continue
+                    if arg.startswith("--filter-udp=") or arg.startswith("--wf-udp="):
+                        part_specs = self._normalize_warp_port_specs(arg.split("=", 1)[1])
+                        for spec in part_specs:
+                            if spec not in specs:
+                                specs.append(spec)
+            except:
+                pass
+            return specs
+
+        def _normalize_warp_protocols(self, raw_protocols):
+            if isinstance(raw_protocols, str):
+                raw_protocols = [raw_protocols]
+            protocols = []
+            for proto in list(raw_protocols or []):
+                p = str(proto or "").strip().lower()
+                if p == "masque":
+                    norm = "MASQUE"
+                elif p in ("wireguard", "warp", "wg"):
+                    norm = "WireGuard"
+                else:
+                    continue
+                if norm not in protocols:
+                    protocols.append(norm)
+            if not protocols:
+                protocols = ["MASQUE", "WireGuard"]
+            return protocols
+
+        def _normalize_warp_masque_options(self, raw_options):
+            if isinstance(raw_options, str):
+                raw_options = [raw_options]
+            options = []
+            for opt in list(raw_options or []):
+                o = str(opt or "").strip().lower()
+                if o in ("h3-with-h2-fallback", "h2-only", "h3-only", "reset") and o not in options:
+                    options.append(o)
+            if not options:
+                options = ["h3-with-h2-fallback"]
+            return options
+
+        def _normalize_warp_endpoints(self, raw_endpoints):
+            seen = set()
+            result = []
+            if isinstance(raw_endpoints, str):
+                raw_endpoints = [raw_endpoints]
+            for item in list(raw_endpoints or []):
+                host = ""
+                port = None
+                if isinstance(item, dict):
+                    host = str(item.get("host", "") or "").strip()
+                    port = item.get("port", None)
+                else:
+                    text = str(item or "").strip()
+                    if not text:
+                        continue
+                    if text.startswith("[") and "]:" in text:
+                        try:
+                            host, port = text[1:].rsplit("]:", 1)
+                        except:
+                            host, port = "", None
+                    elif ":" in text:
+                        try:
+                            host, port = text.rsplit(":", 1)
+                        except:
+                            host, port = "", None
+                try:
+                    port = int(port)
+                except:
+                    continue
+                if not host or not (1 <= port <= 65535):
+                    continue
+                key = (host, int(port))
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append({"host": host, "port": int(port)})
+            return result
+
+        def _normalize_warp_bootstrap_profile(self, raw_profile, idx):
+            try:
+                if isinstance(raw_profile, list):
+                    name = f"warp-{idx}"
+                    args = list(raw_profile)
+                    ports_raw = []
+                    protocols = ["MASQUE", "WireGuard"]
+                    masque_options = ["h3-with-h2-fallback"]
+                    endpoints = []
+                    prefer_exact_endpoints = False
+                elif isinstance(raw_profile, dict):
+                    name = str(raw_profile.get("name") or f"warp-{idx}").strip() or f"warp-{idx}"
+                    args = raw_profile.get("args", [])
+                    ports_raw = raw_profile.get("ports", [])
+                    protocols = self._normalize_warp_protocols(raw_profile.get("protocols"))
+                    masque_options = self._normalize_warp_masque_options(raw_profile.get("masque_options"))
+                    endpoints = self._normalize_warp_endpoints(raw_profile.get("endpoints"))
+                    prefer_exact_endpoints = bool(raw_profile.get("prefer_exact_endpoints", False))
+                else:
+                    return None
+
+                if not isinstance(args, list):
+                    return None
+                args = [str(arg).strip() for arg in args if isinstance(arg, str) and str(arg).strip()]
+                port_specs = self._normalize_warp_port_specs(ports_raw)
+                if not port_specs and endpoints:
+                    port_specs = self._normalize_warp_port_specs([ep.get("port") for ep in endpoints])
+                if not port_specs:
+                    port_specs = self._collect_warp_port_specs_from_args(args)
+
+                if not port_specs:
+                    return None
+
+                return {
+                    "name": name,
+                    "args": args,
+                    "port_specs": port_specs,
+                    "protocols": protocols,
+                    "masque_options": masque_options,
+                    "endpoints": endpoints,
+                    "prefer_exact_endpoints": prefer_exact_endpoints,
+                }
+            except:
+                return None
+
+        def _load_warp_bootstrap_profiles(self):
+            profiles = []
+            try:
+                if not os.path.exists(self.warp_bootstrap_profiles_path):
+                    return profiles
+                with open(self.warp_bootstrap_profiles_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except:
+                return profiles
+
+            raw_profiles = []
+            if isinstance(data, dict) and isinstance(data.get("strategies"), list):
+                raw_profiles = data.get("strategies", [])
+            elif isinstance(data, dict):
+                for key, value in data.items():
+                    if key == "version":
+                        continue
+                    raw_profiles.append({"name": key, "args": value if isinstance(value, list) else []})
+            elif isinstance(data, list):
+                raw_profiles = data
+
+            for idx, raw_profile in enumerate(raw_profiles, start=1):
+                profile = self._normalize_warp_bootstrap_profile(raw_profile, idx)
+                if profile:
+                    profiles.append(profile)
+            return profiles
+
+        def _load_preferred_warp_bootstrap_name(self):
+            try:
+                if not os.path.exists(self.warp_bootstrap_state_path):
+                    return ""
+                with open(self.warp_bootstrap_state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    return ""
+                ts = float(data.get("ts", 0) or 0)
+                if ts > 0 and (time.time() - ts) > 30 * 86400:
+                    return ""
+                return str(data.get("name", "") or "").strip()
+            except:
+                return ""
+
+        def _remember_successful_warp_bootstrap(self, profile_name):
+            try:
+                profile_name = str(profile_name or "").strip()
+                if not profile_name:
+                    return
+                os.makedirs(self.temp_dir, exist_ok=True)
+                with open(self.warp_bootstrap_state_path, "w", encoding="utf-8") as f:
+                    json.dump({"name": profile_name, "ts": int(time.time())}, f, indent=2, ensure_ascii=False)
+            except:
+                pass
+
+        def _get_ordered_warp_bootstrap_profiles(self):
+            profiles = self._load_warp_bootstrap_profiles()
+            if not profiles:
+                fallback = self._normalize_warp_bootstrap_profile(
+                    {
+                        "name": "legacy-inline",
+                        "ports": [443, 500, 1701, 4500],
+                        "args": [
+                            "--dpi-desync=fake",
+                            "--dpi-desync-repeats=10",
+                            "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+                        ],
+                    },
+                    1,
+                )
+                if fallback:
+                    profiles = [fallback]
+
+            preferred_name = self._load_preferred_warp_bootstrap_name()
+            if preferred_name:
+                preferred = [p for p in profiles if p.get("name") == preferred_name]
+                others = [p for p in profiles if p.get("name") != preferred_name]
+                profiles = preferred + others
+            return profiles
+
+        def _build_warp_bootstrap_command(self, profile):
+            try:
+                winws_path = os.path.join(self.bin_dir, WINWS_FILENAME)
+                warp_ipset_path = os.path.join(get_base_dir(), "ip", "warp.txt")
+                if not os.path.exists(winws_path) or not file_has_noncomment_entries(warp_ipset_path):
+                    return None
+
+                port_specs = list(profile.get("port_specs") or [])
+                if not port_specs:
+                    return None
+
+                args = list(profile.get("args") or [])
+                user_has_filter_udp = any(isinstance(arg, str) and arg.startswith("--filter-udp=") for arg in args)
+                user_has_wf_udp = any(isinstance(arg, str) and arg.startswith("--wf-udp=") for arg in args)
+                ports_arg = ",".join(port_specs)
+
+                cmd = [winws_path]
+                if not user_has_wf_udp:
+                    cmd.append(f"--wf-udp={ports_arg}")
+                if not user_has_filter_udp:
+                    cmd.append(f"--filter-udp={ports_arg}")
+
+                cmd.append(f"--ipset={warp_ipset_path}")
+
+                loopback_exclude_path = os.path.join(get_base_dir(), "temp", "loopback_exclude_ipset.txt")
+                if file_has_noncomment_entries(loopback_exclude_path):
+                    cmd.append(f"--ipset-exclude={loopback_exclude_path}")
+
+                for arg in args:
+                    if not isinstance(arg, str):
+                        continue
+                    arg = arg.strip()
+                    if not arg:
+                        continue
+                    if arg in ("--dpi-desync-any-protocol", "--dpi-desync-any-proto"):
+                        arg = "--dpi-desync-any-protocol=1"
+                    if arg.startswith("--wf-udp=") and not user_has_wf_udp:
+                        continue
+                    if "=" in arg and ".bin" in arg:
+                        k, v = arg.split("=", 1)
+                        fname = os.path.basename(v)
+                        fake_path = os.path.join(get_fake_dir(), fname)
+                        if os.path.exists(fake_path):
+                            arg = f"{k}={os.path.join(get_base_dir(), 'fake', fname)}"
+                    cmd.append(arg)
+                return cmd
+            except:
+                return None
+
+        def _start_warp_bootstrap_process(self, profile):
+            self._stop_warp_bootstrap_process()
+            cmd = self._build_warp_bootstrap_command(profile)
+            if not cmd:
+                return False
+            try:
+                cmd_dump_path = os.path.join(get_base_dir(), "temp", "warp_bootstrap_last_command.txt")
+                os.makedirs(os.path.dirname(cmd_dump_path), exist_ok=True)
+                with open(cmd_dump_path, "w", encoding="utf-8") as f:
+                    f.write(" ".join(cmd))
+                    f.write("\n")
+            except:
+                pass
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=get_base_dir(),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                time.sleep(0.9)
+                if proc.poll() is not None:
+                    try:
+                        self.log_func(f"[RU] [Diag] Bootstrap winws завершился сразу (код {proc.poll()}) для профиля {profile.get('name', 'unknown')}.")
+                    except:
+                        pass
+                    return False
+                self.bootstrap_winws_process = proc
+                self.bootstrap_winws_profile_name = str(profile.get("name", "") or "").strip()
+                return True
+            except:
+                return False
+
+        def _stop_warp_bootstrap_process(self):
+            proc = getattr(self, "bootstrap_winws_process", None)
+            self.bootstrap_winws_process = None
+            self.bootstrap_winws_profile_name = ""
+            if not proc:
+                return
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except:
+                        try:
+                            proc.kill()
+                        except:
+                            pass
+                else:
+                    try:
+                        proc.wait(timeout=0.5)
+                    except:
+                        pass
+            except:
+                pass
 
         def _load_warp_connect_profile(self):
             try:
@@ -3101,7 +3531,7 @@ try:
             except:
                 return False
 
-        def _remember_successful_connect_profile(self, protocol="MASQUE", masque_option="h3-with-h2-fallback", ip_mode="auto"):
+        def _remember_successful_connect_profile(self, protocol="MASQUE", masque_option="h3-with-h2-fallback", ip_mode="auto", endpoint_host=None, endpoint_port=None):
             try:
                 profile = {
                     "protocol": str(protocol or "MASQUE"),
@@ -3110,6 +3540,16 @@ try:
                     "port": int(self.port),
                     "ts": int(time.time()),
                 }
+                endpoint_host = str(endpoint_host or "").strip()
+                if endpoint_host:
+                    profile["endpoint_host"] = endpoint_host
+                if endpoint_port:
+                    try:
+                        endpoint_port = int(endpoint_port)
+                    except:
+                        endpoint_port = None
+                    if endpoint_port and 1 <= endpoint_port <= 65535:
+                        profile["endpoint_port"] = int(endpoint_port)
                 self._save_warp_connect_profile(profile)
             except:
                 pass
@@ -3140,11 +3580,22 @@ try:
                 if not (1 <= port <= 65535):
                     port = int(self.port)
 
+                endpoint_port = profile.get("endpoint_port", None)
+                try:
+                    endpoint_port = int(endpoint_port) if endpoint_port is not None else None
+                except:
+                    endpoint_port = None
+                if endpoint_port is not None and not (1 <= endpoint_port <= 65535):
+                    endpoint_port = None
+                endpoint_host = str(profile.get("endpoint_host", "") or "").strip()
+
                 return {
                     "protocol": protocol,
                     "masque_option": masque_option,
                     "ip_mode": ip_mode,
                     "port": port,
+                    "endpoint_host": endpoint_host,
+                    "endpoint_port": endpoint_port,
                 }
             except:
                 return None
@@ -3222,12 +3673,43 @@ try:
                 self.log_func(f"[RU] [Diag] Не удалось применить IP-режим {mode}: {last_err}")
             return mode == "auto"
 
-        def _build_connect_attempts(self, preferred_profile=None):
+        def _discover_warp_endpoint_host(self):
+            cached = getattr(self, "_cached_warp_endpoint_host", "") or ""
+            if cached:
+                return cached
+
+            candidates = []
+            try:
+                stats_result = self.run_warp_cli("tunnel", "stats", timeout=8)
+                stats_text = self._warp_cli_result_text(stats_result)
+                for match in re.findall(r"(\d+\.\d+\.\d+\.\d+)", stats_text or ""):
+                    if match not in candidates:
+                        candidates.append(match)
+            except:
+                pass
+
+            for host_name in ("engage.cloudflareclient.com", "api.cloudflareclient.com"):
+                try:
+                    resolved = socket.gethostbyname(host_name)
+                    if resolved and resolved not in candidates:
+                        candidates.append(resolved)
+                except:
+                    pass
+
+            for fallback in ("162.159.192.1", "162.159.192.2", "188.114.96.1", "188.114.97.1"):
+                if fallback not in candidates:
+                    candidates.append(fallback)
+
+            chosen = candidates[0] if candidates else "162.159.192.1"
+            self._cached_warp_endpoint_host = str(chosen)
+            return self._cached_warp_endpoint_host
+
+        def _build_connect_attempts(self, preferred_profile=None, bootstrap_ports=None, endpoint_candidates=None, protocol_hints=None, masque_option_hints=None, prefer_exact_endpoints=False):
             attempts = []
             seen = set()
 
-            def _add(label, protocol, masque_option, ip_mode, timeout_sec, port=None):
-                key = (str(protocol), str(masque_option), str(ip_mode), int(port or 0))
+            def _add(label, protocol, masque_option, ip_mode, timeout_sec, port=None, endpoint_host=None, endpoint_port=None):
+                key = (str(protocol), str(masque_option), str(ip_mode), int(port or 0), str(endpoint_host or ""), int(endpoint_port or 0))
                 if key in seen:
                     return
                 seen.add(key)
@@ -3239,6 +3721,8 @@ try:
                         "ip_mode": ip_mode,
                         "timeout": int(timeout_sec),
                         "port": int(port) if port else None,
+                        "endpoint_host": str(endpoint_host or "").strip(),
+                        "endpoint_port": int(endpoint_port) if endpoint_port else None,
                     }
                 )
 
@@ -3250,18 +3734,58 @@ try:
                     preferred_profile.get("ip_mode", "auto"),
                     20,
                     preferred_profile.get("port"),
+                    preferred_profile.get("endpoint_host"),
+                    preferred_profile.get("endpoint_port"),
                 )
+
+            allowed_protocols = self._normalize_warp_protocols(protocol_hints)
+            allowed_masque_options = self._normalize_warp_masque_options(masque_option_hints)
+
+            def _add_exact_endpoint_attempts():
+                for endpoint in list(endpoint_candidates or []):
+                    host = str(endpoint.get("host", "") or "").strip()
+                    port = endpoint.get("port", None)
+                    try:
+                        port = int(port)
+                    except:
+                        port = None
+                    if not host or not port:
+                        continue
+                    if "MASQUE" in allowed_protocols:
+                        for opt in allowed_masque_options:
+                            suffix = "" if opt == "h3-with-h2-fallback" else f" ({opt})"
+                            _add(f"MASQUE endpoint {host}:{port}{suffix}", "MASQUE", opt, "auto", 18, endpoint_host=host, endpoint_port=port)
+                    if "WireGuard" in allowed_protocols:
+                        _add(f"WireGuard endpoint {host}:{port}", "WireGuard", "reset", "auto", 18, endpoint_host=host, endpoint_port=port)
+
+            if prefer_exact_endpoints:
+                _add_exact_endpoint_attempts()
 
             _add("MASQUE endpoint default (Auto)", "MASQUE", "h3-with-h2-fallback", "auto", 25)
             _add("MASQUE h2-only", "MASQUE", "h2-only", "auto", 20)
             _add("MASQUE h3-only", "MASQUE", "h3-only", "auto", 20)
             _add("WireGuard (Auto)", "WireGuard", "reset", "auto", 20)
 
+            for port in self._normalize_warp_port_specs(bootstrap_ports or []):
+                if "-" in str(port):
+                    continue
+                try:
+                    port_i = int(port)
+                except:
+                    continue
+                _add(f"MASQUE endpoint port {port_i}", "MASQUE", "h3-with-h2-fallback", "auto", 20, endpoint_port=port_i)
+                _add(f"MASQUE h2-only port {port_i}", "MASQUE", "h2-only", "auto", 18, endpoint_port=port_i)
+                _add(f"MASQUE h3-only port {port_i}", "MASQUE", "h3-only", "auto", 18, endpoint_port=port_i)
+                _add(f"WireGuard port {port_i}", "WireGuard", "reset", "auto", 18, endpoint_port=port_i)
+
             # Secondary rotation by IP family in case one side is filtered by ISP.
             for mode in ("v4", "v6"):
                 _add(f"MASQUE endpoint default ({mode.upper()})", "MASQUE", "h3-with-h2-fallback", mode, 18)
                 _add(f"MASQUE h2-only ({mode.upper()})", "MASQUE", "h2-only", mode, 18)
                 _add(f"WireGuard ({mode.upper()})", "WireGuard", "reset", mode, 18)
+
+            if not prefer_exact_endpoints:
+                _add_exact_endpoint_attempts()
 
             return attempts
 
@@ -3592,11 +4116,14 @@ try:
                     self._log_service_diagnostics()
                     return False
 
-                # Primary mode: Cloudflare bootstrap through active winws strategy (strategies.json).
+                # Primary mode: Cloudflare bootstrap through temporary winws profile from warp.json.
                 # If this path fails, reserve fallback through Opera proxy is attempted below.
                 self.last_bootstrap_transport = "strategy"
                 self._set_service_proxy_environment(enable_proxy=False)
-                self.log_func("[RU] [Diag] Режим запуска WARP: strategy (Cloudflare через winws/strategies.json).")
+                profile_suffix = ""
+                if getattr(self, "bootstrap_winws_profile_name", ""):
+                    profile_suffix = f" / {self.bootstrap_winws_profile_name}"
+                self.log_func(f"[RU] [Diag] Режим запуска WARP: bootstrap{profile_suffix} (Cloudflare через winws/warp.json).")
 
                 ok, last_status, last_error = _start_and_wait_ipc()
                 if ok:
@@ -3765,6 +4292,103 @@ try:
                 "error communicating with daemon",
             ]
             return any(marker in low for marker in markers)
+
+        def _is_registration_conflict_text(self, text):
+            low = str(text or "").strip().lower()
+            if not low:
+                return False
+            markers = [
+                "old registration is still around",
+                "try running: \"warp-cli registration delete\"",
+                "registration delete",
+                "already exists",
+                "conflict",
+            ]
+            return any(marker in low for marker in markers)
+
+        def _is_registration_missing_text(self, text):
+            low = str(text or "").strip().lower()
+            if not low:
+                return False
+            markers = [
+                "registration missing",
+                "does not exist in api",
+                "not registered",
+                "missing due to",
+            ]
+            return any(marker in low for marker in markers)
+
+        def _clear_registration_backoff(self):
+            self._registration_backoff_until = 0.0
+            self._registration_backoff_reason = ""
+            self._registration_backoff_notice_ts = 0.0
+
+        def _set_registration_backoff(self, seconds=45.0, reason=""):
+            try:
+                self._registration_backoff_until = max(float(self._registration_backoff_until or 0.0), time.time() + max(5.0, float(seconds or 0.0)))
+                self._registration_backoff_reason = str(reason or "").strip()
+            except:
+                pass
+
+        def _probe_registration_state(self):
+            result = self.run_warp_cli("registration", "show", timeout=10)
+            text = self._warp_cli_result_text(result)
+            has_registration = bool(result and result.returncode == 0 and text and "account type:" in text.lower())
+            missing = self._is_registration_missing_text(text)
+            return has_registration, missing, text
+
+        def _clear_stale_registration_conflict(self):
+            """Resolve 'Old registration is still around' without looping forever."""
+            try:
+                try:
+                    self.run_warp_cli("disconnect", timeout=8)
+                except:
+                    pass
+
+                delete_text = ""
+                for _ in range(2):
+                    delete_result = self.run_warp_cli("registration", "delete", timeout=15)
+                    delete_text = self._warp_cli_result_text(delete_result)
+                    low = delete_text.lower()
+                    if delete_result and delete_result.returncode == 0:
+                        break
+                    if self._is_registration_missing_text(low):
+                        break
+                    time.sleep(1.0)
+
+                # Important: registration delete alone is not enough on some builds.
+                # Restart the daemon so it forgets stale in-memory registration state.
+                try:
+                    self._set_service_proxy_environment(enable_proxy=False)
+                except:
+                    pass
+                self._restart_service_with_current_env(timeout=16)
+                time.sleep(1.0)
+
+                has_registration, missing, probe_text = self._probe_registration_state()
+                if not has_registration:
+                    return True
+
+                if not self._deep_registration_reset_attempted:
+                    self._deep_registration_reset_attempted = True
+                    self.log_func("[RU] [Diag] Старая регистрация сохранилась после delete. Выполняем глубокую очистку WARP...")
+                    if self.nuke_warp_data():
+                        try:
+                            self._set_service_proxy_environment(enable_proxy=False)
+                        except:
+                            pass
+                        if self._ensure_service_registered():
+                            self._restart_service_with_current_env(timeout=20)
+                            time.sleep(1.0)
+                            has_registration, missing, probe_text = self._probe_registration_state()
+                            if not has_registration:
+                                return True
+
+                return False
+            except Exception as e:
+                if IS_DEBUG_MODE:
+                    self.log_func(f"[RU] [Diag] Ошибка очистки stale registration: {e}")
+                return False
         
         def ensure_masque(self):
             """Ensure MASQUE protocol is enabled."""
@@ -3908,16 +4532,28 @@ try:
             ip_mode = str(attempt_cfg.get("ip_mode", "auto")).lower()
             timeout = int(attempt_cfg.get("timeout", 20) or 20)
             attempt_port = attempt_cfg.get("port", None)
+            endpoint_host = str(attempt_cfg.get("endpoint_host", "") or "").strip()
+            endpoint_port = attempt_cfg.get("endpoint_port", None)
 
             if attempt_port:
                 try:
                     attempt_port = int(attempt_port)
                 except:
                     attempt_port = None
+            if endpoint_port:
+                try:
+                    endpoint_port = int(endpoint_port)
+                except:
+                    endpoint_port = None
             if attempt_port and attempt_port != self.port:
                 self.set_proxy_port(attempt_port)
 
-            self.run_warp_cli("tunnel", "endpoint", "reset")
+            if endpoint_port:
+                if not endpoint_host:
+                    endpoint_host = self._discover_warp_endpoint_host()
+                self.run_warp_cli("tunnel", "endpoint", "set", f"{endpoint_host}:{int(endpoint_port)}")
+            else:
+                self.run_warp_cli("tunnel", "endpoint", "reset")
 
             proto_res = self.run_warp_cli("tunnel", "protocol", "set", protocol)
             if not proto_res or proto_res.returncode != 0:
@@ -3949,7 +4585,7 @@ try:
             self.run_warp_cli("connect")
             if self.wait_for_connection(timeout=timeout):
                 self.is_connected = True
-                self._remember_successful_connect_profile(protocol=protocol, masque_option=masque_option, ip_mode=ip_mode)
+                self._remember_successful_connect_profile(protocol=protocol, masque_option=masque_option, ip_mode=ip_mode, endpoint_host=endpoint_host, endpoint_port=endpoint_port)
                 return True
             return False
 
@@ -4102,13 +4738,200 @@ try:
                 return bool(self.is_connected and self.is_port_open(self.port))
             finally:
                 self._is_recovering_now = False
-        
+
+        def _run_bootstrap_connection_cycle(self, my_run_id, bootstrap_profile=None):
+            # Ensure service is running
+            if not self.ensure_service():
+                self.mark_bootstrap(False)
+                self.log_func("[RU] Не удалось запустить службу!")
+                return False
+
+            # Wait for daemon to be responsive
+            status = "Unknown"
+            for _ in range(40):  # Up to 12s (40 * 0.3s)
+                if is_closing or SERVICE_RUN_ID != my_run_id:
+                    return False
+                status = self.get_status()
+                status_low = (status or "").lower()
+                if status and ("registration missing" in status_low or ("unable" not in status_low and "unknown" not in status_low)):
+                    break
+                time.sleep(0.3)
+
+            if SERVICE_RUN_ID != my_run_id:
+                return False
+            if "Unable to connect" in status or "Unknown" in status:
+                reg_probe = self.run_warp_cli("registration", "show", timeout=8)
+                if not reg_probe or reg_probe.returncode != 0:
+                    self.mark_bootstrap(False)
+                    self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
+                    return False
+                if IS_DEBUG_MODE:
+                    self.log_func("[RU] [Diag] status вернул Unknown, но IPC отвечает (registration show OK). Продолжаем.")
+            else:
+                self.mark_bootstrap(True)
+
+            if "Registration Missing" in status:
+                self.log_func("[RU] Регистрация устройства...")
+                reg_success = False
+                last_error = "Unknown error"
+                for attempt in range(4):
+                    if is_closing or SERVICE_RUN_ID != my_run_id:
+                        return False
+                    if attempt > 0:
+                        time.sleep(1.5)
+
+                    result = self.run_warp_cli("registration", "new")
+                    out = result.stdout.strip() if (result and result.stdout) else ""
+                    err = result.stderr.strip() if (result and result.stderr) else ""
+                    last_error = f"{err} {out}".strip() or "Unknown error"
+
+                    if result and result.returncode == 0:
+                        self._clear_registration_backoff()
+                        self._deep_registration_reset_attempted = False
+                        self.log_func("[RU] Устройство зарегистрировано.")
+                        reg_success = True
+                        break
+
+                    if "IPC call hit a timeout" in last_error or "Error communicating with daemon" in last_error:
+                        self.log_func(f"[RU] Служба занята (попытка {attempt+1}/4).")
+                        time.sleep(2)
+                        continue
+
+                    if self._is_registration_conflict_text(last_error):
+                        self.log_func("[RU] Очистка старой регистрации...")
+                        if self._clear_stale_registration_conflict():
+                            continue
+                        self._set_registration_backoff(45.0, "конфликт старой регистрации")
+                        break
+                    time.sleep(1)
+
+                if not reg_success:
+                    self.mark_bootstrap(False)
+                    self._set_registration_backoff(45.0, last_error)
+                    self.log_func(f"[RU] Ошибка регистрации: {last_error}")
+                    return False
+                status = self.get_status()
+
+            if SERVICE_RUN_ID != my_run_id:
+                return False
+
+            self.run_warp_cli("tunnel", "endpoint", "reset")
+            self.run_warp_cli("tunnel", "protocol", "reset")
+            self.run_warp_cli("tunnel", "masque-options", "reset")
+
+            self.ensure_masque()
+
+            preferred_profile = self._get_preferred_connect_profile()
+            if preferred_profile:
+                try:
+                    pref_port = int(preferred_profile.get("port", self.port))
+                except:
+                    pref_port = int(self.port)
+                if pref_port != self.port:
+                    self.port = pref_port
+                    self.log_func(f"[RU] [Diag] Используем сохраненный порт {self.port} из успешного профиля.")
+
+            self.set_proxy_port(self.port)
+            self.set_proxy_mode()
+
+            if "Connected" in status:
+                self.log_func("[RU] [Diag] WARP уже сообщает Connected. Проверяем рабочий SOCKS/трафик...")
+                connected_now = self.wait_for_connection(timeout=12)
+                self.is_connected = bool(connected_now)
+                if connected_now:
+                    self.mark_bootstrap(True)
+                    return True
+
+                self.log_func("[RU] [Warning] WARP статус Connected, но соединение нерабочее. Перезапуск профиля...")
+                try:
+                    self.run_warp_cli("disconnect", timeout=8)
+                except:
+                    pass
+                time.sleep(1.0)
+
+            bootstrap_ports = []
+            endpoint_candidates = []
+            protocol_hints = None
+            masque_option_hints = None
+            prefer_exact_endpoints = False
+            try:
+                if isinstance(bootstrap_profile, dict):
+                    bootstrap_ports = list(bootstrap_profile.get("port_specs") or [])
+                    endpoint_candidates = list(bootstrap_profile.get("endpoints") or [])
+                    protocol_hints = list(bootstrap_profile.get("protocols") or [])
+                    masque_option_hints = list(bootstrap_profile.get("masque_options") or [])
+                    prefer_exact_endpoints = bool(bootstrap_profile.get("prefer_exact_endpoints", False))
+            except:
+                bootstrap_ports = []
+                endpoint_candidates = []
+                protocol_hints = None
+                masque_option_hints = None
+                prefer_exact_endpoints = False
+
+            for attempt_cfg in self._build_connect_attempts(
+                preferred_profile,
+                bootstrap_ports=bootstrap_ports,
+                endpoint_candidates=endpoint_candidates,
+                protocol_hints=protocol_hints,
+                masque_option_hints=masque_option_hints,
+                prefer_exact_endpoints=prefer_exact_endpoints,
+            ):
+                if is_closing or SERVICE_RUN_ID != my_run_id:
+                    return False
+
+                label = str(attempt_cfg.get("label", "Auto"))
+                if "последний успешный профиль" in label:
+                    self.log_func(f"[RU] Подключение: {label} (fallback)...")
+                else:
+                    self.log_func(f"[RU] Подключение: {label}...")
+
+                if self._run_connect_attempt(attempt_cfg):
+                    self.mark_bootstrap(True)
+                    return True
+
+                self.run_warp_cli("disconnect")
+                time.sleep(0.8)
+
+            self.log_func("[RU] [Diag] Основной цикл не сработал. Пробуем legacy-цикл подключения...")
+            if self._legacy_connect_cycle():
+                self.mark_bootstrap(True)
+                return True
+
+            try:
+                can_try_opera_bootstrap = (
+                    self.last_bootstrap_transport != "opera_1371"
+                    and self._ensure_opera_proxy_ready(timeout=8)
+                )
+            except:
+                can_try_opera_bootstrap = False
+
+            if can_try_opera_bootstrap:
+                self.log_func("[RU] [Diag] Пробуем аварийный bootstrap WARP через 127.0.0.1:1371...")
+                try:
+                    self._set_service_proxy_environment(enable_proxy=True)
+                except:
+                    pass
+                if self._restart_service_with_current_env(timeout=16):
+                    self.last_bootstrap_transport = "opera_1371"
+                    self.set_proxy_port(self.port)
+                    self.set_proxy_mode()
+                    if self._legacy_connect_cycle():
+                        self.mark_bootstrap(True)
+                        return True
+                else:
+                    self.log_func("[RU] [Diag] Аварийный bootstrap через 1371 не поднял службу.")
+
+            self.run_warp_cli("tunnel", "endpoint", "reset")
+            self.run_warp_cli("tunnel", "masque-options", "reset")
+            self.run_warp_cli("tunnel", "protocol", "reset")
+            self.log_func("[RU] [Warning] Все попытки подключения исчерпаны.")
+            return False
+
         def start(self):
-            """Connect to WARP using MASQUE protocol (Stable Version)."""
-            global sing_box_manager
+            """Connect to WARP using temporary bootstrap strategies from warp.json."""
             if hasattr(self, '_is_starting_now') and self._is_starting_now:
                 return
-            
+
             self._is_starting_now = True
             self.bootstrap_ok = False
             try:
@@ -4116,183 +4939,76 @@ try:
             except:
                 pass
             my_run_id = SERVICE_RUN_ID
-            
+
             try:
-                # Ensure service is running
-                if not self.ensure_service():
+                now_ts = time.time()
+                if now_ts < float(getattr(self, "_registration_backoff_until", 0.0) or 0.0):
+                    remaining = int(max(1.0, self._registration_backoff_until - now_ts))
+                    if now_ts - float(getattr(self, "_registration_backoff_notice_ts", 0.0) or 0.0) >= 10.0:
+                        self._registration_backoff_notice_ts = now_ts
+                        suffix = f": {self._registration_backoff_reason}" if self._registration_backoff_reason else ""
+                        self.log_func(f"[RU] [Diag] Повтор регистрации WARP отложен на {remaining}с{suffix}")
                     self.mark_bootstrap(False)
-                    self.log_func("[RU] Не удалось запустить службу!")
                     return
 
-                # Wait for daemon to be responsive
-                status = "Unknown"
-                for i in range(40): # Up to 12s (40 * 0.3s)
-                    if is_closing or SERVICE_RUN_ID != my_run_id: return
-                    status = self.get_status()
-                    status_low = (status or "").lower()
-                    if status and ("registration missing" in status_low or ("unable" not in status_low and "unknown" not in status_low)):
-                        break
-                    
-                    # if i > 0 and i % 30 == 0:
-                    #     # self.log_func(f"[RU] Проверка связи с демоном ({int(i*0.3)} сек)...")
-                    #     pass
-                        
-                    time.sleep(0.3)
+                profiles = self._get_ordered_warp_bootstrap_profiles()
+                if not profiles:
+                    self.mark_bootstrap(False)
+                    self.log_func("[RU] [Warning] Не найдены bootstrap стратегии WARP.")
+                    return
 
-                if SERVICE_RUN_ID != my_run_id: return
-                if "Unable to connect" in status or "Unknown" in status:
-                    # Newer daemon builds can intermittently timeout on `status`
-                    # while IPC for other commands remains healthy.
-                    reg_probe = self.run_warp_cli("registration", "show", timeout=8)
-                    if not reg_probe or reg_probe.returncode != 0:
-                        self.mark_bootstrap(False)
-                        self.log_func("[RU] Ошибка: Служба WARP не отвечает.")
+                total = len(profiles)
+                connected = False
+                winning_profile = ""
+
+                for idx, profile in enumerate(profiles, start=1):
+                    if is_closing or SERVICE_RUN_ID != my_run_id:
                         return
-                    if IS_DEBUG_MODE:
-                        self.log_func("[RU] [Diag] status вернул Unknown, но IPC отвечает (registration show OK). Продолжаем.")
-                else:
-                    self.mark_bootstrap(True)
+                    profile_name = str(profile.get("name", f"warp-{idx}") or f"warp-{idx}")
+                    if total > 1:
+                        self.log_func(f"[RU] [Diag] WARP bootstrap стратегия {idx}/{total}: {profile_name}.")
+                    else:
+                        self.log_func(f"[RU] [Diag] WARP bootstrap стратегия: {profile_name}.")
 
-                # Check if registration is needed
-                if "Registration Missing" in status:
-                    self.log_func("[RU] Регистрация устройства...")
-                    reg_success = False
-                    for attempt in range(2): 
-                        if is_closing or SERVICE_RUN_ID != my_run_id: return
-                        if attempt > 0: time.sleep(1.5)
-                        
-                        result = self.run_warp_cli("registration", "new")
-                        out = result.stdout.strip() if (result and result.stdout) else ""
-                        err = result.stderr.strip() if (result and result.stderr) else ""
-                        last_error = f"{err} {out}".strip() or "Unknown error"
+                    if not self._start_warp_bootstrap_process(profile):
+                        self.log_func(f"[RU] [Diag] Не удалось запустить bootstrap winws для профиля {profile_name}.")
+                        continue
 
-                        if result and result.returncode == 0:
-                            self.log_func("[RU] Устройство зарегистрировано.")
-                            reg_success = True
-                            break
-                        else:
-                            if "IPC call hit a timeout" in last_error or "Error communicating with daemon" in last_error:
-                                self.log_func(f"[RU] Служба занята (попытка {attempt+1}/2).")
-                                time.sleep(2)
-                                continue
-
-                            if any(x in last_error.lower() for x in ["old registration", "registration delete", "already exists", "conflict"]):
-                                self.log_func("[RU] Очистка старой регистрации...")
-                                self.run_warp_cli("registration", "delete")
-                                time.sleep(1.0)
-                                continue 
-                        time.sleep(1)
-                    
-                    if not reg_success:
-                        self.mark_bootstrap(False)
-                        self.log_func(f"[RU] Ошибка регистрации: {last_error}")
-                        return
-                    status = self.get_status()
-                
-                # --- CONFIGURATION ---
-                if SERVICE_RUN_ID != my_run_id: return
-                
-                # FORCE RESET: Clear any manual endpoint/port leftovers from previous experiments
-                self.run_warp_cli("tunnel", "endpoint", "reset")
-                self.run_warp_cli("tunnel", "protocol", "reset")
-                self.run_warp_cli("tunnel", "masque-options", "reset")
-                
-                self.ensure_masque()
-
-                preferred_profile = self._get_preferred_connect_profile()
-                if preferred_profile:
                     try:
-                        pref_port = int(preferred_profile.get("port", self.port))
-                    except:
-                        pref_port = int(self.port)
-                    if pref_port != self.port:
-                        self.port = pref_port
-                        self.log_func(f"[RU] [Diag] Используем сохраненный порт {self.port} из успешного профиля.")
+                        connected = self._run_bootstrap_connection_cycle(my_run_id, bootstrap_profile=profile)
+                    finally:
+                        self._stop_warp_bootstrap_process()
 
-                self.set_proxy_port(self.port)
-                self.set_proxy_mode()
+                    if connected:
+                        winning_profile = profile_name
+                        self._remember_successful_warp_bootstrap(profile_name)
+                        self.log_func(f"[RU] [Diag] WARP bootstrap сработал: {profile_name}.")
+                        break
 
-                # Check if already connected
-                if "Connected" in status:
-                    self.log_func("[RU] [Diag] WARP уже сообщает Connected. Проверяем рабочий SOCKS/трафик...")
-                    connected_now = self.wait_for_connection(timeout=12)
-
-                    self.is_connected = bool(connected_now)
-
-                    # Start Voice Tunnel even when WARP was already connected before this run.
-                    if connected_now:
-                        self._start_voice_tunnel()
-                        return
-
-                    self.log_func(f"[RU] [Warning] WARP статус Connected, но соединение нерабочее. Перезапуск профиля...")
                     try:
                         self.run_warp_cli("disconnect", timeout=8)
                     except:
                         pass
-                    time.sleep(1.0)
-                 
-                # --- CONNECT ATTEMPTS ---
-                for attempt_cfg in self._build_connect_attempts(preferred_profile):
-                    if is_closing or SERVICE_RUN_ID != my_run_id:
-                        return
+                    time.sleep(0.6)
 
-                    label = str(attempt_cfg.get("label", "Auto"))
-                    if "последний успешный профиль" in label:
-                        self.log_func(f"[RU] Подключение: {label} (fallback)...")
-                    else:
-                        self.log_func(f"[RU] Подключение: {label}...")
-
-                    if self._run_connect_attempt(attempt_cfg):
-                        self._start_voice_tunnel()
-                        return
-
-                    self.run_warp_cli("disconnect")
-                    time.sleep(0.8)
-
-                # Compatibility retry path for older/quirky warp-cli builds.
-                self.log_func("[RU] [Diag] Основной цикл не сработал. Пробуем legacy-цикл подключения...")
-                if self._legacy_connect_cycle():
+                if connected:
                     self._start_voice_tunnel()
                     return
 
-                # Last-resort recovery: reboot service with bootstrap through local 1371 proxy.
-                try:
-                    can_try_opera_bootstrap = (
-                        self.last_bootstrap_transport != "opera_1371"
-                        and self._ensure_opera_proxy_ready(timeout=8)
-                    )
-                except:
-                    can_try_opera_bootstrap = False
+                self.mark_bootstrap(False)
+                if total > 1:
+                    self.log_func("[RU] [Warning] Все bootstrap стратегии WARP исчерпаны.")
+                elif not winning_profile:
+                    self.log_func("[RU] [Warning] Bootstrap стратегия WARP не сработала.")
 
-                if can_try_opera_bootstrap:
-                    self.log_func("[RU] [Diag] Пробуем аварийный bootstrap WARP через 127.0.0.1:1371...")
-                    try:
-                        self._set_service_proxy_environment(enable_proxy=True)
-                    except:
-                        pass
-                    if self._restart_service_with_current_env(timeout=16):
-                        self.last_bootstrap_transport = "opera_1371"
-                        self.set_proxy_port(self.port)
-                        self.set_proxy_mode()
-                        if self._legacy_connect_cycle():
-                            self._start_voice_tunnel()
-                            return
-                    else:
-                        self.log_func("[RU] [Diag] Аварийный bootstrap через 1371 не поднял службу.")
-
-                # Restore defaults before giving up.
-                self.run_warp_cli("tunnel", "endpoint", "reset")
-                self.run_warp_cli("tunnel", "masque-options", "reset")
-                self.run_warp_cli("tunnel", "protocol", "reset")
-                
-                self.log_func("[RU] [Warning] Все попытки подключения исчерпаны.")
-            
             except Exception as e:
                 self.log_func(f"[RU] КРИТИЧЕСКАЯ ОШИБКА WARP: {e}")
                 import traceback
-                if IS_DEBUG_MODE: traceback.print_exc()
+                if IS_DEBUG_MODE:
+                    traceback.print_exc()
 
             finally:
+                self._stop_warp_bootstrap_process()
                 if not self.bootstrap_event.is_set():
                     self.mark_bootstrap(False)
                 self._is_starting_now = False
@@ -4300,6 +5016,7 @@ try:
         def stop_service(self):
             """Stop WARP service and clean up."""
             try:
+                self._stop_warp_bootstrap_process()
                 # Stop Voice Tunnel first
                 global sing_box_manager
                 if sing_box_manager:
@@ -4643,8 +5360,8 @@ try:
                 return s.connect_ex(('127.0.0.1', port)) == 0
 
         def _is_http_proxy_alive(self, port, timeout=1.5):
-            """Verify local HTTP proxy socket/parser responsiveness with low-impact local probe."""
-            return is_local_http_proxy_responsive(port=port, timeout=timeout)
+            """Verify local HTTP proxy is really usable for CONNECT tunnels."""
+            return is_local_http_proxy_tunnel_ready(port=port, timeout=timeout)
 
         def generate_pac(self, warp_override=None, opera_override=None):
             """Generates PAC file with smart failover logic.
@@ -4655,13 +5372,18 @@ try:
             """
             try:
                 base = get_base_dir()
+                user_ru_domains = self._load_domain_list(os.path.join(base, "list", "u_ru.txt"))
+                user_eu_domains = self._load_domain_list(os.path.join(base, "list", "u_eu.txt"))
                 ru_domains = self._load_domain_list(os.path.join(base, "list", "ru.txt"))
                 eu_domains = self._load_domain_list(os.path.join(base, "list", "eu.txt"))
                 exclude_domains = self._load_domain_list(os.path.join(base, "list", "exclude.txt"))
                 discord_domains = get_discord_runtime_domains()
                 telegram_domains = get_telegram_runtime_domains()
                 whatsapp_domains = self._load_domain_list(os.path.join(base, "list", "whatsapp.txt"))
+                user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_ru.txt"))
+                user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_eu.txt"))
                 ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
+                eu_ips = self._load_ip_list(os.path.join(base, "ip", "eu.txt"))
                 discord_ips = self._load_ip_list(os.path.join(base, "ip", "discord.txt"))
                 ru_ips.extend(discord_ips)
                 
@@ -4674,15 +5396,30 @@ try:
                 else:
                     warp_port_open = self.is_port_open(self.warp_port)
                     warp_connected = False
+                    warp_socks_ok = False
                     try:
                         wm = globals().get("warp_manager")
                         if wm is not None:
                             warp_connected = bool(getattr(wm, "is_connected", False))
+                            if warp_port_open and warp_connected:
+                                tester = getattr(wm, "_test_socks5_internet", None)
+                                if callable(tester):
+                                    try:
+                                        warp_socks_ok = bool(tester(int(self.warp_port), timeout=1.6))
+                                    except:
+                                        warp_socks_ok = False
                         else:
                             warp_connected = bool(warp_port_open)
                     except:
                         warp_connected = bool(warp_port_open)
-                    warp_active = bool(warp_port_open and warp_connected)
+                    if not warp_connected:
+                        warp_socks_ok = False
+                    elif not warp_port_open:
+                        warp_socks_ok = False
+                    elif not warp_socks_ok:
+                        # Fallback when manager/tester is unavailable: rely on socket availability only.
+                        warp_socks_ok = bool(warp_port_open and warp_connected and globals().get("warp_manager") is None)
+                    warp_active = bool(warp_port_open and warp_connected and warp_socks_ok)
 
                 singbox_port_open = self.is_port_open(1372)
                 singbox_active = False
@@ -4730,11 +5467,11 @@ try:
                     # Kill-switch for EU domains if Opera is down.
                     eu_route = "SOCKS5 127.0.0.1:1"
 
-                # Routing strings for RU domains: Try WARP, then Opera.
+                # Routing strings for RU domains: browser PAC should not enter 1372 first.
+                # When 1372 is alive but its upstream WARP path degrades, browsers wait inside
+                # sing-box and do not promptly reach PAC fallbacks 1370/1371.
                 if warp_active:
                     ru_route_parts = []
-                    if singbox_active:
-                        ru_route_parts.append("PROXY 127.0.0.1:1372") # Via SingBox for DoH resolution to prevent 30s port 53 DPI timeouts
                     ru_route_parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}") # Direct WARP SOCKS fallback
                     if opera_active:
                         ru_route_parts.append("PROXY 127.0.0.1:1371")
@@ -4745,12 +5482,10 @@ try:
                     # Warp down: use Opera if available, otherwise Blackhole (No direct leak)
                     ru_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
 
-                # Discord bootstrap is sensitive to DNS/first-hop behavior.
-                # Prefer SingBox HTTP proxy (DoH-friendly), then direct WARP SOCKS, then Opera.
+                # Browser Discord traffic also uses plain PAC fallbacks.
+                # App Discord traffic still uses sing-box process/domain routing separately.
                 if warp_active:
                     discord_route_parts = []
-                    if singbox_active:
-                        discord_route_parts.append("PROXY 127.0.0.1:1372")
                     discord_route_parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
                     if opera_active:
                         discord_route_parts.append("PROXY 127.0.0.1:1371")
@@ -4758,13 +5493,18 @@ try:
                     discord_route = "; ".join(discord_route_parts)
                 else:
                     discord_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
-                
+
                 # EU route is already set above. Keeping variable consistency.
                 pass
                 
                 import json
+                user_ru_ips_js = json.dumps(user_ru_ips)
+                user_eu_ips_js = json.dumps(user_eu_ips)
                 ru_ips_js = json.dumps(ru_ips)
+                eu_ips_js = json.dumps(eu_ips)
                 exclude_js = "{" + ",".join(f'"{d}":1' for d in exclude_domains) + "}"
+                user_ru_js = "{" + ",".join(f'"{d}":1' for d in user_ru_domains) + "}"
+                user_eu_js = "{" + ",".join(f'"{d}":1' for d in user_eu_domains) + "}"
                 ru_js = "{" + ",".join(f'"{d}":1' for d in ru_domains) + "}"
                 eu_js = "{" + ",".join(f'"{d}":1' for d in eu_domains) + "}"
                 discord_js = "{" + ",".join(f'"{d}":1' for d in discord_domains) + "}"
@@ -4780,13 +5520,18 @@ try:
     if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || isPlainHostName(host)) {{
         return "DIRECT";
     }}
+    var user_ru = {user_ru_js};
+    var user_eu = {user_eu_js};
     var exclude = {exclude_js};
     var ru = {ru_js};
     var eu = {eu_js};
     var discord = {discord_js};
     var telegram = {telegram_js};
     var whatsapp = {whatsapp_js};
+    var user_ru_ips = {user_ru_ips_js};
+    var user_eu_ips = {user_eu_ips_js};
     var ru_ips = {ru_ips_js};
+    var eu_ips = {eu_ips_js};
     
     function matchDomain(list, h) {{
         if (list[h]) return true;
@@ -4799,12 +5544,40 @@ try:
         return false;
     }}
 
-    if (matchDomain(exclude, host)) return "DIRECT";
-    
     var isIpV4 = /^\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}$/.test(host);
     var isIpV6 = (host.indexOf(':') > -1);
     
     if (isIpV4 || isIpV6) {{
+        for (var i = 0; i < user_ru_ips.length; i++) {{
+            var entry = user_ru_ips[i];
+            var ver = entry[2];
+            if (ver === 4 && isIpV4) {{
+                if (isInNet(host, entry[0], entry[1])) {{
+                    return "{ru_route}";
+                }}
+            }} else if (ver === 6 && isIpV6) {{
+                if (typeof isInNetEx === 'function') {{
+                    if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
+                        return "{ru_route}";
+                    }}
+                }}
+            }}
+        }}
+        for (var i = 0; i < user_eu_ips.length; i++) {{
+            var entry = user_eu_ips[i];
+            var ver = entry[2];
+            if (ver === 4 && isIpV4) {{
+                if (isInNet(host, entry[0], entry[1])) {{
+                    return "{eu_route}";
+                }}
+            }} else if (ver === 6 && isIpV6) {{
+                if (typeof isInNetEx === 'function') {{
+                    if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
+                        return "{eu_route}";
+                    }}
+                }}
+            }}
+        }}
         for (var i = 0; i < ru_ips.length; i++) {{
             var entry = ru_ips[i];
             var ver = entry[2];
@@ -4820,8 +5593,26 @@ try:
                 }}
             }}
         }}
+        for (var i = 0; i < eu_ips.length; i++) {{
+            var entry = eu_ips[i];
+            var ver = entry[2];
+            if (ver === 4 && isIpV4) {{
+                if (isInNet(host, entry[0], entry[1])) {{
+                    return "{eu_route}";
+                }}
+            }} else if (ver === 6 && isIpV6) {{
+                if (typeof isInNetEx === 'function') {{
+                    if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
+                        return "{eu_route}";
+                    }}
+                }}
+            }}
+        }}
     }}
     
+    if (matchDomain(user_ru, host)) return "{ru_route}";
+    if (matchDomain(user_eu, host)) return "{eu_route}";
+    if (matchDomain(exclude, host)) return "DIRECT";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
     if (matchDomain(telegram, host)) return "{ru_route}";
@@ -4850,17 +5641,11 @@ try:
                         self.log_func("[PAC] EU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Opera недоступна)")
 
                 # Define RU route state for logging (includes RU + Discord)
-                ru_route_state = ("warp+sb+opera" if singbox_active and warp_active and opera_active else
-                                  "warp+sb" if singbox_active and warp_active else
-                                  "warp+opera" if warp_active and opera_active else
+                ru_route_state = ("warp+opera" if warp_active and opera_active else
                                   ("warp" if warp_active else ("opera" if opera_active else "down")))
                 if ru_route_state != getattr(self, "_last_ru_route_state", None):
                     self._last_ru_route_state = ru_route_state
-                    if ru_route_state == "warp+sb+opera":
-                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority); PROXY 127.0.0.1:1371")
-                    elif ru_route_state == "warp+sb":
-                        self.log_func(f"[PAC] RU маршрут: PROXY 127.0.0.1:1372; SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority)")
-                    elif ru_route_state == "warp+opera":
+                    if ru_route_state == "warp+opera":
                         self.log_func(f"[PAC] RU маршрут: SOCKS5 127.0.0.1:{self.warp_port} (Warp Priority); PROXY 127.0.0.1:1371")
                     elif ru_route_state == "warp":
                         self.log_func(f"[PAC] RU маршрут: SOCKS5 127.0.0.1:{self.warp_port} (Warp Only)")
@@ -4882,11 +5667,13 @@ try:
                         self.log_func("[PAC] [Diag] Порт 1371 открыт, но HTTP-прокси не отвечает корректно.")
                     elif not opera_port_open:
                         self.log_func("[PAC] [Diag] Порт 1371 недоступен: EU маршрут ожидает восстановления Opera VPN.")
-                warp_diag_state = (bool(warp_port_open), bool(warp_connected))
+                warp_diag_state = (bool(warp_port_open), bool(warp_connected), bool(warp_active))
                 if warp_diag_state != getattr(self, "_last_warp_diag_state", None):
                     self._last_warp_diag_state = warp_diag_state
                     if warp_port_open and not warp_connected:
                         self.log_func(f"[PAC] [Diag] Порт {self.warp_port} открыт, но WARP не в Connected. Для RU-маршрута используется Opera fallback.")
+                    elif warp_port_open and warp_connected and not warp_active:
+                        self.log_func(f"[PAC] [Diag] Порт {self.warp_port} открыт, но трафик через WARP SOCKS не проходит. Для RU-маршрута используется Opera fallback.")
             except Exception as e:
                 self.log_func(f"[PAC] Ошибка генерации: {e}")
 
@@ -5215,6 +6002,7 @@ try:
             # Grace window for slow proxy bootstrap (registration/retries).
             self._startup_grace_deadline = 0.0
             self._started_at_ts = 0.0
+            self.endpoint_cache_file = os.path.join(get_base_dir(), "temp", "opera_endpoint_cache.json")
 
         def _is_port_open_local(self):
             try:
@@ -5226,7 +6014,7 @@ try:
                 return False
 
         def _is_http_proxy_alive(self, timeout=1.5):
-            return is_local_http_proxy_responsive(port=self.port, timeout=timeout)
+            return is_local_http_proxy_tunnel_ready(port=self.port, timeout=timeout)
 
         def _has_recent_log_activity(self, max_age_sec=45):
             """True when opera.log is being updated recently (proxy is still progressing)."""
@@ -5239,6 +6027,70 @@ try:
                 return (time.time() - os.path.getmtime(path)) <= float(max_age_sec)
             except:
                 return False
+
+        def _load_cached_endpoint(self):
+            try:
+                data = load_json_robust(self.endpoint_cache_file, {})
+                endpoint = str(data.get("endpoint") or "").strip()
+                country = str(data.get("country") or "").strip().upper()
+                ts = float(data.get("timestamp") or 0.0)
+                if not endpoint or ":" not in endpoint:
+                    return None
+                if country and country != str(self.country or "").strip().upper():
+                    return None
+                if ts and (time.time() - ts) > (7 * 24 * 3600):
+                    return None
+                return endpoint
+            except:
+                return None
+
+        def _save_cached_endpoint(self, endpoint):
+            try:
+                endpoint = str(endpoint or "").strip()
+                if not endpoint or ":" not in endpoint:
+                    return
+                save_json_safe(self.endpoint_cache_file, {
+                    "endpoint": endpoint,
+                    "country": str(self.country or "").strip().upper(),
+                    "timestamp": time.time(),
+                })
+            except:
+                pass
+
+        def _extract_last_selected_endpoint(self):
+            try:
+                path = getattr(self, "log_file", None)
+                if not path or not os.path.exists(path):
+                    return None
+                last_match = None
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        m = re.search(r"Selected endpoint address:\s*([^\s]+)", line)
+                        if m:
+                            last_match = m.group(1).strip()
+                return last_match
+            except:
+                return None
+
+        def _get_warp_bootstrap_proxy(self):
+            """Prefer routing Opera bootstrap through local WARP when it is truly ready."""
+            try:
+                wm = globals().get("warp_manager")
+                if wm is None:
+                    return None
+                if not bool(getattr(wm, "is_connected", False)):
+                    return None
+                warp_port = int(getattr(wm, "port", 1370) or 1370)
+                tester = getattr(wm, "_test_socks5_internet", None)
+                if callable(tester):
+                    try:
+                        if not bool(tester(warp_port, timeout=1.5)):
+                            return None
+                    except:
+                        return None
+                return f"socks5://127.0.0.1:{warp_port}"
+            except:
+                return None
 
         def _sync_pac_state(self, force=False):
             """Refresh PAC when 1371 readiness changes, so browser routing never gets stale."""
@@ -5378,72 +6230,99 @@ try:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
-                cmd = [
-                    self.exe_path,
-                    "-bind-address", f"127.0.0.1:{self.port}",
-                    "-country", self.country
-                ]
-                
                 # FIX: Redirect output to file for debugging
                 log_dir = os.path.join(get_base_dir(), "temp")
                 if not os.path.exists(log_dir): os.makedirs(log_dir)
                 self.log_file = os.path.join(log_dir, "opera.log")
-                _close_log_handle()
-                 
-                # Open file for writing (subprocess will inherit handle)
-                self.f_log = open(self.log_file, "w")
-                
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=self.f_log,
-                    stderr=subprocess.STDOUT,
-                    startupinfo=startupinfo,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                self._started_at_ts = time.time()
-                self._startup_grace_deadline = self._started_at_ts + 120.0
-                # Synchronous readiness wait:
-                # watchdog/startup callers should receive a deterministic state.
-                run_id = SERVICE_RUN_ID
-                ready = False
-                start_t = time.time()
-                while time.time() - start_t < 15:
-                    if is_closing or SERVICE_RUN_ID != run_id or not is_service_active:
-                        break
-                    if self.process and self.process.poll() is not None:
-                        break
-                    port_alive = self._is_port_open_local()
-                    proxy_alive = self._is_http_proxy_alive(timeout=0.8) if port_alive else False
-                    if port_alive and proxy_alive:
-                        ready = True
-                        break
-                    time.sleep(0.4)
 
-                if ready:
-                    if IS_DEBUG_MODE:
-                        self.log_func(f"[EU] Запущен на порту {self.port} (регион: {self.country})")
-                    self.log_func(f"[EU] {self.port} готов")
-                    self.owns_process = True
-                    self.using_external = False
-                    self._startup_grace_deadline = 0.0
-                    self._sync_pac_state(force=True)
-                    return
+                cached_endpoint = self._load_cached_endpoint()
+                warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                attempts = []
+                if warp_bootstrap_proxy:
+                    if cached_endpoint:
+                        attempts.append(("cached-warp", cached_endpoint, 8.0, warp_bootstrap_proxy))
+                    attempts.append(("discover-warp", None, 12.0, warp_bootstrap_proxy))
+                if cached_endpoint:
+                    attempts.append(("cached", cached_endpoint, 8.0, None))
+                attempts.append(("discover", None, 15.0, None))
 
-                if self.process and self.process.poll() is not None:
-                    if IS_DEBUG_MODE:
-                        self.log_func(f"[EU] Процесс завершился сразу после запуска (код: {self.process.returncode}).")
-                    self.process = None
-                    self._startup_grace_deadline = 0.0
-                    self._started_at_ts = 0.0
+                for attempt_mode, override_endpoint, ready_timeout, base_proxy in attempts:
+                    cmd = [
+                        self.exe_path,
+                        "-bind-address", f"127.0.0.1:{self.port}",
+                        "-country", self.country
+                    ]
+                    if base_proxy:
+                        cmd.extend(["-proxy", base_proxy, "-api-proxy", base_proxy])
+                        if IS_DEBUG_MODE:
+                            self.log_func(f"[EU] [Diag] Bootstrap Opera через {base_proxy}.")
+                    if override_endpoint:
+                        cmd.extend(["-override-proxy-address", override_endpoint])
+                        if IS_DEBUG_MODE:
+                            self.log_func(f"[EU] [Diag] Пробуем кэшированный endpoint {override_endpoint}.")
+
                     _close_log_handle()
-                else:
-                    # Keep managed process alive: opera registration may need >15s with retries.
-                    if IS_DEBUG_MODE:
-                        self.log_func("[EU] Предупреждение: Порт 1371 не открылся вовремя. Ожидаем завершения инициализации в фоне.")
-                    self.owns_process = True
-                    self.using_external = False
-                    self._sync_pac_state(force=True)
-                    return
+                    self.f_log = open(self.log_file, "w")
+                    self.process = subprocess.Popen(
+                        cmd,
+                        stdout=self.f_log,
+                        stderr=subprocess.STDOUT,
+                        startupinfo=startupinfo,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    self._started_at_ts = time.time()
+                    self._startup_grace_deadline = self._started_at_ts + 120.0
+
+                    run_id = SERVICE_RUN_ID
+                    ready = False
+                    start_t = time.time()
+                    while time.time() - start_t < ready_timeout:
+                        if is_closing or SERVICE_RUN_ID != run_id or not is_service_active:
+                            break
+                        if self.process and self.process.poll() is not None:
+                            break
+                        port_alive = self._is_port_open_local()
+                        proxy_alive = self._is_http_proxy_alive(timeout=0.8) if port_alive else False
+                        if port_alive and proxy_alive:
+                            ready = True
+                            break
+                        time.sleep(0.4)
+
+                    if ready:
+                        selected_endpoint = self._extract_last_selected_endpoint() or override_endpoint
+                        if selected_endpoint:
+                            self._save_cached_endpoint(selected_endpoint)
+                        if IS_DEBUG_MODE:
+                            self.log_func(f"[EU] Запущен на порту {self.port} (регион: {self.country})")
+                        self.log_func(f"[EU] {self.port} готов")
+                        self.owns_process = True
+                        self.using_external = False
+                        self._startup_grace_deadline = 0.0
+                        self._sync_pac_state(force=True)
+                        return
+
+                    if self.process and self.process.poll() is not None:
+                        if IS_DEBUG_MODE:
+                            self.log_func(f"[EU] Процесс завершился сразу после запуска (код: {self.process.returncode}).")
+                        self.process = None
+                        self._startup_grace_deadline = 0.0
+                        self._started_at_ts = 0.0
+                        _close_log_handle()
+                    elif attempt_mode.startswith("cached"):
+                        _terminate_managed_process("[EU] [Diag] Кэшированный endpoint не поднялся вовремя. Переходим к следующему варианту...")
+                        continue
+                    elif attempt_mode == "discover-warp":
+                        _terminate_managed_process("[EU] [Diag] Bootstrap через WARP не поднялся вовремя. Пробуем direct discover...")
+                        continue
+                    else:
+                        # Keep managed process alive: opera registration may need >15s with retries.
+                        if IS_DEBUG_MODE:
+                            self.log_func("[EU] Предупреждение: Порт 1371 не открылся вовремя. Ожидаем завершения инициализации в фоне.")
+                        self.owns_process = True
+                        self.using_external = False
+                        self._sync_pac_state(force=True)
+                        return
+
                 self.owns_process = False
                 self._sync_pac_state(force=True)
                  
@@ -5540,7 +6419,13 @@ try:
             "whatsapp.txt": "whatsapp.com\nwhatsapp.net\nwa.me\n",
             "cloudflare.txt": "",
             "general.txt": "twitter.com\ninstagram.com\n",
-            "exclude.txt": ""
+            "exclude.txt": "",
+            "u_ru.txt": "# user WARP override domains\n",
+            "u_eu.txt": "# user Opera override domains\n"
+        }
+        ip_files = {
+            "u_ru.txt": "# user WARP override IPs/CIDR\n",
+            "u_eu.txt": "# user Opera override IPs/CIDR\n"
         }
         res = {}
         
@@ -5548,13 +6433,125 @@ try:
         DEFAULT_STRATEGIES = {
             "youtube": [],
             "discord": [],
-            "warp": [],
             "voice": [],
             "cloudflare": [],
             "telegram": [],
             "whatsapp": [],
             "general": [],
             "version": CURRENT_VERSION
+        }
+
+        DEFAULT_WARP_BOOTSTRAP = {
+            "version": CURRENT_VERSION,
+            "strategies": [
+                {
+                    "name": "fakex6-quic",
+                    "ports": [443, 500, 1701, 4500],
+                    "args": [
+                        "--dpi-desync=fake",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+                    ]
+                },
+                {
+                    "name": "fakex11-quic",
+                    "ports": [443, 500, 1701, 4500],
+                    "args": [
+                        "--dpi-desync=fake",
+                        "--dpi-desync-repeats=11",
+                        "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+                    ]
+                },
+                {
+                    "name": "fakex6-ttl3",
+                    "ports": [443, 500, 1701, 4500],
+                    "args": [
+                        "--dpi-desync=fake",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin",
+                        "--dpi-desync-ttl=3"
+                    ]
+                },
+                {
+                    "name": "fakex6-autottl",
+                    "ports": [443, 500, 1701, 4500],
+                    "args": [
+                        "--dpi-desync=fake",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin",
+                        "--dpi-desync-autottl=3"
+                    ]
+                },
+                {
+                    "name": "fakex6-anyproto",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=fake",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-any-protocol"
+                    ]
+                },
+                {
+                    "name": "fakeknownx6",
+                    "ports": [443, 500, 1701, 4500],
+                    "args": [
+                        "--dpi-desync=fakeknown",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+                    ]
+                },
+                {
+                    "name": "ipfrag2",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=ipfrag2",
+                        "--dpi-desync-any-protocol"
+                    ]
+                },
+                {
+                    "name": "fake-ipfrag2",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=fake,ipfrag2",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-any-protocol",
+                        "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+                    ]
+                },
+                {
+                    "name": "hopbyhop",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=hopbyhop",
+                        "--dpi-desync-any-protocol"
+                    ]
+                },
+                {
+                    "name": "destopt",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=destopt",
+                        "--dpi-desync-any-protocol"
+                    ]
+                },
+                {
+                    "name": "fakex6-zeros",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=fake",
+                        "--dpi-desync-repeats=6",
+                        "--dpi-desync-any-protocol"
+                    ]
+                },
+                {
+                    "name": "ipfrag1",
+                    "ports": [443, 500, 1701, 4500, 988, 2408],
+                    "args": [
+                        "--dpi-desync=ipfrag1",
+                        "--dpi-desync-any-protocol"
+                    ]
+                }
+            ]
         }
         
         DEFAULT_DISCORD = {
@@ -5566,10 +6563,17 @@ try:
             path = os.path.join(base_dir, "list", name)
             if not os.path.exists(path) or (name == "general.txt" and os.path.getsize(path) == 0):
                 # Ensure it has version header on creation
-                if not content.startswith("# version:"):
+                if name not in {"u_ru.txt", "u_eu.txt"} and not content.startswith("# version:"):
                     content = f"# version: {CURRENT_VERSION}\n" + content
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
+
+        for name, content in ip_files.items():
+            path = os.path.join(base_dir, "ip", name)
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            res[f"ip_{name.split('.')[0]}"] = path
 
         def _core_list_entries_from_text(text):
             return [line.strip().lower() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
@@ -5612,6 +6616,8 @@ try:
             try:
                 for f in os.listdir(list_dir_path):
                     if f.endswith(".txt"):
+                        if f in {"u_ru.txt", "u_eu.txt"}:
+                            continue
                         f_path = os.path.join(list_dir_path, f)
                         try:
                             with open(f_path, "r", encoding="utf-8") as text_file:
@@ -5683,6 +6689,22 @@ try:
         check_and_update_config(STRATEGIES_FILENAME, DEFAULT_STRATEGIES)
         check_and_update_config("discord.json", DEFAULT_DISCORD)
 
+        warp_bootstrap_path = os.path.join(base_dir, "strat", WARP_STRATEGIES_FILENAME)
+        try:
+            warp_create_default = False
+            if not os.path.exists(warp_bootstrap_path):
+                warp_create_default = True
+            else:
+                with open(warp_bootstrap_path, "r", encoding="utf-8") as f:
+                    warp_payload = json.load(f)
+                if not (isinstance(warp_payload, dict) and isinstance(warp_payload.get("strategies"), list)):
+                    warp_create_default = True
+            if warp_create_default:
+                with open(warp_bootstrap_path, "w", encoding="utf-8") as f:
+                    json.dump(DEFAULT_WARP_BOOTSTRAP, f, indent=4, ensure_ascii=False)
+        except:
+            pass
+
         # === НОВОЕ: Создаем необходимые temp файлы с версионированием ===
         temp_files = {
             "exclude_auto.txt": "",
@@ -5746,6 +6768,7 @@ try:
              with open(res["ip_general"], "w") as f: pass # No header to prevent winws crash
 
         res["strat_json"] = os.path.join(base_dir, "strat", STRATEGIES_FILENAME)
+        res["strat_warp"] = os.path.join(base_dir, "strat", WARP_STRATEGIES_FILENAME)
         res["strat_boost"] = os.path.join(base_dir, "strat", "boost.json")
         if not os.path.exists(res["strat_boost"]):
              with open(res["strat_boost"], "w", encoding="utf-8") as f: f.write("{}")
@@ -6366,81 +7389,9 @@ try:
             return False
 
     def smart_update_general(new_domains_list=None):
-        with general_list_lock:
-            filepath = os.path.join(get_base_dir(), "list", "general.txt")
-            
-            current_lines = []
-            version_header = f"# version: {CURRENT_VERSION}\n"
-            
-            if os.path.exists(filepath):
-                with open(filepath, "r", encoding="utf-8") as f:
-                    current_lines = f.readlines()
-            
-            # Extract existing version header if present
-            if current_lines and current_lines[0].strip().startswith("# version:"):
-                version_header = current_lines[0]  # Preserve existing header
-            
-            unique_domains = set()
-            filtered_service_domains = 0
-            for line in current_lines:
-                raw = line.split('#')[0].strip() # Skip comments
-                if not raw:
-                    continue
-                clean_current = get_registered_domain(raw)
-                if not clean_current:
-                    continue
-                if is_domain_excluded(raw) or is_domain_excluded(clean_current):
-                    filtered_service_domains += 1
-                    continue
-                if is_service_domain_only(raw) or is_service_domain_only(clean_current):
-                    filtered_service_domains += 1
-                    continue
-                unique_domains.add(clean_current)
-                
-            if new_domains_list:
-                for d in new_domains_list:
-                    raw_new = str(d).split('#')[0].strip().lower()
-                    if not raw_new:
-                        continue
-                    clean_new = get_registered_domain(raw_new)
-                    if not clean_new:
-                        continue
-                    if is_domain_excluded(raw_new) or is_domain_excluded(clean_new):
-                        filtered_service_domains += 1
-                        continue
-                    if is_service_domain_only(raw_new) or is_service_domain_only(clean_new):
-                        filtered_service_domains += 1
-                        continue
-                    unique_domains.add(clean_new)
-            
-            sorted_list = sorted(list(unique_domains))
-            
-            # Build new content: Version header + sorted domains
-            new_content = [version_header]
-            for item in sorted_list: 
-                new_content.append(item + "\n")
-                
-            old_content_stripped = [line.strip() for line in current_lines if not line.strip().startswith("#")]
-            new_content_stripped = [line.strip() for line in new_content if not line.strip().startswith("#")]
-            
-            # Compare only domains, ignoring headers for content check
-            if old_content_stripped == new_content_stripped:
-                return False
-                
-            try:
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.writelines(new_content)
-                
-                if new_domains_list:
-                    print(f"[General] Добавлен(ы) новый(е) домен(ы). Файл general.txt ОБНОВЛЕН.")
-                else:
-                    print(f"[General] Файл general.txt ОБНОВЛЕН (сортировка/удаление дубликатов).")
-                if filtered_service_domains:
-                    print(f"[General] Удалено сервисных доменов/корней из general.txt: {filtered_service_domains}")
-                return True
-            except Exception as e: 
-                print(f"ERR: Не удалось сохранить general.txt: {e}")
-                return False
+        # Disabled: list/general.txt is user-managed now.
+        # Nova no longer auto-cleans, auto-sorts, or auto-appends it.
+        return False
 
     def add_to_hard_list(domain):
         filepath = os.path.join(get_base_dir(), "temp", HARD_LIST_FILENAME)
@@ -7030,10 +7981,10 @@ try:
         except:
             return os.path.join(get_base_dir(), "list", "discord.txt")
 
-    CANONICAL_TELEGRAM_DOMAINS = [
-        "telegram.org",
+    CANONICAL_TELEGRAM_APP_DOMAINS = [
         "t.me",
         "telegra.ph",
+        "telegram.org",
         "tdesktop.com",
         "updates.tdesktop.com",
         "desktop.telegram.org",
@@ -7043,13 +7994,6 @@ try:
         "telegram.me",
         "telesco.pe",
         "telegram-cdn.org",
-        "dns.google",
-        "dns.google.com",
-        "cloudflare-dns.com",
-        "one.one.one.one",
-        "1dot1dot1dot1.cloudflare-dns.com",
-        "dns.adguard-dns.com",
-        "doh.opendns.com",
     ]
 
     def get_telegram_runtime_domains():
@@ -7078,7 +8022,7 @@ try:
 
         for domain in source_domains:
             add(domain)
-        for domain in CANONICAL_TELEGRAM_DOMAINS:
+        for domain in CANONICAL_TELEGRAM_APP_DOMAINS:
             add(domain)
 
         return merged
@@ -13191,8 +14135,7 @@ try:
                         record_domain_visit(d)
                     
                     log_func(f"[Audit] Удалено {len(domains_to_remove)} недоступных доменов из exclude_auto.")
-                    smart_update_general(domains_to_remove)
-                    log_func(f"[Audit] Добавлено {len(domains_to_remove)} доменов в general.txt для перепроверки.")
+                    log_func("[Audit] Автодобавление доменов в general.txt отключено.")
                 else:
                     log_func("[Audit] Проверка завершена. Изменений нет.")
                 
@@ -14243,14 +15186,37 @@ try:
         return "normal"
 
     # ================= МОДУЛЬ: NOVA_AUTOTUNE (необходимые функции) =================
+    def get_direct_source_ip():
+        """Best-effort detect current non-tunnel local source IP for direct outbound traffic."""
+        probes = [("1.1.1.1", 53), ("8.8.8.8", 53), ("9.9.9.9", 53)]
+        for host, port in probes:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(1.0)
+                sock.connect((host, port))
+                src_ip = str(sock.getsockname()[0] or "").strip()
+                if src_ip and not src_ip.startswith("127.") and "." in src_ip:
+                    return src_ip
+            except:
+                pass
+            finally:
+                try:
+                    if sock:
+                        sock.close()
+                except:
+                    pass
+        return None
+
     def get_public_ip_isolated():
         import requests
         from requests.adapters import HTTPAdapter
         from urllib3.poolmanager import PoolManager
         
         class SourcePortAdapter(HTTPAdapter):
-            def __init__(self, port, *args, **kwargs):
+            def __init__(self, port, source_ip=None, *args, **kwargs):
                 self._source_port = port
+                self._source_ip = source_ip or "0.0.0.0"
                 super().__init__(*args, **kwargs)
             def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
                 options = [(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)]
@@ -14261,16 +15227,18 @@ try:
                 
                 self.poolmanager = PoolManager(
                     num_pools=connections, maxsize=maxsize,
-                    block=block, source_address=('0.0.0.0', self._source_port), socket_options=options, **pool_kwargs)
+                    block=block, source_address=(self._source_ip, self._source_port), socket_options=options, **pool_kwargs)
 
         services = ['https://api.ipify.org', 'https://ifconfig.me', 'https://icanhazip.com', 'https://ipinfo.io/ip']
         local_port = random.randint(16000, 16009)
+        direct_source_ip = get_direct_source_ip()
         session = requests.Session()
-        session.trust_env = False # FIX: Ignore system proxy to get real ISP IP
+        session.trust_env = False # Ignore system proxy/env to get real ISP IP
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
-        session.mount('https://', SourcePortAdapter(local_port))
+        session.mount('https://', SourcePortAdapter(local_port, source_ip=direct_source_ip))
+        session.mount('http://', SourcePortAdapter(local_port, source_ip=direct_source_ip))
         
         def is_valid_ip(text):
             if not text or len(text) > 45 or '<' in text or '>' in text or 'html' in text.lower():
@@ -14288,14 +15256,27 @@ try:
             
         # Fallback: Standard request (if isolated failed)
         try:
-            # Try one more time with standard requests (no source port binding)
+            # Try one more time with a clean direct-only session (still bypassing proxy env).
+            fallback_session = requests.Session()
+            fallback_session.trust_env = False
+            fallback_session.headers.update(session.headers)
+            fallback_port = random.randint(16000, 16009)
+            fallback_session.mount('https://', SourcePortAdapter(fallback_port, source_ip=direct_source_ip))
+            fallback_session.mount('http://', SourcePortAdapter(fallback_port, source_ip=direct_source_ip))
             for url in services:
-                 try:
-                     # FIX: Explicitly disable proxies for fallback
-                     ip = requests.get(url, headers=session.headers, timeout=5, proxies={"http": None, "https": None}).text.strip()
-                     if is_valid_ip(ip): return ip
-                 except: continue
-        except: pass
+                try:
+                    ip = fallback_session.get(url, timeout=5).text.strip()
+                    if is_valid_ip(ip):
+                        return ip
+                except:
+                    continue
+        except:
+            pass
+        finally:
+            try:
+                fallback_session.close()
+            except:
+                pass
         
         return None
 
@@ -14961,8 +15942,7 @@ try:
                             continue
 
                         if status == "ok":
-                            log_func(f"[HardMatcher] {domain} разблокирован (General). Добавляем в general.txt")
-                            smart_update_general([domain])
+                            log_func(f"[HardMatcher] {domain} разблокирован (General). Автодобавление в general.txt отключено.")
                             remove_from_hard_list_safe(domain)
                             continue
                         
@@ -15027,8 +16007,7 @@ try:
                         log_func(f"[HardMatcher] Миграция {len(domains_to_migrate)} доменов из {hard_name}...")
                         for domain in domains_to_migrate:
                             if check_domain_robust(domain, 0):
-                                log_func(f"[HardMatcher] {domain} работает с General. Добавляем в list/general.txt")
-                                smart_update_general([domain])
+                                log_func(f"[HardMatcher] {domain} работает с General. Автодобавление в list/general.txt отключено.")
                             else:
                                 log_func(f"[HardMatcher] {domain} не работает с General. Переносим в temp/hard.txt")
                                 add_to_hard_list_safe(domain)
@@ -16088,25 +17067,30 @@ try:
         """
         Monitors list/*.txt and ip/*.txt for changes.
         - Updates PAC file.
-        - Optimizes general.txt (removes VPN domains).
-        - Triggers Hot Reload for WinWS if strategies/lists change.
+        - Deduplicates VPN/exclude lists.
+        - Triggers Hot Reload only for exclude.txt additions.
         """
         base = get_base_dir()
         
         # Files to monitor
         # PAC relevant
-        monitor_vpn = [
+        monitor_vpn_managed = [
             os.path.join(base, "list", "ru.txt"),
             os.path.join(base, "list", "eu.txt"),
             os.path.join(base, "ip", "ru.txt"),
             os.path.join(base, "ip", "eu.txt")
         ]
+        monitor_vpn_user = [
+            os.path.join(base, "list", "u_ru.txt"),
+            os.path.join(base, "list", "u_eu.txt"),
+            os.path.join(base, "ip", "u_ru.txt"),
+            os.path.join(base, "ip", "u_eu.txt")
+        ]
+        monitor_vpn = monitor_vpn_managed + monitor_vpn_user
         
-        # General list (for Hot Reload)
-        file_general = os.path.join(base, "list", "general.txt")
         file_exclude = os.path.join(base, "list", "exclude.txt")
         
-        all_monitor_files = monitor_vpn + [file_general, file_exclude]
+        all_monitor_files = monitor_vpn + [file_exclude]
         
         def get_file_stats(p):
             """Returns hash for robust change detection"""
@@ -16117,22 +17101,6 @@ try:
                         return hashlib.md5(content).hexdigest()
             except: pass
             return ""
-
-        def read_general_unique_domains():
-            """Reads normalized unique domain entries from general.txt (comments/empty ignored)."""
-            result = set()
-            try:
-                if not os.path.exists(file_general):
-                    return result
-                with open(file_general, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        raw = line.split("#")[0].strip().lower()
-                        if not raw:
-                            continue
-                        result.add(raw)
-            except:
-                pass
-            return result
 
         def read_unique_entries(path):
             """Reads normalized unique entries from list/ip text file (comments/empty ignored)."""
@@ -16192,76 +17160,12 @@ try:
                 safe_trace(f"[Deduplicator] Error processing {os.path.basename(f_path)}: {e}")
             return False
 
-        # Helper: Optimize General List (Remove VPN domains)
-        def optimize_general_list():
-            """Removes domains from general.txt that are already in VPN lists (ru.txt, eu.txt)"""
-            try:
-                if not os.path.exists(file_general): return False
-                
-                # 0. Cross-deduplicate ru.txt and eu.txt (Priority: eu.txt)
-                ru_path = os.path.join(base, "list", "ru.txt")
-                eu_path = os.path.join(base, "list", "eu.txt")
-                
-                eu_domains = set()
-                if os.path.exists(eu_path):
-                    with open(eu_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            d = line.split("#")[0].strip().lower()
-                            if d and not line.strip().startswith("#"):
-                                eu_domains.add(d)
-                
-                ru_changed = False
-                ru_domains_clean = set()
-                if os.path.exists(ru_path):
-                    with open(ru_path, "r", encoding="utf-8") as f:
-                        ru_lines = f.readlines()
-                    
-                    new_ru_lines = []
-                    for line in ru_lines:
-                        stripped = line.strip()
-                        if not stripped:
-                            new_ru_lines.append(line)
-                            continue
-                        if stripped.startswith("#"):
-                            new_ru_lines.append(line)
-                            continue
-                        
-                        d = stripped.split("#")[0].strip().lower()
-                        if d in eu_domains:
-                            ru_changed = True
-                            continue # Keep only in eu.txt
-                        
-                        new_ru_lines.append(line)
-                        ru_domains_clean.add(d)
-                    
-                    if ru_changed:
-                        with open(ru_path, "w", encoding="utf-8") as f:
-                            f.writelines(new_ru_lines)
-                        log_func("[List] Удалены дубликаты: домены из ru.txt теперь только в eu.txt")
-
-                # 1. Load combined VPN domains for general.txt optimization
-                # vpn_domains = eu_domains.union(ru_domains_clean)
-                
-                # 2. Process General - DISABLED BY USER REQUEST (Feb 2026)
-                # We no longer remove domains from general even if they are in VPN lists,
-                # because winws strategies might need to be applied even if VPN is active.
-                cleaned_count = 0 
-                
-                if ru_changed:
-                    return True # File(s) changed
-
-                    
-            except Exception as e:
-                safe_trace(f"[Optimizer] Error: {e}")
-            return False
-        
         # Init state
         # Initial cleanup: Deduplicate everything first
-        for f in all_monitor_files:
+        for f in monitor_vpn_managed + [file_exclude]:
             deduplicate_list_file(f)
             
         file_hashes = {f: get_file_stats(f) for f in all_monitor_files}
-        general_domains_snapshot = read_general_unique_domains()
         entries_snapshot = {f: read_unique_entries(f) for f in (monitor_vpn + [file_exclude])}
         
         # Capture current run ID
@@ -16279,15 +17183,12 @@ try:
                 if not is_service_active:
                     for f in all_monitor_files:
                         file_hashes[f] = get_file_stats(f)
-                    general_domains_snapshot = read_general_unique_domains()
                     for f in (monitor_vpn + [file_exclude]):
                         entries_snapshot[f] = read_unique_entries(f)
                     continue
 
                 vpn_changed = False
-                general_changed = False
                 exclude_changed = False
-                general_new_unique_domains = set()
                 vpn_new_unique_count = 0
                 exclude_new_unique_count = 0
                 
@@ -16296,8 +17197,8 @@ try:
                     current_hash = get_file_stats(f_path)
                     if current_hash != file_hashes[f_path]:
                         prev_entries = entries_snapshot.get(f_path, set())
-                        # Deduplicate immediately if changed
-                        if deduplicate_list_file(f_path):
+                        # Deduplicate only managed baseline lists, never user overrides.
+                        if f_path in monitor_vpn_managed and deduplicate_list_file(f_path):
                             # Update hash to the cleaned version
                             current_hash = get_file_stats(f_path)
                         cur_entries = read_unique_entries(f_path)
@@ -16306,19 +17207,6 @@ try:
 
                         file_hashes[f_path] = current_hash
                         vpn_changed = True
-
-                # Check General file
-                gen_hash = get_file_stats(file_general)
-                if gen_hash != file_hashes[file_general]:
-                    # ПРАВКА: Очистка дубликатов сразу при изменении!
-                    if deduplicate_list_file(file_general):
-                        gen_hash = get_file_stats(file_general)
-                    
-                    current_general_domains = read_general_unique_domains()
-                    general_new_unique_domains = current_general_domains - general_domains_snapshot
-                    general_domains_snapshot = current_general_domains
-                    file_hashes[file_general] = gen_hash
-                    general_changed = True
 
                 # Check Exclude file
                 exc_hash = get_file_stats(file_exclude)
@@ -16337,16 +17225,8 @@ try:
                         pac_manager.generate_pac()
                         pac_manager.refresh_system_options()
                         log_func("[PAC] Списки VPN обновлены")
-
-                    # 2. Optimize General (might trigger general_changed next loop, or now)
-                    if optimize_general_list():
-                        # Sync hash/snapshot only (no auto-restart for optimizer side effects).
-                        file_hashes[file_general] = get_file_stats(file_general)
-                        general_domains_snapshot = read_general_unique_domains()
                         
                 restart_reasons = []
-                if general_new_unique_domains:
-                    restart_reasons.append(f"general +{len(general_new_unique_domains)}")
                 if exclude_new_unique_count > 0:
                     restart_reasons.append(f"exclude +{exclude_new_unique_count}")
 
@@ -16354,8 +17234,6 @@ try:
                     log_func(f"[Auto] Добавлены новые записи ({', '.join(restart_reasons)}) -> Ядро перезапущено")
                     perform_hot_restart_backend()
                 else:
-                    if general_changed and IS_DEBUG_MODE:
-                        log_func("[Auto] Изменен general.txt без новых доменов (без автоперезапуска).")
                     if exclude_changed and IS_DEBUG_MODE:
                         log_func("[Auto] Изменен exclude.txt без новых записей (без автоперезапуска).")
                     if vpn_changed:
@@ -16370,19 +17248,16 @@ try:
 
     def update_ip_cache_worker(paths, log_func):
         """Checks external IP. If changed, clears domain check cache."""
-        import requests
-        
+
         # Wait a bit for network to stabilize
-        time.sleep(2)
+        time.sleep(8)
         
         try:
             current_ip = None
             try:
-                # Use a reliable IP echo service with timeout
-                r = requests.get("https://api.ipify.org", timeout=5)
-                if r.status_code == 200:
-                    current_ip = r.text.strip()
-            except: pass
+                current_ip = get_public_ip_isolated()
+            except:
+                pass
             
             if not current_ip:
                  safe_trace("[IP Worker] Failed to get external IP")
@@ -16425,7 +17300,7 @@ try:
                 return False
 
         def is_local_http_proxy_alive(port, timeout=1.5):
-            return is_local_http_proxy_responsive(port=port, timeout=timeout)
+            return is_local_http_proxy_tunnel_ready(port=port, timeout=timeout)
 
         my_run_id = SERVICE_RUN_ID
         retry_timestamps = []  # Track retry times
@@ -16446,6 +17321,9 @@ try:
         warp_last_good_ts = 0.0
         warp_next_recovery_ts = 0.0
         singbox_next_restart_ts = 0.0
+        startup_state_hold_until = time.time() + 25.0
+        startup_pending_route_signature = None
+        startup_pending_route_seen = 0
         
         # Keep first PAC/1371 refresh close to startup to minimize DIRECT window for EU domains.
         time.sleep(2)
@@ -16466,6 +17344,10 @@ try:
                     continue
 
                 now = time.time()
+                warp_usable = False
+                opera_usable = False
+                warp_port = 1370
+                opera_port = 1371
                 # Clean old timestamps
                 retry_timestamps[:] = [t for t in retry_timestamps if now - t < RETRY_WINDOW]
                 
@@ -16498,6 +17380,8 @@ try:
                         warp_bad_proxy_streak += 1
                     else:
                         warp_bad_proxy_streak = 0
+
+                    warp_usable = bool(warp_connected_flag and warp_port_open and warp_socks_ok)
 
                     recover_reason = None
                     issue_state = None
@@ -16566,7 +17450,7 @@ try:
                     # Debounce short health-check glitches on 1371 to prevent flapping.
                     opera_usable = bool(opera_port_alive and opera_proxy_alive)
                     if (not opera_usable) and opera_port_alive:
-                        if (now - opera_last_good_ts) < 20 and opera_bad_proxy_streak < 3:
+                        if (now - opera_last_good_ts) < 45 and opera_bad_proxy_streak < 5:
                             opera_usable = True
 
                     need_restart = False
@@ -16616,13 +17500,14 @@ try:
                                 log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
                             last_opera_issue_state = "proxy_bad_external"
                             need_restart = False
-                        # Managed proxy: do not hard-restart on proxy-health probe failures.
-                        # Registration/discovery may be slow and aggressive restarts create endless loops.
-                        elif opera_bad_proxy_streak >= 3:
+                        # Managed proxy: if local parser is alive but CONNECT upstream stays dead
+                        # for several checks, perform a controlled restart with backoff.
+                        elif opera_bad_proxy_streak >= 5:
                             if last_opera_issue_state != "proxy_bad":
                                 log_func(f"[EU] Порт {opera_port} открыт, но прокси не отвечает корректно.")
                             last_opera_issue_state = "proxy_bad"
-                            need_restart = False
+                            enough_time_since_good = (now - opera_last_good_ts) >= 45.0 if opera_last_good_ts else True
+                            need_restart = bool(opera_owned and not recent_activity and enough_time_since_good)
                         else:
                             need_restart = False
                     elif opera_proc is None:
@@ -16669,12 +17554,8 @@ try:
                                 last_opera_issue_state = "recover_failed"
 
                     # Rebuild PAC when 1371 or 1370 availability changes, so EU and RU routing is always fresh.
-                    warp_usable = False
-                    warp_port = 1370
                     if warp_manager:
                         warp_port = getattr(warp_manager, "port", 1370)
-                        if getattr(warp_manager, 'is_connected', False):
-                            warp_usable = is_local_port_open(warp_port)
 
                     state_changed = False
                     if last_opera_port_state is None or last_warp_port_state is None:
@@ -16682,10 +17563,32 @@ try:
                         last_warp_port_state = warp_usable
                         state_changed = True
                     else:
-                        if opera_usable != last_opera_port_state or warp_usable != last_warp_port_state:
-                            last_opera_port_state = opera_usable
-                            last_warp_port_state = warp_usable
-                            state_changed = True
+                        current_route_signature = (bool(opera_usable), bool(warp_usable))
+                        last_route_signature = (bool(last_opera_port_state), bool(last_warp_port_state))
+                        if current_route_signature != last_route_signature:
+                            # Hold startup PAC/app-route flips until the new state repeats at least once.
+                            # This reduces first-minute flapping and avoids browser stalls even for exclude domains.
+                            if now < startup_state_hold_until:
+                                if startup_pending_route_signature != current_route_signature:
+                                    startup_pending_route_signature = current_route_signature
+                                    startup_pending_route_seen = 1
+                                else:
+                                    startup_pending_route_seen += 1
+                                if startup_pending_route_seen >= 2:
+                                    last_opera_port_state = opera_usable
+                                    last_warp_port_state = warp_usable
+                                    state_changed = True
+                                    startup_pending_route_signature = None
+                                    startup_pending_route_seen = 0
+                            else:
+                                last_opera_port_state = opera_usable
+                                last_warp_port_state = warp_usable
+                                state_changed = True
+                                startup_pending_route_signature = None
+                                startup_pending_route_seen = 0
+                        else:
+                            startup_pending_route_signature = None
+                            startup_pending_route_seen = 0
 
                     if state_changed:
                         try:
@@ -16697,6 +17600,27 @@ try:
                                 log_func(f"[PAC] Обновлен: порт {opera_port} {opera_txt}, WARP {warp_port} {warp_txt}.")
                         except Exception as e:
                             safe_trace(f"[PAC Watchdog] refresh error: {e}")
+                        try:
+                            if sing_box_manager:
+                                sb_starting = False
+                                try:
+                                    sb_starting = bool(sing_box_manager.is_startup_in_progress())
+                                except:
+                                    sb_starting = False
+                                sb_proc = getattr(sing_box_manager, "process", None)
+                                sb_alive = bool(sb_proc and sb_proc.poll() is None)
+                                desired_singbox = bool(warp_usable or opera_usable)
+                                if desired_singbox and not sb_starting and now >= singbox_next_restart_ts:
+                                    route_mode = "WARP" if warp_usable else "EU"
+                                    log_func(f"[SingBox] Пересборка маршрутов приложений: активный режим {route_mode}.")
+                                    retry_timestamps.append(now)
+                                    singbox_next_restart_ts = now + 8.0
+                                    sing_box_manager.start()
+                                elif (not desired_singbox) and sb_alive and not sb_starting:
+                                    log_func("[SingBox] WARP и EU недоступны. Остановка голосового туннеля до восстановления маршрута.")
+                                    sing_box_manager.stop()
+                        except Exception as e:
+                            safe_trace(f"[SingBox Watchdog] state change error: {e}")
 
                 # Keep PAC HTTP server resilient: if it dies, browsers silently go DIRECT.
                 if pac_manager:
@@ -16733,7 +17657,7 @@ try:
                     last_pac_server_state = pac_ok
 
                 # Check SingBox voice tunnel; recover if it died after startup.
-                if sing_box_manager and warp_manager and getattr(warp_manager, 'is_connected', False):
+                if sing_box_manager and (warp_usable or opera_usable):
                     sb_starting = False
                     try:
                         sb_starting = bool(sing_box_manager.is_startup_in_progress())
@@ -17055,7 +17979,7 @@ try:
         # TRACE LOGGING
         if restart_mode and not silent:
             if 'log_print' in globals():
-                 log_print("[Init] Ядро перезапущено после изменений в list/general.txt")
+                 log_print("[Init] Ядро перезапущено после изменений конфигурации.")
 
         # Сбрасываем флаг завершения при перезапуске, чтобы фоновые проверки возобновились
         is_closing = False
@@ -17075,10 +17999,9 @@ try:
         try:
             load_auto_exclude(log_print if (not silent and 'log_print' in globals()) else None)
             load_special_strategy_domains(log_print if (not silent and 'log_print' in globals()) else None)
-            smart_update_general()
         except Exception as _e:
             if IS_DEBUG_MODE and not silent:
-                print(f"[Init] [Diag] Не удалось рано очистить general.txt: {_e}")
+                print(f"[Init] [Diag] Не удалось инициализировать списки: {_e}")
         
         # EARLY CLEANUP: Stop old driver + kill old processes. All calls have short timeouts.
         # If any call times out, windivert is in a bad state → auto-recover via config update.
@@ -17233,17 +18156,13 @@ try:
              if file_has_noncomment_entries(arg_tpl[1]):
                  exclusions.append(f"{arg_tpl[0]}={arg_tpl[1]}")
 
-        try:
-            # === FIX: Use list/general.txt directly (User Request) ===
-            # Removed temp/general_clean.txt generation logic
-            pass
-        except: pass
-        
         # RESTORED: Global filter generation from v0.995
         all_tcp_conditions = set()
         all_udp_conditions = set()
         
         for strat_name, strat_args in strategies.items():
+            if strat_name == "warp":
+                continue
             t, u = parse_ports_from_args(strat_args)
             all_tcp_conditions.update(t)
             all_udp_conditions.update(u)
@@ -17288,12 +18207,7 @@ try:
                 lb_mode = "127-only"
             print(f"[Init] Localhost bypass mode for WinWS filters: {lb_mode}.")
 
-        strat_keys = [k for k in strategies.keys() if k != "general"]
-        
-        # Приоритет для WARP: перемещаем его в начало списка, чтобы широкие фильтры (как voice) не перехватывали его трафик
-        if "warp" in strat_keys:
-            strat_keys.remove("warp")
-            strat_keys.insert(0, "warp")
+        strat_keys = [k for k in strategies.keys() if k not in ("general", "warp")]
         
         # === FIX: Load runtime state to filter blocked services ===
         blocked_state = {}
@@ -17342,7 +18256,7 @@ try:
 
             # Формируем контекстные аргументы (списки, исключения), которые должны применяться к каждой части стратегии
             context_args = []
-            if strat_name not in ["voice", "telegram", "whatsapp", "warp"]:
+            if strat_name not in ["voice", "telegram", "whatsapp"]:
                 context_args.extend(exclusions)
 
             if strat_name != "voice":
@@ -17352,7 +18266,7 @@ try:
                 user_defined_ipset = any("--ipset=" in a for a in current_strategy_args)
 
                 if strat_name != "cloudflare": 
-                    if has_list and strat_name != "warp" and not user_defined_hostlist: 
+                    if has_list and not user_defined_hostlist: 
                         context_args.append(f"--hostlist={list_file_path}")
                     if has_ip and not user_defined_ipset:   
                         context_args.append(f"--ipset={ip_file_path}")
@@ -17396,10 +18310,13 @@ try:
                     else: args.append(arg)
 
         target_gen_list = paths['list_general']
-        # Removed "Smart Clean" logic as per user request (restore v0.996 behavior)
-
-
+        # General must stay hostlist-based.
+        # Global web mode turned out to be too aggressive for excluded/browser domains
+        # and could still delay or break sites like github.com before hostname-based
+        # exclusions stabilized.
+        general_global_mode = False
         gen_list_exists = file_has_noncomment_entries(target_gen_list)
+        general_has_args = any(isinstance(arg, str) and str(arg).strip() for arg in strategies.get("general", []))
         
         # FIX: Check if General is blocked
         is_gen_blocked = False
@@ -17408,19 +18325,53 @@ try:
         
         if is_gen_blocked:
              if not silent: print("[Init] Пропуск General стратегии (сервис заблокирован)")
-        elif gen_list_exists or file_has_noncomment_entries(paths['ip_general']):
+        elif general_has_args:
             if num_specific_strats_added > 0:
                 args.append("--new")
             
             # Define common args for General strategy reuse
             general_common_args = []
-            general_common_args.extend(exclusions)
-            if gen_list_exists:
-                 general_common_args.append(f"--hostlist={target_gen_list}")
-            
-            # Add ipset if exists
-            if file_has_noncomment_entries(paths['ip_general']):
-                 general_common_args.append(f"--ipset={paths['ip_general']}")
+            general_seen_args = set()
+
+            def _append_general_arg(arg):
+                arg_s = str(arg or "").strip()
+                if not arg_s or arg_s in general_seen_args:
+                    return
+                general_seen_args.add(arg_s)
+                general_common_args.append(arg_s)
+
+            for item in exclusions:
+                _append_general_arg(item)
+
+            if general_global_mode:
+                general_service_hostlists = [
+                    youtube_runtime_list_path,
+                    discord_runtime_list_path,
+                    telegram_runtime_list_path,
+                    os.path.join(get_base_dir(), "list", "whatsapp.txt"),
+                    os.path.join(get_base_dir(), "list", "cloudflare.txt"),
+                ]
+                general_service_ipsets = [
+                    os.path.join(get_base_dir(), "ip", "warp.txt"),
+                    os.path.join(get_base_dir(), "ip", "discord.txt"),
+                    os.path.join(get_base_dir(), "ip", "telegram.txt"),
+                    os.path.join(get_base_dir(), "ip", "whatsapp.txt"),
+                    os.path.join(get_base_dir(), "ip", "cloudflare.txt"),
+                ]
+
+                for hostlist_path in general_service_hostlists:
+                    if hostlist_path and file_has_noncomment_entries(hostlist_path):
+                        _append_general_arg(f"--hostlist-exclude={hostlist_path}")
+                for ipset_path in general_service_ipsets:
+                    if ipset_path and file_has_noncomment_entries(ipset_path):
+                        _append_general_arg(f"--ipset-exclude={ipset_path}")
+                if not silent:
+                    print("[Init] General стратегия применяется глобально ко всему web-трафику, кроме сервисных исключений.")
+            else:
+                if gen_list_exists:
+                    _append_general_arg(f"--hostlist={target_gen_list}")
+                if file_has_noncomment_entries(paths['ip_general']):
+                    _append_general_arg(f"--ipset={paths['ip_general']}")
 
             args.extend(general_common_args)
             
@@ -17446,7 +18397,7 @@ try:
                 elif arg.startswith("--wf-udp"): args.append(arg.replace("--wf-udp", "--filter-udp"))
                 else: args.append(arg)
         else:
-             if not silent: print("[Init] General список пуст. Общая стратегия не применена.")
+             if not silent: print("[Init] General стратегия пуста. Общая стратегия не применена.")
         
         full_command_parts = [exe_path]
         for arg in args[1:]:
@@ -18090,10 +19041,6 @@ try:
                 if force_driver_stop:
                     time.sleep(0.2)  # Даём ОС время закрыть дескрипторы файла после taskkill winws
                     subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            except: pass
-            
-            # Обновляем general после завершения
-            try: smart_update_general()
             except: pass
             
             if not silent: 
@@ -18950,11 +19897,7 @@ try:
                         d_args = curr.get("discord", [])
                         bad_d = any("--filter-tcp=" in x and "443" in x for x in d_args)
                         
-                        w_args = curr.get("warp", [])
-                        w_udp = next((x for x in w_args if "--filter-udp=" in x), "")
-                        bad_w = "500" not in w_udp or "1701" not in w_udp
-                        
-                        if bad_d or bad_w:
+                        if bad_d:
                             ref = {}
                             if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
                                 i_strat = os.path.join(sys._MEIPASS, "strat", "strategies.json")
@@ -18966,10 +19909,6 @@ try:
                                     curr["discord"] = ref["discord"]
                                     mod = True
                                     if log_func: log_func("[Init] Discord стратегия обновлена из пакета (v1.12).")
-                                if bad_w and "warp" in ref:
-                                    curr["warp"] = ref["warp"]
-                                    mod = True
-                                    if log_func: log_func("[Init] WARP стратегия обновлена из пакета (v1.12).")
                             
                             if mod:
                                  curr["version"] = CURRENT_VERSION
@@ -19402,7 +20341,7 @@ try:
         btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
         refresh_update_button()
 
-        INDICATOR_RU = "#8FD8FF"
+        INDICATOR_WARP = "#8FD8FF"
         INDICATOR_EU = "#D8B6BF"
 
         region_indicator_pill = CanvasRegionPill(
@@ -19418,7 +20357,7 @@ try:
         def apply_main_connection_indicator_state(warp_ok, opera_ok):
             regions = []
             if warp_ok:
-                regions.append(("RU", INDICATOR_RU))
+                regions.append(("WARP", INDICATOR_WARP))
             if opera_ok:
                 regions.append(("EU", INDICATOR_EU))
             try:

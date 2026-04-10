@@ -1,13 +1,392 @@
 {
-    "version": "1.16",
+    "version": "1.17",
     "strategies": [
         {
-            "name": "warp",
+            "name": "masque-zt-autottl",
+            "protocols": [
+                "MASQUE"
+            ],
+            "masque_options": [
+                "h3-with-h2-fallback"
+            ],
+            "prefer_exact_endpoints": true,
+            "ports": [
+                1701,
+                500,
+                8095,
+                4443,
+                8443,
+                443,
+                4500
+            ],
+            "endpoints": [
+                "162.159.198.1:1701",
+                "162.159.198.1:500",
+                "162.159.198.2:500",
+                "162.159.198.1:8095",
+                "162.159.198.1:4443",
+                "162.159.198.1:8443",
+                "162.159.198.1:443",
+                "162.159.198.1:4500",
+                "162.159.198.2:4500",
+                "162.159.198.2:8443"
+            ],
             "args": [
-                "--filter-udp=443",
-                "--dpi-desync=fake,disorder2",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin",
+                "--dpi-desync-autottl=3"
+            ]
+        },
+        {
+            "name": "masque-zt-fakeknown",
+            "protocols": [
+                "MASQUE"
+            ],
+            "masque_options": [
+                "h3-with-h2-fallback"
+            ],
+            "prefer_exact_endpoints": true,
+            "ports": [
+                1701,
+                500,
+                8095,
+                4443,
+                8443,
+                443,
+                4500
+            ],
+            "endpoints": [
+                "162.159.198.1:1701",
+                "162.159.198.1:500",
+                "162.159.198.2:500",
+                "162.159.198.1:8095",
+                "162.159.198.1:4443",
+                "162.159.198.1:8443",
+                "162.159.198.1:443",
+                "162.159.198.1:4500",
+                "162.159.198.2:4500",
+                "162.159.198.2:8443"
+            ],
+            "args": [
+                "--dpi-desync=fakeknown",
                 "--dpi-desync-repeats=6",
                 "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "masque-consumer-fakeknown",
+            "protocols": [
+                "MASQUE"
+            ],
+            "masque_options": [
+                "h3-with-h2-fallback"
+            ],
+            "prefer_exact_endpoints": true,
+            "ports": [
+                500,
+                1701,
+                4500,
+                8443,
+                4443,
+                8095,
+                443
+            ],
+            "endpoints": [
+                "162.159.198.1:500",
+                "162.159.198.1:1701",
+                "162.159.198.1:4500",
+                "162.159.198.1:8443",
+                "162.159.198.1:4443",
+                "162.159.198.1:8095",
+                "162.159.198.1:443"
+            ],
+            "args": [
+                "--dpi-desync=fakeknown",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "masque-consumer-autottl",
+            "protocols": [
+                "MASQUE"
+            ],
+            "masque_options": [
+                "h3-with-h2-fallback"
+            ],
+            "prefer_exact_endpoints": true,
+            "ports": [
+                500,
+                1701,
+                4500,
+                8443,
+                4443,
+                8095,
+                443
+            ],
+            "endpoints": [
+                "162.159.198.1:500",
+                "162.159.198.1:1701",
+                "162.159.198.1:4500",
+                "162.159.198.1:8443",
+                "162.159.198.1:4443",
+                "162.159.198.1:8095",
+                "162.159.198.1:443"
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin",
+                "--dpi-desync-autottl=3"
+            ]
+        },
+        {
+            "name": "fakeknownx6",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500
+            ],
+            "args": [
+                "--dpi-desync=fakeknown",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "fakex6-ttl3",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin",
+                "--dpi-desync-ttl=3"
+            ]
+        },
+        {
+            "name": "fakex6-quic",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "fake-ipfrag2",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=fake,ipfrag2",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-any-protocol",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "fakex11-quic",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=11",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "fakex6-autottl",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin",
+                "--dpi-desync-autottl=3"
+            ]
+        },
+        {
+            "name": "hopbyhop",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=hopbyhop",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "ipfrag2",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=ipfrag2",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "masque-consumer-ipfrag2",
+            "protocols": [
+                "MASQUE"
+            ],
+            "masque_options": [
+                "h3-with-h2-fallback"
+            ],
+            "prefer_exact_endpoints": true,
+            "ports": [
+                500,
+                1701,
+                4500,
+                8443,
+                4443,
+                8095,
+                443
+            ],
+            "endpoints": [
+                "162.159.198.1:500",
+                "162.159.198.1:1701",
+                "162.159.198.1:4500",
+                "162.159.198.1:8443",
+                "162.159.198.1:4443",
+                "162.159.198.1:8095",
+                "162.159.198.1:443"
+            ],
+            "args": [
+                "--dpi-desync=ipfrag2",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "masque-zt-ipfrag2",
+            "protocols": [
+                "MASQUE"
+            ],
+            "masque_options": [
+                "h3-with-h2-fallback"
+            ],
+            "prefer_exact_endpoints": true,
+            "ports": [
+                1701,
+                500,
+                8095,
+                4443,
+                8443,
+                443,
+                4500
+            ],
+            "endpoints": [
+                "162.159.198.1:1701",
+                "162.159.198.1:500",
+                "162.159.198.2:500",
+                "162.159.198.1:8095",
+                "162.159.198.1:4443",
+                "162.159.198.1:8443",
+                "162.159.198.1:443",
+                "162.159.198.1:4500",
+                "162.159.198.2:4500",
+                "162.159.198.2:8443"
+            ],
+            "args": [
+                "--dpi-desync=ipfrag2",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "fakex6-anyproto",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "destopt",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=destopt",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "fakex6-zeros",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-any-protocol"
+            ]
+        },
+        {
+            "name": "ipfrag1",
+            "ports": [
+                443,
+                500,
+                1701,
+                4500,
+                988,
+                2408
+            ],
+            "args": [
+                "--dpi-desync=ipfrag1",
+                "--dpi-desync-any-protocol"
             ]
         }
     ]

@@ -1,4 +1,4 @@
-# version: 1.16
+# version: 1.17
 akamaihd.net
 apteka-april.ru
 apteka.ru
@@ -18,11 +18,10 @@ eapteka.ru
 g.co
 github.com
 github.io
-google.com
-googleusercontent.com
+githubassets.com
+githubusercontent.com
 gosuslugi.ru
 gov.ru
-gstatic.com
 gu-st.ru
 imgsmail.ru
 kaspersky.com
