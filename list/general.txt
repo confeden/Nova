@@ -1,4 +1,4 @@
-# version: 1.17
+# version: 1.19
 1337x.to
 3dn.ru
 7tv.app
@@ -40304,11 +40304,13 @@ notepad-plus-plus.org
 notepin.co
 notesplug.com
 notfans.com
+dis.gd
 notgamstop.com
 nothingtoxic.com
 notion.site
 notiyard.xyz
 notorfilms.biz
+bot-hosting.net
 notorfilms.in
 notorfilms.site
 notorgames.ru

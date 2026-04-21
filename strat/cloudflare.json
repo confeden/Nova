@@ -1,5 +1,5 @@
 {
-    "version": "1.17",
+    "version": "1.19",
     "strategies": [
         {
             "name": "cloudflare_1",

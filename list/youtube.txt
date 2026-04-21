@@ -1,4 +1,4 @@
-# version: 1.17
+# version: 1.19
 yt3.ggpht.com
 yt4.ggpht.com
 yt3.googleusercontent.com

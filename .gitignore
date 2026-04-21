@@ -1,2 +1,8 @@
 Inno.py
 NovaInstaller.iss
+awg/
+awg_profiles/
+NovaWFP/build/
+NovaWFP/.vs/
+*.user
+*.suo

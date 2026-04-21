@@ -1,11 +1,39 @@
-MIT License
+Nova License
 
 Copyright (c) 2026 Brent
 
 All rights reserved.
 
-The source code of this project ("Nova") is proprietary and confidential. 
-Unauthorized copying of files from this repository, via any medium, is strictly prohibited.
-The work is provided "as is", without warranty of any kind.
+The Nova source code and Nova-authored materials in this repository are
+proprietary and confidential unless a separate written license from the
+copyright holder states otherwise.
 
-Redistribution and use in source and binary forms, with or without modification, are NOT permitted without prior written permission from the copyright holder.
+Unauthorized copying of files from this repository, via any medium, is strictly
+prohibited. The work is provided "as is", without warranty of any kind.
+
+Redistribution and use of Nova, in source or binary form, with or without
+modification, are not permitted without prior written permission from the
+copyright holder, except to the limited extent that a bundled third-party
+component license grants rights for that third-party component itself.
+
+Third-party components bundled with Nova are not covered by this license and
+remain subject to their own licenses, notices, and vendor terms.
+
+See:
+- THIRD_PARTY_NOTICES.md
+- licenses/third_party/
+
+Third-party upstream links used by Nova (brief reference list):
+- sing-box: https://github.com/SagerNet/sing-box
+- WinDivert: https://github.com/basil00/WinDivert
+- wireproxy-awg: https://github.com/artem-russkikh/wireproxy-awg
+- amneziawg-go / AmneziaWG-related AWG support: https://github.com/amnezia-vpn/amneziawg-go
+- tg-ws-proxy based Telegram relay work: https://github.com/Flowseal/tg-ws-proxy
+- zapret / winws: https://github.com/bol-van/zapret
+- Cloudflare WARP: https://developers.cloudflare.com/warp-client/
+- Wintun: https://www.wintun.net/
+- Microsoft Visual C++ Redistributable: https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
+
+If there is any conflict between this file and the license terms of a bundled
+third-party component for that component alone, the third-party component terms
+control for that component and only for that component.

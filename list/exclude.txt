@@ -1,4 +1,4 @@
-# version: 1.17
+# version: 1.19
 akamaihd.net
 apteka-april.ru
 apteka.ru
@@ -53,6 +53,7 @@ steamstatic.com
 steamusercontent.com
 t-bank-app.ru
 t-j.ru
+t-pulse.ru
 t-static.ru
 t-tolk.ru
 tbank.ru
