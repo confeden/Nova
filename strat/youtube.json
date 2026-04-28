@@ -1,5 +1,5 @@
 {
-    "version": "1.19",
+    "version": "1.20",
     "strategies": [
         {
             "name": "youtube_M4E2",
@@ -38,78 +38,6 @@
             ]
         },
         {
-            "name": "youtube_MDE4",
-            "args": [
-                "--filter-tcp=443",
-                "--dpi-desync=split2",
-                "--dpi-desync-repeats=3",
-                "--dpi-desync-fooling=badsum",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-autottl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "youtube_MB2F",
-            "args": [
-                "--filter-tcp=443",
-                "--dpi-desync=split2",
-                "--dpi-desync-repeats=4",
-                "--dpi-desync-fooling=badsum",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-ttl=6",
-                "--dpi-desync-autottl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "youtube_M63E",
-            "args": [
-                "--filter-tcp=443",
-                "--dpi-desync=split2",
-                "--dpi-desync-repeats=4",
-                "--dpi-desync-fooling=badsum",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-autottl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "youtube_MB2F",
-            "args": [
-                "--filter-tcp=443",
-                "--dpi-desync=split2",
-                "--dpi-desync-repeats=4",
-                "--dpi-desync-fooling=badsum",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-ttl=6",
-                "--dpi-desync-autottl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
             "name": "youtube_MFDC",
             "args": [
                 "--filter-tcp=443",
@@ -132,6 +60,42 @@
             "args": [
                 "--filter-tcp=443",
                 "--dpi-desync=split2",
+                "--dpi-desync-repeats=4",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-autottl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "youtube_MB2F",
+            "args": [
+                "--filter-tcp=443",
+                "--dpi-desync=split2",
+                "--dpi-desync-repeats=4",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-ttl=6",
+                "--dpi-desync-autottl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "youtube",
+            "args": [
+                "--filter-tcp=443",
+                "--dpi-desync=split2",
                 "--dpi-desync-repeats=3",
                 "--dpi-desync-fooling=badsum",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
@@ -146,11 +110,11 @@
             ]
         },
         {
-            "name": "youtube",
+            "name": "youtube_MDE4",
             "args": [
                 "--filter-tcp=443",
                 "--dpi-desync=split2",
-                "--dpi-desync-repeats=5",
+                "--dpi-desync-repeats=3",
                 "--dpi-desync-fooling=badsum",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
                 "--dpi-desync-split-seqovl=1",
@@ -164,15 +128,51 @@
             ]
         },
         {
-            "name": "youtube",
+            "name": "youtube_MDE4",
             "args": [
                 "--filter-tcp=443",
                 "--dpi-desync=split2",
-                "--dpi-desync-repeats=5",
+                "--dpi-desync-repeats=3",
                 "--dpi-desync-fooling=badsum",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
                 "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-ttl=5",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-autottl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "youtube_MDE4",
+            "args": [
+                "--filter-tcp=443",
+                "--dpi-desync=split2",
+                "--dpi-desync-repeats=3",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-autottl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "youtube_M63E",
+            "args": [
+                "--filter-tcp=443",
+                "--dpi-desync=split2",
+                "--dpi-desync-repeats=4",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-ttl=4",
                 "--dpi-desync-autottl=5",
                 "--new",
                 "--filter-udp=443",

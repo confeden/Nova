@@ -24,7 +24,6 @@ See:
 - licenses/third_party/
 
 Third-party upstream links used by Nova (brief reference list):
-- sing-box: https://github.com/SagerNet/sing-box
 - WinDivert: https://github.com/basil00/WinDivert
 - wireproxy-awg: https://github.com/artem-russkikh/wireproxy-awg
 - amneziawg-go / AmneziaWG-related AWG support: https://github.com/amnezia-vpn/amneziawg-go

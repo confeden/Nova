@@ -10,11 +10,6 @@ of a third-party license text is included, it is stored under
 
 ## Open-source components with bundled notice texts
 
-`bin/sing-box.exe`
-Upstream: `https://github.com/SagerNet/sing-box`
-License: GPL-3.0
-Local notice text: `licenses/third_party/GPL-3.0.txt`
-
 `bin/WinDivert.dll`, `bin/WinDivert64.sys`
 Upstream: `https://github.com/basil00/WinDivert`
 License family used for notice purposes: LGPL-3.0
