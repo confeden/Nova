@@ -1,4 +1,20 @@
-# version: 1.19
+# version: 1.20
+# Nova Telegram CF/WSS domains via WARP/general
+nova-app.eu
+kws1.nova-app.eu
+kws1-1.nova-app.eu
+kws2.nova-app.eu
+kws2-1.nova-app.eu
+kws3.nova-app.eu
+kws3-1.nova-app.eu
+kws4.nova-app.eu
+kws4-1.nova-app.eu
+kws5.nova-app.eu
+kws5-1.nova-app.eu
+kws203.nova-app.eu
+kws203-1.nova-app.eu
+pclead.co.uk
+offshor.co.uk
 1337x.to
 3dn.ru
 7tv.app

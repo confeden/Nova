@@ -1,4 +1,4 @@
-# version: 1.19
+# version: 1.20
 akamaihd.net
 apteka-april.ru
 apteka.ru
@@ -26,7 +26,6 @@ gu-st.ru
 imgsmail.ru
 kaspersky.com
 mozilla.cloudflare-dns.com
-nvidia.com
 ok.me
 ok.ru
 okcdn.ru
