@@ -1,5 +1,5 @@
 # 🌌 Nova
-Программа для обхода всех видов блокировок. Бесплатная и безопасная, без телеметрии.
+Программа для обхода большинства блокировок. Бесплатная и безопасная, без телеметрии.
 # <img width="362" height="302" alt="image" src="https://github.com/user-attachments/assets/59ec654b-0448-4624-9b32-1ef901b95b22" />
 
 [Скачать NovaSetup.exe из Releases](https://github.com/confeden/Nova/releases)
