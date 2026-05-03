@@ -27,6 +27,7 @@ from .transport import open_stream, open_tls_stream, set_upstream_provider
 
 log = logging.getLogger("nova.telegram.relay")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP_ROOT = os.path.dirname(REPO_ROOT) if os.path.basename(REPO_ROOT).lower() == "resources" else REPO_ROOT
 
 ZERO_64 = b"\x00" * 64
 PROTO_ABRIDGED = 0xEFEFEFEF
@@ -60,7 +61,7 @@ CF_FIRST_DCS = {
 }
 CF_FIRST_MEDIA_DCS = {
     int(item)
-    for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_MEDIA_DCS", "5") or "").replace(";", ",").split(",")
+    for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_MEDIA_DCS", "2,4,5,203") or "").replace(";", ",").split(",")
     if item.strip().isdigit()
 }
 
@@ -699,17 +700,20 @@ class TelegramTransparentRelayServer:
         self._prefer_direct_until: Dict[Tuple[int, str], float] = {}
         self._route_preference_until: Dict[Tuple[str, int], Tuple[str, float]] = {}
         self._last_fallback_log: Dict[Tuple[str, str, int, str], float] = {}
+        self._last_wss_route_log: Dict[Tuple[int, str, bool], float] = {}
         self._cf_bootstrap_probe_logged: Dict[int, float] = {}
         self._cf_last_good_domain: Dict[Tuple[int, bool], Tuple[str, float]] = {}
         self._cf_prewarm_started: Dict[Tuple[int, bool], float] = {}
         self._cf_idle: Dict[Tuple[int, bool, bool], deque] = {}
         self._cf_refilling = set()
+        self._start_mono = 0.0
+        self._last_startup_timeout_log = 0.0
 
     def _divert_state_path(self) -> str:
         return str(
             os.environ.get(
                 "NOVA_DIVERT_REDIRECT_MAP",
-                os.path.join(REPO_ROOT, "temp", "NovaDivertRedirectMap.json"),
+                os.path.join(APP_ROOT, "temp", "NovaDivertRedirectMap.json"),
             )
             or ""
         ).strip()
@@ -862,6 +866,7 @@ class TelegramTransparentRelayServer:
             pass
 
     async def _run(self):
+        self._start_mono = time.monotonic()
         proxy_config.buffer_size = max(64 * 1024, int(getattr(proxy_config, "buffer_size", 256 * 1024)))
         if not self._cf_started:
             proxy_config.cfproxy_domains = get_cfproxy_domains("NOVA_TG_RELAY_CF_DOMAINS")
@@ -1139,6 +1144,17 @@ class TelegramTransparentRelayServer:
         except asyncio.IncompleteReadError:
             pass
         except Exception as exc:
+            try:
+                text = str(exc or "").strip().lower()
+                start_age = (time.monotonic() - float(self._start_mono or 0.0)) if self._start_mono else 999.0
+                if text == "timed out" and start_age < 45.0:
+                    now = time.monotonic()
+                    if (now - float(self._last_startup_timeout_log or 0.0)) > 8.0:
+                        self._last_startup_timeout_log = now
+                        self.log_func("[TgRelay] Стартовое окно: ждём стабилизацию WARP/SOCKS, клиентские timeout временно подавлены.")
+                    return
+            except Exception:
+                pass
             self.log_func(f"[TgRelay] Ошибка клиента {label}: {exc}")
         finally:
             if prefetched_ws_task is not None:
@@ -1459,15 +1475,35 @@ class TelegramTransparentRelayServer:
             pass
         self.log_func(f"[TgRelay] TCP fallback route={route_label} target={effective_host}:{effective_port}{route_suffix}")
 
+    def _log_wss_route_unavailable(self, dc_hint: int, target_ip: str, is_media: bool) -> None:
+        try:
+            key = (int(dc_hint or 0), str(target_ip or "").strip().lower(), bool(is_media))
+            now = time.monotonic()
+            last = float(self._last_wss_route_log.get(key, 0.0) or 0.0)
+            if (now - last) < FALLBACK_LOG_INTERVAL:
+                return
+            self._last_wss_route_log[key] = now
+        except Exception:
+            pass
+        self.log_func(
+            f"[TgRelay] WSS path unavailable for DC{dc_hint} target={target_ip} media={is_media}; switching to TCP fallback."
+        )
+
     async def _connect_ws_route(self, dc_hint: int, target_ip: str, is_media: bool, label: str):
         dc_hint = int(dc_hint or 0)
         if dc_hint <= 0:
             return None, ""
 
+        custom_media_cf_only = bool(is_media) and _has_custom_cfproxy_domain()
         if CF_FALLBACK_ENABLED and self._cf_first(dc_hint, is_media):
-            ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media)
-            if ws is not None:
-                return ws, route_label
+            if custom_media_cf_only:
+                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=True)
+                if ws is not None:
+                    return ws, route_label
+            if not custom_media_cf_only:
+                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media)
+                if ws is not None:
+                    return ws, route_label
 
         redirect_target = _TG_WS_REDIRECT_IPS.get(dc_hint)
         if redirect_target:
@@ -1491,11 +1527,15 @@ class TelegramTransparentRelayServer:
                     break
 
         if CF_FALLBACK_ENABLED:
+            if custom_media_cf_only:
+                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=True)
+                if ws is not None:
+                    return ws, route_label
             ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media)
             if ws is not None:
                 return ws, route_label
 
-        self.log_func(f"[TgRelay] WSS route failed for DC{dc_hint} target={target_ip} media={is_media}.")
+        self._log_wss_route_unavailable(dc_hint, target_ip, is_media)
         return None, ""
 
     @staticmethod

@@ -1,5 +1,6 @@
-# version: 1.20
+# version: 1.22.4
 1337x.to
+1e100cdn.net
 abuseipdb.com
 adobe.com
 adobe.io
@@ -13,12 +14,16 @@ archive.org
 arena.ai
 arm.com
 arrow.com
+awswaf.com
 azure.com
+b-cdn.net
 bbc-reporting-api.app
 bbc.com
 benchgecko.ai
 bestrandoms.com
+booktracker.org
 bootstrapcdn.com
+breakingcopyright.com
 brevo.com
 buildwithfern.com
 cdninstagram.com
@@ -41,10 +46,15 @@ cloudflarestatus.com
 cloudflarestorage.com
 cloudflarestream.com
 cloudfront.net
+coinbase.com
 comicbook.com
+cryptocloud.plus
+cryptomus.com
 cursor.directory
+cursor.sh
 deploy.totallyacdn.com
 desmos.com
+digit.in
 discord.com
 discord.gg
 discordapp.com
@@ -62,6 +72,7 @@ fb.me
 fbcdn.net
 fbsbx.com
 filterblade.xyz
+fitgirl-repacks.site
 flagcdn.com
 flibusta.is
 fontawesome.com
@@ -69,6 +80,7 @@ fsdn.com
 fubgun.com
 funpay.com
 g2g.com
+glbgpt.com
 goentri.com
 gokino.su
 good-proxies.ru
@@ -77,6 +89,7 @@ google.ru
 greasyfork.org
 grokusercontent.com
 groq.com
+hdkinoteatr.com
 hexed.it
 ibb.co
 instagram.com
@@ -85,6 +98,7 @@ iplogger.org
 island-of-pleasure.site
 jabber.fr
 kinozal.tv
+laozhang.ai
 litellm.ai
 live.com
 lostfilm.tv
@@ -97,8 +111,10 @@ meet.google.com
 meshworld.in
 microsoft.com
 mmcdn.com
+mobi-films.com
 modrinth.com
 myanimelist.net
+mynoise.world
 namecheap.com
 namecheapapi.com
 nc-img.com
@@ -106,10 +122,10 @@ neuralwriter.com
 nnmclub.to
 nnmstatic.win
 notion.site
-nova-app.eu
 nova.app
 nova.net
 nowpayments.io
+ntfy.sh
 nvidia.com
 obmen.one
 on.aws
@@ -122,10 +138,13 @@ pixelbuilds.org
 play.google.com
 pobb.in
 poedb.tw
+pornolab.net
 proton.me
 proxyliberty.com
 proxynova.com
 recaptcha.net
+receive-sms.io
+rezka.ag
 romexsoftware.com
 roundproxies.com
 rtrvr.ai
@@ -134,12 +153,14 @@ rutor.info
 rutor.is
 rutracker.cc
 scrcpy.org
+seasonvar.ru
 securrity.ru
 sfml-dev.org
 sfunpay.com
 shopify.com
 simgbb.com
 sitechecker.pro
+sms-act.net
 smspool.net
 smtp2go.com
 smtp2gostatus.com
@@ -167,6 +188,7 @@ trustpilot.net
 twimg.com
 twitter.com
 unpkg.com
+userscript.zone
 vecpea.com
 vector.im
 vercel-storage.com
@@ -183,6 +205,8 @@ windscribe.net
 workos.com
 x.com
 xv-ru.com
+xvideos-cdn.com
+xvideos.com
 zendesk.com
 zetflix-online.skin
 zizaran.com

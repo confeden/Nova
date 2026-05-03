@@ -208,11 +208,17 @@ def build_app_transport_decisions(
             whatsapp_tcp_tag = "windivert-tcp"
             whatsapp_include_tcp_rules = False
             whatsapp_keep_tcp_catchall = False
+            if bool(novadivert_udp_redirect_ready) and _env_bool("NOVA_WINDIVERT_WHATSAPP_UDP", True):
+                whatsapp_udp_backend = "windivert"
+                whatsapp_include_udp_rules = False
 
         if _env_bool("NOVA_WINDIVERT_DISCORD", True):
             discord_tcp_backend = "windivert"
             discord_include_tcp_rules = False
             discord_keep_tcp_catchall = False
+            if bool(novadivert_udp_redirect_ready) and _env_bool("NOVA_WINDIVERT_DISCORD_UDP", True):
+                discord_udp_backend = "windivert"
+                discord_include_udp_rules = False
 
     if not singbox_allowed:
         telegram_include_tcp_rules = False

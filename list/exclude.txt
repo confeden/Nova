@@ -1,4 +1,4 @@
-# version: 1.20
+# version: 1.22.4
 akamaihd.net
 apteka-april.ru
 apteka.ru

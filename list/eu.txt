@@ -1,4 +1,4 @@
-# version: 1.20
+# version: 1.22.4
 4pda.to
 alkalimakersuite-pa.clients6.google.com
 analog.com
@@ -9,6 +9,7 @@ autodesk360.com
 bbci.co.uk
 broadcom.com
 cdn.cookielaw.org
+cdnbunny.org
 cerebras.ai
 chatgpt.com
 claude.ai
@@ -28,6 +29,7 @@ emergent.sh
 epicgames.com
 etsy.com
 g2a.com
+gamsgo.com
 gemini.google
 gemini.google.com
 generativelanguage.googleapis.com
@@ -45,6 +47,7 @@ invideo.io
 jules.google.com
 kilo.ai
 kodikplayer.com
+lpsg.com
 meta.ai
 microchip.com
 mouser.com
@@ -59,6 +62,7 @@ oaiusercontent.com
 oauth2.googleapis.com
 onlinesim.io
 openai.com
+orbsrv.com
 otzyvmarketing.ru
 paddle.com
 parklogic.com
@@ -75,12 +79,14 @@ scene7.com
 skcrtxr.com
 smspva.com
 sora.com
+soulmatcher.app
 spotify.com
 spotifycdn.com
 t.me
 telegra.ph
 thisismyip.com
 ti.com
+tiger-sms.com
 usher.ttvnw.net
 withgoogle.com
 x.ai

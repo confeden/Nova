@@ -8,7 +8,6 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.20"
 import sys
 import os
 import io
@@ -27,6 +26,13 @@ import collections
 import json
 import socket
 from datetime import datetime
+from nova_console_logging import (
+    SessionConsoleLogWriter,
+    format_session_console_log_lines,
+    get_default_session_console_log_path,
+)
+from nova_metadata import CURRENT_VERSION, UPDATE_URL, WINWS_FILENAME
+from nova_platform import is_windows_admin
 from nova_routing_profiles import get_default_app_routing_profiles, match_app_by_process_path
 from nova_routing_backends import (
     build_app_transport_decisions,
@@ -59,10 +65,6 @@ try:
         _ORIGINAL_EXE = sys.executable
 except:
     _ORIGINAL_EXE = sys.argv[0]
-
-# === CONFIG ===
-WINWS_FILENAME = "winws.exe"
-UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
 print(f"!!! DEBUG: NOVA SCRIPT LOADING FROM: {os.path.abspath(__file__)} !!!")
 print(f"!!! DEBUG: VERSION: {CURRENT_VERSION} !!!")
@@ -99,76 +101,7 @@ def apply_path_safeguard():
 apply_path_safeguard()
 
 
-class SessionConsoleLogWriter:
-    def __init__(self, path, flush_interval=1.5, max_buffer_bytes=16384):
-        self.path = path
-        self.flush_interval = flush_interval
-        self.max_buffer_bytes = max_buffer_bytes
-        self._lock = threading.Lock()
-        self._buffer = []
-        self._buffer_bytes = 0
-        self._stop_event = threading.Event()
-        self._enabled = False
-        self._thread = None
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write("")
-            self._enabled = True
-            self._thread = threading.Thread(target=self._flush_worker, daemon=True)
-            self._thread.start()
-        except:
-            self._enabled = False
-
-    def write(self, text):
-        if not self._enabled or not text:
-            return
-        if not isinstance(text, str):
-            try:
-                text = str(text)
-            except:
-                return
-        try:
-            size = len(text.encode("utf-8", errors="ignore"))
-        except:
-            size = len(text)
-        should_flush = False
-        with self._lock:
-            self._buffer.append(text)
-            self._buffer_bytes += size
-            if self._buffer_bytes >= self.max_buffer_bytes:
-                should_flush = True
-        if should_flush:
-            self.flush()
-
-    def flush(self):
-        if not self._enabled:
-            return
-        with self._lock:
-            if not self._buffer:
-                return
-            data = "".join(self._buffer)
-            self._buffer.clear()
-            self._buffer_bytes = 0
-        try:
-            with open(self.path, "a", encoding="utf-8", buffering=65536, newline="") as f:
-                f.write(data)
-        except:
-            pass
-
-    def close(self):
-        try:
-            self._stop_event.set()
-        except:
-            pass
-        self.flush()
-
-    def _flush_worker(self):
-        while not self._stop_event.wait(self.flush_interval):
-            self.flush()
-
-
-SESSION_CONSOLE_LOG_PATH = os.path.join(os.environ.get("TEMP", os.path.join(os.getcwd(), "temp")), "nova_console.log")
+SESSION_CONSOLE_LOG_PATH = get_default_session_console_log_path()
 SESSION_CONSOLE_LOG = SessionConsoleLogWriter(SESSION_CONSOLE_LOG_PATH)
 
 
@@ -181,27 +114,7 @@ def _session_console_log_write(text):
 
 
 def _session_console_log_lines(text):
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        try:
-            text = str(text)
-        except:
-            return ""
-    parts = text.splitlines(True)
-    if not parts:
-        parts = [text]
-    out = []
-    for part in parts:
-        if part == "":
-            continue
-        line = part.rstrip("\r\n")
-        nl = part[len(line):]
-        if line:
-            out.append(f"{time.strftime('%H:%M:%S')} {line}{nl or os.linesep}")
-        else:
-            out.append(nl or os.linesep)
-    return "".join(out)
+    return format_session_console_log_lines(text)
 
 
 atexit.register(lambda: SESSION_CONSOLE_LOG.close() if SESSION_CONSOLE_LOG else None)
@@ -210,6 +123,16 @@ try:
     _session_console_log_write(_session_console_log_lines(f"!!! DEBUG: VERSION: {CURRENT_VERSION} !!!\n"))
 except:
     pass
+
+
+def _env_bool_global(name, default=False):
+    try:
+        raw = os.environ.get(str(name), None)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    except:
+        return bool(default)
 
 # === AUTO-INSTALL REQUIREMENTS ===
 def install_requirements_visually():
@@ -548,8 +471,7 @@ except ImportError as e:
 
 # === CHECK ADMIN PRIVILEGES ===
 def is_admin():
-    try: return ctypes.windll.shell32.IsUserAnAdmin()
-    except: return False
+    return is_windows_admin()
 
 if not is_admin():
     # FIX: Check for infinite loop (relaunch flag)
@@ -1033,6 +955,79 @@ try:
                 return candidate
         return candidates[0]
 
+    def _resolve_python_launcher_args():
+        """
+        Resolve a real Python interpreter for helper scripts.
+
+        Frozen Nova.exe must not be used here: launching it with a .py helper
+        argument re-enters the GUI app and can trigger false "already running"
+        dialogs instead of starting NovaDivert/NovaWFP helpers.
+        """
+        candidates = []
+
+        override = str(os.environ.get("NOVA_HELPER_PYTHON", "") or "").strip().strip('"')
+        if override:
+            candidates.append(override)
+
+        try:
+            resources_dir = get_resources_dir()
+            candidates.extend([
+                os.path.join(resources_dir, "pyruntime", "python.exe"),
+                os.path.join(resources_dir, "pyruntime", "pythonw.exe"),
+            ])
+        except:
+            pass
+
+        try:
+            base_dir = get_base_dir()
+            candidates.extend([
+                os.path.join(base_dir, "resources", "pyruntime", "python.exe"),
+                os.path.join(base_dir, "resources", "pyruntime", "pythonw.exe"),
+                os.path.join(base_dir, "pyruntime", "python.exe"),
+                os.path.join(base_dir, "pyruntime", "pythonw.exe"),
+            ])
+        except:
+            pass
+
+        if not getattr(sys, "frozen", False):
+            exe = str(getattr(sys, "executable", "") or "").strip()
+            if exe:
+                lower = exe.lower()
+                if lower.endswith("pythonw.exe"):
+                    candidates.append(exe[:-11] + "python.exe")
+                    candidates.append(exe)
+                elif lower.endswith("python.exe"):
+                    candidates.append(exe)
+                    candidates.append(exe[:-10] + "pythonw.exe")
+                else:
+                    candidates.append(exe)
+
+        seen = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = os.path.abspath(os.path.expandvars(os.path.expanduser(str(candidate))))
+            key = os.path.normcase(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            name = os.path.basename(path).lower()
+            if name not in ("python.exe", "pythonw.exe"):
+                continue
+            if os.path.exists(path):
+                return [path, "-u"]
+
+        for launcher in ("python", "py"):
+            try:
+                resolved = shutil.which(launcher)
+                if resolved:
+                    if launcher == "py":
+                        return [resolved, "-3", "-u"]
+                    return [resolved, "-u"]
+            except:
+                pass
+        return []
+
     def calculate_file_hash(filepath, algorithm="sha256"):
         """Вычисляет хэш файла."""
         import hashlib
@@ -1376,9 +1371,6 @@ try:
         except: pass
 
         return logs
-
-    # Обновляем URL обновлений (как ты просил)
-    UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 
     # ================= МОДУЛЬ: NOVA_BOOT =================
     # Глобальное состояние
@@ -2729,43 +2721,12 @@ try:
                 self.log_func(f"[RU] [Diag] Не удалось применить IP-режим {mode}: {last_err}")
             return mode == "auto"
 
-        def _discover_warp_endpoint_host(self):
-            cached = getattr(self, "_cached_warp_endpoint_host", "") or ""
-            if cached:
-                return cached
-
-            candidates = []
-            try:
-                stats_result = self.run_warp_cli("tunnel", "stats", timeout=8)
-                stats_text = self._warp_cli_result_text(stats_result)
-                for match in re.findall(r"(\d+\.\d+\.\d+\.\d+)", stats_text or ""):
-                    if match not in candidates:
-                        candidates.append(match)
-            except:
-                pass
-
-            for host_name in ("engage.cloudflareclient.com", "api.cloudflareclient.com"):
-                try:
-                    resolved = socket.gethostbyname(host_name)
-                    if resolved and resolved not in candidates:
-                        candidates.append(resolved)
-                except:
-                    pass
-
-            for fallback in ("162.159.192.1", "162.159.192.2", "188.114.96.1", "188.114.97.1"):
-                if fallback not in candidates:
-                    candidates.append(fallback)
-
-            chosen = candidates[0] if candidates else "162.159.192.1"
-            self._cached_warp_endpoint_host = str(chosen)
-            return self._cached_warp_endpoint_host
-
-        def _build_connect_attempts(self, preferred_profile=None, bootstrap_ports=None, endpoint_candidates=None, protocol_hints=None, masque_option_hints=None, prefer_exact_endpoints=False):
+        def _build_connect_attempts(self, preferred_profile=None):
             attempts = []
             seen = set()
 
-            def _add(label, protocol, masque_option, ip_mode, timeout_sec, port=None, endpoint_host=None, endpoint_port=None):
-                key = (str(protocol), str(masque_option), str(ip_mode), int(port or 0), str(endpoint_host or ""), int(endpoint_port or 0))
+            def _add(label, protocol, masque_option, ip_mode, timeout_sec, port=None):
+                key = (str(protocol), str(masque_option), str(ip_mode), int(port or 0))
                 if key in seen:
                     return
                 seen.add(key)
@@ -2777,8 +2738,6 @@ try:
                         "ip_mode": ip_mode,
                         "timeout": int(timeout_sec),
                         "port": int(port) if port else None,
-                        "endpoint_host": str(endpoint_host or "").strip(),
-                        "endpoint_port": int(endpoint_port) if endpoint_port else None,
                     }
                 )
 
@@ -2790,58 +2749,18 @@ try:
                     preferred_profile.get("ip_mode", "auto"),
                     20,
                     preferred_profile.get("port"),
-                    preferred_profile.get("endpoint_host"),
-                    preferred_profile.get("endpoint_port"),
                 )
-
-            allowed_protocols = self._normalize_warp_protocols(protocol_hints)
-            allowed_masque_options = self._normalize_warp_masque_options(masque_option_hints)
-
-            def _add_exact_endpoint_attempts():
-                for endpoint in list(endpoint_candidates or []):
-                    host = str(endpoint.get("host", "") or "").strip()
-                    port = endpoint.get("port", None)
-                    try:
-                        port = int(port)
-                    except:
-                        port = None
-                    if not host or not port:
-                        continue
-                    if "MASQUE" in allowed_protocols:
-                        for opt in allowed_masque_options:
-                            suffix = "" if opt == "h3-with-h2-fallback" else f" ({opt})"
-                            _add(f"MASQUE endpoint {host}:{port}{suffix}", "MASQUE", opt, "auto", 18, endpoint_host=host, endpoint_port=port)
-                    if "WireGuard" in allowed_protocols:
-                        _add(f"WireGuard endpoint {host}:{port}", "WireGuard", "reset", "auto", 18, endpoint_host=host, endpoint_port=port)
-
-            if prefer_exact_endpoints:
-                _add_exact_endpoint_attempts()
 
             _add("MASQUE endpoint default (Auto)", "MASQUE", "h3-with-h2-fallback", "auto", 25)
             _add("MASQUE h2-only", "MASQUE", "h2-only", "auto", 20)
             _add("MASQUE h3-only", "MASQUE", "h3-only", "auto", 20)
             _add("WireGuard (Auto)", "WireGuard", "reset", "auto", 20)
 
-            for port in self._normalize_warp_port_specs(bootstrap_ports or []):
-                if "-" in str(port):
-                    continue
-                try:
-                    port_i = int(port)
-                except:
-                    continue
-                _add(f"MASQUE endpoint port {port_i}", "MASQUE", "h3-with-h2-fallback", "auto", 20, endpoint_port=port_i)
-                _add(f"MASQUE h2-only port {port_i}", "MASQUE", "h2-only", "auto", 18, endpoint_port=port_i)
-                _add(f"MASQUE h3-only port {port_i}", "MASQUE", "h3-only", "auto", 18, endpoint_port=port_i)
-                _add(f"WireGuard port {port_i}", "WireGuard", "reset", "auto", 18, endpoint_port=port_i)
-
             # Secondary rotation by IP family in case one side is filtered by ISP.
             for mode in ("v4", "v6"):
                 _add(f"MASQUE endpoint default ({mode.upper()})", "MASQUE", "h3-with-h2-fallback", mode, 18)
                 _add(f"MASQUE h2-only ({mode.upper()})", "MASQUE", "h2-only", mode, 18)
                 _add(f"WireGuard ({mode.upper()})", "WireGuard", "reset", mode, 18)
-
-            if not prefer_exact_endpoints:
-                _add_exact_endpoint_attempts()
 
             return attempts
 
@@ -3110,7 +3029,7 @@ try:
                     return False
 
                 # Keep WARP helper GUI processes away from service bootstrap.
-                for proc_name in self._warp_process_names():
+                for proc_name in ["warp-taskbar.exe", "Cloudflare WARP.exe", "warp-cli.exe", "warp-svc.exe"]:
                     subprocess.run(
                         ["taskkill", "/F", "/IM", proc_name, "/T"],
                         capture_output=True,
@@ -3172,14 +3091,11 @@ try:
                     self._log_service_diagnostics()
                     return False
 
-                # Primary mode: Cloudflare bootstrap through temporary winws profile from warp.json.
+                # Primary mode: Cloudflare bootstrap through active winws strategy (strategies.json).
                 # If this path fails, reserve fallback through Opera proxy is attempted below.
                 self.last_bootstrap_transport = "strategy"
                 self._set_service_proxy_environment(enable_proxy=False)
-                profile_suffix = ""
-                if getattr(self, "bootstrap_winws_profile_name", ""):
-                    profile_suffix = f" / {self.bootstrap_winws_profile_name}"
-                self.log_func(f"[RU] [Diag] Режим запуска WARP: bootstrap{profile_suffix} (Cloudflare через winws/warp.json).")
+                self.log_func("[RU] [Diag] Режим запуска WARP: strategy (Cloudflare через winws/strategies.json).")
 
                 ok, last_status, last_error = _start_and_wait_ipc()
                 if ok:
@@ -5748,6 +5664,38 @@ try:
             return attempts
 
         def _wait_for_warp_bootstrap_window(self, target_host="", target_port=0, media_hint=False, dc_hint=0):
+            def _warp_transport_ready():
+                try:
+                    wm = globals().get("warp_manager")
+                    if not wm:
+                        return False
+                    if not bool(getattr(wm, "is_connected", False)):
+                        return False
+                    port = int(getattr(wm, "port", 1370) or 1370)
+                    if not is_local_port_open_quick(port, timeout=0.25):
+                        return False
+                    tester = getattr(wm, "_test_socks5_internet", None)
+                    if callable(tester):
+                        return bool(tester(port, timeout=1.2))
+                    return True
+                except Exception:
+                    return False
+
+            def _awg_bootstrap_in_progress():
+                try:
+                    wm = globals().get("warp_manager")
+                    if not wm:
+                        return False
+                    awg_proc = getattr(wm, "awg_process", None)
+                    if awg_proc and awg_proc.poll() is None:
+                        return True
+                    active_backend = getattr(wm, "active_backend", "")
+                    if active_backend == "awg" and not bool(getattr(wm, "is_connected", False)):
+                        return True
+                    return False
+                except Exception:
+                    return False
+
             try:
                 target_port = int(target_port or 0)
             except Exception:
@@ -5768,28 +5716,40 @@ try:
                 return 0.0
             now = time.monotonic()
             age = now - started_mono
-            startup_grace = 18.0
+            startup_grace = 45.0
             if age >= startup_grace:
                 return 0.0
             wm = globals().get("warp_manager")
             if not wm:
                 return 0.0
+            if _awg_bootstrap_in_progress():
+                wait_cap = min(20.0, max(0.0, startup_grace - age))
+                if wait_cap <= 0.0:
+                    return 0.0
+                started_wait = time.monotonic()
+                deadline = started_wait + wait_cap
+                while time.monotonic() < deadline:
+                    if not _awg_bootstrap_in_progress():
+                        break
+                    if not bool(self.server and getattr(self.server, "running", False)):
+                        break
+                    time.sleep(0.20)
             try:
-                if bool(getattr(wm, "is_connected", False)):
+                if _warp_transport_ready():
                     return 0.0
             except Exception:
                 return 0.0
-            wait_cap = min(6.0, max(0.0, startup_grace - age))
+            wait_cap = min(15.0, max(0.0, startup_grace - age))
             if wait_cap <= 0.0:
                 return 0.0
             started_wait = time.monotonic()
             deadline = started_wait + wait_cap
             while time.monotonic() < deadline:
                 try:
-                    if bool(getattr(wm, "is_connected", False)):
+                    if _warp_transport_ready():
                         waited = time.monotonic() - started_wait
                         if waited >= 0.15:
-                            self.log_func(f"{self.log_prefix} Telegram bootstrap дождался WARP: {waited:.2f}s.")
+                            self.log_func(f"{self.log_prefix} Telegram bootstrap дождался WARP/SOCKS: {waited:.2f}s.")
                         return waited
                 except Exception:
                     break
@@ -5847,7 +5807,13 @@ try:
                         return
                     wm = globals().get("warp_manager")
                     if bool(wm and getattr(wm, "is_connected", False)):
-                        break
+                        try:
+                            port = int(getattr(wm, "port", 1370) or 1370)
+                            tester = getattr(wm, "_test_socks5_internet", None)
+                            if is_local_port_open_quick(port, timeout=0.25) and (not callable(tester) or bool(tester(port, timeout=1.2))):
+                                break
+                        except Exception:
+                            pass
                     if not bool(self.server and getattr(self.server, "running", False)):
                         return
                     time.sleep(0.5)
@@ -6762,7 +6728,7 @@ try:
 
 
     class NovaDivertObserverManager:
-        """Runs the signed WinDivert FLOW/SOCKET observer as a user-mode PoC backend."""
+        """Runs the signed WinDivert observer in the background for release-safe app routing."""
 
         def __init__(self, log_func=None, log_path=None, state_path=None):
             self.log_func = log_func or print
@@ -6770,17 +6736,10 @@ try:
             self.state_path = state_path or os.path.join(get_base_dir(), "temp", "NovaDivertObserverState.json")
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaDivertObserver.pid")
             self.process = None
-            self.script_path = os.path.join(get_base_dir(), "NovaDivert", "windivert_observer.py")
+            self.script_path = get_internal_path(os.path.join("NovaDivert", "windivert_observer.py"))
 
         def _python_prefix(self):
-            exe = str(getattr(sys, "executable", "") or "").strip()
-            lower = os.path.basename(exe).lower()
-            if exe and os.path.exists(exe) and "python" in lower:
-                return [exe]
-            launcher = shutil.which("py")
-            if launcher:
-                return [launcher, "-3"]
-            return [exe] if exe else ["py", "-3"]
+            return _resolve_python_launcher_args()
 
         def _read_state(self):
             try:
@@ -6863,8 +6822,24 @@ try:
                         repair_driver(self.log_func, exit_code=34)
 
                 post_state = query_state() or {}
+                post_reasons = []
                 if post_state.get("disabled"):
-                    self.log_func("[NovaDivert] WinDivert всё ещё disabled после подготовки.")
+                    post_reasons.append("disabled")
+                if post_state.get("pending_delete"):
+                    post_reasons.append("pending_delete")
+                if post_state.get("missing"):
+                    post_reasons.append("missing")
+                if post_reasons:
+                    hint = ""
+                    if post_state.get("pending_delete"):
+                        hint = " (возможно: зависшая операция удаления/перерегистрации драйвера)"
+                    elif post_state.get("disabled"):
+                        hint = " (возможно: Core Isolation/Driver Enforcement блокирует драйвер)"
+                    self.log_func(
+                        f"[NovaDivert] WinDivert всё ещё не готов после подготовки: {', '.join(post_reasons)}{hint}. "
+                        "Старт observer/redirect будет отложен."
+                    )
+                    return False
                 return True
             except Exception as e:
                 self.log_func(f"[NovaDivert] Подготовка WinDivert не удалась: {e}")
@@ -6891,14 +6866,22 @@ try:
             if not self._prepare_windivert_service():
                 return False
             self._kill_stale()
+            py_prefix = self._python_prefix()
+            if not py_prefix:
+                self.log_func(f"[NovaDivert] Не найден Python launcher для observer helper: {self.script_path}")
+                return False
+            env = os.environ.copy()
+            if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+                env["NOVA_SAFE_FILTER_MODE"] = "1"
             try:
                 self.process = subprocess.Popen(
-                    self._python_prefix() + [
+                    py_prefix + [
                         self.script_path,
                         "--log", str(self.log_path),
                         "--state", str(self.state_path),
                     ],
                     cwd=get_base_dir(),
+                    env=env,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -6993,7 +6976,7 @@ try:
             self.map_path = map_path or os.path.join(get_base_dir(), "temp", "NovaDivertRedirectMap.json")
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaDivertRedirect.pid")
             self.process = None
-            self.script_path = os.path.join(get_base_dir(), "NovaDivert", "windivert_redirect.py")
+            self.script_path = get_internal_path(os.path.join("NovaDivert", "windivert_redirect.py"))
             self.tcp_proxy_port = 17870
             self.udp_proxy_port = 17871
 
@@ -7027,6 +7010,13 @@ try:
                     return True
             except:
                 pass
+            if 'is_safe_filter_mode_enabled' in globals():
+                try:
+                    if is_safe_filter_mode_enabled():
+                        self.log_func("[NovaDivert] Redirect отключён: active WinDivert safe-mode несовместим с transparent redirect на этом ПК.")
+                        return False
+                except:
+                    pass
             self.process = None
             if not os.path.exists(self.script_path):
                 self.log_func(f"[NovaDivert] Redirect script not found: {self.script_path}")
@@ -7047,20 +7037,27 @@ try:
             with contextlib.suppress(Exception):
                 os.remove(self.state_path)
             try:
-                self.process = subprocess.Popen(
-                    self._python_prefix() + [
-                        self.script_path,
-                        "--log", str(self.log_path),
-                        "--state", str(self.state_path),
-                        "--map", str(self.map_path),
-                        "--tcp-proxy-port", str(self.tcp_proxy_port),
-                        "--udp-proxy-port", str(udp_proxy_port),
-                    ],
-                    cwd=get_base_dir(),
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                startup_log_path = self.log_path + ".startup.log"
+                env = os.environ.copy()
+                if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+                    env["NOVA_SAFE_FILTER_MODE"] = "1"
+                with open(startup_log_path, "a", encoding="utf-8", newline="") as startup_log:
+                    startup_log.write(f"\n{time.strftime('%H:%M:%S')} [NovaDivert][Redirect] launch: {self.script_path}\n")
+                    self.process = subprocess.Popen(
+                        self._python_prefix() + [
+                            self.script_path,
+                            "--log", str(self.log_path),
+                            "--state", str(self.state_path),
+                            "--map", str(self.map_path),
+                            "--tcp-proxy-port", str(self.tcp_proxy_port),
+                            "--udp-proxy-port", str(udp_proxy_port),
+                        ],
+                        cwd=get_base_dir(),
+                        env=env,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        stdout=startup_log,
+                        stderr=startup_log,
+                    )
                 _write_helper_pid(self.pid_path, self.process.pid, self.script_path)
             except Exception as e:
                 self.process = None
@@ -7108,6 +7105,15 @@ try:
                 with contextlib.suppress(Exception):
                     self.process.wait(timeout=2.0)
             self.process = None
+            if rc not in (None, 0):
+                try:
+                    with open(startup_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                        tail = f.read()[-900:].strip()
+                    if tail:
+                        compact_tail = " | ".join(line.strip() for line in tail.splitlines() if line.strip())
+                        self.log_func(f"[NovaDivert] Redirect startup log: {compact_tail[-700:]}")
+                except:
+                    pass
             self.log_func(f"[NovaDivert] Redirect не стартовал (код: {rc}).")
             return False
 
@@ -7614,7 +7620,7 @@ try:
             self.log_path = log_path or os.path.join(get_base_dir(), "temp", "NovaWfpTcpProxy.log")
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaWfpTcpProxy.pid")
             self.process = None
-            self.script_path = os.path.join(get_base_dir(), "NovaWFP", "proxy", "tcp_proxy.py")
+            self.script_path = get_internal_path(os.path.join("NovaWFP", "proxy", "tcp_proxy.py"))
             self.service_exe_path = self._resolve_service_exe_path()
             self.host = "0.0.0.0"
             self.port = 17870
@@ -7740,14 +7746,7 @@ try:
             return True
 
         def _python_prefix(self):
-            exe = str(getattr(sys, "executable", "") or "").strip()
-            lower = os.path.basename(exe).lower()
-            if exe and os.path.exists(exe) and "python" in lower:
-                return [exe]
-            launcher = shutil.which("py")
-            if launcher:
-                return [launcher, "-3"]
-            return [exe] if exe else ["py", "-3"]
+            return _resolve_python_launcher_args()
 
         def _kill_stale(self):
             _terminate_helper_pid(self.pid_path)
@@ -7780,9 +7779,13 @@ try:
             except:
                 pass
             self._kill_stale()
+            py_prefix = self._python_prefix()
+            if not py_prefix:
+                self.log_func(f"[NovaWFP][Proxy] Не найден Python launcher для TCP proxy helper: {self.script_path}")
+                return False
             try:
                 self.process = subprocess.Popen(
-                    self._python_prefix() + [
+                    py_prefix + [
                         self.script_path,
                         "--host", str(self.host),
                         "--port", str(self.port),
@@ -7915,7 +7918,8 @@ try:
             self.map_path = map_path or os.path.join(get_base_dir(), "temp", "NovaDivertRedirectMap.json")
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaDivertTcpProxy.pid")
             self.process = None
-            self.script_path = os.path.join(get_base_dir(), "NovaWFP", "proxy", "tcp_proxy.py")
+            self._adopted_pid_logged = False
+            self.script_path = get_internal_path(os.path.join("NovaWFP", "proxy", "tcp_proxy.py"))
             self.host = "0.0.0.0"
             self.port = 17870
 
@@ -7927,6 +7931,39 @@ try:
                 if not (self.process and self.process.poll() is None):
                     return False
                 return int(self.process.pid) in _tcp_listen_pids_for_port(self.port)
+            except:
+                return False
+
+        def _listener_pids(self):
+            try:
+                return sorted(int(pid) for pid in _tcp_listen_pids_for_port(self.port))
+            except:
+                return []
+
+        def _adopt_listener_if_ready(self):
+            try:
+                listener_pids = self._listener_pids()
+                if not listener_pids:
+                    return False
+                chosen_pid = None
+                launcher_pid = None
+                try:
+                    if self.process and self.process.poll() is None and int(self.process.pid) in listener_pids:
+                        chosen_pid = int(self.process.pid)
+                    if self.process and self.process.poll() is None:
+                        launcher_pid = int(self.process.pid)
+                except:
+                    chosen_pid = None
+                if not chosen_pid:
+                    chosen_pid = int(listener_pids[0])
+                if launcher_pid and chosen_pid != launcher_pid and not self._adopted_pid_logged:
+                    try:
+                        self.log_func(f"[NovaDivert][Proxy] TCP proxy listener adopted: launcher_pid={launcher_pid} listener_pid={chosen_pid}.")
+                    except:
+                        pass
+                    self._adopted_pid_logged = True
+                _write_helper_pid(self.pid_path, chosen_pid, self.script_path)
+                return True
             except:
                 return False
 
@@ -7954,9 +7991,15 @@ try:
             _terminate_tcp_listeners_on_port(self.port, log_func=self.log_func)
             env = os.environ.copy()
             env["NOVA_DIVERT_REDIRECT_MAP"] = str(self.map_path)
+            if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+                env["NOVA_SAFE_FILTER_MODE"] = "1"
+            py_prefix = self._python_prefix()
+            if not py_prefix:
+                self.log_func(f"[NovaDivert][Proxy] Не найден Python launcher для TCP proxy helper: {self.script_path}")
+                return False
             try:
                 self.process = subprocess.Popen(
-                    self._python_prefix() + [
+                    py_prefix + [
                         self.script_path,
                         "--host", str(self.host),
                         "--port", str(self.port),
@@ -7968,6 +8011,7 @@ try:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                self._adopted_pid_logged = False
                 _write_helper_pid(self.pid_path, self.process.pid, self.script_path)
             except Exception as e:
                 self.process = None
@@ -7976,15 +8020,15 @@ try:
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 try:
-                    if self.process.poll() is not None:
+                    if self._adopt_listener_if_ready():
                         break
-                    if self._port_owned_by_self():
+                    if self.process.poll() is not None:
                         break
                 except:
                     break
                 time.sleep(0.1)
             try:
-                if self.process and self.process.poll() is None and self._port_owned_by_self():
+                if self._adopt_listener_if_ready():
                     self.log_func(f"[NovaDivert][Proxy] TCP proxy активен: {self.log_path}")
                     refresh_routing_backend_control_plane(force=True)
                     _stop_singbox_if_light_fallback_ready(log_func=self.log_func)
@@ -8010,19 +8054,23 @@ try:
             except:
                 pass
             self.process = None
+            self._adopted_pid_logged = False
             self._kill_stale()
             _terminate_tcp_listeners_on_port(self.port, log_func=self.log_func)
             refresh_routing_backend_control_plane(force=True)
 
         def is_ready(self):
             try:
-                return bool(self.process and self.process.poll() is None and self._port_owned_by_self())
+                return bool(self._adopt_listener_if_ready())
             except:
                 return False
 
         def get_pid(self):
             try:
-                return int(self.process.pid) if self.process and self.process.poll() is None else 0
+                if self.process and self.process.poll() is None and self._port_owned_by_self():
+                    return int(self.process.pid)
+                listener_pids = self._listener_pids()
+                return int(listener_pids[0]) if listener_pids else 0
             except:
                 return 0
 
@@ -8035,19 +8083,12 @@ try:
             self.log_path = log_path or os.path.join(get_base_dir(), "temp", "NovaWfpUdpProxy.log")
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaWfpUdpProxy.pid")
             self.process = None
-            self.script_path = os.path.join(get_base_dir(), "NovaWFP", "proxy", "udp_proxy.py")
+            self.script_path = get_internal_path(os.path.join("NovaWFP", "proxy", "udp_proxy.py"))
             self.host = "127.0.0.1"
             self.port = 17871
 
         def _python_prefix(self):
-            exe = str(getattr(sys, "executable", "") or "").strip()
-            lower = os.path.basename(exe).lower()
-            if exe and os.path.exists(exe) and "python" in lower:
-                return [exe]
-            launcher = shutil.which("py")
-            if launcher:
-                return [launcher, "-3"]
-            return [exe] if exe else ["py", "-3"]
+            return _resolve_python_launcher_args()
 
         def _kill_stale(self):
             _terminate_helper_pid(self.pid_path)
@@ -8066,9 +8107,13 @@ try:
             except:
                 pass
             self._kill_stale()
+            py_prefix = self._python_prefix()
+            if not py_prefix:
+                self.log_func(f"[NovaWFP][UDP] Не найден Python launcher для UDP proxy helper: {self.script_path}")
+                return False
             try:
                 self.process = subprocess.Popen(
-                    self._python_prefix() + [
+                    py_prefix + [
                         self.script_path,
                         "--host", str(self.host),
                         "--port", str(self.port),
@@ -8158,7 +8203,8 @@ try:
             self.map_path = map_path or os.path.join(get_base_dir(), "temp", "NovaDivertRedirectMap.json")
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaDivertUdpProxy.pid")
             self.process = None
-            self.script_path = os.path.join(get_base_dir(), "NovaWFP", "proxy", "udp_proxy.py")
+            self._adopted_pid_logged = False
+            self.script_path = get_internal_path(os.path.join("NovaWFP", "proxy", "udp_proxy.py"))
             self.host = "0.0.0.0"
             self.port = 17871
 
@@ -8170,6 +8216,39 @@ try:
                 if not (self.process and self.process.poll() is None):
                     return False
                 return int(self.process.pid) in _udp_listen_pids_for_port(self.port)
+            except:
+                return False
+
+        def _listener_pids(self):
+            try:
+                return sorted(int(pid) for pid in _udp_listen_pids_for_port(self.port))
+            except:
+                return []
+
+        def _adopt_listener_if_ready(self):
+            try:
+                listener_pids = self._listener_pids()
+                if not listener_pids:
+                    return False
+                chosen_pid = None
+                launcher_pid = None
+                try:
+                    if self.process and self.process.poll() is None and int(self.process.pid) in listener_pids:
+                        chosen_pid = int(self.process.pid)
+                    if self.process and self.process.poll() is None:
+                        launcher_pid = int(self.process.pid)
+                except:
+                    chosen_pid = None
+                if not chosen_pid:
+                    chosen_pid = int(listener_pids[0])
+                if launcher_pid and chosen_pid != launcher_pid and not self._adopted_pid_logged:
+                    try:
+                        self.log_func(f"[NovaDivert][UDP] UDP proxy listener adopted: launcher_pid={launcher_pid} listener_pid={chosen_pid}.")
+                    except:
+                        pass
+                    self._adopted_pid_logged = True
+                _write_helper_pid(self.pid_path, chosen_pid, self.script_path)
+                return True
             except:
                 return False
 
@@ -8198,9 +8277,15 @@ try:
             env = os.environ.copy()
             env["NOVA_DIVERT_REDIRECT_MAP"] = str(self.map_path)
             env["NOVA_UDP_PROXY_LABEL"] = "NovaDivert"
+            if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+                env["NOVA_SAFE_FILTER_MODE"] = "1"
+            py_prefix = self._python_prefix()
+            if not py_prefix:
+                self.log_func(f"[NovaDivert][UDP] Не найден Python launcher для UDP proxy helper: {self.script_path}")
+                return False
             try:
                 self.process = subprocess.Popen(
-                    self._python_prefix() + [
+                    py_prefix + [
                         self.script_path,
                         "--host", str(self.host),
                         "--port", str(self.port),
@@ -8212,6 +8297,7 @@ try:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                self._adopted_pid_logged = False
                 _write_helper_pid(self.pid_path, self.process.pid, self.script_path)
             except Exception as e:
                 self.process = None
@@ -8220,15 +8306,15 @@ try:
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 try:
-                    if self.process.poll() is not None:
+                    if self._adopt_listener_if_ready():
                         break
-                    if self._port_owned_by_self():
+                    if self.process.poll() is not None:
                         break
                 except:
                     break
                 time.sleep(0.1)
             try:
-                if self.process and self.process.poll() is None and self._port_owned_by_self():
+                if self._adopt_listener_if_ready():
                     self.log_func(f"[NovaDivert][UDP] UDP proxy активен: {self.log_path}")
                     refresh_routing_backend_control_plane(force=True)
                     _stop_singbox_if_light_fallback_ready(log_func=self.log_func)
@@ -8254,13 +8340,14 @@ try:
             except:
                 pass
             self.process = None
+            self._adopted_pid_logged = False
             self._kill_stale()
             _terminate_udp_listeners_on_port(self.port, log_func=self.log_func)
             refresh_routing_backend_control_plane(force=True)
 
         def is_ready(self):
             try:
-                return bool(self.process and self.process.poll() is None and self._port_owned_by_self())
+                return bool(self._adopt_listener_if_ready())
             except:
                 return False
 
@@ -8530,6 +8617,45 @@ try:
             except: pass
             
         # === FIX: Config Auto-Update Logic ===
+        def _strategy_payload_has_ports(arg_list):
+            try:
+                if not isinstance(arg_list, list):
+                    return False
+                for item in arg_list:
+                    if not isinstance(item, str):
+                        continue
+                    text = item.strip().lower()
+                    if text.startswith("--filter-tcp=") or text.startswith("--filter-udp="):
+                        return True
+            except:
+                return False
+            return False
+
+        def _validate_strategies_config(data):
+            try:
+                if not isinstance(data, dict):
+                    return False
+                found_ports = False
+                for key, value in data.items():
+                    if key == "version":
+                        continue
+                    payload = value
+                    if isinstance(payload, dict):
+                        payload = payload.get("args", [])
+                    if _strategy_payload_has_ports(payload):
+                        found_ports = True
+                        break
+                if not found_ports:
+                    return False
+                general_payload = data.get("general", [])
+                if isinstance(general_payload, dict):
+                    general_payload = general_payload.get("args", [])
+                if isinstance(general_payload, list) and not _strategy_payload_has_ports(general_payload):
+                    return False
+                return True
+            except:
+                return False
+
         def check_and_update_config(filename, default_data, validation_callback=None):
             fpath = os.path.join(base_dir, "strat", filename)
             should_update = False
@@ -8580,7 +8706,7 @@ try:
                 except Exception as e:
                     print(f"Error updating {filename}: {e}")
 
-        check_and_update_config(STRATEGIES_FILENAME, DEFAULT_STRATEGIES)
+        check_and_update_config(STRATEGIES_FILENAME, DEFAULT_STRATEGIES, validation_callback=_validate_strategies_config)
         check_and_update_config("discord.json", DEFAULT_DISCORD)
 
         warp_bootstrap_path = os.path.join(base_dir, "strat", WARP_STRATEGIES_FILENAME)
@@ -8944,10 +9070,6 @@ try:
         except: pass
         finally: config_lock.release()
 
-    def is_admin():
-        try: return ctypes.windll.shell32.IsUserAnAdmin()
-        except: return False
-
     def check_single_instance():
         kernel32 = ctypes.windll.kernel32
         force_instance_mode = ("--force-instance" in sys.argv or "--restart" in sys.argv)
@@ -8982,7 +9104,13 @@ try:
                 continue
             return app_mutex
         
+        dialog_mutex = None
         try:
+            dialog_mutex_name = "Nova_Unique_AlreadyRunning_Dialog"
+            dialog_mutex = kernel32.CreateMutexW(None, False, dialog_mutex_name)
+            dialog_last_err = kernel32.GetLastError()
+            if dialog_last_err == 183:  # ERROR_ALREADY_EXISTS
+                sys.exit(1)
             temp_root = tk.Tk(); temp_root.withdraw(); temp_root.attributes("-topmost", True)
             if force_instance_mode:
                 msg = "Перезапуск не смог получить mutex экземпляра Nova.\n\nЗавершите зависшие процессы pythonw.exe / Nova.exe и запустите Nova снова."
@@ -8991,6 +9119,12 @@ try:
             messagebox.showerror("Nova - Ошибка запуска", msg)
             temp_root.destroy()
         except: pass
+        finally:
+            try:
+                if dialog_mutex:
+                    kernel32.CloseHandle(dialog_mutex)
+            except:
+                pass
         sys.exit(1)
 
     class POINT(ctypes.Structure): _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -11375,6 +11509,75 @@ try:
     def is_vpn_active_func():
         """Проверяет наличие активных VPN/туннельных интерфейсов без PowerShell polling."""
         try:
+            globals()["_last_vpn_detect_reason"] = ""
+
+            def _is_nova_managed_warp_context_active():
+                try:
+                    wm = globals().get("warp_manager")
+                    if not wm:
+                        return False
+                    if bool(getattr(wm, "is_connected", False)):
+                        return True
+                    try:
+                        status = str(wm.get_status() or "").strip().lower()
+                    except:
+                        status = ""
+                    if "connected" in status or "connecting (awg:" in status:
+                        return True
+                    try:
+                        port = int(globals().get("WARP_PORT", 1370))
+                    except:
+                        port = 1370
+                    try:
+                        if port and hasattr(wm, "is_port_open") and wm.is_port_open(port):
+                            return True
+                    except:
+                        pass
+                except:
+                    pass
+                return False
+
+            def _is_nova_managed_adapter(combined_text, own_warp_active):
+                trusted_markers = [
+                    "nova",
+                    "novavoice",
+                    "nova voice",
+                    "cloudflarewarp",
+                    "cloudflare warp",
+                    "cloudflare warp (nova)",
+                ]
+                if any(marker in combined_text for marker in trusted_markers):
+                    return True
+                if not own_warp_active:
+                    return False
+                external_vendor_markers = [
+                    "nord",
+                    "proton",
+                    "mullvad",
+                    "privado",
+                    "tailscale",
+                    "zerotier",
+                    "openvpn",
+                    "fortinet",
+                    "forticlient",
+                    "cisco",
+                    "anyconnect",
+                    "wiresock",
+                    "sstap",
+                    "secu",
+                ]
+                if any(marker in combined_text for marker in external_vendor_markers):
+                    return False
+                own_tunnel_markers = [
+                    "cloudflare",
+                    "warp",
+                    "wireguard",
+                    "wintun",
+                    "amnezia",
+                    "happ-tun",
+                ]
+                return any(marker in combined_text for marker in own_tunnel_markers)
+
             adapters = _list_active_adapters_native()
             if not adapters and str(os.environ.get("NOVA_VPN_DETECT_LEGACY_PS", "0")).strip().lower() in ("1", "true", "yes", "on"):
                 cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object Name, InterfaceDescription | ConvertTo-Json"]
@@ -11388,16 +11591,39 @@ try:
             if not adapters:
                 return False
 
+            own_warp_active = _is_nova_managed_warp_context_active()
             keywords = ["vpn", "wireguard", "openvpn", "tun", "tap", "zerotier", "tailscale", "secu", "fortinet", "cisco", "amnezia", "warp", "cloudflare", "privado", "mullvad", "nord", "proton", "happ-tun"]
-            exclusions = ["radmin", "novavoice", "nova voice", "cloudflarewarp", "cloudflare warp"]
+            exclusions = [
+                "radmin",
+                "radmin vpn",
+                "famatech",
+                "novavoice",
+                "nova voice",
+                "cloudflarewarp",
+                "cloudflare warp",
+                # Not privacy VPNs; these are local/system virtual adapters and
+                # can contain broad tokens such as "tun" in "tunneling".
+                "virtualbox",
+                "host-only",
+                "teredo",
+                "isatap",
+                "6to4",
+                "loopback pseudo-interface",
+            ]
 
             for adapter in adapters:
                 name = str(adapter.get("Name", "")).lower()
                 desc = str(adapter.get("InterfaceDescription", "")).lower()
                 combined = name + " " + desc
                 if any(ex in combined for ex in exclusions):
-                     continue
+                    continue
+                if _is_nova_managed_adapter(combined, own_warp_active):
+                    continue
                 if any(k in combined for k in keywords):
+                    try:
+                        globals()["_last_vpn_detect_reason"] = combined.strip()
+                    except:
+                        pass
                     return True
             return False
         except:
@@ -11415,7 +11641,11 @@ try:
                 vpn_is_currently_active = is_vpn_active_func()
 
                 if vpn_is_currently_active and not is_vpn_active:
-                    log_func("[VPN Detector] Обнаружен активный VPN. Работа приостановлена.")
+                    reason = str(globals().get("_last_vpn_detect_reason", "") or "").strip()
+                    if reason:
+                        log_func(f"[VPN Detector] Обнаружен активный VPN ({reason}). Работа приостановлена.")
+                    else:
+                        log_func("[VPN Detector] Обнаружен активный VPN. Работа приостановлена.")
                     is_vpn_active = True
                     was_service_active_before_vpn = is_service_active
                     
@@ -11676,6 +11906,130 @@ try:
     # ================= УМНЫЙ ПЕРЕЗАПУСК (SMART RESTART) =================
     # Global Process Status: "Running", "Restarting", "Stopped"
     nova_service_status = "Running"
+    _core_backend_degraded = [False]
+    _core_backend_reason = [""]
+    _degraded_core_recovery_scheduled = [False]
+    _degraded_core_recovery_attempts = [0]
+    _safe_filter_mode_notice_shown = [False]
+
+    def is_safe_filter_mode_enabled():
+        raw = str(os.environ.get("NOVA_SAFE_FILTER_MODE", "") or "").strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def enable_safe_filter_mode(log_func=None, reason=""):
+        os.environ["NOVA_SAFE_FILTER_MODE"] = "1"
+        if not _safe_filter_mode_notice_shown[0]:
+            _safe_filter_mode_notice_shown[0] = True
+            try:
+                logger = log_func or globals().get("log_print", print)
+                suffix = f": {reason}" if str(reason or "").strip() else ""
+                logger(f"[Compat] Включён safe-mode WinDivert без --wf-raw{suffix}.")
+            except:
+                pass
+
+    def detect_winws_filter_protocols(arg_list):
+        has_tcp = False
+        has_udp = False
+        try:
+            for arg in list(arg_list or []):
+                text = str(arg or "").strip().lower()
+                if text.startswith("--filter-tcp=") or text.startswith("--wf-tcp="):
+                    has_tcp = True
+                elif text.startswith("--filter-udp=") or text.startswith("--wf-udp="):
+                    has_udp = True
+        except:
+            pass
+        return has_tcp, has_udp
+
+    def inject_safe_mode_test_filters(arg_list, tcp_ports=None, udp_ports=None):
+        try:
+            has_tcp, has_udp = detect_winws_filter_protocols(arg_list)
+            added = False
+            if tcp_ports and not has_tcp:
+                arg_list.append(f"--filter-tcp={tcp_ports}")
+                added = True
+            if udp_ports and not has_udp:
+                arg_list.append(f"--filter-udp={udp_ports}")
+                added = True
+            return added
+        except:
+            return False
+
+    def set_core_backend_health(healthy=True, reason=""):
+        _core_backend_degraded[0] = not bool(healthy)
+        _core_backend_reason[0] = "" if healthy else str(reason or "").strip()
+        if healthy:
+            _degraded_core_recovery_attempts[0] = 0
+
+    def is_core_backend_ready():
+        try:
+            if _core_backend_degraded[0]:
+                return False
+            if not is_service_active:
+                return False
+            if str(nova_service_status or "") != "Running":
+                return False
+            proc = globals().get("process")
+            return bool(proc and proc.poll() is None)
+        except:
+            return False
+
+    def schedule_degraded_core_recovery(delay_seconds=20.0, reason=""):
+        if is_closing or not is_service_active:
+            return False
+        if _degraded_core_recovery_scheduled[0]:
+            return False
+        try:
+            delay_ms = max(1000, int(float(delay_seconds) * 1000))
+        except:
+            delay_ms = 20000
+        _degraded_core_recovery_scheduled[0] = True
+        reason_txt = str(reason or "").strip()
+        if reason_txt:
+            try:
+                log_print(f"[Recovery] {reason_txt}. Повтор восстановления ядра через {max(1, delay_ms // 1000)}с.")
+            except:
+                pass
+
+        def _retry():
+            _degraded_core_recovery_scheduled[0] = False
+            if is_closing or not is_service_active:
+                return
+            if str(nova_service_status or "") != "Degraded":
+                return
+            try:
+                windivert_state = _query_windivert_service_state()
+            except:
+                windivert_state = {}
+            if windivert_state.get("pending_delete"):
+                _degraded_core_recovery_attempts[0] += 1
+                next_delay = min(60.0, 20.0 + (_degraded_core_recovery_attempts[0] * 10.0))
+                schedule_degraded_core_recovery(next_delay, "WinDivert всё ещё освобождается")
+                return
+            try:
+                log_print("[Recovery] Пробуем восстановить ядро Nova после degraded-mode...")
+            except:
+                pass
+            try:
+                perform_hot_restart_backend()
+            except:
+                try:
+                    start_nova_service(silent=True, restart_mode=True)
+                except:
+                    pass
+
+        try:
+            if root:
+                root.after(delay_ms, _retry)
+            else:
+                threading.Thread(
+                    target=lambda: (time.sleep(delay_ms / 1000.0), _retry()),
+                    daemon=True,
+                ).start()
+            return True
+        except:
+            _degraded_core_recovery_scheduled[0] = False
+            return False
     
     last_restart_time = 0
     restart_scheduled = False
@@ -12664,6 +13018,8 @@ try:
                      hint = explain_winws_exit_code(exit_code)
                      if hint:
                          log_func(f"[Warning] WinWS код {exit_code}: {hint}")
+                     if exit_code == 123:
+                         enable_safe_filter_mode(log_func, reason="ядро winws завершилось с кодом 123")
                      
                      # FIX: Auto-repair driver if service is disabled (Code 34 / 0x422) or missing (Code 177)
                      if (exit_code == 34 or exit_code == 177) and not _windivert_broken:
@@ -12853,11 +13209,19 @@ try:
                         # Изоляция трафика
                         p_end = test_port + 3
                         
+                        orig_has_tcp, orig_has_udp = detect_winws_filter_protocols(strat_args)
                         test_args = clean_args_for_check(strat_args)
+                        if is_safe_filter_mode_enabled():
+                            if not orig_has_tcp and not orig_has_udp:
+                                orig_has_tcp = orig_has_udp = True
+                            inject_safe_mode_test_filters(
+                                test_args,
+                                tcp_ports=f"{test_port}-{p_end}" if orig_has_tcp else None,
+                                udp_ports=f"{test_port}-{p_end}" if orig_has_udp else None,
+                            )
                         
                         # Определяем протоколы для захвата
-                        has_tcp = any("filter-tcp" in a for a in test_args)
-                        has_udp = any("filter-udp" in a for a in test_args)
+                        has_tcp, has_udp = detect_winws_filter_protocols(test_args)
                         if not has_tcp and not has_udp: has_tcp = has_udp = True
                         loopback_bypass_clause = get_loopback_bypass_clause()
                         
@@ -12867,7 +13231,8 @@ try:
                         
                         isolation_filter = f"outbound and !loopback and ({' or '.join(proto_parts)})"
                         
-                        test_args.extend(['--wf-raw', isolation_filter])
+                        if not is_safe_filter_mode_enabled():
+                            test_args.extend(['--wf-raw', isolation_filter])
                         
                         exe_path = os.path.join(get_bin_dir(), WINWS_FILENAME)
                         # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
@@ -12979,7 +13344,16 @@ try:
                         p_end = port_start + port_count + 2
                         
                         # Очищаем стратегию от параметров драйвера и адаптируем фильтры
+                        orig_has_tcp, orig_has_udp = detect_winws_filter_protocols(strat_args)
                         test_args = clean_args_for_check(strat_args)
+                        if is_safe_filter_mode_enabled():
+                            if not orig_has_tcp and not orig_has_udp:
+                                orig_has_tcp = orig_has_udp = True
+                            inject_safe_mode_test_filters(
+                                test_args,
+                                tcp_ports=f"{port_start}-{p_end}" if orig_has_tcp else None,
+                                udp_ports=f"{port_start}-{p_end}" if orig_has_udp else None,
+                            )
                         
                         # Преобразуем пути к bin-файлам в абсолютные для логов и надежности запуска из любого места
                         for i in range(len(test_args)):
@@ -13020,8 +13394,7 @@ try:
                                     ip_filter_part = f" and ({' or '.join(safe_ips)})"
                         
                         # Определяем протоколы для захвата
-                        has_tcp = any("filter-tcp" in a for a in test_args)
-                        has_udp = any("filter-udp" in a for a in test_args)
+                        has_tcp, has_udp = detect_winws_filter_protocols(test_args)
                         if not has_tcp and not has_udp: has_tcp = has_udp = True
                         loopback_bypass_clause = get_loopback_bypass_clause()
                         
@@ -13051,7 +13424,8 @@ try:
                         
                         final_args = [final_exe]
                         final_args.extend(test_args)
-                        final_args.extend(['--wf-raw', isolation_filter])
+                        if not is_safe_filter_mode_enabled():
+                            final_args.extend(['--wf-raw', isolation_filter])
                         
                         # Попытка запуска с ретраем для надежности (исправляет падения с кодом 1)
                         for attempt in range(2):
@@ -13082,6 +13456,10 @@ try:
                             
                             # Идентифицируем проблемы с драйвером (Code 34 / 177 / pending delete)
                             err_msg = combined_out.strip() if combined_out else ""
+                            is_filter_compat_issue = (
+                                              proc.returncode == 123 or
+                                              "syntax is incorrect" in err_msg.lower() or
+                                              "filename, directory name, or volume label syntax is incorrect" in err_msg.lower())
                             is_driver_issue = (proc.returncode in (34, 177) or 
                                               _is_windivert_pending_delete_text(err_msg) or
                                               _is_windivert_disabled_text(err_msg) or
@@ -13108,6 +13486,11 @@ try:
                                     return 0 # Не пытаемся снова, этот параметр сломан
                                 
                             # FIX: Auto-repair driver
+                            if is_filter_compat_issue:
+                                enable_safe_filter_mode(log_func if not is_first_driver_fail else None, reason="фоновые проверки WinWS вернули код 123")
+                                if is_safe_filter_mode_enabled():
+                                    return 0
+
                             if is_driver_issue:
                                 # If driver is confirmed broken globally, skip immediately
                                 if _windivert_broken:
@@ -14423,6 +14806,21 @@ try:
 
                 
                 # HELPER: Update Active Config Immediate
+                def _should_defer_general_hotswap():
+                    try:
+                        if is_closing:
+                            return False
+                    except:
+                        pass
+                    for manager_name in ("novadivert_redirect_manager", "telegram_relay_manager"):
+                        try:
+                            manager = globals().get(manager_name)
+                            if manager and bool(getattr(manager, "is_ready", lambda: False)()):
+                                return True
+                        except:
+                            pass
+                    return False
+
                 def update_active_config_immediate(succ_svc, succ_args, reason_msg):
                     try:
                         s_path = os.path.join(base_dir, "strat", "strategies.json")
@@ -14440,6 +14838,13 @@ try:
                         
                         if updated:
                             save_json_safe(s_path, c_data)
+                            if succ_svc == "general" and _should_defer_general_hotswap():
+                                defer_msg = f"{reason_msg}. Hot-restart отложен: активен Telegram transparent path; стратегия вступит в силу после следующего ручного перезапуска Nova."
+                                if root:
+                                    root.after(0, lambda m=defer_msg: log_print(m))
+                                else:
+                                    print(defer_msg)
+                                return True
                             if root: root.after(0, lambda: log_print(f"{reason_msg}. Ядро перезапущено."))
                             else: print(f"{reason_msg}. Ядро перезапущено.")
                             
@@ -18120,6 +18525,7 @@ try:
         proc = None
         try:
             test_args = []
+            orig_has_tcp, orig_has_udp = detect_winws_filter_protocols(strat_args)
             for arg in strat_args:
                 if arg.startswith(("--wf-tcp", "--wf-udp", "--hostlist", "--ipset")):
                     continue
@@ -18136,8 +18542,15 @@ try:
                         test_args[i] = f"{k}={os.path.join(base_dir, 'fake', fname)}"
 
             p_end = port + 1
-            has_tcp = any("filter-tcp" in a for a in test_args)
-            has_udp = any("filter-udp" in a for a in test_args)
+            if is_safe_filter_mode_enabled():
+                if not orig_has_tcp and not orig_has_udp:
+                    orig_has_tcp = orig_has_udp = True
+                inject_safe_mode_test_filters(
+                    test_args,
+                    tcp_ports=f"{port}-{p_end}" if orig_has_tcp else None,
+                    udp_ports=f"{port}-{p_end}" if orig_has_udp else None,
+                )
+            has_tcp, has_udp = detect_winws_filter_protocols(test_args)
             if not has_tcp and not has_udp: has_tcp = has_udp = True
             loopback_bypass_clause = get_loopback_bypass_clause()
             
@@ -18154,7 +18567,9 @@ try:
                 exe_name = "winws_test.exe"
 
             exe_path = os.path.join(get_bin_dir(), exe_name)
-            final_args = [exe_path] + test_args + ['--wf-raw', isolation_filter]
+            final_args = [exe_path] + test_args
+            if not is_safe_filter_mode_enabled():
+                final_args.extend(['--wf-raw', isolation_filter])
             
             # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
             proc = subprocess.Popen(final_args, cwd=base_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
@@ -19290,6 +19705,32 @@ try:
         except:
             return 0
 
+    def cleanup_update_installer_artifacts(log_func=None):
+        """Remove installer downloads left in Nova temp after an update run."""
+        try:
+            temp_dir = os.path.join(get_base_dir(), "temp")
+            if not os.path.isdir(temp_dir):
+                return 0
+            removed = 0
+            for name in os.listdir(temp_dir):
+                lower = str(name or "").lower()
+                if not lower.startswith("novasetup-"):
+                    continue
+                if not (lower.endswith(".exe") or lower.endswith(".exe.part") or lower.endswith(".part")):
+                    continue
+                path = os.path.join(temp_dir, name)
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                        removed += 1
+                except:
+                    pass
+            if removed and log_func:
+                log_func(f"[Update] Удалены временные установочные файлы: {removed}.")
+            return removed
+        except:
+            return 0
+
     def get_update_state():
         with update_state_lock:
             return dict(update_state)
@@ -19892,6 +20333,11 @@ try:
                 opera_usable = False
                 warp_port = 1370
                 opera_port = 1371
+                core_backend_ready = False
+                try:
+                    core_backend_ready = bool(is_core_backend_ready())
+                except:
+                    core_backend_ready = False
                 # Clean old timestamps
                 retry_timestamps[:] = [t for t in retry_timestamps if now - t < RETRY_WINDOW]
                 
@@ -19900,6 +20346,12 @@ try:
                 
                 # Check WARP runtime health and recover from dead/stuck sessions.
                 if warp_manager:
+                    if (not core_backend_ready) and str(nova_service_status or "") == "Degraded":
+                        try:
+                            schedule_degraded_core_recovery(20.0, "Ожидание восстановления ядра перед WARP recovery")
+                        except:
+                            pass
+                        continue
                     warp_port = int(getattr(warp_manager, "port", 1370))
                     warp_status = str(warp_manager.get_status() or "Unknown").strip()
                     warp_status_low = warp_status.lower()
@@ -20401,8 +20853,10 @@ try:
 
                 def _start_manager_async(label, manager):
                     def _runner():
-                        with contextlib.suppress(Exception):
+                        try:
                             manager.start()
+                        except Exception as e:
+                            safe_log(f"[Init] Ошибка запуска {label}: {e}")
                     try:
                         threading.Thread(target=_runner, daemon=True, name=label).start()
                     except Exception as e:
@@ -20513,7 +20967,8 @@ try:
                     routing_backend_manager = RoutingBackendManager(log_func=safe_log)
 
                 # Start Opera proxy early, but WARP daemon bootstrap is deferred until kernel is up.
-                threading.Thread(target=opera_proxy_manager.start, daemon=True).start()
+                if opera_proxy_manager:
+                    _start_manager_async("NovaOperaProxyStart", opera_proxy_manager)
                 for relay_key, relay_manager in _iter_public_relay_managers():
                     if relay_key in enabled_public_relays and relay_manager:
                         _start_manager_async(f"NovaPublicRelayStart_{relay_key}", relay_manager)
@@ -20533,7 +20988,14 @@ try:
                     _start_manager_async("NovaWfpUdpProxyStart", novawfp_udp_proxy_manager)
                 if routing_backend_manager:
                     _start_manager_async("NovaRoutingBackendStart", routing_backend_manager)
-                threading.Thread(target=lambda: (pac_manager.start_server(), pac_manager.set_system_proxy()), daemon=True).start()
+                def _start_pac_server_async():
+                    try:
+                        pac_manager.start_server()
+                        pac_manager.set_system_proxy()
+                    except Exception as e:
+                        safe_log(f"[Init] Ошибка запуска PAC server/system proxy: {e}")
+                if pac_manager:
+                    threading.Thread(target=_start_pac_server_async, daemon=True, name="NovaPacServerStart").start()
             except Exception as e:
                 safe_trace(f"[Init] BG Services Error: {e}")
 
@@ -20573,6 +21035,7 @@ try:
         _windivert_unrecoverable_reason = ""
         _windivert_unrecoverable_detail = ""
         _warp_early_started = False
+        set_core_backend_health(False, "starting")
         
         # TRACE LOGGING
         if restart_mode and not silent:
@@ -20674,7 +21137,12 @@ try:
                 if wm:
                     if not silent:
                         logger("[Init] Ранний запуск WARP после очистки ядра...")
-                    threading.Thread(target=wm.start, daemon=True, name="NovaWarpEarlyStart").start()
+                    def _run_warp_early_start():
+                        try:
+                            wm.start()
+                        except Exception as _e:
+                            logger(f"[Init] Ошибка раннего запуска WARP worker: {_e}")
+                    threading.Thread(target=_run_warp_early_start, daemon=True, name="NovaWarpEarlyStart").start()
                     _warp_early_started = True
             except Exception as _e:
                 if IS_DEBUG_MODE and not silent:
@@ -20744,6 +21212,36 @@ try:
         if not strategies:
              if not silent: print("[Init] Внимание: Стратегии не загружены (0). Используем встроенные настройки по умолчанию.")
              strategies = DEFAULT_STRATEGIES.copy()
+
+        def _runtime_strategies_have_ports(payload):
+            try:
+                for _k, _v in list((payload or {}).items()):
+                    if _k == "version":
+                        continue
+                    if isinstance(_v, dict):
+                        _v = _v.get("args", [])
+                    if not isinstance(_v, list):
+                        continue
+                    for _item in _v:
+                        if not isinstance(_item, str):
+                            continue
+                        _text = _item.strip().lower()
+                        if _text.startswith("--filter-tcp=") or _text.startswith("--filter-udp="):
+                            return True
+            except:
+                return False
+            return False
+
+        if not _runtime_strategies_have_ports(strategies):
+            if not silent:
+                print("[Init] Обнаружен повреждённый strategies.json без портов WinWS. Восстанавливаем встроенный набор.")
+            strategies = DEFAULT_STRATEGIES.copy()
+            try:
+                repaired_payload = dict(strategies)
+                repaired_payload["version"] = CURRENT_VERSION
+                save_json_safe(paths['strat_json'], repaired_payload)
+            except:
+                pass
         
         if not silent: print(f"Загружено стратегий: {len(strategies)}")
         
@@ -20812,19 +21310,22 @@ try:
             udp_part = f"(udp and ({udp_ports_logic}) and (udp.SrcPort < 16000 or udp.SrcPort > 16500){loopback_bypass_clause})"
             
         global_filter = f"outbound and !loopback and ({tcp_part} or {udp_part})"
-        
-        # FIX: Pass as two separate arguments to avoid quoting issues with huge limits
-        args.extend(["--wf-raw", global_filter])
         section_loopback_guard = "outbound and !loopback"
-        if not silent: print(f"[Init] Global filter passed via command line ({len(global_filter)} chars)")
-        if not silent:
-            if not loopback_bypass_clause:
-                lb_mode = "off"
-            elif "ipv6.DstAddr" in loopback_bypass_clause:
-                lb_mode = "127+::1"
-            else:
-                lb_mode = "127-only"
-            print(f"[Init] Localhost bypass mode for WinWS filters: {lb_mode}.")
+        if is_safe_filter_mode_enabled():
+            if not silent:
+                print("[Init] Safe-mode WinDivert активен: --wf-raw пропущен.")
+        else:
+            # FIX: Pass as two separate arguments to avoid quoting issues with huge limits
+            args.extend(["--wf-raw", global_filter])
+            if not silent: print(f"[Init] Global filter passed via command line ({len(global_filter)} chars)")
+            if not silent:
+                if not loopback_bypass_clause:
+                    lb_mode = "off"
+                elif "ipv6.DstAddr" in loopback_bypass_clause:
+                    lb_mode = "127+::1"
+                else:
+                    lb_mode = "127-only"
+                print(f"[Init] Localhost bypass mode for WinWS filters: {lb_mode}.")
 
         strat_keys = [k for k in strategies.keys() if k not in ("general", "warp")]
         
@@ -21063,7 +21564,7 @@ try:
         if not silent: root.after(0, insert_cmd_link)
 
         def _strip_loopback_bypass_from_wfraw(arg_list):
-            """Remove optional localhost-bypass clauses from --wf-raw for strict WinWS builds (code 87)."""
+            """Remove optional localhost-bypass clauses from --wf-raw for strict WinWS builds (code 87/123)."""
             changed = False
             try:
                 patterns = [
@@ -21097,7 +21598,7 @@ try:
             return changed
         
         def _remove_all_wfraw_from_args(arg_list):
-            """Remove all --wf-raw rules as last-resort fallback for strict WinWS parser (code 87)."""
+            """Remove all --wf-raw rules as last-resort fallback for strict WinWS parser (code 87/123)."""
             try:
                 cleaned = []
                 i = 0
@@ -21173,6 +21674,7 @@ try:
                 print("[Init] WinWS недоступен. Переход в режим 'только EU'...")
                 nova_service_status = "Degraded"
                 is_restarting = False
+                set_core_backend_health(False, f"degraded:{exit_code}")
 
                 try:
                     wm = globals().get("warp_manager")
@@ -21225,6 +21727,12 @@ try:
 
                 if not silent:
                     log_print("[Init] WARP не запускается: нет активного ядра winws. RU-маршрут временно переведен на Opera.")
+
+                try:
+                    if exit_code in (34, 177) or _windivert_unrecoverable_reason == "pending_delete_stuck":
+                        schedule_degraded_core_recovery(20.0, "Ожидание восстановления WinDivert/WARP backend")
+                except:
+                    pass
 
                 if not is_restarting:
                     threading.Thread(target=lambda: init_checker_system(log_print), daemon=True).start()
@@ -21338,8 +21846,11 @@ try:
                                 time.sleep(1.0)
                                 continue
 
-                            # FIX: Handling for Code 87 (Invalid parameter / strict wf-raw parser)
-                            if exit_code == 87:
+# FIX: Handling for Code 87/123 (strict/legacy wf-raw parser)
+                            if exit_code in (87, 123):
+                                strict_label = "87" if exit_code == 87 else "123"
+                                if exit_code == 123:
+                                    enable_safe_filter_mode(log_print if not silent else None, reason="startup winws вернул код 123")
                                 try:
                                     downgraded = _strip_loopback_bypass_from_wfraw(args)
                                 except:
@@ -21348,7 +21859,7 @@ try:
                                     os.environ["NOVA_WINWS_LOOPBACK_BYPASS"] = "0"
                                     os.environ["NOVA_WINWS_LOOPBACK_BYPASS_IPV6"] = "0"
                                     if not silent:
-                                        log_print("[Init] [Diag] Код 87: текущий winws не принимает localhost-bypass в wf-raw. Повторяем запуск без bypass.")
+                                        log_print(f"[Init] [Diag] Код {strict_label}: текущий winws не принимает localhost-bypass в wf-raw. Повторяем запуск без bypass.")
                                     time.sleep(0.5)
                                     continue
                                 # Last-resort compatibility mode for strict/old WinWS builds.
@@ -21358,7 +21869,7 @@ try:
                                     wfraw_removed = False
                                 if wfraw_removed:
                                     if not silent:
-                                        log_print("[Init] [Diag] Код 87 сохраняется. Переключаемся в safe-mode без --wf-raw.")
+                                        log_print(f"[Init] [Diag] Код {strict_label}: parser wf-raw несовместим. Переключаемся в safe-mode без --wf-raw.")
                                     time.sleep(0.5)
                                     continue
 
@@ -21384,6 +21895,7 @@ try:
                         # Process is stable -> NOW we expose it to the system
                         process = proc
                         nova_service_status = "Running"
+                        set_core_backend_health(True, "")
                         # Reset Restart Flag
                         is_restarting = False
                         try:
@@ -21401,16 +21913,34 @@ try:
                             nrm = globals().get("novadivert_redirect_manager")
                             selected_backend_mode = get_selected_routing_backend_mode()
                             if ndm and wants_windivert_hybrid_backend(selected_backend_mode):
-                                threading.Thread(target=ndm.start, daemon=True, name="NovaDivertObserverStart").start()
+                                def _start_observer_with_retries():
+                                    retry_delays = [2.0, 3.0, 5.0, 8.0, 12.0, 15.0]
+                                    for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        try:
+                                            if ndm.start():
+                                                return
+                                        except:
+                                            pass
+                                        if is_closing:
+                                            return
+                                        if _attempt < len(retry_delays):
+                                            time.sleep(_delay)
+                                    log_print("[NovaDivert] Observer не запустился после всех попыток. App redirect будет недоступен; WARP/EU/PAC продолжают работать.")
+                                threading.Thread(target=_start_observer_with_retries, daemon=True, name="NovaDivertObserverStart").start()
                             if nrm and wants_windivert_hybrid_backend(selected_backend_mode):
                                 def _start_redirect_with_retries():
-                                    for _attempt in range(3):
+                                    retry_delays = [2.0, 3.0, 5.0, 8.0, 12.0, 15.0]
+                                    for _attempt, _delay in enumerate(retry_delays, start=1):
                                         try:
                                             if nrm.start():
                                                 return
                                         except:
                                             pass
-                                        time.sleep(2.0)
+                                        if is_closing:
+                                            return
+                                        if _attempt < len(retry_delays):
+                                            time.sleep(_delay)
+                                    log_print("[NovaDivert] Redirect не запустился после всех попыток. App redirect будет недоступен; WARP/EU/PAC продолжают работать.")
                                 threading.Thread(target=_start_redirect_with_retries, daemon=True, name="NovaDivertRedirectStart").start()
                         except Exception as _e:
                             if IS_DEBUG_MODE and not silent:
@@ -21423,7 +21953,12 @@ try:
                                 if wm:
                                     if not silent:
                                         log_print("[Init] Запуск WARP после старта ядра...")
-                                    threading.Thread(target=wm.start, daemon=True).start()
+                                    def _run_warp_deferred_start():
+                                        try:
+                                            wm.start()
+                                        except Exception as _e:
+                                            log_print(f"[Init] Ошибка запуска WARP после старта ядра: {_e}")
+                                    threading.Thread(target=_run_warp_deferred_start, daemon=True, name="NovaWarpDeferredStart").start()
                             except Exception as _e:
                                 if IS_DEBUG_MODE and not silent:
                                     log_print(f"[Init] Ошибка отложенного запуска WARP: {_e}")
@@ -21579,6 +22114,8 @@ try:
         # === НЕМЕДЛЕННОЕ обновление состояния ===
         if not restart_mode:
             is_service_active = False
+            set_core_backend_health(False, "stopped")
+            _degraded_core_recovery_scheduled[0] = False
             # FIX: Only set is_closing in on_closing() to allow background workers (like VPN monitor)
             # to continue running during a manual stop or VPN pause.
             SERVICES_RUNNING = False
@@ -21977,6 +22514,14 @@ try:
                 r"NovaWFP\proxy\udp_proxy.py",
                 r"NovaWFP/proxy/tcp_proxy.py",
                 r"NovaWFP/proxy/udp_proxy.py",
+                r"resources\NovaWFP\proxy\tcp_proxy.py",
+                r"resources\NovaWFP\proxy\udp_proxy.py",
+                r"resources/NovaWFP/proxy/tcp_proxy.py",
+                r"resources/NovaWFP/proxy/udp_proxy.py",
+                r"resources\NovaDivert\windivert_redirect.py",
+                r"resources\NovaDivert\windivert_observer.py",
+                r"resources/NovaDivert/windivert_redirect.py",
+                r"resources/NovaDivert/windivert_observer.py",
             ])
 
             time.sleep(0.2) # Даём ОС время закрыть дескрипторы файла после taskkill winws/warp
@@ -22034,6 +22579,7 @@ try:
         _hot_swap_pause_log_shown[0] = False
         _hot_swap_pause_since[0] = 0.0
         _hot_swap_pending_delete_retries[0] = 0
+        _degraded_core_recovery_scheduled[0] = False
         if log_resume and is_service_active and not is_closing:
             try:
                 log_print("[HotSwap] Ядро восстановлено. Фоновые проверки продолжены с сохранённого места.")
@@ -22921,6 +23467,10 @@ try:
                     try: os.remove(s_path)
                     except: pass
 
+            # Update installers are launched from temp and can remain locked until the
+            # installer exits. Remove old downloads on the next Nova start.
+            cleanup_update_installer_artifacts()
+
         except: pass
 
         app_mutex = check_single_instance()
@@ -23157,11 +23707,17 @@ try:
                 while not is_closing:
                     warp_ok = False
                     opera_ok = False
+                    backend_ok = False
+                    try:
+                        backend_ok = bool(is_core_backend_ready())
+                    except:
+                        backend_ok = False
+
                     try:
                         wm = globals().get("warp_manager")
                         warp_connected = bool(getattr(wm, "is_connected", False)) if wm else False
                         warp_port = int(globals().get("WARP_PORT", 1370))
-                        warp_ok = bool(warp_connected and is_local_port_open_quick(warp_port, timeout=0.2))
+                        warp_ok = bool(backend_ok and warp_connected and is_local_port_open_quick(warp_port, timeout=0.2))
                     except:
                         warp_ok = False
 

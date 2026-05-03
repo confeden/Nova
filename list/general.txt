@@ -1,4 +1,4 @@
-# version: 1.20
+# version: 1.22.4
 # Nova Telegram CF/WSS domains via WARP/general
 nova-app.eu
 kws1.nova-app.eu
@@ -40304,6 +40304,7 @@ nosh1.ru
 noskar.com
 nosong.ru
 nostrabet.com
+nova-app.eu
 nostradamus.biz
 notarealjob.com
 notarius-blohina.ru
