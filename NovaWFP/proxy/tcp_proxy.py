@@ -133,6 +133,83 @@ TG_WS_STARTUP_PREWARM_PLAN = (
     (2, True),
     (4, True),
 )
+ROUTING_SETTINGS_PATH = REPO_ROOT / "temp" / "routing_settings.json"
+_ROUTING_SETTINGS_CACHE: dict = {}
+_ROUTING_SETTINGS_MTIME: float = -1.0
+ROUTING_GROUP_ALIASES = {
+    "browser": "browser",
+    "telegram": "telegram",
+    "whatsapp": "whatsapp",
+    "discord": "discord",
+    "ide": "ide",
+    "cli": "cli",
+    "opencode": "ide",
+}
+
+
+def _load_routing_settings() -> dict:
+    global _ROUTING_SETTINGS_CACHE, _ROUTING_SETTINGS_MTIME
+    try:
+        stat = ROUTING_SETTINGS_PATH.stat()
+        mtime = float(stat.st_mtime)
+    except Exception:
+        _ROUTING_SETTINGS_CACHE = {}
+        _ROUTING_SETTINGS_MTIME = -1.0
+        return {}
+    if mtime == _ROUTING_SETTINGS_MTIME and isinstance(_ROUTING_SETTINGS_CACHE, dict):
+        return _ROUTING_SETTINGS_CACHE
+    try:
+        with ROUTING_SETTINGS_PATH.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    _ROUTING_SETTINGS_CACHE = payload
+    _ROUTING_SETTINGS_MTIME = mtime
+    return payload
+
+
+def _get_app_route_mode(app_key: str) -> str:
+    payload = _load_routing_settings()
+    key = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
+    routes = payload.get("routes") if isinstance(payload, dict) else {}
+    if isinstance(routes, dict) and routes:
+        mode = str(routes.get(key) or "auto").strip().lower()
+        if mode not in {"auto", "warp", "opera", "direct"}:
+            mode = "auto"
+        if key != "browser" and mode == "auto":
+            mode = str(routes.get("browser") or "auto").strip().lower()
+            if mode not in {"auto", "warp", "opera", "direct"}:
+                mode = "auto"
+        return mode
+    apps = payload.get("apps") if isinstance(payload, dict) else {}
+    if not isinstance(apps, dict):
+        return "auto"
+    legacy_key = "opencode" if key == "ide" else key
+    mode = str(apps.get(legacy_key) or "auto").strip().lower()
+    if mode not in {"auto", "warp", "opera", "direct"}:
+        mode = "auto"
+    return mode
+
+
+def _reorder_route_labels(mode: str, labels: List[str]) -> List[str]:
+    normalized = [str(item or "").strip().lower() for item in list(labels or []) if str(item or "").strip()]
+    if mode == "warp":
+        preferred = ["warp-socks", "opera-http", "direct"]
+    elif mode == "opera":
+        preferred = ["opera-http", "warp-socks", "direct"]
+    elif mode == "direct":
+        preferred = ["direct", "warp-socks", "opera-http"]
+    else:
+        preferred = list(normalized)
+    rendered: List[str] = []
+    seen = set()
+    for label in preferred + normalized:
+        if label in normalized and label not in seen:
+            seen.add(label)
+            rendered.append(label)
+    return rendered
 
 
 class NOVA_WFP_SOCKET_ADDRESS_V1(ctypes.Structure):
@@ -372,8 +449,10 @@ class NovaWfpTcpProxy:
             or "whatsapp\\app.exe" in lower
         ):
             return "whatsapp"
-        if any(token in lower for token in ("opencode.exe", "opencode-cli.exe", "\\opencode\\")):
-            return "opencode"
+        if any(token in lower for token in ("opencode.exe", "\\opencode\\", "code.exe", "\\vscode\\", "cursor.exe", "\\cursor\\", "windsurf.exe", "\\windsurf\\", "antigravity.exe", "\\antigravity\\", "codex.exe", "\\codex\\")):
+            return "ide"
+        if any(token in lower for token in ("opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe")):
+            return "cli"
         return ""
 
     def _resolve_webview_host_family(self, process_id: int) -> str:
@@ -398,8 +477,11 @@ class NovaWfpTcpProxy:
                 visited.add(current_pid)
                 parent_pid, exe_name = snapshot.get(current_pid, (0, ""))
                 lower_name = str(exe_name or "").strip().lower()
-                if lower_name in {"opencode.exe", "opencode-cli.exe"}:
-                    family = "opencode"
+                if lower_name in {"opencode.exe", "code.exe", "cursor.exe", "windsurf.exe", "antigravity.exe", "codex.exe"}:
+                    family = "ide"
+                    break
+                if lower_name in {"opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe"}:
+                    family = "cli"
                     break
                 if lower_name in {"whatsapp.exe", "whatsapp.root.exe"}:
                     family = "whatsapp"
@@ -687,6 +769,24 @@ class NovaWfpTcpProxy:
                 attempts = ["opera-http", "direct", "warp-socks"]
             else:
                 attempts = ["direct", "warp-socks", "opera-http"]
+
+        route_mode_key = ""
+        if is_telegram_target or is_telegram_app:
+            route_mode_key = "telegram"
+        elif is_discord_target:
+            route_mode_key = "discord"
+        elif is_whatsapp_target:
+            route_mode_key = "whatsapp"
+        elif app_family == "ide":
+            route_mode_key = "ide"
+        elif app_family == "cli":
+            route_mode_key = "cli"
+        route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
+        if route_mode != "auto":
+            for label in ("warp-socks", "opera-http", "direct"):
+                if label not in attempts:
+                    attempts.append(label)
+            attempts = _reorder_route_labels(route_mode, attempts)
 
         cached_label = self._route_label_cache_get(target_host, target_port, route_scope=route_scope)
         if cached_label in attempts:
@@ -1486,7 +1586,7 @@ class NovaWfpTcpProxy:
                 app_family = self._app_family_from_app_id(app_id)
                 if (not app_family) and ("msedgewebview2.exe" in str(app_id or "").replace("/", "\\").lower()):
                     app_family = self._resolve_webview_host_family(int(context.ProcessId))
-                    if app_family == "opencode":
+                    if app_family == "ide":
                         preferred_egress = 2
                     elif app_family == "whatsapp":
                         preferred_egress = 1

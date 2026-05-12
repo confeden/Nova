@@ -4401,6 +4401,8 @@ try:
             """
             try:
                 base = get_base_dir()
+                routing_settings = load_routing_settings()
+                pac_config = get_routing_pac_config(routing_settings)
                 user_ru_domains = self._load_domain_list(os.path.join(base, "list", "u_ru.txt"))
                 user_eu_domains = self._load_domain_list(os.path.join(base, "list", "u_eu.txt"))
                 ru_domains = self._load_domain_list(os.path.join(base, "list", "ru.txt"))
@@ -4409,6 +4411,9 @@ try:
                 discord_domains = get_discord_runtime_domains()
                 telegram_domains = get_telegram_runtime_domains()
                 whatsapp_domains = self._load_domain_list(os.path.join(base, "list", "whatsapp.txt"))
+                ide_domains = self._load_domain_list(os.path.join(base, "list", "ide.txt"))
+                if not ide_domains:
+                    ide_domains = self._load_domain_list(os.path.join(base, "list", "opencode.txt"))
                 user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_ru.txt"))
                 user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_eu.txt"))
                 ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
@@ -4461,6 +4466,49 @@ try:
                     opera_port_open = self.is_port_open(1371)
                     opera_proxy_ok = self._is_http_proxy_alive(1371) if opera_port_open else False
                     opera_active = bool(opera_port_open and opera_proxy_ok)
+
+                def _dedupe_route_parts(parts):
+                    result = []
+                    seen = set()
+                    for part in parts:
+                        text = str(part or "").strip()
+                        if not text or text in seen:
+                            continue
+                        seen.add(text)
+                        result.append(text)
+                    return result
+
+                def _route_for_target(target, strict=False):
+                    target = str(target or "").strip().lower()
+                    if target == "direct":
+                        return "DIRECT"
+                    if target == "warp":
+                        parts = []
+                        if warp_active:
+                            parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
+                        elif not strict and opera_active:
+                            parts.append("PROXY 127.0.0.1:1371")
+                        parts.append("SOCKS5 127.0.0.1:1" if strict or parts else "DIRECT")
+                        return "; ".join(_dedupe_route_parts(parts))
+                    if target == "opera":
+                        parts = []
+                        if opera_active:
+                            parts.append("PROXY 127.0.0.1:1371")
+                        elif not strict and warp_active:
+                            parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
+                        parts.append("SOCKS5 127.0.0.1:1" if strict or parts else "DIRECT")
+                        return "; ".join(_dedupe_route_parts(parts))
+                    return "DIRECT"
+
+                def _route_for_app_mode(mode, default_route):
+                    mode = str(mode or "").strip().lower()
+                    if mode == "warp":
+                        return _route_for_target("warp", strict=False)
+                    if mode == "opera":
+                        return _route_for_target("opera", strict=False)
+                    if mode == "direct":
+                        return "DIRECT"
+                    return default_route
                 # Keep WinHTTP in sync with actual 1371 health (optional).
                 if self._sync_winhttp_proxy:
                     try:
@@ -4515,6 +4563,13 @@ try:
                 else:
                     discord_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
 
+                telegram_route = _route_for_app_mode(get_routing_app_mode("telegram", routing_settings), ru_route)
+                discord_route = _route_for_app_mode(get_routing_app_mode("discord", routing_settings), discord_route)
+                whatsapp_route = _route_for_app_mode(get_routing_app_mode("whatsapp", routing_settings), ru_route)
+                ide_route = _route_for_app_mode(get_routing_app_mode("ide", routing_settings), eu_route)
+                pac_mode = str(pac_config.get("mode") or "hybrid").strip().lower()
+                pac_full_route = _route_for_target(pac_config.get("full_target"), strict=True)
+
                 # EU route is already set above. Keeping variable consistency.
                 pass
                 
@@ -4532,6 +4587,7 @@ try:
                 discord_js = "{" + ",".join(f'"{d}":1' for d in discord_domains) + "}"
                 telegram_js = "{" + ",".join(f'"{d}":1' for d in telegram_domains) + "}"
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in whatsapp_domains) + "}"
+                ide_js = "{" + ",".join(f'"{d}":1' for d in ide_domains) + "}"
                 
                 pac_content = f"""
     function FindProxyForURL(url, host) {{
@@ -4542,6 +4598,14 @@ try:
     if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || isPlainHostName(host)) {{
         return "DIRECT";
     }}
+    var pac_mode = {json.dumps(pac_mode)};
+    var pac_full_route = {json.dumps(pac_full_route)};
+    if (pac_mode === "off") {{
+        return "DIRECT";
+    }}
+    if (pac_mode === "full") {{
+        return pac_full_route;
+    }}
     var user_ru = {user_ru_js};
     var user_eu = {user_eu_js};
     var exclude = {exclude_js};
@@ -4550,6 +4614,7 @@ try:
     var discord = {discord_js};
     var telegram = {telegram_js};
     var whatsapp = {whatsapp_js};
+    var ide = {ide_js};
     var user_ru_ips = {user_ru_ips_js};
     var user_eu_ips = {user_eu_ips_js};
     var ru_ips = {ru_ips_js};
@@ -4684,18 +4749,34 @@ try:
     if (matchDomain(exclude, host)) return "DIRECT";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
-    if (matchDomain(telegram, host)) return "{ru_route}";
-    if (matchDomain(whatsapp, host)) return "{ru_route}";
+    if (matchDomain(telegram, host)) return "{telegram_route}";
+    if (matchDomain(whatsapp, host)) return "{whatsapp_route}";
+    if (matchDomain(ide, host)) return "{ide_route}";
     if (matchDomain(eu, host)) return "{eu_route}";
     
     return "DIRECT";
 }}
 """
-                with open(self.pac_file, "w", encoding="utf-8") as f:
+                pac_temp_path = f"{self.pac_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+                with open(pac_temp_path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(pac_content)
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except:
+                        pass
+                os.replace(pac_temp_path, self.pac_file)
 
                 cloudflare_ip_signature = tuple(tuple(entry) for entry in cloudflare_ips)
-                route_signature = (bool(warp_active), bool(opera_active), cloudflare_ip_signature)
+                app_pref_signature = tuple((key, get_routing_group_mode(key, routing_settings)) for key in ROUTING_GROUP_KEYS)
+                route_signature = (
+                    bool(warp_active),
+                    bool(opera_active),
+                    cloudflare_ip_signature,
+                    str(pac_mode),
+                    str(pac_config.get("full_target") or "warp"),
+                    app_pref_signature,
+                )
                 if route_signature != self._last_route_signature:
                     self._last_route_signature = route_signature
                     # Force OS and browsers to immediately re-fetch the PAC file
@@ -4748,6 +4829,19 @@ try:
                 if cloudflare_ip_count != getattr(self, "_last_cloudflare_ip_count", None):
                     self._last_cloudflare_ip_count = cloudflare_ip_count
                     self.log_func(f"[PAC] Cloudflare IP routing: {cloudflare_ip_count} CIDR → WARP.")
+                pac_mode_signature = (
+                    str(pac_mode),
+                    str(pac_config.get("full_target") or "warp"),
+                    tuple((key, get_routing_group_mode(key, routing_settings)) for key in ROUTING_GROUP_KEYS),
+                )
+                if pac_mode_signature != getattr(self, "_last_pac_mode_signature", None):
+                    self._last_pac_mode_signature = pac_mode_signature
+                    if pac_mode == "hybrid":
+                        self.log_func("[PAC] Режим PAC: гибридный.")
+                    elif pac_mode == "full":
+                        self.log_func(f"[PAC] Режим PAC: полный через {str(pac_config.get('full_target') or 'warp').upper()}.")
+                    else:
+                        self.log_func("[PAC] Режим PAC: отключён, трафик браузеров идёт напрямую.")
             except Exception as e:
                 self.log_func(f"[PAC] Ошибка генерации: {e}")
 
@@ -5053,6 +5147,33 @@ try:
                 ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
                 ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
             except: pass
+
+        def refresh_pac_runtime(self):
+            """Lightweight PAC refresh for ru/eu/ip list edits without full proxy rebinding."""
+            try:
+                import winreg
+                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE)
+                try:
+                    current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+                    if isinstance(current_pac, str) and "nova.pac" in current_pac.lower():
+                        pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time() * 1000)}"
+                        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                except FileNotFoundError:
+                    pass
+                except:
+                    pass
+                try:
+                    winreg.CloseKey(key)
+                except:
+                    pass
+            except:
+                pass
+            try:
+                INTERNET_OPTION_REFRESH = 37
+                ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
+            except:
+                pass
 
 
     # [REMOVED] Duplicate legacy relay manager class was here.
@@ -5624,44 +5745,52 @@ try:
             )
 
         def _build_upstream_attempts(self):
-            attempts = []
+            attempts_by_label = {}
             try:
                 wm = globals().get("warp_manager")
                 warp_port = int(getattr(wm, "port", 1370) or 1370) if wm is not None else 1370
-                attempts.append({
+                attempts_by_label["warp-socks"] = {
                     "kind": "socks5",
                     "host": "127.0.0.1",
                     "port": warp_port,
                     "label": "warp-socks",
                     "timeout": 1.6,
-                })
+                }
             except:
-                attempts.append({
+                attempts_by_label["warp-socks"] = {
                     "kind": "socks5",
                     "host": "127.0.0.1",
                     "port": 1370,
                     "label": "warp-socks",
                     "timeout": 1.6,
-                })
+                }
             try:
                 opm = globals().get("opera_proxy_manager")
                 opera_port = int(getattr(opm, "port", 1371) or 1371) if opm is not None else 1371
-                attempts.append({
+                attempts_by_label["opera-http"] = {
                     "kind": "http",
                     "host": "127.0.0.1",
                     "port": opera_port,
                     "label": "opera-http",
                     "timeout": 2.2,
-                })
+                }
             except:
-                attempts.append({
+                attempts_by_label["opera-http"] = {
                     "kind": "http",
                     "host": "127.0.0.1",
                     "port": 1371,
                     "label": "opera-http",
                     "timeout": 2.2,
-                })
-            return attempts
+                }
+            attempts_by_label["direct"] = {
+                "kind": "direct",
+                "label": "direct",
+                "timeout": 1.2,
+            }
+            route_mode = get_routing_app_mode("telegram")
+            labels = reorder_route_labels_for_mode(route_mode, ["warp-socks", "opera-http", "direct"])
+            rendered = [dict(attempts_by_label[label]) for label in labels if label in attempts_by_label]
+            return rendered or list(attempts_by_label.values())
 
         def _wait_for_warp_bootstrap_window(self, target_host="", target_port=0, media_hint=False, dc_hint=0):
             def _warp_transport_ready():
@@ -6871,7 +7000,7 @@ try:
                 self.log_func(f"[NovaDivert] Не найден Python launcher для observer helper: {self.script_path}")
                 return False
             env = os.environ.copy()
-            if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+            if is_safe_filter_mode_enabled():
                 env["NOVA_SAFE_FILTER_MODE"] = "1"
             try:
                 self.process = subprocess.Popen(
@@ -7039,7 +7168,7 @@ try:
             try:
                 startup_log_path = self.log_path + ".startup.log"
                 env = os.environ.copy()
-                if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+                if is_safe_filter_mode_enabled():
                     env["NOVA_SAFE_FILTER_MODE"] = "1"
                 with open(startup_log_path, "a", encoding="utf-8", newline="") as startup_log:
                     startup_log.write(f"\n{time.strftime('%H:%M:%S')} [NovaDivert][Redirect] launch: {self.script_path}\n")
@@ -7155,6 +7284,7 @@ try:
         def _current_state(self):
             backend_info = get_selected_routing_backend_info()
             preferred_mode = str((backend_info or {}).get("mode") or get_selected_routing_backend_mode())
+            routing_settings = load_routing_settings()
 
             def _ready(obj):
                 try:
@@ -7243,6 +7373,11 @@ try:
                     warp_manager=globals().get("warp_manager"),
                     opera_proxy_manager=globals().get("opera_proxy_manager"),
                 ),
+                "ide": build_public_app_transport_plan(
+                    "ide",
+                    warp_manager=globals().get("warp_manager"),
+                    opera_proxy_manager=globals().get("opera_proxy_manager"),
+                ),
             }
 
             return {
@@ -7250,6 +7385,7 @@ try:
                 "backend_requested_mode": preferred_mode,
                 "backend_source": str((backend_info or {}).get("source") or ""),
                 "backend_raw": str((backend_info or {}).get("raw") or ""),
+                "routing_preferences": routing_settings,
                 "components": {
                     "warp_connected": warp_connected,
                     "opera_proxy_ready": opera_ready,
@@ -7991,7 +8127,7 @@ try:
             _terminate_tcp_listeners_on_port(self.port, log_func=self.log_func)
             env = os.environ.copy()
             env["NOVA_DIVERT_REDIRECT_MAP"] = str(self.map_path)
-            if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+            if is_safe_filter_mode_enabled():
                 env["NOVA_SAFE_FILTER_MODE"] = "1"
             py_prefix = self._python_prefix()
             if not py_prefix:
@@ -8277,7 +8413,7 @@ try:
             env = os.environ.copy()
             env["NOVA_DIVERT_REDIRECT_MAP"] = str(self.map_path)
             env["NOVA_UDP_PROXY_LABEL"] = "NovaDivert"
-            if os.environ.get("NOVA_SAFE_FILTER_MODE") == "1":
+            if is_safe_filter_mode_enabled():
                 env["NOVA_SAFE_FILTER_MODE"] = "1"
             py_prefix = self._python_prefix()
             if not py_prefix:
@@ -8398,6 +8534,8 @@ try:
             "discord.txt": "discord.media\n",
             "telegram.txt": "telegram.org\nt.me\ntelegra.ph\ntdesktop.com\n",
             "whatsapp.txt": "whatsapp.com\nwhatsapp.net\nwa.me\n",
+            "ide.txt": "api.openai.com\nauth.openai.com\nchatgpt.com\noaistatic.com\n",
+            "opencode.txt": "api.openai.com\nauth.openai.com\nchatgpt.com\noaistatic.com\n",
             "cloudflare.txt": "",
             "general.txt": "twitter.com\ninstagram.com\n",
             "exclude.txt": "",
@@ -8803,6 +8941,11 @@ try:
         res["list_rkn"] = os.path.join(base_dir, "list", "rkn.txt")
         res["temp_strategy_builder_state"] = os.path.join(base_dir, "temp", "strategy_builder_state.json")
         res["temp_strategy_builder_ips"] = os.path.join(base_dir, "temp", "strategy_builder_ips.txt")
+        try:
+            if not os.path.exists(ROUTING_SETTINGS_PATH):
+                save_json_safe(ROUTING_SETTINGS_PATH, DEFAULT_ROUTING_SETTINGS)
+        except:
+            pass
         
         return res
 
@@ -8853,6 +8996,158 @@ try:
             with open(temp_path, "w", encoding="utf-8") as f: json.dump(data, f, indent=4)
             os.replace(temp_path, filepath)
         except: pass
+
+    ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
+    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli")
+    ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
+    ROUTING_GROUP_ALIASES = {
+        "browser": "browser",
+        "telegram": "telegram",
+        "whatsapp": "whatsapp",
+        "discord": "discord",
+        "ide": "ide",
+        "cli": "cli",
+        "opencode": "ide",
+        "vscode": "ide",
+        "cursor": "ide",
+        "windsurf": "ide",
+        "codex": "ide",
+        "antigravity": "ide",
+        "powershell": "cli",
+        "pwsh": "cli",
+        "cmd": "cli",
+        "gemini": "cli",
+    }
+    DEFAULT_ROUTING_SETTINGS = {
+        "version": CURRENT_VERSION,
+        "routes": {
+            "browser": "auto",
+            "telegram": "warp",
+            "whatsapp": "warp",
+            "discord": "warp",
+            "ide": "direct",
+            "cli": "direct",
+        },
+    }
+
+    def _normalize_routing_mode(value, default_value="auto"):
+        mode = str(value or "").strip().lower()
+        if mode not in ROUTING_MODE_VALUES:
+            mode = str(default_value or "auto").strip().lower()
+        if mode not in ROUTING_MODE_VALUES:
+            mode = "auto"
+        return mode
+
+    def _browser_mode_from_legacy_pac(pac_payload):
+        pac = pac_payload if isinstance(pac_payload, dict) else {}
+        mode = str(pac.get("mode") or "").strip().lower()
+        full_target = str(pac.get("full_target") or "").strip().lower()
+        if mode == "off":
+            return "direct"
+        if mode == "full":
+            return _normalize_routing_mode(full_target or "warp", "warp")
+        return "auto"
+
+    def normalize_routing_settings(data):
+        normalized = {
+            "version": CURRENT_VERSION,
+            "routes": dict(DEFAULT_ROUTING_SETTINGS["routes"]),
+        }
+        try:
+            if not isinstance(data, dict):
+                return normalized
+            routes = data.get("routes") or {}
+            if isinstance(routes, dict):
+                for route_key in ROUTING_GROUP_KEYS:
+                    if route_key in routes:
+                        normalized["routes"][route_key] = _normalize_routing_mode(
+                            routes.get(route_key),
+                            normalized["routes"][route_key],
+                        )
+            else:
+                normalized["routes"]["browser"] = _browser_mode_from_legacy_pac(data.get("pac"))
+                apps = data.get("apps") or {}
+                if isinstance(apps, dict):
+                    legacy_map = {
+                        "telegram": "telegram",
+                        "whatsapp": "whatsapp",
+                        "discord": "discord",
+                        "opencode": "ide",
+                    }
+                    for old_key, route_key in legacy_map.items():
+                        if old_key in apps:
+                            normalized["routes"][route_key] = _normalize_routing_mode(
+                                apps.get(old_key),
+                                normalized["routes"][route_key],
+                            )
+            for alias_key, route_key in ROUTING_GROUP_ALIASES.items():
+                if alias_key in data.get("routes", {}) and route_key in normalized["routes"]:
+                    normalized["routes"][route_key] = _normalize_routing_mode(
+                        data["routes"].get(alias_key),
+                        normalized["routes"][route_key],
+                    )
+        except:
+            pass
+        return normalized
+
+    def load_routing_settings():
+        return normalize_routing_settings(load_json_robust(ROUTING_SETTINGS_PATH, DEFAULT_ROUTING_SETTINGS))
+
+    def save_routing_settings(data):
+        payload = normalize_routing_settings(data)
+        save_json_safe(ROUTING_SETTINGS_PATH, payload)
+        return payload
+
+    def get_routing_app_mode(app_key, settings=None):
+        key = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
+        payload = settings if isinstance(settings, dict) else load_routing_settings()
+        routes = payload.get("routes") or {}
+        mode = _normalize_routing_mode(routes.get(key), DEFAULT_ROUTING_SETTINGS["routes"].get(key, "auto"))
+        if key != "browser" and mode == "auto":
+            mode = _normalize_routing_mode(routes.get("browser"), DEFAULT_ROUTING_SETTINGS["routes"]["browser"])
+        return mode
+
+    def get_routing_pac_config(settings=None):
+        payload = settings if isinstance(settings, dict) else load_routing_settings()
+        routes = payload.get("routes") or {}
+        browser_mode = _normalize_routing_mode(routes.get("browser"), DEFAULT_ROUTING_SETTINGS["routes"]["browser"])
+        if browser_mode == "auto":
+            mode = "hybrid"
+            full_target = "warp"
+        elif browser_mode == "direct":
+            mode = "off"
+            full_target = "direct"
+        else:
+            mode = "full"
+            full_target = browser_mode
+        return {"mode": mode, "full_target": full_target}
+
+    def get_routing_group_mode(group_key, settings=None):
+        key = ROUTING_GROUP_ALIASES.get(str(group_key or "").strip().lower(), "browser")
+        payload = settings if isinstance(settings, dict) else load_routing_settings()
+        routes = payload.get("routes") or {}
+        return _normalize_routing_mode(routes.get(key), DEFAULT_ROUTING_SETTINGS["routes"].get(key, "auto"))
+
+    def reorder_route_labels_for_mode(mode, default_labels):
+        labels = [str(item or "").strip().lower() for item in list(default_labels or []) if str(item or "").strip()]
+        if not labels:
+            return []
+        mode = str(mode or "").strip().lower()
+        if mode == "warp":
+            preferred = ["warp-socks", "opera-http", "direct"]
+        elif mode == "opera":
+            preferred = ["opera-http", "warp-socks", "direct"]
+        elif mode == "direct":
+            preferred = ["direct", "warp-socks", "opera-http"]
+        else:
+            preferred = list(labels)
+        ordered = []
+        seen = set()
+        for label in preferred + labels:
+            if label in labels and label not in seen:
+                seen.add(label)
+                ordered.append(label)
+        return ordered
 
     # === EVOLUTION LEARNING SYSTEM ===
     LEARNING_DATA_PATH = os.path.join(get_base_dir(), "temp", "learning_data.json")
@@ -9674,10 +9969,66 @@ try:
 
     COLOR_BLUEBERRY_YOGURT = "#DCD0FF"
     COLOR_BG = "#F0F0F0"
-    COLOR_TEXT_NORMAL = "#13A10E"
-    COLOR_TEXT_ERROR = "#FFA500"
-    COLOR_TEXT_INFO = "#AAAAAA"
-    COLOR_TEXT_FAIL = "#FF4444"
+    MAIN_COLOR_TEXT_NORMAL = "#13A10E"
+    MAIN_COLOR_TEXT_ERROR = "#FFA500"
+    MAIN_COLOR_TEXT_INFO = "#AAAAAA"
+    MAIN_COLOR_TEXT_FAIL = "#FF4444"
+    COLOR_TEXT_NORMAL = MAIN_COLOR_TEXT_NORMAL
+    COLOR_TEXT_ERROR = MAIN_COLOR_TEXT_ERROR
+    COLOR_TEXT_INFO = MAIN_COLOR_TEXT_INFO
+    COLOR_TEXT_FAIL = MAIN_COLOR_TEXT_FAIL
+    if SYSTEM_THEME == "dark":
+        LOG_THEME = {
+            "bg": "#000000",
+            "panel": "#000000",
+            "text": "#B8F5C2",
+            "button": "#000000",
+            "button_hover": "#101010",
+            "button_fg": COLOR_BLUEBERRY_YOGURT,
+            "button_hover_fg": "#F2FFF4",
+            "grip": "#2F4A36",
+        }
+        LOG_COLOR_TEXT_NORMAL = "#47E05F"
+        LOG_COLOR_TEXT_ERROR = "#E4C05B"
+        LOG_COLOR_TEXT_INFO = "#92B49B"
+        LOG_COLOR_TEXT_FAIL = "#FF6B6B"
+        SETTINGS_THEME = {
+            "bg": "#0B1410",
+            "panel": "#111B15",
+            "border": "#22402B",
+            "text": "#E5F7E8",
+            "muted": "#93AD98",
+            "pill_on_bg": "#12381D",
+            "pill_on_fg": "#D9FFE1",
+            "pill_off_bg": "#1A241D",
+            "pill_off_fg": "#8DA38F",
+        }
+    else:
+        LOG_THEME = {
+            "bg": "#000000",
+            "panel": "#000000",
+            "text": "#0E5F21",
+            "button": "#000000",
+            "button_hover": "#111111",
+            "button_fg": "#315A39",
+            "button_hover_fg": "#17351E",
+            "grip": "#82A28A",
+        }
+        LOG_COLOR_TEXT_NORMAL = "#47E05F"
+        LOG_COLOR_TEXT_ERROR = "#E4C05B"
+        LOG_COLOR_TEXT_INFO = "#92B49B"
+        LOG_COLOR_TEXT_FAIL = "#FF6B6B"
+        SETTINGS_THEME = {
+            "bg": "#F4F8F5",
+            "panel": "#FFFFFF",
+            "border": "#C8D8CB",
+            "text": "#183120",
+            "muted": "#667B6B",
+            "pill_on_bg": "#D6F0DA",
+            "pill_on_fg": "#145328",
+            "pill_off_bg": "#E8EFEB",
+            "pill_off_fg": "#6A7C6E",
+        }
 
     log_window = None
     log_text_widget = None
@@ -9752,6 +10103,114 @@ try:
         if current_seg:
             segments.append(current_seg)
         return segments
+
+    def _join_winws_segments_portable(segments):
+        rendered = []
+        for index, segment in enumerate(list(segments or [])):
+            if not segment:
+                continue
+            if index > 0:
+                rendered.append("--new")
+            rendered.extend(segment)
+        return rendered
+
+    def _sanitize_safe_mode_winws_args(arg_list):
+        raw = [str(item) for item in list(arg_list or []) if isinstance(item, str)]
+        if not raw:
+            return raw, False, []
+        prefix = [raw[0]]
+        body = raw[1:]
+        segments = _split_strategy_segments_portable(body)
+        kept = []
+        removed_reasons = []
+        changed = False
+
+        for segment in segments:
+            normalized = [str(item or "").strip() for item in list(segment or []) if str(item or "").strip()]
+            if not normalized:
+                changed = True
+                continue
+            has_filter = any(
+                item.startswith("--filter-tcp")
+                or item.startswith("--filter-udp")
+                or item.startswith("--wf-raw")
+                for item in normalized
+            )
+            if not has_filter:
+                removed_reasons.append("empty-filter-segment")
+                changed = True
+                continue
+            has_udp = any(item.startswith("--filter-udp") for item in normalized)
+            has_tcp = any(item.startswith("--filter-tcp") for item in normalized)
+            has_context = any(
+                item.startswith("--hostlist=")
+                or item.startswith("--ipset=")
+                or item.startswith("--hostlist-exclude=")
+                or item.startswith("--ipset-exclude=")
+                for item in normalized
+            )
+            has_stun = any("--filter-l7=discord,stun" in item or "--filter-l7=stun" in item for item in normalized)
+            if has_udp and has_stun:
+                removed_reasons.append("stun-aux-udp")
+                changed = True
+                continue
+            if has_tcp or has_udp:
+                stripped_segment = []
+                dropped_hostlist = False
+                for item in normalized:
+                    if item.startswith("--hostlist=") or item.startswith("--hostlist-exclude="):
+                        dropped_hostlist = True
+                        changed = True
+                        continue
+                    stripped_segment.append(item)
+                if dropped_hostlist:
+                    normalized = stripped_segment
+                    has_context = any(
+                        item.startswith("--hostlist=")
+                        or item.startswith("--ipset=")
+                        or item.startswith("--hostlist-exclude=")
+                        or item.startswith("--ipset-exclude=")
+                        for item in normalized
+                    )
+            if has_udp and not has_tcp:
+                has_ipset_scope = any(item.startswith("--ipset=") for item in normalized)
+                has_layer7_scope = any(item.startswith("--filter-l7=") for item in normalized)
+                if not has_ipset_scope and not has_layer7_scope:
+                    removed_reasons.append("udp-hostlist-only")
+                    changed = True
+                    continue
+            if has_tcp:
+                has_ipset_scope = any(item.startswith("--ipset=") for item in normalized)
+                has_layer7_scope = any(item.startswith("--filter-l7=") for item in normalized)
+                has_raw_scope = any(item.startswith("--wf-raw") for item in normalized)
+                if not has_ipset_scope and not has_layer7_scope and not has_raw_scope:
+                    removed_reasons.append("tcp-hostlist-only")
+                    changed = True
+                    continue
+            if has_udp and not has_tcp and not has_context:
+                removed_reasons.append("contextless-udp")
+                changed = True
+                continue
+            kept.append(normalized)
+
+        if len(kept) > 1:
+            tcp_segments = [segment for segment in kept if any(item.startswith("--filter-tcp") for item in segment)]
+            preferred_tcp = None
+            for segment in tcp_segments:
+                if any(item.startswith("--filter-tcp=80,443") for item in segment):
+                    preferred_tcp = segment
+                    break
+            if preferred_tcp is None and tcp_segments:
+                preferred_tcp = tcp_segments[-1]
+            if preferred_tcp is not None:
+                kept = [preferred_tcp]
+                removed_reasons.append("safe-minimal-single-tcp")
+                changed = True
+
+        if not kept:
+            return raw, False, []
+        rebuilt = prefix + _join_winws_segments_portable(kept)
+        return rebuilt, bool(changed and rebuilt != raw), removed_reasons
 
     def build_youtube_strategy_args(tcp_repeats=4, tcp_ttl=4, tcp_fooling="badsum"):
         if tcp_repeats not in (3, 4, 5):
@@ -10218,13 +10677,13 @@ try:
         def __init__(self, master, command=None, **kwargs):
             # Цвета скроллбара в зависимости от темы Windows
             if SYSTEM_THEME == "dark":
-                self.bg_color = "#000000" # Фон трека (сливается с логом)
-                self.thumb_color = "#444444"
-                self.hover_color = "#666666"
+                self.bg_color = LOG_THEME["bg"]
+                self.thumb_color = "#2D5A37"
+                self.hover_color = "#418050"
             else:
-                self.bg_color = "#F0F0F0" # Светлый трек для светлой темы
-                self.thumb_color = "#CDCDCD"
-                self.hover_color = "#A6A6A6"
+                self.bg_color = LOG_THEME["bg"]
+                self.thumb_color = "#9CC8A5"
+                self.hover_color = "#79B487"
             
             super().__init__(master, bg=self.bg_color, width=12, highlightthickness=0, **kwargs)
             self.command = command
@@ -10763,7 +11222,7 @@ try:
         try:
             apply_window_icon(log_window)
         except: pass
-        log_window.configure(bg="#000000")
+        log_window.configure(bg=LOG_THEME["bg"])
         log_window.transient(root)
         log_window.protocol("WM_DELETE_WINDOW", hide_log_window)
         # FIX: Ensure log window is NOT topmost by default (keeps it attached but not forced top)
@@ -10808,7 +11267,7 @@ try:
         root.bind('<Configure>', align_log_window_to_main)
         
         # === НОВОЕ: Кнопка Telegram внизу (добавляем ПЕРЕД контентом) ===
-        bottom_frame = tk.Frame(log_window, bg="#1a1a1a", height=21)  # 150% от высоты строки
+        bottom_frame = tk.Frame(log_window, bg=LOG_THEME["panel"], height=21)  # 150% от высоты строки
         bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
         bottom_frame.pack_propagate(False)  # Закрепляем высоту
         
@@ -10825,7 +11284,7 @@ try:
                 if globals().get("SYSTEM_THEME", "dark") != "dark": is_dark_theme = False
             except: pass
             
-            grip_bg = "#1a1a1a" if is_dark_theme else "#f0f0f0"
+            grip_bg = LOG_THEME["panel"] if is_dark_theme else LOG_THEME["panel"]
             style.configure("TSizegrip", background=grip_bg)
         except: pass
 
@@ -10851,7 +11310,7 @@ try:
                 w = int(self["width"])
                 h = int(self["height"])
                 # Dots color
-                c = "#666666" 
+                c = LOG_THEME["grip"]
                 
                 # Draw dots forming a triangle
                 # Pushed strictly to the corner (margin ~2px)
@@ -10933,25 +11392,35 @@ try:
                 print(f"[Log] Ошибка открытия ссылки: {e}")
         
         # Кнопка-текст "Перейти в чат"
-        chat_button = tk.Label(bottom_frame, text="→ Telegram чат", fg=COLOR_BLUEBERRY_YOGURT, bg="#1a1a1a", 
+        chat_button = tk.Label(bottom_frame, text="→ Telegram чат", fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"], 
                               font=("Segoe UI", 11, "bold"), cursor="hand2", padx=10, pady=2)
         chat_button.pack(side=tk.RIGHT, padx=10, pady=2)
         chat_button.bind("<Button-1>", lambda e: open_telegram_chat())
-        chat_button.bind("<Enter>", lambda e: chat_button.config(fg="white", bg="#2a2a2a"))
-        chat_button.bind("<Leave>", lambda e: chat_button.config(fg=COLOR_BLUEBERRY_YOGURT, bg="#1a1a1a"))
+        chat_button.bind("<Enter>", lambda e: chat_button.config(fg=LOG_THEME["button_hover_fg"], bg=LOG_THEME["button_hover"]))
+        chat_button.bind("<Leave>", lambda e: chat_button.config(fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"]))
 
         # Используем Frame для компоновки текста и кастомного скроллбара
-        content_frame = tk.Frame(log_window, bg="#000000")
+        content_frame = tk.Frame(log_window, bg=LOG_THEME["bg"])
         content_frame.pack(fill=tk.BOTH, expand=True)
         
         scrollbar = ModernScrollbar(content_frame)
-        log_text_widget = tk.Text(content_frame, wrap=tk.WORD, font=("Consolas", 11, "bold"), bg="#000000", fg="#E0E0E0", yscrollcommand=scrollbar.set, bd=0, highlightthickness=0)
+        log_text_widget = tk.Text(
+            content_frame,
+            wrap=tk.WORD,
+            font=("Consolas", 11),
+            bg=LOG_THEME["bg"],
+            fg=LOG_THEME["text"],
+            insertbackground=LOG_THEME["text"],
+            yscrollcommand=scrollbar.set,
+            bd=0,
+            highlightthickness=0,
+        )
         scrollbar.command = log_text_widget.yview
         
         log_text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        for tag, col in [("normal", COLOR_TEXT_NORMAL), ("error", COLOR_TEXT_ERROR), ("info", COLOR_TEXT_INFO), ("fail", COLOR_TEXT_FAIL)]:
+        for tag, col in [("normal", LOG_COLOR_TEXT_NORMAL), ("error", LOG_COLOR_TEXT_ERROR), ("info", LOG_COLOR_TEXT_INFO), ("fail", LOG_COLOR_TEXT_FAIL)]:
             log_text_widget.tag_config(tag, foreground=col)
 
         log_text_widget.tag_config("warning", foreground="#E6C200") # Тускло-желтый для предупреждений
@@ -10975,7 +11444,7 @@ try:
         log_text_widget.tag_bind("link_yellow", "<Enter>", lambda e: log_text_widget.config(cursor="hand2"))
         log_text_widget.tag_bind("link_yellow", "<Leave>", lambda e: log_text_widget.config(cursor=""))
 
-        log_text_widget.tag_config("clickable_cmd", foreground=COLOR_TEXT_NORMAL, underline=True)
+        log_text_widget.tag_config("clickable_cmd", foreground=LOG_COLOR_TEXT_NORMAL, underline=True)
         
         def copy_command(event):
             try:
@@ -11016,21 +11485,6 @@ try:
         context_menu.add_command(label="Выделить все", command=select_all)
         context_menu.add_separator()
 
-        # === Autostart Option ===
-        autostart_log_var = tk.BooleanVar()
-        def toggle_autostart_wrapper():
-            # Use separate thread to ensure UI is not blocked
-            threading.Thread(target=toggle_startup, args=(log_print,), daemon=True).start()
-
-        def update_autostart_label():
-            is_auto = get_startup_status_cached()
-            autostart_log_var.set(is_auto)
-            refresh_autostart_status_async(lambda value: autostart_log_var.set(bool(value)))
-
-        context_menu.add_checkbutton(label="Автозапуск Nova", variable=autostart_log_var, command=toggle_autostart_wrapper)
-        context_menu.configure(postcommand=update_autostart_label)
-        context_menu.add_separator()
-
         def force_reset_warp_ui():
             global warp_manager
             if warp_manager:
@@ -11049,7 +11503,6 @@ try:
         log_text_widget.tag_bind("clickable_cmd", "<Button-1>", copy_command)
         def show_log_context_menu(event):
             try:
-                update_autostart_label()
                 context_menu.tk_popup(event.x_root, event.y_root)
             except:
                 pass
@@ -11084,6 +11537,18 @@ try:
         log_window.deiconify()
         log_window.lift()
         log_window.attributes('-topmost', False)
+        try:
+            settings_ref = globals().get("routing_settings_window_ref", {})
+            existing = settings_ref.get("win") if isinstance(settings_ref, dict) else None
+            if existing and existing.winfo_exists() and str(existing.state()) != "withdrawn":
+                raise_fn = getattr(existing, "_nova_raise_above_owner", None)
+                if callable(raise_fn):
+                    raise_fn()
+                else:
+                    existing.lift(log_window)
+                    existing.after(1, existing.lift)
+        except:
+            pass
         
         # Применяем тёмную тему ПОСЛЕ показа окна с минимальной задержкой
         # (окно должно быть видимым для корректного применения DWM атрибута)
@@ -11911,12 +12376,36 @@ try:
     _degraded_core_recovery_scheduled = [False]
     _degraded_core_recovery_attempts = [0]
     _safe_filter_mode_notice_shown = [False]
+    _safe_filter_mode_block_notice_shown = [False]
+    _safe_filter_mode_explicit_opt_in = _env_bool_global("NOVA_DEV_EXPERIMENTAL_SAFE_FILTER_MODE", False)
+    _safe_filter_mode_runtime = [bool(_safe_filter_mode_explicit_opt_in)]
+
+    if _safe_filter_mode_explicit_opt_in:
+        os.environ["NOVA_SAFE_FILTER_MODE"] = "1"
+    else:
+        try:
+            os.environ["NOVA_SAFE_FILTER_MODE"] = "0"
+        except:
+            pass
 
     def is_safe_filter_mode_enabled():
-        raw = str(os.environ.get("NOVA_SAFE_FILTER_MODE", "") or "").strip().lower()
-        return raw in ("1", "true", "yes", "on")
+        try:
+            return bool(_safe_filter_mode_explicit_opt_in and _safe_filter_mode_runtime[0])
+        except:
+            return False
 
     def enable_safe_filter_mode(log_func=None, reason=""):
+        if not _safe_filter_mode_explicit_opt_in:
+            if not _safe_filter_mode_block_notice_shown[0]:
+                _safe_filter_mode_block_notice_shown[0] = True
+                try:
+                    logger = log_func or globals().get("log_print", print)
+                    suffix = f": {reason}" if str(reason or "").strip() else ""
+                    logger(f"[Compat] Автоматический safe-mode WinWS suppressed{suffix}. Nova продолжит полноценный запуск.")
+                except:
+                    pass
+            return False
+        _safe_filter_mode_runtime[0] = True
         os.environ["NOVA_SAFE_FILTER_MODE"] = "1"
         if not _safe_filter_mode_notice_shown[0]:
             _safe_filter_mode_notice_shown[0] = True
@@ -11926,6 +12415,7 @@ try:
                 logger(f"[Compat] Включён safe-mode WinDivert без --wf-raw{suffix}.")
             except:
                 pass
+        return True
 
     def detect_winws_filter_protocols(arg_list):
         has_tcp = False
@@ -13232,7 +13722,7 @@ try:
                         isolation_filter = f"outbound and !loopback and ({' or '.join(proto_parts)})"
                         
                         if not is_safe_filter_mode_enabled():
-                            test_args.extend(['--wf-raw', isolation_filter])
+                            test_args.append(f"--wf-raw={isolation_filter}")
                         
                         exe_path = os.path.join(get_bin_dir(), WINWS_FILENAME)
                         # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
@@ -13425,7 +13915,7 @@ try:
                         final_args = [final_exe]
                         final_args.extend(test_args)
                         if not is_safe_filter_mode_enabled():
-                            final_args.extend(['--wf-raw', isolation_filter])
+                            final_args.append(f"--wf-raw={isolation_filter}")
                         
                         # Попытка запуска с ретраем для надежности (исправляет падения с кодом 1)
                         for attempt in range(2):
@@ -18569,7 +19059,7 @@ try:
             exe_path = os.path.join(get_bin_dir(), exe_name)
             final_args = [exe_path] + test_args
             if not is_safe_filter_mode_enabled():
-                final_args.extend(['--wf-raw', isolation_filter])
+                final_args.append(f"--wf-raw={isolation_filter}")
             
             # PRIORITY_BELOW_NORMAL (0x00004000) for background checks to avoid GUI freezes
             proc = subprocess.Popen(final_args, cwd=base_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
@@ -19115,6 +19605,8 @@ try:
             "disabled": False,
             "running": False,
             "stopped": False,
+            "win32_exit_code": None,
+            "driver_bad_state": False,
             "registry_exists": False,
             "start": None,
             "delete_flag": False,
@@ -19135,6 +19627,18 @@ try:
             state["running"] = True
         if "stopped" in msg_lower:
             state["stopped"] = True
+        m = re.search(r"WIN32_EXIT_CODE\s*:\s*(\d+)", msg, re.IGNORECASE)
+        if m:
+            try:
+                state["win32_exit_code"] = int(m.group(1))
+            except Exception:
+                state["win32_exit_code"] = None
+        state["driver_bad_state"] = (
+            state["stopped"]
+            and state["win32_exit_code"] not in (None, 0)
+            and not state["missing"]
+            and not state["pending_delete"]
+        )
 
         try:
             import winreg
@@ -20155,10 +20659,14 @@ try:
                 
                 # Logic Flow
                 if vpn_changed:
-                    # 1. Update PAC
+                    # 1. Update PAC content only.
+                    # Do not force-refresh WinINet/system proxy settings here:
+                    # ru/eu/ip list edits only change PAC payload, and aggressive
+                    # INTERNET_OPTION_SETTINGS_CHANGED calls can tear down active
+                    # browser connections on every domain append.
                     if pac_manager:
                         pac_manager.generate_pac()
-                        pac_manager.refresh_system_options()
+                        pac_manager.refresh_pac_runtime()
                         log_func("[PAC] Списки VPN обновлены")
                         
                 restart_reasons = []
@@ -20309,6 +20817,8 @@ try:
         startup_fast_retry_until = time.time() + 150.0
         startup_pending_route_signature = None
         startup_pending_route_seen = 0
+        ROUTE_FLAP_HOLD_OPERA_SEC = 20.0
+        ROUTE_FLAP_HOLD_WARP_SEC = 12.0
         
         # Keep first PAC/1371 refresh close to startup to minimize DIRECT window for EU domains.
         time.sleep(1)
@@ -20560,12 +21070,49 @@ try:
 
                     prev_warp_port_state = last_warp_port_state
                     state_changed = False
+                    route_opera_usable = bool(opera_usable)
+                    route_warp_usable = bool(warp_usable)
+
+                    # Route-state hysteresis: keep last good state for short transient blips.
+                    # This prevents PAC flapping during brief proxy/WARP jitters.
+                    try:
+                        if not route_opera_usable and bool(last_opera_port_state):
+                            recent_opera_good = (now - opera_last_good_ts) < ROUTE_FLAP_HOLD_OPERA_SEC if opera_last_good_ts else False
+                            opera_transient = bool(
+                                recent_opera_good
+                                and (
+                                    opera_starting
+                                    or need_restart
+                                    or opera_bad_proxy_streak < 4
+                                )
+                            )
+                            if opera_transient:
+                                route_opera_usable = True
+                    except Exception:
+                        pass
+
+                    try:
+                        if not route_warp_usable and bool(last_warp_port_state):
+                            recent_warp_good = (now - warp_last_good_ts) < ROUTE_FLAP_HOLD_WARP_SEC if warp_last_good_ts else False
+                            warp_transient = bool(
+                                recent_warp_good
+                                and (
+                                    warp_starting
+                                    or warp_recovering
+                                    or warp_bad_proxy_streak < 3
+                                )
+                            )
+                            if warp_transient:
+                                route_warp_usable = True
+                    except Exception:
+                        pass
+
                     if last_opera_port_state is None or last_warp_port_state is None:
-                        last_opera_port_state = opera_usable
-                        last_warp_port_state = warp_usable
+                        last_opera_port_state = route_opera_usable
+                        last_warp_port_state = route_warp_usable
                         state_changed = True
                     else:
-                        current_route_signature = (bool(opera_usable), bool(warp_usable))
+                        current_route_signature = (bool(route_opera_usable), bool(route_warp_usable))
                         last_route_signature = (bool(last_opera_port_state), bool(last_warp_port_state))
                         if current_route_signature != last_route_signature:
                             # Hold startup PAC/app-route flips until the new state repeats at least once.
@@ -20577,14 +21124,14 @@ try:
                                 else:
                                     startup_pending_route_seen += 1
                                 if startup_pending_route_seen >= 2:
-                                    last_opera_port_state = opera_usable
-                                    last_warp_port_state = warp_usable
+                                    last_opera_port_state = route_opera_usable
+                                    last_warp_port_state = route_warp_usable
                                     state_changed = True
                                     startup_pending_route_signature = None
                                     startup_pending_route_seen = 0
                             else:
-                                last_opera_port_state = opera_usable
-                                last_warp_port_state = warp_usable
+                                last_opera_port_state = route_opera_usable
+                                last_warp_port_state = route_warp_usable
                                 state_changed = True
                                 startup_pending_route_signature = None
                                 startup_pending_route_seen = 0
@@ -20593,13 +21140,13 @@ try:
                             startup_pending_route_seen = 0
 
                     if state_changed:
-                        warp_became_usable = bool(warp_usable) and not bool(prev_warp_port_state)
+                        warp_became_usable = bool(route_warp_usable) and not bool(prev_warp_port_state)
                         try:
                             if pac_manager:
-                                pac_manager.generate_pac(warp_override=warp_usable, opera_override=opera_usable)
+                                pac_manager.generate_pac(warp_override=route_warp_usable, opera_override=route_opera_usable)
                                 pac_manager.refresh_system_options()
-                                opera_txt = "доступен" if opera_usable else "недоступен"
-                                warp_txt = "доступен" if warp_usable else "недоступен"
+                                opera_txt = "доступен" if route_opera_usable else "недоступен"
+                                warp_txt = "доступен" if route_warp_usable else "недоступен"
                                 log_func(f"[PAC] Обновлен: порт {opera_port} {opera_txt}, WARP {warp_port} {warp_txt}.")
                         except Exception as e:
                             safe_trace(f"[PAC Watchdog] refresh error: {e}")
@@ -20611,7 +21158,7 @@ try:
                         except Exception as e:
                             safe_trace(f"[TgRelay] warp-usable notify error: {e}")
                         try:
-                            _stop_singbox_if_light_fallback_ready(log_func=log_func, warp_usable=warp_usable)
+                            _stop_singbox_if_light_fallback_ready(log_func=log_func, warp_usable=route_warp_usable)
                         except Exception as e:
                             safe_trace(f"[Cleanup] legacy helper cleanup error: {e}")
 
@@ -21251,19 +21798,11 @@ try:
         telegram_runtime_list_path = prepare_telegram_runtime_hostlist()
         
         exclusions = []
-        # Always exclude localhost IPC from WinWS interception.
-        # This protects local agent channels (Gemini/Codex/Discord updater IPC) even
-        # when strict WinWS builds force us to downgrade/disable wf-raw rules.
-        loopback_exclude_path = os.path.join(get_base_dir(), "temp", "loopback_exclude_ipset.txt")
-        try:
-            os.makedirs(os.path.dirname(loopback_exclude_path), exist_ok=True)
-            with open(loopback_exclude_path, "w", encoding="utf-8") as f:
-                f.write("127.0.0.0/8\n")
-                f.write("::1/128\n")
-            exclusions.append(f"--ipset-exclude={loopback_exclude_path}")
-        except Exception as _e:
-            if IS_DEBUG_MODE and not silent:
-                print(f"[Init] [Diag] Не удалось подготовить loopback exclude: {_e}")
+        # Do not inject synthetic localhost ipset-exclude into the main winws
+        # command. This was introduced by recent compatibility work and has a
+        # realistic chance of breaking older Windows winws builds with code 123.
+        # Full Nova behavior should rely on the native strategy/profile filters,
+        # not on an auto-generated localhost exclusion here.
 
         # Check exclusion files and only add if they are not empty (to avoid winws crash)
         for arg_tpl in [("--ipset-exclude", paths['ip_exclude']), 
@@ -21273,18 +21812,63 @@ try:
              if file_has_noncomment_entries(arg_tpl[1]):
                  exclusions.append(f"{arg_tpl[0]}={arg_tpl[1]}")
 
-        # RESTORED: Global filter generation from v0.995
-        all_tcp_conditions = set()
-        all_udp_conditions = set()
-        
+        # Use the standard winws Windows global capture path:
+        # collect minimal required TCP/UDP ports and pass them via
+        # --wf-tcp/--wf-udp. This matches upstream guidance better than
+        # forcing a custom global --wf-raw expression.
+        all_tcp_specs = set()
+        all_udp_specs = set()
+
+        def _collect_global_wf_specs(arg_list):
+            tcp_specs = set()
+            udp_specs = set()
+            if isinstance(arg_list, dict):
+                arg_list = arg_list.get("args", [])
+            if not isinstance(arg_list, list):
+                return tcp_specs, udp_specs
+            for arg in arg_list:
+                if not isinstance(arg, str):
+                    continue
+                arg_clean = arg.strip()
+                if "=" not in arg_clean:
+                    continue
+                if arg_clean.startswith("--wf-tcp=") or arg_clean.startswith("--filter-tcp="):
+                    value = arg_clean.split("=", 1)[1]
+                    for part in value.split(","):
+                        part = part.strip()
+                        if part:
+                            tcp_specs.add(part)
+                if arg_clean.startswith("--wf-udp=") or arg_clean.startswith("--filter-udp="):
+                    value = arg_clean.split("=", 1)[1]
+                    for part in value.split(","):
+                        part = part.strip()
+                        if part:
+                            udp_specs.add(part)
+            return tcp_specs, udp_specs
+
+        def _sort_port_specs(parts):
+            def _key(value):
+                text = str(value or "").strip()
+                if "-" in text:
+                    try:
+                        start, end = text.split("-", 1)
+                        return (int(start), 1, int(end))
+                    except Exception:
+                        return (10**9, 1, text)
+                try:
+                    return (int(text), 0, int(text))
+                except Exception:
+                    return (10**9, 0, text)
+            return sorted(parts, key=_key)
+
         for strat_name, strat_args in strategies.items():
             if strat_name == "warp":
                 continue
-            t, u = parse_ports_from_args(strat_args)
-            all_tcp_conditions.update(t)
-            all_udp_conditions.update(u)
+            tcp_specs, udp_specs = _collect_global_wf_specs(strat_args)
+            all_tcp_specs.update(tcp_specs)
+            all_udp_specs.update(udp_specs)
 
-        if not all_tcp_conditions and not all_udp_conditions:
+        if not all_tcp_specs and not all_udp_specs:
              msg = f"!!! ВНИМАНИЕ: Не найдены порты (wf-tcp/wf-udp) для WinWS.\n"
              msg += f"Загружено стратегий: {len(strategies)}\n"
              if strategies:
@@ -21295,37 +21879,19 @@ try:
              
              print(msg)
              if not silent: root.after(0, lambda: messagebox.showwarning("Проблема конфигурации", msg))
-
-        loopback_bypass_clause = get_loopback_bypass_clause()
-
-        tcp_part = "false"
-        if all_tcp_conditions:
-            tcp_ports_logic = " or ".join(all_tcp_conditions)
-            # Exclude internal range 16000-16500 for safety
-            tcp_part = f"(tcp and ({tcp_ports_logic}) and (tcp.SrcPort < 16000 or tcp.SrcPort > 16500){loopback_bypass_clause})"
-        
-        udp_part = "false"
-        if all_udp_conditions:
-            udp_ports_logic = " or ".join(all_udp_conditions)
-            udp_part = f"(udp and ({udp_ports_logic}) and (udp.SrcPort < 16000 or udp.SrcPort > 16500){loopback_bypass_clause})"
-            
-        global_filter = f"outbound and !loopback and ({tcp_part} or {udp_part})"
-        section_loopback_guard = "outbound and !loopback"
         if is_safe_filter_mode_enabled():
             if not silent:
-                print("[Init] Safe-mode WinDivert активен: --wf-raw пропущен.")
+                print("[Init] Safe-mode WinDivert активен: глобальный захват WinWS пропущен.")
         else:
-            # FIX: Pass as two separate arguments to avoid quoting issues with huge limits
-            args.extend(["--wf-raw", global_filter])
-            if not silent: print(f"[Init] Global filter passed via command line ({len(global_filter)} chars)")
+            if all_tcp_specs:
+                args.append(f"--wf-tcp={','.join(_sort_port_specs(all_tcp_specs))}")
+            if all_udp_specs:
+                args.append(f"--wf-udp={','.join(_sort_port_specs(all_udp_specs))}")
             if not silent:
-                if not loopback_bypass_clause:
-                    lb_mode = "off"
-                elif "ipv6.DstAddr" in loopback_bypass_clause:
-                    lb_mode = "127+::1"
-                else:
-                    lb_mode = "127-only"
-                print(f"[Init] Localhost bypass mode for WinWS filters: {lb_mode}.")
+                print(
+                    f"[Init] Global WinWS capture passed via --wf-tcp/--wf-udp "
+                    f"(tcp={len(all_tcp_specs)}, udp={len(all_udp_specs)})."
+                )
 
         strat_keys = [k for k in strategies.keys() if k not in ("general", "warp")]
         
@@ -21518,6 +22084,14 @@ try:
                 else: args.append(arg)
         else:
              if not silent: print("[Init] General стратегия пуста. Общая стратегия не применена.")
+
+        if is_safe_filter_mode_enabled():
+            sanitized_args, sanitized_changed, sanitized_reasons = _sanitize_safe_mode_winws_args(args)
+            if sanitized_changed:
+                args[:] = sanitized_args
+                if not silent:
+                    reasons_text = ", ".join(sorted(set(sanitized_reasons))) if sanitized_reasons else "compat"
+                    print(f"[Compat] Safe-mode WinWS: отключены конфликтные auxiliary-сегменты ({reasons_text}).")
         
         full_command_parts = [exe_path]
         for arg in args[1:]:
@@ -21558,7 +22132,7 @@ try:
                 print("[Info] Команда скопирована.")
             # FIX: Removed extra newline
             log_text_widget.insert(tk.END, "Нажмите чтобы скопировать команду запуска winws\n", tag_name)
-            log_text_widget.tag_config(tag_name, foreground=COLOR_TEXT_NORMAL, underline=True)
+            log_text_widget.tag_config(tag_name, foreground=LOG_COLOR_TEXT_NORMAL, underline=True)
             log_text_widget.tag_bind(tag_name, "<Button-1>", copy_cmd)
 
         if not silent: root.after(0, insert_cmd_link)
@@ -21815,6 +22389,15 @@ try:
                                  time.sleep(4.0)
                                  continue
 
+                            if exit_code == 123 and current_windivert_state.get("driver_bad_state"):
+                                 svc_code = current_windivert_state.get("win32_exit_code")
+                                 if not silent:
+                                     log_print(f"[Error] WinDivert находится в bad state (SCM WIN32_EXIT_CODE={svc_code}). Пытаемся восстановить драйвер без перезагрузки...")
+                                 if not _repair_windivert_or_degrade(123, failed_lines=captured_output):
+                                     return
+                                 time.sleep(2.0)
+                                 continue
+
                             if current_windivert_state["disabled"] or _is_windivert_disabled_text(combined_output):
                                  if not silent: log_print("[Error] WinDivert недоступен. Пытаемся восстановить службу/драйвер...")
                                  if not _repair_windivert_or_degrade(34, failed_lines=captured_output):
@@ -21849,7 +22432,8 @@ try:
 # FIX: Handling for Code 87/123 (strict/legacy wf-raw parser)
                             if exit_code in (87, 123):
                                 strict_label = "87" if exit_code == 87 else "123"
-                                if exit_code == 123:
+                                has_wfraw = any(isinstance(a, str) and a.startswith("--wf-raw") for a in args)
+                                if exit_code == 123 and _safe_filter_mode_explicit_opt_in:
                                     enable_safe_filter_mode(log_print if not silent else None, reason="startup winws вернул код 123")
                                 try:
                                     downgraded = _strip_loopback_bypass_from_wfraw(args)
@@ -21862,16 +22446,11 @@ try:
                                         log_print(f"[Init] [Diag] Код {strict_label}: текущий winws не принимает localhost-bypass в wf-raw. Повторяем запуск без bypass.")
                                     time.sleep(0.5)
                                     continue
-                                # Last-resort compatibility mode for strict/old WinWS builds.
-                                try:
-                                    wfraw_removed = _remove_all_wfraw_from_args(args)
-                                except:
-                                    wfraw_removed = False
-                                if wfraw_removed:
-                                    if not silent:
-                                        log_print(f"[Init] [Diag] Код {strict_label}: parser wf-raw несовместим. Переключаемся в safe-mode без --wf-raw.")
-                                    time.sleep(0.5)
-                                    continue
+                                if exit_code == 123 and not silent and not _safe_filter_mode_explicit_opt_in:
+                                    if has_wfraw:
+                                        log_print(f"[Init] [Diag] Код {strict_label}: parser wf-raw несовместим, но safe-mode отключён для обычного запуска. Полная стратегия сохранена без урезания.")
+                                    else:
+                                        log_print(f"[Init] [Diag] Код {strict_label}: основной запуск winws завершился до старта захвата. Текущая конфигурация сохраняется без урезания.")
 
                             # Downgrade to Info for first attempt (Driver Busy common scenario)
                             msg_type = "Info" if (attempt == 0 and exit_code == 1) else "Warning"
@@ -21911,7 +22490,39 @@ try:
                         try:
                             ndm = globals().get("novadivert_observer_manager")
                             nrm = globals().get("novadivert_redirect_manager")
+                            ntpm = globals().get("novadivert_tcp_proxy_manager")
+                            nupm = globals().get("novadivert_udp_proxy_manager")
                             selected_backend_mode = get_selected_routing_backend_mode()
+                            if ntpm and wants_windivert_hybrid_backend(selected_backend_mode):
+                                def _start_tcp_proxy_with_retries():
+                                    retry_delays = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0]
+                                    for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        try:
+                                            if ntpm.start():
+                                                return
+                                        except:
+                                            pass
+                                        if is_closing:
+                                            return
+                                        if _attempt < len(retry_delays):
+                                            time.sleep(_delay)
+                                    log_print("[NovaDivert][Proxy] TCP proxy не запустился после всех попыток. App redirect будет недоступен; WARP/EU/PAC продолжают работать.")
+                                threading.Thread(target=_start_tcp_proxy_with_retries, daemon=True, name="NovaDivertTcpProxyEnsure").start()
+                            if nupm and wants_windivert_hybrid_backend(selected_backend_mode):
+                                def _start_udp_proxy_with_retries():
+                                    retry_delays = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0]
+                                    for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        try:
+                                            if nupm.start():
+                                                return
+                                        except:
+                                            pass
+                                        if is_closing:
+                                            return
+                                        if _attempt < len(retry_delays):
+                                            time.sleep(_delay)
+                                    log_print("[NovaDivert][UDP] UDP proxy не запустился после всех попыток. App redirect будет частично недоступен; WARP/EU/PAC продолжают работать.")
+                                threading.Thread(target=_start_udp_proxy_with_retries, daemon=True, name="NovaDivertUdpProxyEnsure").start()
                             if ndm and wants_windivert_hybrid_backend(selected_backend_mode):
                                 def _start_observer_with_retries():
                                     retry_delays = [2.0, 3.0, 5.0, 8.0, 12.0, 15.0]
@@ -22782,12 +23393,22 @@ try:
         
         threading.Thread(target=_bg_tasks_worker, daemon=True).start()
 
+    _ROUND_RECT_IMG_CACHE = {}
+    _GRADIENT_PILL_IMG_CACHE = {}
+    _ROUND_OUTLINE_IMG_CACHE = {}
+
     def create_round_rect_img(width, height, radius, color, alpha=255):
         """Генерирует изображение закругленного прямоугольника с поддержкой Alpha-канала"""
         from PIL import Image, ImageDraw, ImageTk, ImageFilter
         width = int(width); height = int(height); radius = int(radius)
-        # Создаем пустое изображение с альфа-каналом
-        img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        key = ("fill", width, height, radius, str(color), int(alpha))
+        cached = _ROUND_RECT_IMG_CACHE.get(key)
+        if cached is not None:
+            return cached
+        scale = 4
+        sw, sh = max(1, width * scale), max(1, height * scale)
+        sradius = max(1, radius * scale)
+        img = Image.new('RGBA', (sw, sh), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         
         # Получаем RGB цвет из Tkinter названия/hex
@@ -22797,8 +23418,15 @@ try:
         else:
             fill_color = (128, 128, 128, alpha)
             
-        draw.rounded_rectangle((0, 0, width, height), radius=radius, fill=fill_color)
-        return ImageTk.PhotoImage(img)
+        draw.rounded_rectangle((0, 0, sw, sh), radius=sradius, fill=fill_color)
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        img = img.resize((width, height), resample)
+        rendered = ImageTk.PhotoImage(img)
+        _ROUND_RECT_IMG_CACHE[key] = rendered
+        return rendered
 
     def get_darker_rgb(color, factor=0.6):
         if not root: return (50, 50, 50)
@@ -22814,10 +23442,23 @@ try:
             return (int(rgb[0]/256), int(rgb[1]/256), int(rgb[2]/256))
         except: return (128, 128, 128)
 
+    def get_lighter_hex(color, factor=0.22):
+        r, g, b = get_rgb(color)
+        r = min(255, int(r + (255 - r) * factor))
+        g = min(255, int(g + (255 - g) * factor))
+        b = min(255, int(b + (255 - b) * factor))
+        return f"#{r:02X}{g:02X}{b:02X}"
+
+    OUTLINE_ACCENT_COLOR = MAIN_COLOR_TEXT_NORMAL
+
     def create_gradient_pill_img(width, height, radius, color_rgb, center_alpha=128):
         blur = 10
         w = int(width) + 2 * blur
         h = int(height) + 2 * blur
+        key = ("grad", int(width), int(height), int(radius), tuple(int(v) for v in color_rgb), int(center_alpha))
+        cached = _GRADIENT_PILL_IMG_CACHE.get(key)
+        if cached is not None:
+            return cached
         
         from PIL import Image, ImageDraw, ImageTk, ImageFilter
         img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
@@ -22825,7 +23466,43 @@ try:
         
         draw.rounded_rectangle((blur, blur, blur+width, blur+height), radius=radius, fill=color_rgb + (center_alpha,))
         img = img.filter(ImageFilter.GaussianBlur(radius=4))
-        return ImageTk.PhotoImage(img)
+        rendered = ImageTk.PhotoImage(img)
+        _GRADIENT_PILL_IMG_CACHE[key] = rendered
+        return rendered
+
+    def create_round_outline_img(width, height, radius, color, thickness=2, alpha=255):
+        from PIL import Image, ImageDraw, ImageTk
+        width = int(width); height = int(height); radius = int(radius); thickness = max(1, int(thickness))
+        key = ("outline", width, height, radius, str(color), thickness, int(alpha))
+        cached = _ROUND_OUTLINE_IMG_CACHE.get(key)
+        if cached is not None:
+            return cached
+        scale = 4
+        sw, sh = max(1, width * scale), max(1, height * scale)
+        sradius = max(1, radius * scale)
+        sthickness = max(1, thickness * scale)
+        img = Image.new('RGBA', (sw, sh), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        if root:
+            rgb = root.winfo_rgb(color)
+            outline_color = (rgb[0]//256, rgb[1]//256, rgb[2]//256, alpha)
+        else:
+            outline_color = (128, 128, 128, alpha)
+        inset = max(scale, sthickness // 2)
+        draw.rounded_rectangle(
+            (inset, inset, max(inset, sw - inset - 1), max(inset, sh - inset - 1)),
+            radius=max(1, sradius - inset),
+            outline=outline_color,
+            width=sthickness,
+        )
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        img = img.resize((width, height), resample)
+        rendered = ImageTk.PhotoImage(img)
+        _ROUND_OUTLINE_IMG_CACHE[key] = rendered
+        return rendered
 
     class RoundedButton:
         def __init__(self, canvas, x, y, width, height, radius, color, text, command=None, fg="#333333"):
@@ -22839,16 +23516,20 @@ try:
             self.radius = radius
             self.x = x
             self.y = y
+            self.base_fg = fg
+            self.hover_fg = fg
+            self.normal_font = ("Segoe UI", 10, "bold")
+            self.hover_font = self.normal_font
             
             self.bg_image = None # Ссылка для предотвращения GC
             self.bg_id = canvas.create_image(x, y, anchor="center")
+            self.outline_image = None
+            self.outline_id = canvas.create_image(x, y, anchor="center", state="hidden")
             self._update_image(color)
             
-            font_spec = ("Segoe UI", 10, "bold")
+            self.text_id = canvas.create_text(x, y, text=text, fill=fg, font=self.normal_font, tags="btn_text")
             
-            self.text_id = canvas.create_text(x, y, text=text, fill=fg, font=font_spec, tags="btn_text")
-            
-            for item in [self.bg_id, self.text_id]:
+            for item in [self.bg_id, self.outline_id, self.text_id]:
                 canvas.tag_bind(item, "<Button-1>", self._on_click)
                 canvas.tag_bind(item, "<Enter>", self._on_enter)
                 canvas.tag_bind(item, "<Leave>", self._on_leave)
@@ -22858,14 +23539,24 @@ try:
             # center_alpha=170 (33% прозрачности)
             self.bg_image = create_gradient_pill_img(self.width, self.height, self.radius, get_rgb(color), center_alpha=170)
             self.canvas.itemconfig(self.bg_id, image=self.bg_image)
+            self.outline_image = create_round_outline_img(self.width, self.height, self.radius, OUTLINE_ACCENT_COLOR, thickness=2, alpha=240)
+            self.canvas.itemconfig(self.outline_id, image=self.outline_image)
+            self.canvas.tag_raise(self.outline_id, self.bg_id)
+            if hasattr(self, "text_id"):
+                self.canvas.tag_raise(self.text_id, self.outline_id)
             
         def _on_click(self, event):
             if self.state_val == "normal" and self.command:
                 self.command()
         def _on_enter(self, event):
-            if self.state_val == "normal": self.canvas.config(cursor="hand2")
+            if self.state_val == "normal":
+                self.canvas.config(cursor="hand2")
+                self.canvas.itemconfig(self.outline_id, state="normal")
+                self.canvas.itemconfig(self.text_id, fill=self.hover_fg, font=self.hover_font)
         def _on_leave(self, event):
             self.canvas.config(cursor="")
+            self.canvas.itemconfig(self.outline_id, state="hidden")
+            self.canvas.itemconfig(self.text_id, fill=self.base_fg, font=self.normal_font)
         def config(self, **kwargs):
             if "text" in kwargs: 
                 self.canvas.itemconfig(self.text_id, text=kwargs["text"])
@@ -23155,17 +23846,46 @@ try:
             self.canvas = canvas
             self.command = command
             self.fg = fg
+            self.hover_fg = get_lighter_hex(fg, 0.28)
             self.bg_color = bg_color
+            self._last_invoke_ts = 0.0
+            self._pressed = False
             self.padding_x = 10
             self.padding_y = 4
-            self.text_id = canvas.create_text(x, y, text=text, font=font, fill=fg, anchor=anchor)
+            self.base_font = tuple(font)
+            font_family = self.base_font[0]
+            font_size = self.base_font[1] if len(self.base_font) > 1 else 9
+            self.hover_font = (font_family, font_size, "bold")
+            self.text_id = canvas.create_text(x, y, text=text, font=self.base_font, fill=fg, anchor=anchor)
             self.bg_id = canvas.create_image(x, y, anchor="center")
+            self.outline_id = canvas.create_image(x, y, anchor="center", state="hidden")
             self.bg_image = None
+            self.outline_image = None
             self._draw_bg()
 
-            self.canvas.tag_bind(self.text_id, "<Button-1>", lambda e: self.command())
-            self.canvas.tag_bind(self.text_id, "<Enter>", lambda e: canvas.config(cursor="hand2"))
-            self.canvas.tag_bind(self.text_id, "<Leave>", lambda e: canvas.config(cursor=""))
+            self.canvas.tag_bind(self.text_id, "<ButtonPress-1>", self._on_press)
+            self.canvas.tag_bind(self.text_id, "<ButtonRelease-1>", self._on_release)
+            self.canvas.tag_bind(self.text_id, "<Enter>", lambda e: self._set_hover(True))
+            self.canvas.tag_bind(self.text_id, "<Leave>", lambda e: self._set_hover(False))
+
+        def _on_press(self, event=None):
+            self._pressed = True
+            return "break"
+
+        def _on_release(self, event=None):
+            if not self._pressed:
+                return "break"
+            self._pressed = False
+            try:
+                now = time.time()
+                if now - float(self._last_invoke_ts or 0.0) < 0.25:
+                    return "break"
+                self._last_invoke_ts = now
+                if callable(self.command):
+                    self.command()
+            except:
+                pass
+            return "break"
             
         def _draw_bg(self):
             bbox = self.canvas.bbox(self.text_id)
@@ -23179,23 +23899,57 @@ try:
             # Генерируем градиентный фон
             bg_source = self.bg_color if self.bg_color is not None else self.fg
             self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(bg_source), center_alpha=128)
+            self.outline_image = create_round_outline_img(max(1, int(w)), max(1, int(h)), max(1, int(r)), OUTLINE_ACCENT_COLOR, thickness=2, alpha=240)
             
             cx = x1 + (x2 - x1) / 2
             cy = y1 + (y2 - y1) / 2
             
             self.canvas.coords(self.bg_id, cx, cy)
             self.canvas.itemconfig(self.bg_id, image=self.bg_image)
+            self.canvas.coords(self.outline_id, cx, cy)
+            self.canvas.itemconfig(self.outline_id, image=self.outline_image)
             self.canvas.tag_lower(self.bg_id, self.text_id)
+            self.canvas.tag_raise(self.outline_id, self.bg_id)
+            self.canvas.tag_raise(self.text_id, self.outline_id)
             
             # Привязываем события к фону
-            self.canvas.tag_bind(self.bg_id, "<Button-1>", lambda e: self.command())
-            self.canvas.tag_bind(self.bg_id, "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
-            self.canvas.tag_bind(self.bg_id, "<Leave>", lambda e: self.canvas.config(cursor=""))
+            self.canvas.tag_bind(self.bg_id, "<ButtonPress-1>", self._on_press)
+            self.canvas.tag_bind(self.bg_id, "<ButtonRelease-1>", self._on_release)
+            self.canvas.tag_bind(self.bg_id, "<Enter>", lambda e: self._set_hover(True))
+            self.canvas.tag_bind(self.bg_id, "<Leave>", lambda e: self._set_hover(False))
+            self.canvas.tag_bind(self.outline_id, "<ButtonPress-1>", self._on_press)
+            self.canvas.tag_bind(self.outline_id, "<ButtonRelease-1>", self._on_release)
+            self.canvas.tag_bind(self.outline_id, "<Enter>", lambda e: self._set_hover(True))
+            self.canvas.tag_bind(self.outline_id, "<Leave>", lambda e: self._set_hover(False))
+
+        def _set_hover(self, hovered):
+            try:
+                self.canvas.config(cursor="hand2" if hovered else "")
+                self.canvas.itemconfig(self.outline_id, state="normal" if hovered else "hidden")
+                self.canvas.itemconfig(
+                    self.text_id,
+                    fill=self.hover_fg if hovered else self.fg,
+                    font=self.hover_font if hovered else self.base_font,
+                )
+            except:
+                pass
 
         def move_to(self, x, y, anchor):
             self.canvas.coords(self.text_id, x, y)
             self.canvas.itemconfig(self.text_id, anchor=anchor)
             self._draw_bg()
+
+        def bbox(self):
+            try:
+                box = self.canvas.bbox(self.bg_id)
+                if box:
+                    return box
+            except:
+                pass
+            try:
+                return self.canvas.bbox(self.text_id)
+            except:
+                return None
 
         def config(self, **kwargs):
             if "text" in kwargs:
@@ -23672,8 +24426,482 @@ try:
         btn_update.bind("<Enter>", lambda e: main_canvas.config(cursor="hand2"))
         btn_update.bind("<Leave>", lambda e: main_canvas.config(cursor=""))
         btn_update.set_visible(False)
-        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9, "bold"), toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
+        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9), toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
+        btn_settings = None
         refresh_update_button()
+
+        routing_settings_window_ref = {
+            "win": None,
+            "last_toggle_ts": 0.0,
+        }
+        globals()["routing_settings_window_ref"] = routing_settings_window_ref
+        routing_group_rows = (
+            ("browser", "Браузеры"),
+            ("telegram", "Telegram"),
+            ("whatsapp", "WhatsApp"),
+            ("discord", "Discord"),
+            ("ide", "IDE"),
+            ("cli", "CLI"),
+        )
+        routing_mode_pill_labels = {
+            "auto": "Auto",
+            "warp": "WARP",
+            "opera": "EU",
+            "direct": "Direct",
+        }
+
+        class PopupPillButton(tk.Canvas):
+            def __init__(self, master, text, command, width=68, height=28):
+                super().__init__(
+                    master,
+                    width=width,
+                    height=height,
+                    bg=SETTINGS_THEME["bg"],
+                    highlightthickness=0,
+                    bd=0,
+                    relief="flat",
+                )
+                self._command = command
+                self._selected = False
+                self._hover = False
+                self._width = int(width)
+                self._height = int(height)
+                self._radius = 11
+                self._base_font = ("Segoe UI", 8)
+                self._hover_font = ("Segoe UI Semibold", 8)
+                self._fill_id = self.create_image(self._width // 2, self._height // 2, anchor="center")
+                self._outline_id = self.create_image(self._width // 2, self._height // 2, anchor="center", state="hidden")
+                self._text_id = self.create_text(self._width // 2, self._height // 2, text=text, font=self._base_font)
+                for item in (self, self._fill_id, self._outline_id, self._text_id):
+                    try:
+                        self.tag_bind(item, "<Enter>", self._on_enter)
+                        self.tag_bind(item, "<Leave>", self._on_leave)
+                        self.tag_bind(item, "<Button-1>", self._on_click)
+                    except:
+                        pass
+                self.bind("<Enter>", self._on_enter)
+                self.bind("<Leave>", self._on_leave)
+                self.bind("<Button-1>", self._on_click)
+                self._render()
+
+            def set_selected(self, selected):
+                self._selected = bool(selected)
+                self._render()
+
+            def _on_enter(self, _event=None):
+                self._hover = True
+                self.configure(cursor="hand2")
+                self._render()
+
+            def _on_leave(self, _event=None):
+                self._hover = False
+                self.configure(cursor="")
+                self._render()
+
+            def _on_click(self, _event=None):
+                if callable(self._command):
+                    self._command()
+
+            def _render(self):
+                bg = SETTINGS_THEME["pill_on_bg"] if self._selected else SETTINGS_THEME["pill_off_bg"]
+                fg = SETTINGS_THEME["pill_on_fg"] if self._selected else SETTINGS_THEME["pill_off_fg"]
+                hover_fg = get_lighter_hex(fg, 0.18)
+                outline_color = OUTLINE_ACCENT_COLOR if self._hover else SETTINGS_THEME["border"]
+                self.itemconfig(
+                    self._fill_id,
+                    image=create_round_rect_img(self._width, self._height, self._radius, bg, alpha=255),
+                )
+                self.itemconfig(
+                    self._outline_id,
+                    image=create_round_outline_img(self._width, self._height, self._radius, outline_color, thickness=2, alpha=245),
+                    state="normal" if (self._hover or self._selected) else "hidden",
+                )
+                self.itemconfig(
+                    self._text_id,
+                    fill=hover_fg if self._hover else fg,
+                    font=self._hover_font if self._hover else self._base_font,
+                )
+
+        def apply_routing_settings_live(payload):
+            saved = save_routing_settings(payload)
+            logger = globals().get("log_print", print)
+            try:
+                os.environ["NOVA_ROUTING_SETTINGS_PATH"] = ROUTING_SETTINGS_PATH
+            except:
+                pass
+            try:
+                pm = globals().get("pac_manager")
+                if pm:
+                    pm.generate_pac()
+                    pm.refresh_system_options()
+            except Exception as e:
+                logger(f"[Routing] Ошибка применения PAC-настроек: {e}")
+            try:
+                refresh_routing_backend_control_plane(force=True)
+            except Exception as e:
+                logger(f"[Routing] Ошибка обновления control plane: {e}")
+            logger(
+                "[Routing] Настройки сохранены: "
+                + ", ".join(
+                    f"{label}={get_routing_group_mode(key, saved)}"
+                    for key, label in routing_group_rows
+                )
+            )
+            return saved
+
+        def _compute_settings_popup_geometry(popup_w, popup_h, forced_main_geom=None, cached_mon_bounds=None):
+            try:
+                if forced_main_geom:
+                    mx, my, mw, mh = forced_main_geom
+                else:
+                    main_geom = root.geometry()
+                    match = re.match(r"(\d+)x(\d+)\+([-\d]+)\+([-\d]+)", main_geom)
+                    if not match:
+                        raise ValueError("main geometry is unavailable")
+                    mw, mh = int(match.group(1)), int(match.group(2))
+                    mx, my = int(match.group(3)), int(match.group(4))
+
+                if cached_mon_bounds:
+                    mon_left, mon_top, mon_right, mon_bottom = cached_mon_bounds
+                else:
+                    mon_left, mon_top, mon_right, mon_bottom = get_monitor_work_area(mx + mw // 2, my + 10)
+
+                existing = routing_settings_window_ref.get("win")
+                current_side = getattr(existing, "current_side", None) if existing and existing.winfo_exists() else None
+                pos_x, pos_y, side = calc_log_window_pos(
+                    mx,
+                    my,
+                    mw,
+                    mh,
+                    int(popup_w),
+                    int(popup_h),
+                    mon_left,
+                    mon_right,
+                    current_side,
+                )
+                if existing and existing.winfo_exists():
+                    existing.current_side = side
+                return int(pos_x), int(pos_y)
+            except:
+                return int(root.winfo_rootx() + root.winfo_width()), int(root.winfo_rooty())
+
+        def _sync_settings_owner(existing):
+            return
+
+        def _raise_settings_window(existing):
+            try:
+                if not existing or not existing.winfo_exists():
+                    return
+                _sync_settings_owner(existing)
+                try:
+                    owner = log_window if (log_window and tk.Toplevel.winfo_exists(log_window) and str(log_window.state()) != "withdrawn") else root
+                    existing.lift(owner)
+                except:
+                    pass
+                existing.lift()
+                try:
+                    existing.attributes("-topmost", True)
+                    existing.after(80, lambda w=existing: w.winfo_exists() and w.attributes("-topmost", False))
+                except:
+                    pass
+            except:
+                pass
+
+        def _align_routing_settings_window_to_main(event=None, forced_main_geom=None, cached_mon_bounds=None):
+            try:
+                existing = routing_settings_window_ref.get("win")
+                if not existing or not existing.winfo_exists() or str(existing.state()) == "withdrawn":
+                    return
+                if event and getattr(event, "widget", None) not in (None, root):
+                    return
+                existing.update_idletasks()
+                popup_w = max(360, existing.winfo_width() or existing.winfo_reqwidth())
+                popup_h = existing.winfo_height() or existing.winfo_reqheight()
+                pos_x, pos_y = _compute_settings_popup_geometry(
+                    popup_w,
+                    popup_h,
+                    forced_main_geom=forced_main_geom,
+                    cached_mon_bounds=cached_mon_bounds,
+                )
+                target_geometry = f"{popup_w}x{popup_h}+{pos_x}+{pos_y}"
+                if existing.geometry() != target_geometry:
+                    existing.geometry(target_geometry)
+                _sync_settings_owner(existing)
+            except:
+                pass
+
+        def _close_routing_settings_window():
+            existing = routing_settings_window_ref.get("win")
+            try:
+                if existing and existing.winfo_exists():
+                    existing.withdraw()
+            except:
+                pass
+
+        def _show_existing_routing_settings_window(existing):
+            try:
+                if not existing or not existing.winfo_exists():
+                    return
+                try:
+                    refresh_state = getattr(existing, "_refresh_state", None)
+                    if callable(refresh_state):
+                        refresh_state()
+                except:
+                    pass
+                popup_w = max(360, existing.winfo_reqwidth())
+                popup_h = existing.winfo_reqheight()
+                pos_x, pos_y = _compute_settings_popup_geometry(popup_w, popup_h)
+                existing.geometry(f"{popup_w}x{popup_h}+{pos_x}+{pos_y}")
+                existing.deiconify()
+                _raise_settings_window(existing)
+            except:
+                pass
+
+        def _show_new_routing_settings_window(win):
+            try:
+                if not win or not win.winfo_exists():
+                    return
+                popup_w = max(360, win.winfo_reqwidth())
+                popup_h = win.winfo_reqheight()
+                pos_x, pos_y = _compute_settings_popup_geometry(popup_w, popup_h)
+                win.geometry(f"{popup_w}x{popup_h}+{pos_x}+{pos_y}")
+                win.deiconify()
+                _raise_settings_window(win)
+            except:
+                pass
+
+        def toggle_routing_settings_window():
+            now_ts = time.time()
+            last_toggle_ts = float(routing_settings_window_ref.get("last_toggle_ts") or 0.0)
+            if now_ts - last_toggle_ts < 0.18:
+                return
+            routing_settings_window_ref["last_toggle_ts"] = now_ts
+            existing = routing_settings_window_ref.get("win")
+            try:
+                if existing and existing.winfo_exists():
+                    if str(existing.state()) != "withdrawn":
+                        _close_routing_settings_window()
+                        return
+                    root.after_idle(lambda w=existing: _show_existing_routing_settings_window(w))
+                    return
+            except:
+                routing_settings_window_ref["win"] = None
+
+            saved = load_routing_settings()
+            current_modes = {
+                key: get_routing_group_mode(key, saved)
+                for key, _label in routing_group_rows
+            }
+            win = tk.Toplevel(root)
+            win.withdraw()
+            routing_settings_window_ref["win"] = win
+            win._nova_raise_above_owner = lambda w=win: _raise_settings_window(w)
+            win.title("Настройки маршрутизации")
+            win.resizable(False, False)
+            win.configure(bg=SETTINGS_THEME["bg"], bd=1, highlightthickness=1, highlightbackground=SETTINGS_THEME["border"])
+            try:
+                apply_window_icon(win)
+            except:
+                pass
+            try:
+                use_dark = 1 if SYSTEM_THEME == "dark" else 0
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(use_dark)), 4)
+            except:
+                pass
+
+            def _close_settings():
+                _close_routing_settings_window()
+
+            win.protocol("WM_DELETE_WINDOW", _close_settings)
+
+            outer = tk.Frame(win, bg=SETTINGS_THEME["bg"], padx=10, pady=10)
+            outer.pack(fill="both", expand=True)
+
+            tk.Label(
+                outer,
+                text="Настройки",
+                font=("Segoe UI", 10),
+                bg=SETTINGS_THEME["bg"],
+                fg=SETTINGS_THEME["text"],
+                anchor="w",
+            ).pack(fill="x", pady=(0, 6))
+
+            pills_by_group = {}
+            autostart_state = {"enabled": bool(get_startup_status_cached()), "dirty": False}
+            autostart_pills = {}
+
+            def _refresh_group_pills(group_key):
+                selected_mode = current_modes.get(group_key, DEFAULT_ROUTING_SETTINGS["routes"].get(group_key, "auto"))
+                for mode_key, btn in pills_by_group.get(group_key, {}).items():
+                    btn.set_selected(mode_key == selected_mode)
+
+            def _set_group_mode(group_key, mode_key):
+                current_modes[group_key] = _normalize_routing_mode(mode_key, DEFAULT_ROUTING_SETTINGS["routes"].get(group_key, "auto"))
+                _refresh_group_pills(group_key)
+
+            for group_key, group_label in routing_group_rows:
+                row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
+                row.pack(fill="x", pady=3)
+                tk.Label(
+                    row,
+                    text=group_label,
+                    width=11,
+                    anchor="w",
+                    bg=SETTINGS_THEME["bg"],
+                    fg=SETTINGS_THEME["text"],
+                    font=("Segoe UI", 9),
+                ).pack(side="left")
+                pill_frame = tk.Frame(row, bg=SETTINGS_THEME["bg"])
+                pill_frame.pack(side="right", fill="x", expand=True)
+                pills_by_group[group_key] = {}
+                for index, mode_key in enumerate(("auto", "warp", "opera", "direct")):
+                    btn = PopupPillButton(
+                        pill_frame,
+                        routing_mode_pill_labels[mode_key],
+                        command=lambda g=group_key, m=mode_key: _set_group_mode(g, m),
+                        width=62,
+                        height=26,
+                    )
+                    btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
+                    pills_by_group[group_key][mode_key] = btn
+                _refresh_group_pills(group_key)
+
+            divider = tk.Frame(outer, bg=SETTINGS_THEME["border"], height=1)
+            divider.pack(fill="x", pady=(8, 6))
+
+            def _refresh_autostart_pills():
+                enabled = bool(autostart_state.get("enabled", False))
+                for mode_key, btn in autostart_pills.items():
+                    btn.set_selected((mode_key == "on" and enabled) or (mode_key == "off" and not enabled))
+
+            def _set_autostart_enabled(enabled):
+                autostart_state["enabled"] = bool(enabled)
+                autostart_state["dirty"] = True
+                _refresh_autostart_pills()
+
+            def _sync_autostart_state(value):
+                if not win.winfo_exists():
+                    return
+                if autostart_state.get("dirty"):
+                    return
+                autostart_state["enabled"] = bool(value)
+                _refresh_autostart_pills()
+
+            autostart_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
+            autostart_row.pack(fill="x", pady=(0, 3))
+            tk.Label(
+                autostart_row,
+                text="Автозапуск",
+                width=11,
+                anchor="w",
+                bg=SETTINGS_THEME["bg"],
+                fg=SETTINGS_THEME["text"],
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+            autostart_pill_frame = tk.Frame(autostart_row, bg=SETTINGS_THEME["bg"])
+            autostart_pill_frame.pack(side="right", fill="x", expand=True)
+            for index, mode_key in enumerate(("on", "off")):
+                btn = PopupPillButton(
+                    autostart_pill_frame,
+                    "Вкл" if mode_key == "on" else "Выкл",
+                    command=lambda enabled=(mode_key == "on"): _set_autostart_enabled(enabled),
+                    width=74,
+                    height=26,
+                )
+                btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
+                autostart_pills[mode_key] = btn
+            _refresh_autostart_pills()
+
+            button_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
+            button_row.pack(fill="x", pady=(8, 0))
+
+            def _save_and_apply():
+                payload = {
+                    "version": CURRENT_VERSION,
+                    "routes": {key: current_modes.get(key, DEFAULT_ROUTING_SETTINGS["routes"].get(key, "auto")) for key, _label in routing_group_rows},
+                }
+                desired_autostart = bool(autostart_state.get("enabled", False))
+                logger = globals().get("log_print", print)
+
+                def _apply_autostart_and_routing():
+                    try:
+                        apply_routing_settings_live(payload)
+                    except Exception as e:
+                        try:
+                            logger(f"[Routing] Ошибка сохранения настроек: {e}")
+                        except:
+                            pass
+                    try:
+                        actual_autostart = bool(get_startup_status())
+                    except:
+                        actual_autostart = bool(get_startup_status_cached())
+                    try:
+                        if actual_autostart != desired_autostart:
+                            toggle_startup(logger)
+                        else:
+                            refresh_autostart_status_async()
+                    except Exception as e:
+                        try:
+                            logger(f"[Routing] Ошибка применения автозапуска: {e}")
+                        except:
+                            pass
+                def _start_apply_thread():
+                    try:
+                        threading.Thread(
+                            target=_apply_autostart_and_routing,
+                            daemon=True,
+                            name="NovaRoutingSettingsApply",
+                        ).start()
+                    except Exception as e:
+                        try:
+                            logger(f"[Routing] Ошибка запуска сохранения настроек: {e}")
+                        except:
+                            pass
+
+                _close_settings()
+                try:
+                    root.after_idle(_start_apply_thread)
+                except:
+                    _start_apply_thread()
+
+            btn_close_popup = PopupPillButton(button_row, "Закрыть", _close_settings, width=74, height=26)
+            btn_close_popup.pack(side="right")
+            btn_save_popup = PopupPillButton(button_row, "Сохранить", _save_and_apply, width=84, height=26)
+            btn_save_popup.set_selected(True)
+            btn_save_popup.pack(side="right", padx=(0, 6))
+
+            def _refresh_popup_state():
+                try:
+                    latest = load_routing_settings()
+                except:
+                    latest = DEFAULT_ROUTING_SETTINGS
+                for key, _label in routing_group_rows:
+                    current_modes[key] = get_routing_group_mode(key, latest)
+                    _refresh_group_pills(key)
+                autostart_state["dirty"] = False
+                autostart_state["enabled"] = bool(get_startup_status_cached())
+                _refresh_autostart_pills()
+                refresh_autostart_status_async(_sync_autostart_state)
+
+            win._refresh_state = _refresh_popup_state
+            _refresh_popup_state()
+
+            win.update_idletasks()
+            root.after_idle(lambda w=win: _show_new_routing_settings_window(w))
+            root.bind("<Configure>", _align_routing_settings_window_to_main, add="+")
+
+        btn_settings = CanvasButton(
+            main_canvas,
+            w - 10,
+            h - 44,
+            "⚙ Настройки",
+            ("Segoe UI", 9),
+            toggle_routing_settings_window,
+            anchor="e",
+            fg=log_fg,
+            bg_color=log_bg,
+        )
 
         INDICATOR_WARP = "#8FD8FF"
         INDICATOR_EU = "#D8B6BF"
@@ -23749,37 +24977,11 @@ try:
 
         refresh_main_connection_indicators()
 
-        # === Autostart Context Menu (Main Window) ===
         main_context_menu = tk.Menu(root, tearoff=0)
-        autostart_var = tk.BooleanVar()
-        
-        def toggle_autostart_main():
-            # Work in background
-            logger = globals().get('log_print', print)
-            threading.Thread(target=toggle_startup, args=(logger,), daemon=True).start()
-            
-        def update_main_autostart_label():
-            # Recreate completely to ensure state is fresh
-            try:
-                # Safer cleanup of menu items
-                last_idx = main_context_menu.index('end')
-                if last_idx is not None:
-                    for i in range(last_idx, -1, -1):
-                        main_context_menu.delete(i)
-            except: pass
-            
-            is_auto = get_startup_status_cached()
-            autostart_var.set(is_auto)
-            refresh_autostart_status_async(lambda value: autostart_var.set(bool(value)))
-            main_context_menu.add_checkbutton(label="Автозапуск Nova", variable=autostart_var, command=toggle_autostart_main)
-            main_context_menu.add_separator()
-            main_context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
+        main_context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
 
         def show_main_context_menu(event):
             try: 
-                # Update label by recreating item
-                update_main_autostart_label()
-                # Using post with return "break" prevents double-triggering from event bubbling
                 main_context_menu.tk_popup(event.x_root, event.y_root)
             except: pass
             finally:

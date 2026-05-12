@@ -1,4 +1,4 @@
-# version: 1.22.4
+# version: 1.23.1
 4pda.to
 alkalimakersuite-pa.clients6.google.com
 analog.com
@@ -6,6 +6,7 @@ anthropic.com
 apihub.googleapis.com
 autodesk.com
 autodesk360.com
+b-cdn.net
 bbci.co.uk
 broadcom.com
 cdn.cookielaw.org
@@ -28,6 +29,7 @@ dreamina.capcut.com
 emergent.sh
 epicgames.com
 etsy.com
+flibusta.is
 g2a.com
 gamsgo.com
 gemini.google
@@ -62,6 +64,7 @@ oaiusercontent.com
 oauth2.googleapis.com
 onlinesim.io
 openai.com
+openrouter.ai
 orbsrv.com
 otzyvmarketing.ru
 paddle.com
@@ -69,8 +72,10 @@ parklogic.com
 people.googleapis.com
 plati.io
 plati.market
+puter.com
 qt.io
 ru-board.com
+rutor.info
 rutracker.org
 rutrk.org
 sagernet.org
@@ -82,7 +87,11 @@ sora.com
 soulmatcher.app
 spotify.com
 spotifycdn.com
+streamx.cash
+stripe.com
+stripe.network
 t.me
+tampermonkey.net
 telegra.ph
 thisismyip.com
 ti.com

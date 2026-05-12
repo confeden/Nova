@@ -1,7 +1,8 @@
-# version: 1.22.4
+# version: 1.23.1
 1337x.to
 1e100cdn.net
 abuseipdb.com
+adguard-mail.com
 adobe.com
 adobe.io
 akamaiedge.net
@@ -16,7 +17,6 @@ arm.com
 arrow.com
 awswaf.com
 azure.com
-b-cdn.net
 bbc-reporting-api.app
 bbc.com
 benchgecko.ai
@@ -59,6 +59,7 @@ discord.com
 discord.gg
 discordapp.com
 dl.sourceforge.net
+dropboxstatic.com
 ecosyste.ms
 edgee.ai
 element.io
@@ -74,7 +75,6 @@ fbsbx.com
 filterblade.xyz
 fitgirl-repacks.site
 flagcdn.com
-flibusta.is
 fontawesome.com
 fsdn.com
 fubgun.com
@@ -129,6 +129,7 @@ ntfy.sh
 nvidia.com
 obmen.one
 on.aws
+onorca.dev
 ookla.com
 optimizely.com
 pacloudflare.com
@@ -137,11 +138,14 @@ perfops.net
 pixelbuilds.org
 play.google.com
 pobb.in
+pocketnet.app
 poedb.tw
 pornolab.net
 proton.me
 proxyliberty.com
 proxynova.com
+puter.chat
+puter.site
 recaptcha.net
 receive-sms.io
 rezka.ag
@@ -149,7 +153,6 @@ romexsoftware.com
 roundproxies.com
 rtrvr.ai
 rustdesk.com
-rutor.info
 rutor.is
 rutracker.cc
 scrcpy.org
@@ -176,7 +179,6 @@ symantecliveupdate.com
 systeminformer.com
 t.co
 tadst.com
-tampermonkey.net
 tapeop.dev
 telegram.org
 telesco.pe
@@ -207,6 +209,8 @@ x.com
 xv-ru.com
 xvideos-cdn.com
 xvideos.com
+z-lib.sk
+z-library.sk
 zendesk.com
 zetflix-online.skin
 zizaran.com

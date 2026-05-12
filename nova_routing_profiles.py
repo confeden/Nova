@@ -57,15 +57,30 @@ def get_default_app_routing_profiles():
             domain_glob_patterns=("whatsapp*.txt",),
             path_markers=("whatsapp", "whatsappdesktop"),
         ),
-        "opencode": AppRoutingProfile(
-            key="opencode",
-            display_name="OpenCode",
+        "ide": AppRoutingProfile(
+            key="ide",
+            display_name="IDE",
             process_names=(
                 "OpenCode.exe", "OpenCode", "opencode.exe", "opencode",
-                "opencode-cli.exe", "opencode-cli",
+                "Code.exe", "code.exe",
+                "Cursor.exe", "cursor.exe",
+                "Windsurf.exe", "windsurf.exe",
+                "Antigravity.exe", "antigravity.exe",
+                "Codex.exe", "codex.exe",
             ),
-            process_path_regex=r"(?i).*[\\/]opencode[\\/].*",
-            path_markers=("opencode",),
+            process_path_regex=r"(?i).*[\\/](opencode|vscode|code|cursor|windsurf|antigravity|codex)[\\/].*",
+            path_markers=("opencode", "vscode", "code.exe", "cursor", "windsurf", "antigravity", "codex"),
+        ),
+        "cli": AppRoutingProfile(
+            key="cli",
+            display_name="CLI",
+            process_names=(
+                "cmd.exe", "powershell.exe", "pwsh.exe",
+                "WindowsTerminal.exe", "windowsterminal.exe",
+                "opencode-cli.exe", "codex-cli.exe", "gemini-cli.exe", "gemini.exe",
+            ),
+            process_path_regex=r"(?i).*[\\/](cmd|powershell|pwsh|windowsterminal|opencode-cli|codex-cli|gemini-cli|gemini)(?:\.exe)?$",
+            path_markers=("cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal", "opencode-cli", "codex-cli", "gemini-cli", "gemini.exe"),
         ),
     }
 
