@@ -297,7 +297,6 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         "--hidden-import=tkinter.messagebox",
         "--hidden-import=tkinter.scrolledtext",
         "--hidden-import=tkinter.font",
-        "--collect-all=tkinter",
         "--collect-data=certifi",
         str(main_script),
     ]
