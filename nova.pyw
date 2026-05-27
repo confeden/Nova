@@ -9935,6 +9935,7 @@ try:
             dialog_last_err = kernel32.GetLastError()
             if dialog_last_err == 183:  # ERROR_ALREADY_EXISTS
                 sys.exit(1)
+            _close_splash()
             temp_root = tk.Tk(); temp_root.withdraw(); temp_root.attributes("-topmost", True)
             if force_instance_mode:
                 msg = "Перезапуск не смог получить mutex экземпляра Nova.\n\nЗавершите зависшие процессы pythonw.exe / Nova.exe и запустите Nova снова."
@@ -24876,9 +24877,9 @@ try:
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Nova.App.Main.1")
         except: pass
 
+        _close_splash()  # Must destroy splash Tk() before creating main Tk()
         root = tk.Tk()
         root.withdraw()
-        _close_splash()  # Splash served its purpose — main window is loading
         root.title(f"Nova v{CURRENT_VERSION}")
         try: apply_window_icon(root)
         except: pass
