@@ -706,11 +706,47 @@ except ImportError as e:
     ctypes.windll.user32.MessageBoxW(0, f"Critical Error: Failed to load Tkinter.\n\n{e}", "Nova Boot Error", 0x10)
     sys.exit(1)
 
+# === SPLASH SCREEN: Immediate visual feedback while loading ===
+_splash_root = None
+_splash_label = None
+try:
+    _splash_root = tk.Tk()
+    _splash_root.overrideredirect(True)
+    _splash_root.attributes("-topmost", True)
+    _splash_root.configure(bg="#1a1a2e")
+    _sw = _splash_root.winfo_screenwidth()
+    _sh = _splash_root.winfo_screenheight()
+    _w, _h = 340, 80
+    _splash_root.geometry(f"{_w}x{_h}+{(_sw-_w)//2}+{(_sh-_h)//2}")
+    _splash_label = tk.Label(
+        _splash_root, text="Nova \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430\u2026",
+        fg="#e0e0e0", bg="#1a1a2e", font=("Segoe UI", 13)
+    )
+    _splash_label.pack(expand=True)
+    _splash_root.update()
+except Exception:
+    if _splash_root:
+        try: _splash_root.destroy()
+        except: pass
+        _splash_root = None
+
+def _close_splash():
+    """Destroy the splash screen (called once the main window is ready)."""
+    global _splash_root, _splash_label
+    if _splash_root:
+        try: _splash_root.destroy()
+        except: pass
+        _splash_root = None
+        _splash_label = None
+
+
 # === CHECK ADMIN PRIVILEGES ===
 def is_admin():
     return is_windows_admin()
 
 if not is_admin():
+    # Close splash before UAC relaunch (this process will exit after elevation)
+    _close_splash()
     # FIX: Check for infinite loop (relaunch flag)
     if "--admin-relaunch" in sys.argv:
         ctypes.windll.user32.MessageBoxW(0, "Не удалось получить права администратора автоматически.\n\nПожалуйста, нажмите правой кнопкой мыши на файл и выберите 'Запуск от имени администратора'.", "Nova - Ошибка прав", 0x10)
@@ -752,6 +788,7 @@ if not is_admin():
             sys.exit(1)
         
         # If success, the new process is starting. We can exit.
+        _close_splash()
         sys.exit(0)
             
     except Exception as e:
@@ -24841,6 +24878,7 @@ try:
 
         root = tk.Tk()
         root.withdraw()
+        _close_splash()  # Splash served its purpose — main window is loading
         root.title(f"Nova v{CURRENT_VERSION}")
         try: apply_window_icon(root)
         except: pass
