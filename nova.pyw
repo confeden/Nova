@@ -202,6 +202,22 @@ from datetime import datetime
 def _bootstrap_tk_runtime_env():
     """Help broken/local Python installs find Tcl/Tk runtime files."""
     try:
+        if getattr(sys, "frozen", False):
+            bundle_dir = os.path.dirname(sys.executable)
+            tcl_dir = os.path.join(bundle_dir, "resources", "tcl_data")
+            tk_dir = os.path.join(bundle_dir, "resources", "tk_data")
+            
+            if not os.path.exists(os.path.join(tcl_dir, "init.tcl")):
+                tcl_dir = os.path.join(bundle_dir, "tcl_data")
+            if not os.path.exists(os.path.join(tk_dir, "tk.tcl")):
+                tk_dir = os.path.join(bundle_dir, "tk_data")
+                
+            if os.path.exists(os.path.join(tcl_dir, "init.tcl")):
+                os.environ["TCL_LIBRARY"] = tcl_dir
+            if os.path.exists(os.path.join(tk_dir, "tk.tcl")):
+                os.environ["TK_LIBRARY"] = tk_dir
+            return
+
         candidate_roots = []
         for raw_root in (
             getattr(sys, "prefix", ""),
