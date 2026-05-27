@@ -89,27 +89,17 @@ logging.basicConfig(level=logging.INFO,
 def _ensure_pip():
     try:
         import pip  # noqa: F401 – just checking availability
-        logging.info("pip already present.")
+        return True
     except Exception:
         logging.warning("pip not found – attempting to install via ensurepip.")
         try:
             import ensurepip
             ensurepip.bootstrap()
             logging.info("ensurepip completed, pip installed.")
+            return True
         except Exception as exc:  # pragma: no cover
             logging.exception("Failed to install pip via ensurepip.")
             return False
-    # Upgrade pip to a recent version (helps avoid strange errors)
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
-                       timeout=30)
-        logging.info("pip upgraded (if needed).")
-    except subprocess.TimeoutExpired:
-        logging.warning("pip upgrade timed out (30s) – skipping, not critical.")
-    except Exception as exc:  # pragma: no cover
-        logging.warning("Failed to upgrade pip – skipping, not critical.")
-    return True
 
 # -----------------------------------------------------------------
 # 2) After pip is guaranteed, check other third‑party dependencies
@@ -122,9 +112,22 @@ _REQUIRED = [
     ("cryptography", "cryptography"),
 ]
 
+_pip_upgraded = False
+
 def _install(pkg_name: str) -> bool:
     """Install *pkg_name* using the same interpreter that runs this script.
     Returns ``True`` on success, ``False`` otherwise."""
+    global _pip_upgraded
+    # One-time pip upgrade before the first actual install
+    if not _pip_upgraded:
+        _pip_upgraded = True
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                check=False, timeout=30)
+        except Exception:
+            pass  # best-effort, not critical
     try:
         logging.info("Installing %s…", pkg_name)
         result = subprocess.run(
