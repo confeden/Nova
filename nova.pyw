@@ -102,12 +102,14 @@ def _ensure_pip():
     # Upgrade pip to a recent version (helps avoid strange errors)
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+                       timeout=30)
         logging.info("pip upgraded (if needed).")
-        return True
+    except subprocess.TimeoutExpired:
+        logging.warning("pip upgrade timed out (30s) – skipping, not critical.")
     except Exception as exc:  # pragma: no cover
-        logging.exception("Failed to upgrade pip.")
-        return False
+        logging.warning("Failed to upgrade pip – skipping, not critical.")
+    return True
 
 # -----------------------------------------------------------------
 # 2) After pip is guaranteed, check other third‑party dependencies
@@ -127,7 +129,8 @@ def _install(pkg_name: str) -> bool:
         logging.info("Installing %s…", pkg_name)
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", pkg_name, "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
+            timeout=60)
         if result.returncode != 0:
             logging.error("pip returned code %s: %s", result.returncode, result.stdout)
             return False
