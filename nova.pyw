@@ -8,6 +8,170 @@
 # or other electronic or mechanical methods, without the prior written
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+# ------------------------------------------------------------
+# Auto‑install required third‑party packages if they are missing.
+# This runs before any other imports, so the script can recover
+# from a fresh Windows installation where the environment is empty.
+import subprocess, sys, importlib, logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+_REQUIRED = [
+    ("requests", "requests"),
+    ("urllib3", "urllib3"),
+    ("PIL", "Pillow"),
+    ("pystray", "pystray"),
+    ("cryptography", "cryptography"),
+]
+
+def _install(pkg_name: str) -> bool:
+    """Install *pkg_name* using the same interpreter that runs this script.
+    Returns ``True`` on success, ``False`` otherwise."""
+    try:
+        logging.info("Installing %s…", pkg_name)
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", pkg_name, "--quiet"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if result.returncode != 0:
+            logging.error("pip failed (code %s): %s", result.returncode, result.stdout)
+            return False
+        logging.info("%s installed successfully.", pkg_name)
+        return True
+    except Exception as exc:  # pragma: no cover
+        logging.exception("Unexpected error while installing %s", pkg_name)
+        return False
+
+def _ensure_dependencies() -> None:
+    missing = []
+    for import_name, package_name in _REQUIRED:
+        try:
+            importlib.import_module(import_name)
+        except Exception:
+            missing.append((import_name, package_name))
+    if not missing:
+        return
+    logging.warning("Missing dependencies: %s", ", ".join(p for _, p in missing))
+    for import_name, package_name in missing:
+        if _install(package_name):
+            try:
+                importlib.import_module(import_name)
+            except Exception as exc:
+                logging.error("%s installed but cannot be imported: %s", package_name, exc)
+        else:
+            logging.error("Failed to install %s", package_name)
+    # Final check – abort if something is still unavailable.
+    for import_name, _ in missing:
+        try:
+            importlib.import_module(import_name)
+        except Exception:
+            sys.exit(f"Critical: required module '{import_name}' is still missing. Install it manually and restart.")
+
+if False:
+    _ensure_dependencies()
+
+# ------------------------------------------------------------
+# Original imports continue below
+# -*- coding: utf-8 -*-
+# ------------------------------------------------------------
+# Auto‑install required third‑party packages if they are missing.
+# Works even when the Python installation does not have pip yet.
+# ------------------------------------------------------------
+import subprocess, sys, importlib, logging, os
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+
+# -----------------------------------------------------------------
+# 1) Ensure that the *pip* module exists (some Python builds skip it)
+# -----------------------------------------------------------------
+def _ensure_pip():
+    try:
+        import pip  # noqa: F401 – just checking availability
+        logging.info("pip already present.")
+    except Exception:
+        logging.warning("pip not found – attempting to install via ensurepip.")
+        try:
+            import ensurepip
+            ensurepip.bootstrap()
+            logging.info("ensurepip completed, pip installed.")
+        except Exception as exc:  # pragma: no cover
+            logging.exception("Failed to install pip via ensurepip.")
+            return False
+    # Upgrade pip to a recent version (helps avoid strange errors)
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+        logging.info("pip upgraded (if needed).")
+        return True
+    except Exception as exc:  # pragma: no cover
+        logging.exception("Failed to upgrade pip.")
+        return False
+
+# -----------------------------------------------------------------
+# 2) After pip is guaranteed, check other third‑party dependencies
+# -----------------------------------------------------------------
+_REQUIRED = [
+    ("requests", "requests"),
+    ("urllib3", "urllib3"),
+    ("PIL", "Pillow"),
+    ("pystray", "pystray"),
+    ("cryptography", "cryptography"),
+]
+
+def _install(pkg_name: str) -> bool:
+    """Install *pkg_name* using the same interpreter that runs this script.
+    Returns ``True`` on success, ``False`` otherwise."""
+    try:
+        logging.info("Installing %s…", pkg_name)
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", pkg_name, "--quiet"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+        if result.returncode != 0:
+            logging.error("pip returned code %s: %s", result.returncode, result.stdout)
+            return False
+        logging.info("%s installed.", pkg_name)
+        return True
+    except Exception as exc:  # pragma: no cover
+        logging.exception("Unexpected error while installing %s", pkg_name)
+        return False
+
+def _ensure_dependencies() -> None:
+    missing = []
+    for import_name, package_name in _REQUIRED:
+        try:
+            importlib.import_module(import_name)
+        except Exception:
+            missing.append((import_name, package_name))
+    if not missing:
+        return
+    logging.warning("Missing dependencies: %s", ", ".join(p for _, p in missing))
+    for import_name, package_name in missing:
+        if _install(package_name):
+            try:
+                importlib.import_module(import_name)
+            except Exception as exc:
+                logging.error("%s installed but cannot be imported: %s", package_name, exc)
+        else:
+            logging.error("Failed to install %s", package_name)
+    # Final check – abort if something still unavailable.
+    for import_name, _ in missing:
+        try:
+            importlib.import_module(import_name)
+        except Exception:
+            sys.exit(f"Critical: required module '{import_name}' is still missing. Install it manually and restart.")
+
+# ------------------------------------------------------------
+# Run environment preparation
+# ------------------------------------------------------------
+if not _ensure_pip():
+    sys.exit("Unable to install pip – script cannot continue.")
+_ensure_dependencies()
+
+# ------------------------------------------------------------
+# Original imports continue below
+# ------------------------------------------------------------
 import sys
 import os
 import io
@@ -26,6 +190,72 @@ import collections
 import json
 import socket
 from datetime import datetime
+
+
+def _bootstrap_tk_runtime_env():
+    """Help broken/local Python installs find Tcl/Tk runtime files."""
+    try:
+        candidate_roots = []
+        for raw_root in (
+            getattr(sys, "prefix", ""),
+            getattr(sys, "base_prefix", ""),
+            os.path.dirname(os.path.abspath(getattr(sys, "executable", "") or "")),
+            os.path.dirname(os.path.dirname(os.path.abspath(getattr(sys, "executable", "") or ""))),
+        ):
+            root = str(raw_root or "").strip()
+            if root:
+                candidate_roots.append(root)
+
+        local_python_root = os.path.join(
+            os.path.expanduser("~"),
+            "AppData",
+            "Local",
+            "Programs",
+            "Python",
+        )
+        if os.path.isdir(local_python_root):
+            for entry in os.listdir(local_python_root):
+                full_path = os.path.join(local_python_root, entry)
+                if os.path.isdir(full_path):
+                    candidate_roots.append(full_path)
+
+        seen = set()
+        tcl_dir = ""
+        tk_dir = ""
+        for raw_root in candidate_roots:
+            root = os.path.abspath(raw_root)
+            norm = os.path.normcase(root)
+            if norm in seen:
+                continue
+            seen.add(norm)
+
+            maybe_tcl = os.path.join(root, "tcl", "tcl8.6")
+            maybe_tk = os.path.join(root, "tcl", "tk8.6")
+
+            if not tcl_dir and os.path.exists(os.path.join(maybe_tcl, "init.tcl")):
+                tcl_dir = maybe_tcl
+            if not tk_dir and os.path.exists(os.path.join(maybe_tk, "tk.tcl")):
+                tk_dir = maybe_tk
+
+            if tcl_dir and tk_dir:
+                break
+
+        if tcl_dir and (
+            not os.environ.get("TCL_LIBRARY")
+            or not os.path.exists(os.path.join(os.environ.get("TCL_LIBRARY", ""), "init.tcl"))
+        ):
+            os.environ["TCL_LIBRARY"] = tcl_dir
+        if tk_dir and (
+            not os.environ.get("TK_LIBRARY")
+            or not os.path.exists(os.path.join(os.environ.get("TK_LIBRARY", ""), "tk.tcl"))
+        ):
+            os.environ["TK_LIBRARY"] = tk_dir
+    except Exception:
+        pass
+
+
+_bootstrap_tk_runtime_env()
+
 from nova_console_logging import (
     SessionConsoleLogWriter,
     format_session_console_log_lines,
@@ -4221,6 +4451,7 @@ try:
             self._last_proxy_diag_state = None
             self._winhttp_backup_dump = None
             self._winhttp_proxy_applied = False
+            self._system_pac_enabled = False
             # WinHTTP override can break some desktop apps; keep opt-in.
             try:
                 self._sync_winhttp_proxy = str(os.environ.get("NOVA_SYNC_WINHTTP_PROXY", "0")).strip().lower() in ("1", "true", "yes", "on")
@@ -4745,7 +4976,6 @@ try:
     
     if (matchDomain(user_ru, host)) return "{ru_route}";
     if (matchDomain(user_eu, host)) return "{eu_route}";
-    if (!isIpV4 && !isIpV6 && anyIpMatches(resolveHostIps(host), cloudflare_ips)) return "{ru_route}";
     if (matchDomain(exclude, host)) return "DIRECT";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
@@ -4753,6 +4983,9 @@ try:
     if (matchDomain(whatsapp, host)) return "{whatsapp_route}";
     if (matchDomain(ide, host)) return "{ide_route}";
     if (matchDomain(eu, host)) return "{eu_route}";
+    // Cloudflare IP routing is a fallback for unknown domains only.
+    // Explicit domain lists above must keep their selected geography.
+    if (!isIpV4 && !isIpV6 && anyIpMatches(resolveHostIps(host), cloudflare_ips)) return "{ru_route}";
     
     return "DIRECT";
 }}
@@ -5015,6 +5248,7 @@ try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE)
                 pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac"
                 winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                self._system_pac_enabled = True
                 # Keep system switches explicitly enabled for PAC scenarios.
                 # Some Windows builds ignore AutoConfigURL when AutoDetect is off.
                 try:
@@ -5118,6 +5352,7 @@ try:
                     pass
                 
                 winreg.CloseKey(key)
+                self._system_pac_enabled = False
                 self.refresh_system_options()
                 self._restore_winhttp_proxy()
                 self.log_func("[System] Настройки прокси восстановлены.")
@@ -5129,15 +5364,24 @@ try:
                 import winreg
                 key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE)
-                # Refresh PAC cache-busting token only when Nova PAC is already active.
-                # Never recreate AutoConfigURL after it was intentionally removed.
+                # Refresh PAC cache-busting token. If Nova is active and owns PAC
+                # routing, recreate AutoConfigURL when Windows/browser cleanup has
+                # removed it; otherwise browsers silently bypass PAC rules.
                 try:
                     current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
                     if isinstance(current_pac, str) and "nova.pac" in current_pac.lower():
                         pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
                         winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                    elif self._system_pac_enabled and not is_closing and bool(globals().get("is_service_active", False)):
+                        pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
+                        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
                 except FileNotFoundError:
-                    pass
+                    try:
+                        if self._system_pac_enabled and not is_closing and bool(globals().get("is_service_active", False)):
+                            pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
+                            winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                    except:
+                        pass
                 except:
                     pass
                 winreg.CloseKey(key)
@@ -5187,7 +5431,7 @@ try:
         def __init__(self, log_func=None, port=1371, country="EU"):
             self.log_func = log_func or print
             self.port = port
-            self.country = country
+            self.country = str(country or "EU").strip().upper() or "EU"
             self.process = None
             self.f_log = None
             self.owns_process = False
@@ -5200,6 +5444,15 @@ try:
             self._start_lock = threading.Lock()
             self._start_in_progress = False
             self.endpoint_cache_file = os.path.join(get_base_dir(), "temp", "opera_endpoint_cache.json")
+            self._current_attempt_mode = ""
+            self._current_bootstrap_proxy = ""
+            self._current_override_endpoint = ""
+
+        def configure_country(self, country):
+            try:
+                self.country = str(country or "EU").strip().upper() or "EU"
+            except:
+                self.country = "EU"
 
         def _is_port_open_local(self):
             try:
@@ -5276,6 +5529,29 @@ try:
             except:
                 return None
 
+        def _ensure_cached_endpoint_persisted(self, wait_timeout=0.0):
+            """Persist the last selected Opera endpoint once it appears in the log."""
+            try:
+                if self._load_cached_endpoint():
+                    return True
+            except:
+                pass
+            deadline = time.time() + max(0.0, float(wait_timeout or 0.0))
+            endpoint = None
+            while True:
+                endpoint = self._extract_last_selected_endpoint()
+                if endpoint:
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.15)
+            if endpoint:
+                self._save_cached_endpoint(endpoint)
+                if IS_DEBUG_MODE:
+                    self.log_func(f"[EU] [Diag] Сохранён endpoint в кэш: {endpoint}.")
+                return True
+            return False
+
         def _get_warp_bootstrap_proxy(self):
             """Prefer routing Opera bootstrap through local WARP when it is truly ready."""
             try:
@@ -5302,15 +5578,17 @@ try:
                 port_alive = self._is_port_open_local()
                 proxy_alive = self._is_http_proxy_alive() if port_alive else False
                 state = bool(port_alive and proxy_alive)
-                if (not force) and self._last_pac_sync_state is not None and state == self._last_pac_sync_state:
+                state_changed = self._last_pac_sync_state is None or state != self._last_pac_sync_state
+                if (not force) and not state_changed:
                     return
                 self._last_pac_sync_state = state
                 pm = globals().get("pac_manager")
                 if pm:
                     pm.generate_pac()
                     pm.refresh_system_options()
-                    state_text = "доступен" if state else "недоступен"
-                    self.log_func(f"[PAC] Обновлен: порт {self.port} {state_text}.")
+                    if state_changed:
+                        state_text = "доступен" if state else "недоступен"
+                        self.log_func(f"[PAC] Обновлен: порт {self.port} {state_text}.")
             except Exception as e:
                 safe_trace(f"[EU] PAC sync error: {e}")
         
@@ -5348,6 +5626,9 @@ try:
                 self.owns_process = False
                 self._startup_grace_deadline = 0.0
                 self._started_at_ts = 0.0
+                self._current_attempt_mode = ""
+                self._current_bootstrap_proxy = ""
+                self._current_override_endpoint = ""
                 _close_log_handle()
 
             try:
@@ -5367,18 +5648,57 @@ try:
                     now_ts = time.time()
                     in_grace = bool(self._startup_grace_deadline and now_ts < self._startup_grace_deadline)
                     if in_grace:
-                        # Keep process alive during bootstrap; health may be unavailable while registration retries.
-                        self.using_external = False
-                        self.owns_process = True
-                        self._sync_pac_state(force=True)
-                        return
+                        # Upgrade a stuck direct-discover start to WARP bootstrap once WARP becomes ready.
+                        try:
+                            proc_age = (now_ts - float(self._started_at_ts or now_ts)) if self._started_at_ts else 0.0
+                            warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                            direct_discover_stuck = bool(
+                                not port_alive
+                                and str(getattr(self, "_current_attempt_mode", "") or "").strip().lower() == "discover"
+                                and not str(getattr(self, "_current_bootstrap_proxy", "") or "").strip()
+                                and not str(getattr(self, "_current_override_endpoint", "") or "").strip()
+                                and warp_bootstrap_proxy
+                                and proc_age >= 18.0
+                            )
+                            if direct_discover_stuck:
+                                _terminate_managed_process("[EU] [Diag] Direct discover застрял до готовности 1371. Перезапуск через WARP bootstrap...")
+                            else:
+                                # Keep process alive during bootstrap; health may be unavailable while registration retries.
+                                self.using_external = False
+                                self.owns_process = True
+                                self._sync_pac_state(force=True)
+                                return
+                        except:
+                            self.using_external = False
+                            self.owns_process = True
+                            self._sync_pac_state(force=True)
+                            return
                     # Even after grace, do not kill an active process while it keeps progressing in log.
                     # discover/registration retries can legitimately exceed initial grace on bad routes.
                     if self._has_recent_log_activity(max_age_sec=60):
-                        self.using_external = False
-                        self.owns_process = True
-                        self._sync_pac_state(force=True)
-                        return
+                        try:
+                            proc_age = (now_ts - float(self._started_at_ts or now_ts)) if self._started_at_ts else 0.0
+                            warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                            direct_discover_stuck = bool(
+                                not port_alive
+                                and str(getattr(self, "_current_attempt_mode", "") or "").strip().lower() == "discover"
+                                and not str(getattr(self, "_current_bootstrap_proxy", "") or "").strip()
+                                and not str(getattr(self, "_current_override_endpoint", "") or "").strip()
+                                and warp_bootstrap_proxy
+                                and proc_age >= 18.0
+                            )
+                            if direct_discover_stuck:
+                                _terminate_managed_process("[EU] [Diag] Direct discover завис при готовом WARP. Перезапуск через WARP bootstrap...")
+                            else:
+                                self.using_external = False
+                                self.owns_process = True
+                                self._sync_pac_state(force=True)
+                                return
+                        except:
+                            self.using_external = False
+                            self.owns_process = True
+                            self._sync_pac_state(force=True)
+                            return
                     _terminate_managed_process("[EU] Обнаружен зависший локальный proxy. Перезапуск...")
                 elif self.process and self.process.poll() is not None:
                     self.process = None
@@ -5461,7 +5781,10 @@ try:
                     cmd = [
                         self.exe_path,
                         "-bind-address", f"127.0.0.1:{self.port}",
-                        "-country", self.country
+                        "-country", self.country,
+                        # Keep 1371 startup independent from the public benchmark URL
+                        # used by opera-proxy's default fastest selector.
+                        "-server-selection", "first",
                     ]
                     if base_proxy:
                         cmd.extend(["-proxy", base_proxy, "-api-proxy", base_proxy])
@@ -5470,6 +5793,9 @@ try:
                     if override_endpoint:
                         cmd.extend(["-override-proxy-address", override_endpoint])
                         self.log_func(f"[EU] [Diag] Пробуем кэшированный endpoint {override_endpoint}.")
+                    self._current_attempt_mode = str(attempt_mode or "")
+                    self._current_bootstrap_proxy = str(base_proxy or "")
+                    self._current_override_endpoint = str(override_endpoint or "")
 
                     _close_log_handle()
                     self.f_log = open(self.log_file, "w")
@@ -5499,7 +5825,14 @@ try:
                         time.sleep(0.4)
 
                     if ready:
-                        selected_endpoint = self._extract_last_selected_endpoint() or override_endpoint
+                        selected_endpoint = None
+                        try:
+                            self._ensure_cached_endpoint_persisted(wait_timeout=1.2)
+                            selected_endpoint = self._load_cached_endpoint()
+                        except:
+                            selected_endpoint = None
+                        if not selected_endpoint:
+                            selected_endpoint = self._extract_last_selected_endpoint() or override_endpoint
                         if selected_endpoint:
                             self._save_cached_endpoint(selected_endpoint)
                         if IS_DEBUG_MODE:
@@ -5577,6 +5910,9 @@ try:
                 self.owns_process = False
                 self._startup_grace_deadline = 0.0
                 self._started_at_ts = 0.0
+                self._current_attempt_mode = ""
+                self._current_bootstrap_proxy = ""
+                self._current_override_endpoint = ""
                 if IS_DEBUG_MODE: self.log_func("[EU] Остановлен.")
 
             # Failsafe cleanup for orphaned proxy processes.
@@ -5622,6 +5958,7 @@ try:
             self._health_log_ts = 0.0
             self._health_probe_failures = 0
             self._runtime_adaptation_started = False
+            self._last_bootstrap_wait_log_ts = 0.0
 
         def _build_upstream_attempts(self):
             try:
@@ -5878,7 +6215,10 @@ try:
                     if _warp_transport_ready():
                         waited = time.monotonic() - started_wait
                         if waited >= 0.15:
-                            self.log_func(f"{self.log_prefix} Telegram bootstrap дождался WARP/SOCKS: {waited:.2f}s.")
+                            now_ts = time.monotonic()
+                            if (now_ts - float(self._last_bootstrap_wait_log_ts or 0.0)) >= 12.0:
+                                self._last_bootstrap_wait_log_ts = now_ts
+                                self.log_func(f"{self.log_prefix} Telegram bootstrap дождался WARP/SOCKS: {waited:.2f}s.")
                         return waited
                 except Exception:
                     break
@@ -6897,6 +7237,13 @@ try:
                 requested_mode = str((get_selected_routing_backend_info() or {}).get("mode") or get_selected_routing_backend_mode())
                 auto_mode = is_auto_routing_backend(requested_mode)
                 state = query_state() or {}
+                if _windivert_repair_succeeded_recently() and (
+                    state.get("disabled")
+                    or state.get("pending_delete")
+                    or state.get("missing")
+                ):
+                    time.sleep(0.8)
+                    state = query_state() or {}
                 needs_repair = bool(
                     state.get("disabled")
                     or state.get("pending_delete")
@@ -6948,7 +7295,10 @@ try:
                 )
                 if callable(repair_driver) and needs_destructive_repair:
                     with contextlib.suppress(Exception):
-                        repair_driver(self.log_func, exit_code=34)
+                        repair_driver(
+                            self.log_func,
+                            exit_code=1060 if state.get("missing") and not state.get("pending_delete") else 34,
+                        )
 
                 post_state = query_state() or {}
                 post_reasons = []
@@ -8997,9 +9347,11 @@ try:
             os.replace(temp_path, filepath)
         except: pass
 
-    ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
+    ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
+    LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
     ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli")
     ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
+    OPERA_REGION_VALUES = {"EU", "US"}
     ROUTING_GROUP_ALIASES = {
         "browser": "browser",
         "telegram": "telegram",
@@ -9020,6 +9372,7 @@ try:
     }
     DEFAULT_ROUTING_SETTINGS = {
         "version": CURRENT_VERSION,
+        "opera_region": "EU",
         "routes": {
             "browser": "auto",
             "telegram": "warp",
@@ -9027,6 +9380,10 @@ try:
             "discord": "warp",
             "ide": "direct",
             "cli": "direct",
+        },
+        "system": {
+            "suppress_game_overlay": False,
+            "game_dvr_capture_backup": None,
         },
     }
 
@@ -9048,14 +9405,32 @@ try:
             return _normalize_routing_mode(full_target or "warp", "warp")
         return "auto"
 
+    def _normalize_opera_region(value, default_value="EU"):
+        region = str(value or "").strip().upper()
+        if region not in OPERA_REGION_VALUES:
+            region = str(default_value or "EU").strip().upper()
+        if region not in OPERA_REGION_VALUES:
+            region = "EU"
+        return region
+
+    def _opera_region_to_country(region):
+        normalized = _normalize_opera_region(region, "EU")
+        return "AM" if normalized == "US" else "EU"
+
     def normalize_routing_settings(data):
         normalized = {
             "version": CURRENT_VERSION,
+            "opera_region": DEFAULT_ROUTING_SETTINGS["opera_region"],
             "routes": dict(DEFAULT_ROUTING_SETTINGS["routes"]),
+            "system": dict(DEFAULT_ROUTING_SETTINGS["system"]),
         }
         try:
             if not isinstance(data, dict):
                 return normalized
+            normalized["opera_region"] = _normalize_opera_region(
+                data.get("opera_region", data.get("opera_country", data.get("country"))),
+                normalized["opera_region"],
+            )
             routes = data.get("routes") or {}
             if isinstance(routes, dict):
                 for route_key in ROUTING_GROUP_KEYS:
@@ -9086,17 +9461,127 @@ try:
                         data["routes"].get(alias_key),
                         normalized["routes"][route_key],
                     )
+            system_payload = data.get("system") or {}
+            if isinstance(system_payload, dict):
+                normalized["system"]["suppress_game_overlay"] = bool(
+                    system_payload.get("suppress_game_overlay", normalized["system"]["suppress_game_overlay"])
+                )
+                backup = system_payload.get("game_dvr_capture_backup")
+                if isinstance(backup, dict) and isinstance(backup.get("exists"), bool):
+                    normalized["system"]["game_dvr_capture_backup"] = {
+                        "exists": bool(backup.get("exists")),
+                        "value": backup.get("value"),
+                        "type": int(backup.get("type", winreg.REG_DWORD)),
+                    }
         except:
             pass
         return normalized
 
     def load_routing_settings():
-        return normalize_routing_settings(load_json_robust(ROUTING_SETTINGS_PATH, DEFAULT_ROUTING_SETTINGS))
+        payload = load_json_robust(ROUTING_SETTINGS_PATH, None)
+        if isinstance(payload, dict) and payload:
+            return normalize_routing_settings(payload)
+        legacy_payload = load_json_robust(LEGACY_ROUTING_SETTINGS_PATH, None)
+        if isinstance(legacy_payload, dict) and legacy_payload:
+            normalized = normalize_routing_settings(legacy_payload)
+            with contextlib.suppress(Exception):
+                save_json_safe(ROUTING_SETTINGS_PATH, normalized)
+            return normalized
+        return normalize_routing_settings(DEFAULT_ROUTING_SETTINGS)
 
     def save_routing_settings(data):
         payload = normalize_routing_settings(data)
         save_json_safe(ROUTING_SETTINGS_PATH, payload)
+        # Redirect helpers run outside the GUI module and still read the
+        # runtime copy from temp. Keep it in sync with the durable settings.
+        save_json_safe(LEGACY_ROUTING_SETTINGS_PATH, payload)
         return payload
+
+    GAME_DVR_REG_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR"
+    GAME_DVR_CAPTURE_VALUE = "AppCaptureEnabled"
+
+    def _read_game_dvr_capture_registry():
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, GAME_DVR_REG_PATH, 0, winreg.KEY_READ)
+        except FileNotFoundError:
+            return {"exists": False, "value": None, "type": winreg.REG_DWORD}
+        try:
+            value, value_type = winreg.QueryValueEx(key, GAME_DVR_CAPTURE_VALUE)
+            return {"exists": True, "value": value, "type": int(value_type)}
+        except FileNotFoundError:
+            return {"exists": False, "value": None, "type": winreg.REG_DWORD}
+        finally:
+            with contextlib.suppress(Exception):
+                winreg.CloseKey(key)
+
+    def _set_game_dvr_capture_registry(value, value_type=winreg.REG_DWORD):
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            GAME_DVR_REG_PATH,
+            0,
+            winreg.KEY_SET_VALUE,
+        )
+        try:
+            winreg.SetValueEx(key, GAME_DVR_CAPTURE_VALUE, 0, int(value_type), value)
+        finally:
+            with contextlib.suppress(Exception):
+                winreg.CloseKey(key)
+
+    def _delete_game_dvr_capture_registry():
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, GAME_DVR_REG_PATH, 0, winreg.KEY_SET_VALUE)
+        except FileNotFoundError:
+            return
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                winreg.DeleteValue(key, GAME_DVR_CAPTURE_VALUE)
+        finally:
+            with contextlib.suppress(Exception):
+                winreg.CloseKey(key)
+
+    def apply_game_overlay_suppression(enabled, log_func=None):
+        logger = log_func if callable(log_func) else print
+        settings = load_routing_settings()
+        system_payload = dict(settings.get("system") or {})
+        backup = system_payload.get("game_dvr_capture_backup")
+        try:
+            if enabled:
+                if not isinstance(backup, dict):
+                    backup = _read_game_dvr_capture_registry()
+                _set_game_dvr_capture_registry(0, winreg.REG_DWORD)
+                system_payload["suppress_game_overlay"] = True
+                system_payload["game_dvr_capture_backup"] = backup
+                settings["system"] = system_payload
+                save_routing_settings(settings)
+                logger("[System] Ложный вызов Xbox Game Bar подавлен.")
+                return True
+
+            if isinstance(backup, dict) and backup.get("exists"):
+                _set_game_dvr_capture_registry(
+                    backup.get("value"),
+                    int(backup.get("type", winreg.REG_DWORD)),
+                )
+            elif isinstance(backup, dict):
+                _delete_game_dvr_capture_registry()
+            system_payload["suppress_game_overlay"] = False
+            system_payload["game_dvr_capture_backup"] = None
+            settings["system"] = system_payload
+            save_routing_settings(settings)
+            logger("[System] Настройка Xbox Game Bar восстановлена.")
+            return True
+        except Exception as e:
+            logger(f"[System] Ошибка изменения Xbox Game Bar: {e}")
+            return False
+
+    def get_routing_opera_region(settings=None):
+        payload = settings if isinstance(settings, dict) else load_routing_settings()
+        return _normalize_opera_region(
+            payload.get("opera_region"),
+            DEFAULT_ROUTING_SETTINGS.get("opera_region", "EU"),
+        )
+
+    def get_routing_opera_country(settings=None):
+        return _opera_region_to_country(get_routing_opera_region(settings))
 
     def get_routing_app_mode(app_key, settings=None):
         key = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
@@ -10010,7 +10495,7 @@ try:
             "text": "#0E5F21",
             "button": "#000000",
             "button_hover": "#111111",
-            "button_fg": "#315A39",
+            "button_fg": COLOR_BLUEBERRY_YOGURT,
             "button_hover_fg": "#17351E",
             "grip": "#82A28A",
         }
@@ -12036,10 +12521,6 @@ try:
                 own_tunnel_markers = [
                     "cloudflare",
                     "warp",
-                    "wireguard",
-                    "wintun",
-                    "amnezia",
-                    "happ-tun",
                 ]
                 return any(marker in combined_text for marker in own_tunnel_markers)
 
@@ -12310,26 +12791,62 @@ try:
         except:
             return False
 
+    WINWS_LOCAL_IPV4_BYPASS_CIDRS = (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    )
+
+    def _winws_ipv4_not_in_net_clause(cidr):
+        try:
+            import ipaddress
+            net = ipaddress.ip_network(str(cidr), strict=False)
+            if net.version != 4:
+                return ""
+            # WinDivert filter language accepts IPv4 literals but not CIDR
+            # literals in comparisons, so render CIDR exclusion as a range.
+            return f"(ip.DstAddr < {net.network_address} or ip.DstAddr > {net.broadcast_address})"
+        except:
+            return ""
+
     def get_loopback_bypass_clause():
         """
-        Extra guard for localhost IPC traffic.
-        Disabled by default for maximum WinWS compatibility (some builds fail with code 87).
-        Enable manually via NOVA_WINWS_LOOPBACK_BYPASS=1 if you explicitly need localhost bypass.
-        IPv6 localhost clause is opt-in because some WinWS builds fail with code 87.
+        Extra guard for local/private traffic.
+        Nova must never apply WinWS strategies to local IPC/LAN traffic. Keep this
+        enabled by default; strict WinWS fallback below can strip it if a build
+        rejects the raw filter syntax.
         """
         try:
-            enabled = str(os.environ.get("NOVA_WINWS_LOOPBACK_BYPASS", "0")).strip().lower() in ("1", "true", "yes", "on")
+            enabled = str(os.environ.get("NOVA_WINWS_LOOPBACK_BYPASS", "1")).strip().lower() in ("1", "true", "yes", "on")
         except:
-            enabled = False
+            enabled = True
         if not enabled:
             return ""
         try:
             use_ipv6 = str(os.environ.get("NOVA_WINWS_LOOPBACK_BYPASS_IPV6", "0")).strip().lower() in ("1", "true", "yes", "on")
         except:
             use_ipv6 = False
+        ipv4_clauses = [
+            clause for clause in (_winws_ipv4_not_in_net_clause(cidr) for cidr in WINWS_LOCAL_IPV4_BYPASS_CIDRS)
+            if clause
+        ]
+        if not ipv4_clauses:
+            ipv4_clauses = ["(ip.DstAddr < 127.0.0.0 or ip.DstAddr > 127.255.255.255)"]
+        clause = " and " + " and ".join(ipv4_clauses)
         if use_ipv6:
-            return " and !(ip.DstAddr == 127.0.0.1) and !(ipv6.DstAddr == ::1)"
-        return " and !(ip.DstAddr == 127.0.0.1)"
+            clause += " and !(ipv6.DstAddr == ::1)"
+        return clause
 
     def is_warp_ip(ip):
         try:
@@ -19431,6 +19948,7 @@ try:
     _windivert_unrecoverable_detail = ""
     _unsupported_winws_args = set()  # Global cache of unsupported winws options
     _repair_advice_shown = False  # Prevent duplicate advice messages
+    _windivert_last_repair_success_ts = 0.0
     def _decode_console_bytes(data):
         if data is None:
             return ""
@@ -19748,6 +20266,18 @@ try:
 
         return False, last_probe, last_state
 
+    def _windivert_repair_succeeded_recently(window_seconds=6.0):
+        try:
+            ts = float(globals().get("_windivert_last_repair_success_ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            return False
+        try:
+            return (time.time() - ts) <= max(0.5, float(window_seconds))
+        except Exception:
+            return False
+
     def _write_windivert_registry(driver_image_path):
         import winreg
 
@@ -19843,6 +20373,7 @@ try:
         """
         global _repair_in_progress, _windivert_broken, _repair_advice_shown
         global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
+        global _windivert_last_repair_success_ts
 
         # If another thread is already repairing, just wait for it
         if _repair_in_progress:
@@ -20038,6 +20569,7 @@ try:
                 _windivert_broken = False
                 _windivert_unrecoverable_reason = ""
                 _windivert_unrecoverable_detail = ""
+                _windivert_last_repair_success_ts = time.time()
             elif config_probe["pending_delete"] or svc_state["pending_delete"]:
                 _windivert_broken = True
                 _windivert_unrecoverable_reason = "pending_delete_stuck"
@@ -20046,7 +20578,7 @@ try:
                     log_func("[Repair] WinDivert застрял в состоянии SCM 'marked for deletion'. Без перезагрузки или завершения внешнего процесса, который держит service handle, Windows может не освободить службу.")
 
             # Diagnostic advice (context-sensitive, show only once per session).
-            if log_func and exit_code not in (None, 1060) and not _repair_advice_shown:
+            if log_func and not repair_success and exit_code not in (None, 1060) and not _repair_advice_shown:
                 _repair_advice_shown = True
                 if exit_code == 34:
                     log_func("[Repair] Совет: Код 34 — драйвер заблокирован. Проверьте: 1) антивирус (добавьте папку Nova в исключения), 2) 'Изоляцию ядра' (Целостность памяти) в Защитнике Windows.")
@@ -20809,6 +21341,8 @@ try:
         opera_bad_proxy_streak = 0
         opera_last_good_ts = 0.0
         opera_next_restart_ts = 0.0
+        opera_last_port_down_log_ts = 0.0
+        opera_last_recover_fail_log_ts = 0.0
         warp_bad_proxy_streak = 0
         warp_last_good_ts = 0.0
         warp_next_recovery_ts = 0.0
@@ -20949,6 +21483,13 @@ try:
                     if opera_port_alive and opera_proxy_alive:
                         opera_bad_proxy_streak = 0
                         opera_last_good_ts = now
+                        opera_last_port_down_log_ts = 0.0
+                        opera_last_recover_fail_log_ts = 0.0
+                        try:
+                            if opera_owned and hasattr(opera_proxy_manager, "_ensure_cached_endpoint_persisted"):
+                                opera_proxy_manager._ensure_cached_endpoint_persisted(wait_timeout=0.0)
+                        except:
+                            pass
                     elif opera_port_alive and not opera_proxy_alive:
                         opera_bad_proxy_streak += 1
                     else:
@@ -20982,8 +21523,9 @@ try:
                             pass
                         need_restart = True
                     elif not opera_port_alive:
-                        if last_opera_issue_state != "port_down":
+                        if (now - opera_last_port_down_log_ts) >= 45.0:
                             log_func(f"[EU] Порт {opera_port} недоступен. Запуск/восстановление...")
+                            opera_last_port_down_log_ts = now
                         last_opera_issue_state = "port_down"
                         need_restart = True
                     elif not opera_proxy_alive:
@@ -21054,14 +21596,17 @@ try:
                                 opera_bad_proxy_streak = 0
                                 opera_last_good_ts = now
                                 opera_next_restart_ts = 0.0
+                                opera_last_port_down_log_ts = 0.0
+                                opera_last_recover_fail_log_ts = 0.0
                                 log_func(f"[EU] Порт {opera_port} восстановлен.")
                                 last_opera_issue_state = None
                             else:
                                 # Backoff to avoid rapid restart loops when upstream registration is failing.
                                 # During the first startup window we retry faster to reduce EU cold-start latency.
                                 opera_next_restart_ts = now + (5.0 if now < startup_fast_retry_until else 30.0)
-                                if last_opera_issue_state != "recover_failed":
+                                if (now - opera_last_recover_fail_log_ts) >= 45.0:
                                     log_func(f"[EU] Не удалось восстановить порт {opera_port}.")
+                                    opera_last_recover_fail_log_ts = now
                                 last_opera_issue_state = "recover_failed"
 
                     # Rebuild PAC when 1371 or 1370 availability changes, so EU and RU routing is always fresh.
@@ -21413,7 +21958,15 @@ try:
                 global warp_manager, pac_manager, opera_proxy_manager, telegram_relay_manager, public_relay_managers, novawfp_observer_manager, novadivert_observer_manager, novadivert_tcp_proxy_manager, novadivert_udp_proxy_manager, novadivert_redirect_manager, novawfp_tcp_proxy_manager, novawfp_udp_proxy_manager, routing_backend_manager
                 if not warp_manager: warp_manager = WarpManager(log_func=safe_log)
                 if not pac_manager: pac_manager = PacManager(log_func=safe_log)
-                if not opera_proxy_manager: opera_proxy_manager = OperaProxyManager(log_func=safe_log)
+                current_routing_settings = load_routing_settings()
+                desired_opera_country = get_routing_opera_country(current_routing_settings)
+                if not opera_proxy_manager:
+                    opera_proxy_manager = OperaProxyManager(log_func=safe_log, country=desired_opera_country)
+                else:
+                    try:
+                        opera_proxy_manager.configure_country(desired_opera_country)
+                    except:
+                        pass
                 if not isinstance(public_relay_managers, dict):
                     public_relay_managers = {}
 
@@ -21650,7 +22203,7 @@ try:
             elif _windivert_state["missing"]:
                 if not silent:
                     logger("[Init] WinDivert service отсутствует до запуска ядра. Создаём до старта winws.")
-                repair_windivert_driver(logger if not silent else None, exit_code=34)
+                repair_windivert_driver(logger if not silent else None, exit_code=1060)
         except:
             pass
 
@@ -21722,7 +22275,7 @@ try:
         is_service_active = True
         try: restart_requested_event.clear()
         except: pass
-        root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
+        root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
         root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
         
         paths = ensure_structure()
@@ -21861,6 +22414,30 @@ try:
                     return (10**9, 0, text)
             return sorted(parts, key=_key)
 
+        def _render_windivert_port_clause(protocol, specs):
+            proto = str(protocol or "").strip().lower()
+            rendered = []
+            for value in _sort_port_specs(specs):
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                if "-" in text:
+                    try:
+                        start, end = text.split("-", 1)
+                        rendered.append(f"({proto}.DstPort >= {int(start)} and {proto}.DstPort <= {int(end)})")
+                    except:
+                        continue
+                else:
+                    try:
+                        rendered.append(f"({proto}.DstPort == {int(text)})")
+                    except:
+                        continue
+            if not rendered:
+                return ""
+            if len(rendered) == 1:
+                return rendered[0]
+            return "(" + " or ".join(rendered) + ")"
+
         for strat_name, strat_args in strategies.items():
             if strat_name == "warp":
                 continue
@@ -21883,13 +22460,24 @@ try:
             if not silent:
                 print("[Init] Safe-mode WinDivert активен: глобальный захват WinWS пропущен.")
         else:
-            if all_tcp_specs:
-                args.append(f"--wf-tcp={','.join(_sort_port_specs(all_tcp_specs))}")
-            if all_udp_specs:
-                args.append(f"--wf-udp={','.join(_sort_port_specs(all_udp_specs))}")
+            tcp_port_clause = _render_windivert_port_clause("tcp", all_tcp_specs)
+            udp_port_clause = _render_windivert_port_clause("udp", all_udp_specs)
+            local_bypass_clause = get_loopback_bypass_clause()
+            raw_proto_parts = []
+            if tcp_port_clause:
+                raw_proto_parts.append(f"(tcp and {tcp_port_clause}{local_bypass_clause})")
+            if udp_port_clause:
+                raw_proto_parts.append(f"(udp and {udp_port_clause}{local_bypass_clause})")
+            if raw_proto_parts:
+                args.append(f"--wf-raw=outbound and !loopback and ({' or '.join(raw_proto_parts)})")
+            else:
+                if all_tcp_specs:
+                    args.append(f"--wf-tcp={','.join(_sort_port_specs(all_tcp_specs))}")
+                if all_udp_specs:
+                    args.append(f"--wf-udp={','.join(_sort_port_specs(all_udp_specs))}")
             if not silent:
                 print(
-                    f"[Init] Global WinWS capture passed via --wf-tcp/--wf-udp "
+                    f"[Init] Global WinWS capture passed via --wf-raw "
                     f"(tcp={len(all_tcp_specs)}, udp={len(all_udp_specs)})."
                 )
 
@@ -22138,13 +22726,21 @@ try:
         if not silent: root.after(0, insert_cmd_link)
 
         def _strip_loopback_bypass_from_wfraw(arg_list):
-            """Remove optional localhost-bypass clauses from --wf-raw for strict WinWS builds (code 87/123)."""
+            """Remove optional local-bypass clauses from --wf-raw for strict WinWS builds (code 87/123)."""
             changed = False
             try:
                 patterns = [
                     " and !(ip.DstAddr == 127.0.0.1)",
                     " and !(ipv6.DstAddr == ::1)",
                 ]
+                try:
+                    patterns.extend(
+                        " and " + _winws_ipv4_not_in_net_clause(cidr)
+                        for cidr in WINWS_LOCAL_IPV4_BYPASS_CIDRS
+                        if _winws_ipv4_not_in_net_clause(cidr)
+                    )
+                except:
+                    pass
                 i = 0
                 while i < len(arg_list):
                     a = arg_list[i]
@@ -22297,7 +22893,7 @@ try:
 
                 if not silent and root:
                     root.after(0, lambda: status_label.config(text="АКТИВНО : ТОЛЬКО EU", fg="#FFA500"))
-                    root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
+                    root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
 
                 if not silent:
                     log_print("[Init] WARP не запускается: нет активного ядра winws. RU-маршрут временно переведен на Opera.")
@@ -22436,7 +23032,11 @@ try:
                                 if exit_code == 123 and _safe_filter_mode_explicit_opt_in:
                                     enable_safe_filter_mode(log_print if not silent else None, reason="startup winws вернул код 123")
                                 try:
-                                    downgraded = _strip_loopback_bypass_from_wfraw(args)
+                                    allow_local_bypass_downgrade = str(os.environ.get("NOVA_ALLOW_UNSAFE_LOCAL_BYPASS_DOWNGRADE", "0")).strip().lower() in ("1", "true", "yes", "on")
+                                except:
+                                    allow_local_bypass_downgrade = False
+                                try:
+                                    downgraded = _strip_loopback_bypass_from_wfraw(args) if allow_local_bypass_downgrade else False
                                 except:
                                     downgraded = False
                                 if downgraded:
@@ -22485,7 +23085,7 @@ try:
                         # Update UI Status
                         if not silent and root:
                             root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
-                            root.after(0, lambda: btn_toggle.config(text="ОСТАНОВИТЬ"))
+                            root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
 
                         try:
                             ndm = globals().get("novadivert_observer_manager")
@@ -22684,7 +23284,7 @@ try:
                             print(f"[Error] Слишком много падений (5 за 5 минут). Автоперезапуск остановлен.")
                             is_service_active = False
                             if root:
-                                root.after(0, lambda: btn_toggle.config(text="ЗАПУСТИТЬ"))
+                                root.after(0, lambda: btn_toggle.config(text="ПОДКЛЮЧИТЬ"))
                                 root.after(0, lambda: status_label.config(text="ОСТАНОВЛЕНО (СБОЙ)", fg=COLOR_TEXT_FAIL))
             except Exception as e: 
                 if not is_closing: print(f"\nCRASH: {e}\n")
@@ -22745,7 +23345,7 @@ try:
         
         # === НЕМЕДЛЕННОЕ обновление UI ===
         if root and not restart_mode:
-            root.after(0, lambda: btn_toggle.config(text="ЗАПУСТИТЬ"))
+            root.after(0, lambda: btn_toggle.config(text="ПОДКЛЮЧИТЬ"))
             root.after(0, lambda: status_label.config(text="ОСТАНОВЛЕНО", fg=COLOR_TEXT_FAIL))
         
         try:
@@ -24400,7 +25000,7 @@ try:
         status_label.bind("<Button-1>", start_move)
         status_label.bind("<B1-Motion>", do_move)
         
-        btn_toggle = RoundedButton(main_canvas, w/2, h/2 + 10, 160, 40, 20, COLOR_BLUEBERRY_YOGURT, "ЗАПУСТИТЬ", toggle_service)
+        btn_toggle = RoundedButton(main_canvas, w/2, h/2 + 10, 160, 40, 20, COLOR_BLUEBERRY_YOGURT, "ПОДКЛЮЧИТЬ", toggle_service)
         
         # Style for Log Button
         log_fg = "#777777"
@@ -24448,6 +25048,10 @@ try:
             "warp": "WARP",
             "opera": "EU",
             "direct": "Direct",
+        }
+        opera_region_pill_labels = {
+            "EU": "EU",
+            "US": "US",
         }
 
         class PopupPillButton(tk.Canvas):
@@ -24529,6 +25133,25 @@ try:
                 os.environ["NOVA_ROUTING_SETTINGS_PATH"] = ROUTING_SETTINGS_PATH
             except:
                 pass
+            desired_opera_region = get_routing_opera_region(saved)
+            desired_opera_country = get_routing_opera_country(saved)
+            try:
+                opm = globals().get("opera_proxy_manager")
+                if opm:
+                    current_country = str(getattr(opm, "country", "EU") or "EU").strip().upper()
+                    if current_country != desired_opera_country:
+                        opm.configure_country(desired_opera_country)
+                        logger(f"[EU] Регион Opera переключён: {desired_opera_region} ({desired_opera_country}). Перезапуск прокси...")
+                        try:
+                            opm.stop()
+                        except:
+                            pass
+                        try:
+                            opm.start()
+                        except Exception as e:
+                            logger(f"[EU] Ошибка перезапуска Opera proxy после смены региона: {e}")
+            except Exception as e:
+                logger(f"[EU] Ошибка применения региона Opera: {e}")
             try:
                 pm = globals().get("pac_manager")
                 if pm:
@@ -24546,6 +25169,7 @@ try:
                     f"{label}={get_routing_group_mode(key, saved)}"
                     for key, label in routing_group_rows
                 )
+                + f", OperaRegion={desired_opera_region}"
             )
             return saved
 
@@ -24728,8 +25352,13 @@ try:
             ).pack(fill="x", pady=(0, 6))
 
             pills_by_group = {}
+            opera_region_state = {"value": get_routing_opera_region(saved)}
+            opera_region_pills = {}
             autostart_state = {"enabled": bool(get_startup_status_cached()), "dirty": False}
             autostart_pills = {}
+            saved_system_settings = saved.get("system") or {}
+            game_overlay_state = {"enabled": bool(saved_system_settings.get("suppress_game_overlay", False))}
+            game_overlay_pills = {}
 
             def _refresh_group_pills(group_key):
                 selected_mode = current_modes.get(group_key, DEFAULT_ROUTING_SETTINGS["routes"].get(group_key, "auto"))
@@ -24766,6 +25395,41 @@ try:
                     btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
                     pills_by_group[group_key][mode_key] = btn
                 _refresh_group_pills(group_key)
+
+            def _refresh_opera_region_pills():
+                selected_region = _normalize_opera_region(opera_region_state.get("value"), DEFAULT_ROUTING_SETTINGS.get("opera_region", "EU"))
+                opera_region_state["value"] = selected_region
+                for region_key, btn in opera_region_pills.items():
+                    btn.set_selected(region_key == selected_region)
+
+            def _set_opera_region(region_key):
+                opera_region_state["value"] = _normalize_opera_region(region_key, DEFAULT_ROUTING_SETTINGS.get("opera_region", "EU"))
+                _refresh_opera_region_pills()
+
+            region_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
+            region_row.pack(fill="x", pady=(6, 3))
+            tk.Label(
+                region_row,
+                text="Регион",
+                width=11,
+                anchor="w",
+                bg=SETTINGS_THEME["bg"],
+                fg=SETTINGS_THEME["text"],
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+            region_pill_frame = tk.Frame(region_row, bg=SETTINGS_THEME["bg"])
+            region_pill_frame.pack(side="right", fill="x", expand=True)
+            for index, region_key in enumerate(("EU", "US")):
+                btn = PopupPillButton(
+                    region_pill_frame,
+                    opera_region_pill_labels[region_key],
+                    command=lambda rk=region_key: _set_opera_region(rk),
+                    width=74,
+                    height=26,
+                )
+                btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
+                opera_region_pills[region_key] = btn
+            _refresh_opera_region_pills()
 
             divider = tk.Frame(outer, bg=SETTINGS_THEME["border"], height=1)
             divider.pack(fill="x", pady=(8, 6))
@@ -24813,15 +25477,55 @@ try:
                 autostart_pills[mode_key] = btn
             _refresh_autostart_pills()
 
+            def _refresh_game_overlay_pills():
+                enabled = bool(game_overlay_state.get("enabled", False))
+                for mode_key, btn in game_overlay_pills.items():
+                    btn.set_selected((mode_key == "off" and enabled) or (mode_key == "restore" and not enabled))
+
+            def _set_game_overlay_enabled(enabled):
+                game_overlay_state["enabled"] = bool(enabled)
+                _refresh_game_overlay_pills()
+
+            game_overlay_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
+            game_overlay_row.pack(fill="x", pady=(3, 3))
+            tk.Label(
+                game_overlay_row,
+                text="Game Bar",
+                width=11,
+                anchor="w",
+                bg=SETTINGS_THEME["bg"],
+                fg=SETTINGS_THEME["text"],
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+            game_overlay_pill_frame = tk.Frame(game_overlay_row, bg=SETTINGS_THEME["bg"])
+            game_overlay_pill_frame.pack(side="right", fill="x", expand=True)
+            for index, mode_key in enumerate(("off", "restore")):
+                btn = PopupPillButton(
+                    game_overlay_pill_frame,
+                    "Отключить" if mode_key == "off" else "Включить",
+                    command=lambda enabled=(mode_key == "off"): _set_game_overlay_enabled(enabled),
+                    width=74,
+                    height=26,
+                )
+                btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
+                game_overlay_pills[mode_key] = btn
+            _refresh_game_overlay_pills()
+
             button_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
             button_row.pack(fill="x", pady=(8, 0))
 
             def _save_and_apply():
+                latest_settings = load_routing_settings()
+                system_settings = dict(latest_settings.get("system") or {})
+                system_settings["suppress_game_overlay"] = bool(game_overlay_state.get("enabled", False))
                 payload = {
                     "version": CURRENT_VERSION,
+                    "opera_region": _normalize_opera_region(opera_region_state.get("value"), DEFAULT_ROUTING_SETTINGS.get("opera_region", "EU")),
                     "routes": {key: current_modes.get(key, DEFAULT_ROUTING_SETTINGS["routes"].get(key, "auto")) for key, _label in routing_group_rows},
+                    "system": system_settings,
                 }
                 desired_autostart = bool(autostart_state.get("enabled", False))
+                desired_game_overlay = bool(game_overlay_state.get("enabled", False))
                 logger = globals().get("log_print", print)
 
                 def _apply_autostart_and_routing():
@@ -24830,6 +25534,13 @@ try:
                     except Exception as e:
                         try:
                             logger(f"[Routing] Ошибка сохранения настроек: {e}")
+                        except:
+                            pass
+                    try:
+                        apply_game_overlay_suppression(desired_game_overlay, logger)
+                    except Exception as e:
+                        try:
+                            logger(f"[Routing] Ошибка применения Game Bar: {e}")
                         except:
                             pass
                     try:
@@ -24879,10 +25590,15 @@ try:
                 for key, _label in routing_group_rows:
                     current_modes[key] = get_routing_group_mode(key, latest)
                     _refresh_group_pills(key)
+                opera_region_state["value"] = get_routing_opera_region(latest)
+                _refresh_opera_region_pills()
                 autostart_state["dirty"] = False
                 autostart_state["enabled"] = bool(get_startup_status_cached())
                 _refresh_autostart_pills()
                 refresh_autostart_status_async(_sync_autostart_state)
+                system_settings = latest.get("system") or {}
+                game_overlay_state["enabled"] = bool(system_settings.get("suppress_game_overlay", False))
+                _refresh_game_overlay_pills()
 
             win._refresh_state = _refresh_popup_state
             _refresh_popup_state()
@@ -24916,12 +25632,21 @@ try:
         )
         region_indicator_pill.set_regions([])
 
+        def _get_opera_region_indicator_label():
+            try:
+                region = _normalize_opera_region(get_routing_opera_region(load_routing_settings()), "EU")
+                if region == "US":
+                    return "US"
+            except:
+                pass
+            return "EU"
+
         def apply_main_connection_indicator_state(warp_ok, opera_ok):
             regions = []
             if warp_ok:
                 regions.append(("WARP", INDICATOR_WARP))
             if opera_ok:
-                regions.append(("EU", INDICATOR_EU))
+                regions.append((_get_opera_region_indicator_label(), INDICATOR_EU))
             try:
                 region_indicator_pill.set_regions(regions)
             except:
