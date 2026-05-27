@@ -12,8 +12,8 @@ from pathlib import Path
 from nova_metadata import read_project_version
 
 try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True, encoding="utf-8")
+    sys.stderr.reconfigure(line_buffering=True, encoding="utf-8")
 except Exception:
     pass
 
@@ -262,32 +262,79 @@ def get_background_png_bytes():
     return PYI_ASSET_DIR
 
 
-def ensure_tcl_data(resources_dir: Path) -> None:
-    """Copy Tcl/Tk library data into resources/tcl_data if PyInstaller didn't."""
-    tcl_data = resources_dir / "tcl_data"
-    if tcl_data.exists() and any(tcl_data.iterdir()):
-        print("[BUILD] tcl_data already present — skipping.")
-        return
+def find_tcl_root() -> Path | None:
+    """Robustly locate the Tcl/Tk library directory on the system."""
+    candidates = []
 
-    # Locate tcl/ directory from the Python installation
+    # 1. Active Python's prefix or executable folder
     python_root = Path(sys.base_prefix).resolve()
-    tcl_root = python_root / "tcl"
-    if not tcl_root.exists():
-        tcl_root = Path(sys.executable).resolve().parent / "tcl"
+    candidates.append(python_root / "tcl")
+    candidates.append(Path(sys.executable).resolve().parent / "tcl")
 
-    if not tcl_root.exists():
-        print(f"[WARN] Cannot find Tcl/Tk data at {tcl_root} — tkinter may fail at runtime.")
+    # 2. Hardcoded typical Windows paths (including AppData)
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    if localappdata:
+        python_dir = Path(localappdata) / "Programs" / "Python"
+        if python_dir.exists():
+            for p in python_dir.glob("Python*/tcl"):
+                candidates.append(p)
+
+    # 3. System-wide python installations
+    candidates.append(Path(r"C:\Python314\tcl"))
+    candidates.append(Path(r"C:\Python313\tcl"))
+    candidates.append(Path(r"C:\Python312\tcl"))
+    candidates.append(Path(r"C:\Program Files\Python314\tcl"))
+    candidates.append(Path(r"C:\Program Files\Python313\tcl"))
+    candidates.append(Path(r"C:\Program Files\Python312\tcl"))
+
+    for cand in candidates:
+        cand = cand.resolve()
+        if cand.exists() and cand.is_dir():
+            # Verify if it has a tcl subdirectory containing init.tcl
+            for sub in cand.iterdir():
+                if sub.is_dir() and sub.name.startswith("tcl") and (sub / "init.tcl").exists():
+                    return cand
+    return None
+
+
+def ensure_tcl_data(resources_dir: Path) -> None:
+    """Copy Tcl/Tk library data into resources/tcl_data and resources/tk_data if PyInstaller didn't."""
+    tcl_data_dest = resources_dir / "tcl_data"
+    tk_data_dest = resources_dir / "tk_data"
+
+    if tcl_data_dest.exists() and any(tcl_data_dest.iterdir()) and tk_data_dest.exists() and any(tk_data_dest.iterdir()):
+        print("[BUILD] tcl_data and tk_data already present — skipping.")
         return
 
-    tcl_data.mkdir(parents=True, exist_ok=True)
-    copied = 0
+    tcl_root = find_tcl_root()
+    if not tcl_root:
+        print("[WARN] Cannot find Tcl/Tk root directory — tkinter may fail at runtime.")
+        return
+
+    tcl_src = None
+    tk_src = None
     for subdir in tcl_root.iterdir():
-        if subdir.is_dir() and (subdir.name.startswith("tcl") or subdir.name.startswith("tk")):
-            dst = tcl_data / subdir.name
-            if not dst.exists():
-                shutil.copytree(subdir, dst, ignore=shutil.ignore_patterns("__pycache__"))
-                copied += 1
-    print(f"[BUILD] Patched tcl_data: copied {copied} directories from {tcl_root}")
+        if subdir.is_dir():
+            if subdir.name.startswith("tcl") and (subdir / "init.tcl").exists():
+                tcl_src = subdir
+            elif subdir.name.startswith("tk") and (subdir / "tk.tcl").exists():
+                tk_src = subdir
+
+    if not tcl_src or not tk_src:
+        print(f"[WARN] Incomplete Tcl/Tk data in {tcl_root} — tkinter may fail at runtime.")
+        return
+
+    # Copy tcl library contents directly to resources/tcl_data
+    if not (tcl_data_dest.exists() and any(tcl_data_dest.iterdir())):
+        safe_rmtree(tcl_data_dest)
+        shutil.copytree(tcl_src, tcl_data_dest, ignore=shutil.ignore_patterns("__pycache__", "demos"))
+        print(f"[BUILD] Patched tcl_data: copied {tcl_src} to {tcl_data_dest}")
+
+    # Copy tk library contents directly to resources/tk_data
+    if not (tk_data_dest.exists() and any(tk_data_dest.iterdir())):
+        safe_rmtree(tk_data_dest)
+        shutil.copytree(tk_src, tk_data_dest, ignore=shutil.ignore_patterns("__pycache__", "demos"))
+        print(f"[BUILD] Patched tk_data: copied {tk_src} to {tk_data_dest}")
 
 
 def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
