@@ -262,6 +262,34 @@ def get_background_png_bytes():
     return PYI_ASSET_DIR
 
 
+def ensure_tcl_data(resources_dir: Path) -> None:
+    """Copy Tcl/Tk library data into resources/tcl_data if PyInstaller didn't."""
+    tcl_data = resources_dir / "tcl_data"
+    if tcl_data.exists() and any(tcl_data.iterdir()):
+        print("[BUILD] tcl_data already present — skipping.")
+        return
+
+    # Locate tcl/ directory from the Python installation
+    python_root = Path(sys.base_prefix).resolve()
+    tcl_root = python_root / "tcl"
+    if not tcl_root.exists():
+        tcl_root = Path(sys.executable).resolve().parent / "tcl"
+
+    if not tcl_root.exists():
+        print(f"[WARN] Cannot find Tcl/Tk data at {tcl_root} — tkinter may fail at runtime.")
+        return
+
+    tcl_data.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for subdir in tcl_root.iterdir():
+        if subdir.is_dir() and (subdir.name.startswith("tcl") or subdir.name.startswith("tk")):
+            dst = tcl_data / subdir.name
+            if not dst.exists():
+                shutil.copytree(subdir, dst, ignore=shutil.ignore_patterns("__pycache__"))
+                copied += 1
+    print(f"[BUILD] Patched tcl_data: copied {copied} directories from {tcl_root}")
+
+
 def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
     ensure_pyinstaller()
     ensure_clean_dir(TEMP_ROOT)
@@ -313,6 +341,10 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
 
     staging_dir = release_dir / APP_NAME
     copytree_filtered(built_dir, staging_dir)
+
+    # FIX: PyInstaller may fail to create tcl_data on Python 3.14+.
+    # Manually copy Tcl/Tk library directories so pyi_rth_tkinter finds them.
+    ensure_tcl_data(staging_dir / "resources")
 
     for folder_name in TOP_LEVEL_DIRS:
         src_dir = base_dir / folder_name
