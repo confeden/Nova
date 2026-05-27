@@ -165,9 +165,10 @@ def _ensure_dependencies() -> None:
 # ------------------------------------------------------------
 # Run environment preparation
 # ------------------------------------------------------------
-if not _ensure_pip():
-    sys.exit("Unable to install pip – script cannot continue.")
-_ensure_dependencies()
+if not (getattr(sys, 'frozen', False) or "__compiled__" in globals() or (sys.argv and sys.argv[0].lower().endswith(".exe"))):
+    if not _ensure_pip():
+        sys.exit("Unable to install pip – script cannot continue.")
+    _ensure_dependencies()
 
 # ------------------------------------------------------------
 # Original imports continue below
@@ -366,7 +367,7 @@ def _env_bool_global(name, default=False):
 
 # === AUTO-INSTALL REQUIREMENTS ===
 def install_requirements_visually():
-    if getattr(sys, 'frozen', False): return
+    if getattr(sys, 'frozen', False) or "__compiled__" in globals() or (sys.argv and sys.argv[0].lower().endswith(".exe")): return
     
     # Check for required packages
     required = {
@@ -664,7 +665,7 @@ if is_compiled and not is_debug_launch:
         pass
 
 # === FIX: Исправление загрузки DLL для Nuitka/Python 3.13+ ===
-if getattr(sys, 'frozen', False):
+if getattr(sys, 'frozen', False) or "__compiled__" in globals() or (sys.argv and sys.argv[0].lower().endswith(".exe")):
     base_path = os.path.dirname(os.path.abspath(__file__))
     # Добавляем корень и папку DLLs в PATH, чтобы _tkinter.pyd нашел tcl86t.dll
     os.environ['PATH'] = base_path + ";" + os.path.join(base_path, "DLLs") + ";" + os.environ.get('PATH', '')
