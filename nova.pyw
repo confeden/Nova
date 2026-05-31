@@ -204,13 +204,13 @@ def _bootstrap_tk_runtime_env():
     try:
         if getattr(sys, "frozen", False):
             bundle_dir = os.path.dirname(sys.executable)
-            tcl_dir = os.path.join(bundle_dir, "resources", "tcl_data")
-            tk_dir = os.path.join(bundle_dir, "resources", "tk_data")
+            tcl_dir = os.path.join(bundle_dir, "resources", "_tcl_data")
+            tk_dir = os.path.join(bundle_dir, "resources", "_tk_data")
             
             if not os.path.exists(os.path.join(tcl_dir, "init.tcl")):
-                tcl_dir = os.path.join(bundle_dir, "tcl_data")
+                tcl_dir = os.path.join(bundle_dir, "_tcl_data")
             if not os.path.exists(os.path.join(tk_dir, "tk.tcl")):
-                tk_dir = os.path.join(bundle_dir, "tk_data")
+                tk_dir = os.path.join(bundle_dir, "_tk_data")
                 
             if os.path.exists(os.path.join(tcl_dir, "init.tcl")):
                 os.environ["TCL_LIBRARY"] = tcl_dir
@@ -9409,7 +9409,7 @@ try:
 
     ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
     LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
-    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli")
+    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli", "games")
     ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
     OPERA_REGION_VALUES = {"EU", "US"}
     ROUTING_GROUP_ALIASES = {
@@ -9419,6 +9419,9 @@ try:
         "discord": "discord",
         "ide": "ide",
         "cli": "cli",
+        "games": "games",
+        "poe": "games",
+        "pathofexile": "games",
         "opencode": "ide",
         "vscode": "ide",
         "cursor": "ide",
@@ -9440,10 +9443,12 @@ try:
             "discord": "warp",
             "ide": "direct",
             "cli": "direct",
+            "games": "auto",
         },
         "system": {
             "suppress_game_overlay": False,
             "game_dvr_capture_backup": None,
+            "ai_unlock": True,
         },
     }
 
@@ -9525,6 +9530,9 @@ try:
             if isinstance(system_payload, dict):
                 normalized["system"]["suppress_game_overlay"] = bool(
                     system_payload.get("suppress_game_overlay", normalized["system"]["suppress_game_overlay"])
+                )
+                normalized["system"]["ai_unlock"] = bool(
+                    system_payload.get("ai_unlock", normalized["system"].get("ai_unlock", True))
                 )
                 backup = system_payload.get("game_dvr_capture_backup")
                 if isinstance(backup, dict) and isinstance(backup.get("exists"), bool):
@@ -9987,6 +9995,127 @@ try:
                 except:
                     continue
         return False
+
+    # ================= МОДУЛЬ: NRPT DNS UNBLOCK =================
+    # Selective DNS routing for Google/AI domains via xbox-dns.ru NRPT rules.
+    # This allows Gemini and other region-locked Google AI services to resolve
+    # to non-blocked IPs without proxying all traffic.
+
+    NOVA_NRPT_TAG = "NOVA_DNS_UNBLOCK"
+    NOVA_NRPT_NAMESPACES = (
+        ".googleapis.com",
+        ".googleusercontent.com",
+        "accounts.google.com",
+        "gemini.google.com",
+        ".gemini.google.com",
+        "gemini.google",
+        ".gemini.google",
+        "aistudio.google.com",
+        ".aistudio.google.com",
+        "ai.google.dev",
+        ".ai.google.dev",
+        "generativelanguage.googleapis.com",
+        "alkalimakersuite-pa.clients6.google.com",
+    )
+    # xbox-dns.ru servers (v4 + v6)
+    NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
+
+    def _check_nrpt_rules_applied(log_func=None):
+        """Check if all required NRPT rules with NOVA_DNS_UNBLOCK tag are already applied."""
+        try:
+            cmd = (
+                f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
+                f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
+                f"| Select-Object -ExpandProperty Namespace"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            if result.returncode != 0:
+                return False
+            existing = set()
+            for line in result.stdout.strip().splitlines():
+                ns = line.strip()
+                if ns:
+                    existing.add(ns)
+            required = set(NOVA_NRPT_NAMESPACES)
+            if required.issubset(existing):
+                if log_func:
+                    log_func(f"[NRPT] DNS-правила уже применены ({len(existing)} правил).")
+                return True
+            if log_func:
+                missing = required - existing
+                log_func(f"[NRPT] Отсутствуют правила: {', '.join(sorted(missing))}")
+            return False
+        except Exception as e:
+            if log_func:
+                log_func(f"[NRPT] Ошибка проверки правил: {e}")
+            return False
+
+    def setup_nrpt_dns_unblock(log_func=None):
+        """Setup NRPT rules for Google/AI DNS unblocking. Idempotent: skips if already applied."""
+        try:
+            if _check_nrpt_rules_applied(log_func=log_func):
+                return True
+            # Remove any stale rules with our tag first
+            remove_nrpt_dns_unblock(log_func=log_func, silent=True)
+            errors = []
+            for namespace in NOVA_NRPT_NAMESPACES:
+                cmd = (
+                    f"Add-DnsClientNrptRule -Namespace '{namespace}' "
+                    f"-NameServers @({NOVA_NRPT_NAMESERVERS}) "
+                    f"-Comment '{NOVA_NRPT_TAG}' "
+                    f"-DisplayName 'Nova DNS Unblock' "
+                    f"-ErrorAction Stop"
+                )
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                    capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.strip()
+                    if "denied" in stderr.lower() or "elevation" in stderr.lower():
+                        if log_func:
+                            log_func("[NRPT] Требуются права администратора для DNS-правил.")
+                        return False
+                    errors.append(f"{namespace}: {stderr[:80]}")
+            # Flush DNS cache
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Clear-DnsClientCache -ErrorAction SilentlyContinue"],
+                capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            if errors:
+                if log_func:
+                    log_func(f"[NRPT] Частичные ошибки: {'; '.join(errors[:3])}")
+                return False
+            if log_func:
+                log_func(f"[NRPT] DNS-правила для Gemini/Google AI применены ({len(NOVA_NRPT_NAMESPACES)} правил).")
+            return True
+        except Exception as e:
+            if log_func:
+                log_func(f"[NRPT] Ошибка настройки DNS: {e}")
+            return False
+
+    def remove_nrpt_dns_unblock(log_func=None, silent=False):
+        """Remove all NRPT rules tagged with NOVA_DNS_UNBLOCK."""
+        try:
+            cmd = (
+                f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
+                f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
+                f"| Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; "
+                f"Clear-DnsClientCache -ErrorAction SilentlyContinue"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            if log_func and not silent:
+                log_func("[NRPT] DNS-правила удалены.")
+        except Exception as e:
+            if log_func and not silent:
+                log_func(f"[NRPT] Ошибка удаления DNS-правил: {e}")
 
     # ================= МОДУЛЬ: NOVA_LOGIC =================
 
@@ -10529,14 +10658,14 @@ try:
             "panel": "#000000",
             "text": "#B8F5C2",
             "button": "#000000",
-            "button_hover": "#101010",
+            "button_hover": "#1E1B3A",
             "button_fg": COLOR_BLUEBERRY_YOGURT,
-            "button_hover_fg": "#F2FFF4",
+            "button_hover_fg": "#FFFFFF",
             "grip": "#2F4A36",
         }
         LOG_COLOR_TEXT_NORMAL = "#47E05F"
         LOG_COLOR_TEXT_ERROR = "#E4C05B"
-        LOG_COLOR_TEXT_INFO = "#92B49B"
+        LOG_COLOR_TEXT_INFO = "#C5DFCC"
         LOG_COLOR_TEXT_FAIL = "#FF6B6B"
         SETTINGS_THEME = {
             "bg": "#0B1410",
@@ -10555,14 +10684,14 @@ try:
             "panel": "#000000",
             "text": "#0E5F21",
             "button": "#000000",
-            "button_hover": "#111111",
+            "button_hover": "#1E1B3A",
             "button_fg": COLOR_BLUEBERRY_YOGURT,
-            "button_hover_fg": "#17351E",
+            "button_hover_fg": "#FFFFFF",
             "grip": "#82A28A",
         }
         LOG_COLOR_TEXT_NORMAL = "#47E05F"
         LOG_COLOR_TEXT_ERROR = "#E4C05B"
-        LOG_COLOR_TEXT_INFO = "#92B49B"
+        LOG_COLOR_TEXT_INFO = "#C5DFCC"
         LOG_COLOR_TEXT_FAIL = "#FF6B6B"
         SETTINGS_THEME = {
             "bg": "#F4F8F5",
@@ -11929,6 +12058,14 @@ try:
         sizegrip.place(relx=1.0, rely=1.0, anchor="se", x=0, y=0) 
         log_window.sizegrip = sizegrip # Save reference
         
+        def open_website():
+            """Открывает официальный сайт Nova"""
+            try:
+                import webbrowser
+                webbrowser.open("https://nova-app.eu/")
+            except Exception as e:
+                print(f"[Log] Ошибка открытия сайта: {e}")
+
         def open_telegram_chat():
             """Открывает чат Telegram"""
             try:
@@ -11938,12 +12075,25 @@ try:
                 print(f"[Log] Ошибка открытия ссылки: {e}")
         
         # Кнопка-текст "Перейти в чат"
-        chat_button = tk.Label(bottom_frame, text="→ Telegram чат", fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"], 
+        chat_button = tk.Label(bottom_frame, text="Telegram чат ↗", fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"], 
                               font=("Segoe UI", 11, "bold"), cursor="hand2", padx=10, pady=2)
-        chat_button.pack(side=tk.RIGHT, padx=10, pady=2)
+        chat_button.pack(side=tk.RIGHT, padx=(5, 10), pady=2)
         chat_button.bind("<Button-1>", lambda e: open_telegram_chat())
         chat_button.bind("<Enter>", lambda e: chat_button.config(fg=LOG_THEME["button_hover_fg"], bg=LOG_THEME["button_hover"]))
         chat_button.bind("<Leave>", lambda e: chat_button.config(fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"]))
+
+        # Тонкий вертикальный разделитель
+        separator = tk.Frame(bottom_frame, width=1, height=14, bg=LOG_THEME["grip"])
+        separator.pack(side=tk.RIGHT, padx=5, pady=6)
+
+        # Кнопка-текст "Перейти на сайт"
+        site_button = tk.Label(bottom_frame, text="Сайт ↗", fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"], 
+                              font=("Segoe UI", 11, "bold"), cursor="hand2", padx=10, pady=2)
+        site_button.pack(side=tk.RIGHT, padx=(10, 5), pady=2)
+        site_button.bind("<Button-1>", lambda e: open_website())
+        site_button.bind("<Enter>", lambda e: site_button.config(fg=LOG_THEME["button_hover_fg"], bg=LOG_THEME["button_hover"]))
+        site_button.bind("<Leave>", lambda e: site_button.config(fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"]))
+
 
         # Используем Frame для компоновки текста и кастомного скроллбара
         content_frame = tk.Frame(log_window, bg=LOG_THEME["bg"])
@@ -12238,6 +12388,12 @@ try:
         global early_log_buffer
         if should_suppress_strategy_noise(string):
             return
+        try:
+            ll = str(string).lower()
+            if not IS_DEBUG_MODE and "[tgrelay]" in ll and "подключено:" in ll:
+                return
+        except:
+            pass
         string = mask_ips_in_text(string)
         lw_exists = log_window and tk.Toplevel.winfo_exists(log_window)
         
@@ -22157,6 +22313,19 @@ try:
                         safe_log(f"[Init] Ошибка запуска PAC server/system proxy: {e}")
                 if pac_manager:
                     threading.Thread(target=_start_pac_server_async, daemon=True, name="NovaPacServerStart").start()
+                # Apply NRPT DNS rules for Gemini/Google AI unblocking
+                def _setup_nrpt_async():
+                    try:
+                        settings = current_routing_settings or load_routing_settings()
+                        sys_settings = settings.get("system") or {}
+                        ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
+                        if ai_unlock_enabled:
+                            setup_nrpt_dns_unblock(log_func=safe_log)
+                        else:
+                            remove_nrpt_dns_unblock(log_func=safe_log, silent=True)
+                    except Exception as e:
+                        safe_log(f"[Init] NRPT setup error: {e}")
+                threading.Thread(target=_setup_nrpt_async, daemon=True, name="NovaNrptSetup").start()
             except Exception as e:
                 safe_trace(f"[Init] BG Services Error: {e}")
 
@@ -22526,9 +22695,9 @@ try:
             local_bypass_clause = get_loopback_bypass_clause()
             raw_proto_parts = []
             if tcp_port_clause:
-                raw_proto_parts.append(f"(tcp and {tcp_port_clause}{local_bypass_clause})")
+                raw_proto_parts.append(f"(tcp and {tcp_port_clause}{local_bypass_clause} and (tcp.SrcPort < 16000 or tcp.SrcPort > 16500))")
             if udp_port_clause:
-                raw_proto_parts.append(f"(udp and {udp_port_clause}{local_bypass_clause})")
+                raw_proto_parts.append(f"(udp and {udp_port_clause}{local_bypass_clause} and (udp.SrcPort < 16000 or udp.SrcPort > 16500))")
             if raw_proto_parts:
                 args.append(f"--wf-raw=outbound and !loopback and ({' or '.join(raw_proto_parts)})")
             else:
@@ -23719,6 +23888,10 @@ try:
                 save_exclude_auto_checked()
                 flush_learning_data()
             except: pass
+
+            try:
+                remove_nrpt_dns_unblock()
+            except: pass
             
             try:
                 queue_list = []
@@ -24585,6 +24758,8 @@ try:
 
         def _set_hover(self, hovered):
             try:
+                if self.canvas.itemcget(self.text_id, "state") == "hidden":
+                    return
                 self.canvas.config(cursor="hand2" if hovered else "")
                 self.canvas.itemconfig(self.outline_id, state="normal" if hovered else "hidden")
                 self.canvas.itemconfig(
@@ -24594,6 +24769,15 @@ try:
                 )
             except:
                 pass
+
+        def set_visible(self, visible):
+            state = "normal" if visible else "hidden"
+            try: self.canvas.itemconfig(self.text_id, state=state)
+            except: pass
+            try: self.canvas.itemconfig(self.bg_id, state=state)
+            except: pass
+            try: self.canvas.itemconfig(self.outline_id, state="hidden")
+            except: pass
 
         def move_to(self, x, y, anchor):
             self.canvas.coords(self.text_id, x, y)
@@ -25089,8 +25273,41 @@ try:
         btn_update.bind("<Leave>", lambda e: main_canvas.config(cursor=""))
         btn_update.set_visible(False)
         btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9), toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
+        btn_logs.set_visible(False)
         btn_settings = None
         refresh_update_button()
+
+        window_hovered = False
+
+        def on_window_enter(event):
+            global window_hovered
+            if window_hovered:
+                return
+            window_hovered = True
+            if btn_logs:
+                btn_logs.set_visible(True)
+            if btn_settings:
+                btn_settings.set_visible(True)
+
+        def on_window_leave(event):
+            global window_hovered
+            if not window_hovered:
+                return
+            # Prevent flickering on child widgets
+            x, y = root.winfo_pointerxy()
+            wx = root.winfo_rootx()
+            wy = root.winfo_rooty()
+            ww = root.winfo_width()
+            wh = root.winfo_height()
+            if not (wx <= x < wx + ww and wy <= y < wy + wh):
+                window_hovered = False
+                if btn_logs:
+                    btn_logs.set_visible(False)
+                if btn_settings:
+                    btn_settings.set_visible(False)
+
+        root.bind("<Enter>", on_window_enter)
+        root.bind("<Leave>", on_window_leave)
 
         routing_settings_window_ref = {
             "win": None,
@@ -25104,6 +25321,7 @@ try:
             ("discord", "Discord"),
             ("ide", "IDE"),
             ("cli", "CLI"),
+            ("games", "Games"),
         )
         routing_mode_pill_labels = {
             "auto": "Auto",
@@ -25225,6 +25443,25 @@ try:
                 refresh_routing_backend_control_plane(force=True)
             except Exception as e:
                 logger(f"[Routing] Ошибка обновления control plane: {e}")
+            try:
+                sys_settings = saved.get("system") or {}
+                ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
+                if ai_unlock_enabled:
+                    threading.Thread(
+                        target=setup_nrpt_dns_unblock,
+                        args=(logger,),
+                        daemon=True,
+                        name="NovaNrptSettingsApply"
+                    ).start()
+                else:
+                    threading.Thread(
+                        target=remove_nrpt_dns_unblock,
+                        args=(logger, True),
+                        daemon=True,
+                        name="NovaNrptSettingsRemove"
+                    ).start()
+            except Exception as e:
+                logger(f"[NRPT] Ошибка динамического применения DNS: {e}")
             logger(
                 "[Routing] Настройки сохранены: "
                 + ", ".join(
@@ -25421,6 +25658,8 @@ try:
             saved_system_settings = saved.get("system") or {}
             game_overlay_state = {"enabled": bool(saved_system_settings.get("suppress_game_overlay", False))}
             game_overlay_pills = {}
+            ai_unlock_state = {"enabled": bool(saved_system_settings.get("ai_unlock", True))}
+            ai_unlock_pills = {}
 
             def _refresh_group_pills(group_key):
                 selected_mode = current_modes.get(group_key, DEFAULT_ROUTING_SETTINGS["routes"].get(group_key, "auto"))
@@ -25573,6 +25812,40 @@ try:
                 game_overlay_pills[mode_key] = btn
             _refresh_game_overlay_pills()
 
+            def _refresh_ai_unlock_pills():
+                enabled = bool(ai_unlock_state.get("enabled", True))
+                for mode_key, btn in ai_unlock_pills.items():
+                    btn.set_selected((mode_key == "on" and enabled) or (mode_key == "off" and not enabled))
+
+            def _set_ai_unlock_enabled(enabled):
+                ai_unlock_state["enabled"] = bool(enabled)
+                _refresh_ai_unlock_pills()
+
+            ai_unlock_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
+            ai_unlock_row.pack(fill="x", pady=(3, 3))
+            tk.Label(
+                ai_unlock_row,
+                text="Разблок. ИИ",
+                width=11,
+                anchor="w",
+                bg=SETTINGS_THEME["bg"],
+                fg=SETTINGS_THEME["text"],
+                font=("Segoe UI", 9),
+            ).pack(side="left")
+            ai_unlock_pill_frame = tk.Frame(ai_unlock_row, bg=SETTINGS_THEME["bg"])
+            ai_unlock_pill_frame.pack(side="right", fill="x", expand=True)
+            for index, mode_key in enumerate(("on", "off")):
+                btn = PopupPillButton(
+                    ai_unlock_pill_frame,
+                    "Вкл" if mode_key == "on" else "Выкл",
+                    command=lambda enabled=(mode_key == "on"): _set_ai_unlock_enabled(enabled),
+                    width=74,
+                    height=26,
+                )
+                btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
+                ai_unlock_pills[mode_key] = btn
+            _refresh_ai_unlock_pills()
+
             button_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
             button_row.pack(fill="x", pady=(8, 0))
 
@@ -25580,6 +25853,7 @@ try:
                 latest_settings = load_routing_settings()
                 system_settings = dict(latest_settings.get("system") or {})
                 system_settings["suppress_game_overlay"] = bool(game_overlay_state.get("enabled", False))
+                system_settings["ai_unlock"] = bool(ai_unlock_state.get("enabled", True))
                 payload = {
                     "version": CURRENT_VERSION,
                     "opera_region": _normalize_opera_region(opera_region_state.get("value"), DEFAULT_ROUTING_SETTINGS.get("opera_region", "EU")),
@@ -25661,6 +25935,8 @@ try:
                 system_settings = latest.get("system") or {}
                 game_overlay_state["enabled"] = bool(system_settings.get("suppress_game_overlay", False))
                 _refresh_game_overlay_pills()
+                ai_unlock_state["enabled"] = bool(system_settings.get("ai_unlock", True))
+                _refresh_ai_unlock_pills()
 
             win._refresh_state = _refresh_popup_state
             _refresh_popup_state()
@@ -25680,6 +25956,7 @@ try:
             fg=log_fg,
             bg_color=log_bg,
         )
+        btn_settings.set_visible(False)
 
         INDICATOR_WARP = "#8FD8FF"
         INDICATOR_EU = "#D8B6BF"
@@ -25732,14 +26009,14 @@ try:
                         wm = globals().get("warp_manager")
                         warp_connected = bool(getattr(wm, "is_connected", False)) if wm else False
                         warp_port = int(globals().get("WARP_PORT", 1370))
-                        warp_ok = bool(backend_ok and warp_connected and is_local_port_open_quick(warp_port, timeout=0.2))
+                        warp_ok = bool(backend_ok and warp_connected and is_local_port_open_quick(warp_port, timeout=1.0))
                     except:
                         warp_ok = False
 
                     try:
                         opm = globals().get("opera_proxy_manager")
                         opera_port = int(getattr(opm, "port", 1371)) if opm else 1371
-                        opera_ok = bool(is_local_http_proxy_responsive(port=opera_port, timeout=0.25))
+                        opera_ok = bool(is_local_http_proxy_responsive(port=opera_port, timeout=1.0))
                     except:
                         opera_ok = False
 

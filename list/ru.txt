@@ -1,6 +1,8 @@
-# version: 1.23.1
+# version: 1.25
 1337x.to
 1e100cdn.net
+7tv.app
+7tv.io
 abuseipdb.com
 adguard-mail.com
 adobe.com
@@ -17,6 +19,7 @@ arm.com
 arrow.com
 awswaf.com
 azure.com
+b-cdn.net
 bbc-reporting-api.app
 bbc.com
 benchgecko.ai
@@ -26,6 +29,7 @@ bootstrapcdn.com
 breakingcopyright.com
 brevo.com
 buildwithfern.com
+cdn.bsky.app
 cdninstagram.com
 cfapi.net
 chartbeat.com
@@ -34,6 +38,7 @@ chesscomfiles.com
 clawbot.ai
 cloudflare-ech.com
 cloudflare.com
+cloudflare.dev
 cloudflare.net
 cloudflareaccess.com
 cloudflareclient.com
@@ -45,6 +50,7 @@ cloudflaressl.com
 cloudflarestatus.com
 cloudflarestorage.com
 cloudflarestream.com
+cloudfront.hls.ttvnw.net
 cloudfront.net
 coinbase.com
 comicbook.com
@@ -58,6 +64,7 @@ digit.in
 discord.com
 discord.gg
 discordapp.com
+discourse-cdn.com
 dl.sourceforge.net
 dropboxstatic.com
 ecosyste.ms
@@ -76,6 +83,7 @@ filterblade.xyz
 fitgirl-repacks.site
 flagcdn.com
 fontawesome.com
+frankerfacez.com
 fsdn.com
 fubgun.com
 funpay.com
@@ -100,13 +108,17 @@ jabber.fr
 kinozal.tv
 laozhang.ai
 litellm.ai
+live-video.net
 live.com
+login.pathofexile.com
+login.pathofexile2.com
 lostfilm.tv
 lumalabs.ai
 mangamirai.com
 mate.tools
 matrix.org
 mcpmarket.com
+media-amazon.com
 meet.google.com
 meshworld.in
 microsoft.com
@@ -133,10 +145,12 @@ onorca.dev
 ookla.com
 optimizely.com
 pacloudflare.com
+patch.pathofexile.com
 pathofbuilding.community
 perfops.net
 pixelbuilds.org
 play.google.com
+playlist.ttvnw.net
 pobb.in
 pocketnet.app
 poedb.tw

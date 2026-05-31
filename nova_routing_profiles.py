@@ -82,6 +82,20 @@ def get_default_app_routing_profiles():
             process_path_regex=r"(?i).*[\\/](cmd|powershell|pwsh|windowsterminal|opencode-cli|codex-cli|gemini-cli|gemini)(?:\.exe)?$",
             path_markers=("cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal", "opencode-cli", "codex-cli", "gemini-cli", "gemini.exe"),
         ),
+        "games": AppRoutingProfile(
+            key="games",
+            display_name="Games",
+            process_names=(
+                "PathOfExile.exe", "pathofexile.exe",
+                "PathOfExile_x64.exe", "pathofexile_x64.exe",
+                "PathOfExileSteam.exe", "pathofexilesteam.exe",
+                "PathOfExile_x64Steam.exe", "pathofexile_x64steam.exe",
+                "PathOfExile_KG.exe", "pathofexile_kg.exe",
+                "PathOfExile_x64_KG.exe", "pathofexile_x64_kg.exe",
+            ),
+            process_path_regex=r"(?i).*(pathofexile).*(?:\.exe)?$",
+            path_markers=("pathofexile",),
+        ),
     }
 
 

@@ -1,4 +1,4 @@
-# version: 1.23.1
+# version: 1.25
 akamaihd.net
 apteka-april.ru
 apteka.ru
@@ -9,6 +9,7 @@ chrome.cloudflare-dns.com
 cloud.ru
 cloudcode-pa.googleapis.com
 cloudflare-dns.com
+deploy.static.akamaitechnologies.com
 dev-tcsgroup.io
 dns.google
 dns.google.com
@@ -60,6 +61,7 @@ tinkoff.ru
 tricolor.ru
 tricolor.tv
 userapi.com
+valve.net
 valvesoftware.com
 vk-portal.net
 vk.cc

@@ -299,8 +299,8 @@ def find_tcl_root() -> Path | None:
 
 def ensure_tcl_data(resources_dir: Path) -> None:
     """Copy Tcl/Tk library data into resources/tcl_data and resources/tk_data if PyInstaller didn't."""
-    tcl_data_dest = resources_dir / "tcl_data"
-    tk_data_dest = resources_dir / "tk_data"
+    tcl_data_dest = resources_dir / "_tcl_data"
+    tk_data_dest = resources_dir / "_tk_data"
 
     if tcl_data_dest.exists() and any(tcl_data_dest.iterdir()) and tk_data_dest.exists() and any(tk_data_dest.iterdir()):
         print("[BUILD] tcl_data and tk_data already present — skipping.")

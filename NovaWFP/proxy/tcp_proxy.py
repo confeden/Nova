@@ -143,6 +143,8 @@ ROUTING_GROUP_ALIASES = {
     "discord": "discord",
     "ide": "ide",
     "cli": "cli",
+    "games": "games",
+    "poe": "games",
     "opencode": "ide",
 }
 
@@ -168,6 +170,96 @@ def _load_routing_settings() -> dict:
     _ROUTING_SETTINGS_CACHE = payload
     _ROUTING_SETTINGS_MTIME = mtime
     return payload
+
+
+_DOMAIN_LISTS_CACHE = {}
+_DOMAIN_LISTS_MTIMES = {}
+
+
+def _load_domain_list(name: str) -> set:
+    global _DOMAIN_LISTS_CACHE, _DOMAIN_LISTS_MTIMES
+    path = REPO_ROOT / "list" / f"{name}.txt"
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        return set()
+    if _DOMAIN_LISTS_MTIMES.get(name) == mtime:
+        return _DOMAIN_LISTS_CACHE.get(name, set())
+    
+    domains = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.split("#", 1)[0].strip().lower()
+                if line:
+                    domains.add(line)
+    except Exception:
+        pass
+    _DOMAIN_LISTS_CACHE[name] = domains
+    _DOMAIN_LISTS_MTIMES[name] = mtime
+    return domains
+
+
+def _match_domain(host: str, domain_set: set) -> bool:
+    host = str(host or "").strip().lower()
+    if not host:
+        return False
+    if host in domain_set:
+        return True
+    parts = host.split('.')
+    for i in range(1, len(parts)):
+        suffix = '.'.join(parts[i:])
+        if suffix in domain_set:
+            return True
+    return False
+
+
+_IP_LISTS_CACHE = {}
+_IP_LISTS_MTIMES = {}
+
+
+def _load_ip_list(name: str) -> list:
+    global _IP_LISTS_CACHE, _IP_LISTS_MTIMES
+    path = REPO_ROOT / "ip" / f"{name}.txt"
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        return []
+    if _IP_LISTS_MTIMES.get(name) == mtime:
+        return _IP_LISTS_CACHE.get(name, [])
+    
+    networks = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                try:
+                    if "/" not in line:
+                        if ":" in line:
+                            line += "/128"
+                        else:
+                            line += "/32"
+                    networks.append(ipaddress.ip_network(line, strict=False))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    _IP_LISTS_CACHE[name] = networks
+    _IP_LISTS_MTIMES[name] = mtime
+    return networks
+
+
+def _match_ip(ip_str: str, networks: list) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except Exception:
+        return False
+    for net in networks:
+        if ip in net:
+            return True
+    return False
 
 
 def _get_app_route_mode(app_key: str) -> str:
@@ -414,6 +506,7 @@ class NovaWfpTcpProxy:
         self.log_func = log_func or (lambda message: LOG.info(message))
         self._route_cache = {}
         self._route_cache_ttl = 300.0
+        self._last_routing_settings_mtime = -1.0
         self._bad_route_cache = {}
         self._bad_route_cache_ttl = 90.0
         self._webview_host_family_cache = {}
@@ -453,6 +546,8 @@ class NovaWfpTcpProxy:
             return "ide"
         if any(token in lower for token in ("opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe")):
             return "cli"
+        if "pathofexile" in lower:
+            return "games"
         return ""
 
     def _resolve_webview_host_family(self, process_id: int) -> str:
@@ -562,6 +657,14 @@ class NovaWfpTcpProxy:
         return value.split("|", 1)[0]
 
     def _route_label_cache_get(self, target_host: str, target_port: int, route_scope: str = "") -> Optional[str]:
+        try:
+            mtime = float(ROUTING_SETTINGS_PATH.stat().st_mtime)
+        except Exception:
+            mtime = -1.0
+        if mtime != self._last_routing_settings_mtime:
+            self._last_routing_settings_mtime = mtime
+            self._route_cache.clear()
+            self.log_func("[NovaWFP][Proxy] Routing settings modification detected. Route cache cleared.")
         key = f"{self._route_scope_value(route_scope)}|{str(target_host).strip()}:{int(target_port)}"
         now = time.monotonic()
         entry = self._route_cache.get(key)
@@ -660,7 +763,7 @@ class NovaWfpTcpProxy:
                 "timeout": 3.0,
                 "first_byte_timeout": 2.4,
             },
-            "direct": {"kind": "direct", "label": "direct", "timeout": 1.2, "first_byte_timeout": 1.4},
+            "direct": {"kind": "direct", "label": "direct", "timeout": 8.0, "first_byte_timeout": 8.0},
         }
         return dict(mapping[label]) if label in mapping else None
 
@@ -777,11 +880,41 @@ class NovaWfpTcpProxy:
             route_mode_key = "discord"
         elif is_whatsapp_target:
             route_mode_key = "whatsapp"
+        elif app_family == "games":
+            route_mode_key = "games"
         elif app_family == "ide":
             route_mode_key = "ide"
         elif app_family == "cli":
             route_mode_key = "cli"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
+        if route_mode == "auto":
+            exclude_domains = _load_domain_list("exclude")
+            if _match_domain(target_host, exclude_domains):
+                route_mode = "direct"
+            else:
+                ru_domains = _load_domain_list("ru")
+                u_ru_domains = _load_domain_list("u_ru")
+                if _match_domain(target_host, ru_domains) or _match_domain(target_host, u_ru_domains):
+                    route_mode = "warp"
+                else:
+                    eu_domains = _load_domain_list("eu")
+                    u_eu_domains = _load_domain_list("u_eu")
+                    if _match_domain(target_host, eu_domains) or _match_domain(target_host, u_eu_domains):
+                        route_mode = "opera"
+                    else:
+                        ru_ips = _load_ip_list("ru")
+                        u_ru_ips = _load_ip_list("u_ru")
+                        cf_ips = _load_ip_list("cloudflare")
+                        dc_ips = _load_ip_list("discord")
+                        is_cf = _match_ip(target_host, cf_ips)
+                        if _match_ip(target_host, ru_ips) or _match_ip(target_host, u_ru_ips) or (is_cf and route_mode_key != "games") or _match_ip(target_host, dc_ips):
+                            route_mode = "warp"
+
+                        else:
+                            eu_ips = _load_ip_list("eu")
+                            u_eu_ips = _load_ip_list("u_eu")
+                            if _match_ip(target_host, eu_ips) or _match_ip(target_host, u_eu_ips):
+                                route_mode = "opera"
         if route_mode != "auto":
             for label in ("warp-socks", "opera-http", "direct"):
                 if label not in attempts:
@@ -919,7 +1052,13 @@ class NovaWfpTcpProxy:
                         except Exception:
                             continue
                         if local_host != peer_host:
-                            continue
+                            try:
+                                ip_local = ipaddress.ip_address(local_host)
+                                ip_peer = ipaddress.ip_address(peer_host)
+                                if not (ip_local.is_private and ip_peer.is_private):
+                                    continue
+                            except Exception:
+                                continue
                         if expires < now:
                             continue
                         if abs(local_port - peer_port) > 16:
@@ -1764,6 +1903,29 @@ class NovaWfpTcpProxy:
                 writer.close()
                 await writer.wait_closed()
 
+    async def _warp_keepalive_loop(self):
+        self.log_func("[NovaWFP][Proxy] Warp Keepalive Loop started")
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.sleep(15.0)
+                if self._warp_socks_available():
+                    # Perform a tiny SOCKS5 request to keep the UDP tunnel warm!
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", 1370),
+                        timeout=1.5
+                    )
+                    writer.write(b"\x05\x01\x00")
+                    await writer.drain()
+                    resp = await asyncio.wait_for(reader.read(2), timeout=1.0)
+                    if resp == b"\x05\x00":
+                        writer.write(b"\x05\x01\x00\x01\x01\x01\x01\x01\x00\x35")
+                        await writer.drain()
+                        await asyncio.wait_for(reader.read(10), timeout=1.0)
+                    writer.close()
+                    await writer.wait_closed()
+            except Exception:
+                pass
+
     async def run(self):
         self.server = await asyncio.start_server(self._handle_client, self.host, self.port)
         self.log_func(f"[NovaWFP][Proxy] listening on {self.host}:{self.port}")
@@ -1771,7 +1933,11 @@ class NovaWfpTcpProxy:
         async with self.server:
             serve_task = asyncio.create_task(self.server.serve_forever())
             stop_task = asyncio.create_task(self.stop_event.wait())
+            keepalive_task = asyncio.create_task(self._warp_keepalive_loop())
             done, pending = await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            keepalive_task.cancel()
+            with contextlib.suppress(Exception):
+                await keepalive_task
             for task in pending:
                 task.cancel()
                 with contextlib.suppress(Exception):

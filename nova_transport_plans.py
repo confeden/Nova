@@ -9,6 +9,8 @@ ROUTING_GROUP_ALIASES = {
     "discord": "discord",
     "ide": "ide",
     "cli": "cli",
+    "games": "games",
+    "poe": "games",
     "opencode": "ide",
 }
 ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
