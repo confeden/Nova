@@ -12390,8 +12390,9 @@ try:
             return
         try:
             ll = str(string).lower()
-            if not IS_DEBUG_MODE and "[tgrelay]" in ll and "подключено:" in ll:
-                return
+            if not IS_DEBUG_MODE and "[tgrelay]" in ll:
+                if "подключено:" in ll or "bootstrap" in ll or "probe" in ll:
+                    return
         except:
             pass
         string = mask_ips_in_text(string)
