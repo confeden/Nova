@@ -1,7 +1,12 @@
-# version: 1.25
+# version: 1.26
+1c-bitrix.ru
 akamaihd.net
 apteka-april.ru
 apteka.ru
+bitrix24.by
+bitrix24.kz
+bitrix24.ru
+bitrix24.tech
 cdn-tinkoff.ru
 cdnflow.ru
 cdnwb.ru

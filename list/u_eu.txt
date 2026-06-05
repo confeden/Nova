@@ -1,0 +1,3 @@
+# version: 1.26
+# user Opera override domains
+speedtest.foxford.ru

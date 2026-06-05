@@ -1,4 +1,4 @@
-# version: 1.25
+# version: 1.26
 # Nova Telegram CF/WSS domains via WARP/general
 nova-app.eu
 kws1.nova-app.eu

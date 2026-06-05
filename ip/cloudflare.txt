@@ -1,4 +1,4 @@
-# version: 1.25
+# version: 1.26
 # Source: https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6
 173.245.48.0/20
 103.21.244.0/22

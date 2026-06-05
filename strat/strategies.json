@@ -59,13 +59,13 @@
     "general": [
         "--filter-tcp=80,443",
         "--dpi-desync=hostfakesplit",
-        "--dpi-desync-fake-tls-mod=none",
+        "--dpi-desync-fake-tls-mod=rnd,dupsid",
         "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
         "--dpi-desync-fooling=ts,md5sig",
         "--dpi-desync-split-seqovl=1",
         "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
         "--dpi-desync-autottl=1",
-        "--dpi-desync-ttl=8",
+        "--dpi-desync-ttl=11",
         "--new",
         "--filter-udp=443",
         "--dpi-desync=fake",
@@ -314,5 +314,5 @@
         "--dpi-desync-repeats=6",
         "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
     ],
-    "version": "1.25"
+    "version": "1.26"
 }

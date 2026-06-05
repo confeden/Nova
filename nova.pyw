@@ -9297,22 +9297,36 @@ try:
             # 1. Version Check & Cleanup (JSON only)
             # FIX: Exclude persistent data files from aggressive wipe
             protected_files = ["ip_history.json", "learning_data.json", "checker_state.json"]
-            if os.path.exists(path) and name.endswith(".json") and name not in protected_files:
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                         d = json.load(f)
-                         if isinstance(d, dict):
-                             v = d.get("version")
-                             if v != CURRENT_VERSION:
-                                 os.remove(path) # Delete old version
-                                 # log_func not available here yet, print or silent? Silent is safest in init.
-                         else:
-                             # Not a dict (maybe corrupted or old format)
-                             os.remove(path)
-                except:
-                    # Corrupted file
-                    try: os.remove(path)
-                    except: pass
+            if os.path.exists(path) and name.endswith(".json"):
+                if name not in protected_files:
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                             d = json.load(f)
+                             if isinstance(d, dict):
+                                 v = d.get("version")
+                                 if v != CURRENT_VERSION:
+                                     os.remove(path) # Delete old version
+                                     # log_func not available here yet, print or silent? Silent is safest in init.
+                             else:
+                                 # Not a dict (maybe corrupted or old format)
+                                 os.remove(path)
+                    except:
+                        # Corrupted file
+                        try: os.remove(path)
+                        except: pass
+                elif name != "ip_history.json":
+                    # For protected JSON files (learning_data, checker_state), update version key in-place
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                             d = json.load(f)
+                             if isinstance(d, dict):
+                                 v = d.get("version")
+                                 if v != CURRENT_VERSION:
+                                     d["version"] = CURRENT_VERSION
+                                     with open(path, "w", encoding="utf-8") as fw:
+                                         json.dump(d, fw, indent=4, ensure_ascii=False)
+                    except:
+                        pass
             
             # 2. Create if missing
             if not os.path.exists(path):
@@ -9548,12 +9562,16 @@ try:
     def load_routing_settings():
         payload = load_json_robust(ROUTING_SETTINGS_PATH, None)
         if isinstance(payload, dict) and payload:
-            return normalize_routing_settings(payload)
+            normalized = normalize_routing_settings(payload)
+            if payload.get("version") != CURRENT_VERSION:
+                with contextlib.suppress(Exception):
+                    save_routing_settings(normalized)
+            return normalized
         legacy_payload = load_json_robust(LEGACY_ROUTING_SETTINGS_PATH, None)
         if isinstance(legacy_payload, dict) and legacy_payload:
             normalized = normalize_routing_settings(legacy_payload)
             with contextlib.suppress(Exception):
-                save_json_safe(ROUTING_SETTINGS_PATH, normalized)
+                save_routing_settings(normalized)
             return normalized
         return normalize_routing_settings(DEFAULT_ROUTING_SETTINGS)
 
@@ -9729,6 +9747,11 @@ try:
             for k, v in default.items():
                 if k not in _learning_data_cache:
                     _learning_data_cache[k] = v
+            
+            if _learning_data_cache.get("version") != CURRENT_VERSION:
+                _learning_data_cache["version"] = CURRENT_VERSION
+                with contextlib.suppress(Exception):
+                    save_json_safe(LEARNING_DATA_PATH, _learning_data_cache)
             
             return _learning_data_cache
 
@@ -10016,6 +10039,18 @@ try:
         ".ai.google.dev",
         "generativelanguage.googleapis.com",
         "alkalimakersuite-pa.clients6.google.com",
+        # OpenAI / ChatGPT
+        "openai.com",
+        ".openai.com",
+        "chatgpt.com",
+        ".chatgpt.com",
+        # Anthropic / Claude
+        "claude.ai",
+        ".claude.ai",
+        "claude.com",
+        ".claude.com",
+        "anthropic.com",
+        ".anthropic.com",
     )
     # xbox-dns.ru servers (v4 + v6)
     NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
@@ -25408,21 +25443,42 @@ try:
                 )
 
         def apply_routing_settings_live(payload):
-            saved = save_routing_settings(payload)
             logger = globals().get("log_print", print)
+            try:
+                previous = load_routing_settings()
+            except Exception:
+                previous = dict(DEFAULT_ROUTING_SETTINGS)
+            saved = save_routing_settings(payload)
             try:
                 os.environ["NOVA_ROUTING_SETTINGS_PATH"] = ROUTING_SETTINGS_PATH
             except:
                 pass
-            desired_opera_region = get_routing_opera_region(saved)
-            desired_opera_country = get_routing_opera_country(saved)
-            try:
-                opm = globals().get("opera_proxy_manager")
-                if opm:
-                    current_country = str(getattr(opm, "country", "EU") or "EU").strip().upper()
-                    if current_country != desired_opera_country:
+
+            # --- Differential comparison ---
+            prev_routes = previous.get("routes") or {}
+            new_routes = saved.get("routes") or {}
+            routes_changed = any(
+                prev_routes.get(key) != new_routes.get(key)
+                for key, _ in routing_group_rows
+            )
+            prev_opera = get_routing_opera_region(previous)
+            new_opera = get_routing_opera_region(saved)
+            opera_changed = prev_opera != new_opera
+
+            prev_sys = previous.get("system") or {}
+            new_sys = saved.get("system") or {}
+            ai_unlock_changed = bool(prev_sys.get("ai_unlock", True)) != bool(new_sys.get("ai_unlock", True))
+
+            # --- Apply only what changed ---
+
+            # 1. Opera region
+            if opera_changed:
+                desired_opera_country = get_routing_opera_country(saved)
+                try:
+                    opm = globals().get("opera_proxy_manager")
+                    if opm:
                         opm.configure_country(desired_opera_country)
-                        logger(f"[EU] Регион Opera переключён: {desired_opera_region} ({desired_opera_country}). Перезапуск прокси...")
+                        logger(f"[EU] Регион Opera переключён: {new_opera} ({desired_opera_country}). Перезапуск прокси...")
                         try:
                             opm.stop()
                         except:
@@ -25431,45 +25487,51 @@ try:
                             opm.start()
                         except Exception as e:
                             logger(f"[EU] Ошибка перезапуска Opera proxy после смены региона: {e}")
-            except Exception as e:
-                logger(f"[EU] Ошибка применения региона Opera: {e}")
-            try:
-                pm = globals().get("pac_manager")
-                if pm:
-                    pm.generate_pac()
-                    pm.refresh_system_options()
-            except Exception as e:
-                logger(f"[Routing] Ошибка применения PAC-настроек: {e}")
-            try:
-                refresh_routing_backend_control_plane(force=True)
-            except Exception as e:
-                logger(f"[Routing] Ошибка обновления control plane: {e}")
-            try:
-                sys_settings = saved.get("system") or {}
-                ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
-                if ai_unlock_enabled:
-                    threading.Thread(
-                        target=setup_nrpt_dns_unblock,
-                        args=(logger,),
-                        daemon=True,
-                        name="NovaNrptSettingsApply"
-                    ).start()
-                else:
-                    threading.Thread(
-                        target=remove_nrpt_dns_unblock,
-                        args=(logger, True),
-                        daemon=True,
-                        name="NovaNrptSettingsRemove"
-                    ).start()
-            except Exception as e:
-                logger(f"[NRPT] Ошибка динамического применения DNS: {e}")
+                except Exception as e:
+                    logger(f"[EU] Ошибка применения региона Opera: {e}")
+
+            # 2. PAC + routing control plane (only if routes or opera region changed)
+            if routes_changed or opera_changed:
+                try:
+                    pm = globals().get("pac_manager")
+                    if pm:
+                        pm.generate_pac()
+                        pm.refresh_system_options()
+                except Exception as e:
+                    logger(f"[Routing] Ошибка применения PAC-настроек: {e}")
+                try:
+                    refresh_routing_backend_control_plane(force=True)
+                except Exception as e:
+                    logger(f"[Routing] Ошибка обновления control plane: {e}")
+
+            # 3. AI DNS unlock (only if ai_unlock setting changed)
+            if ai_unlock_changed:
+                try:
+                    ai_unlock_enabled = bool(new_sys.get("ai_unlock", True))
+                    if ai_unlock_enabled:
+                        threading.Thread(
+                            target=setup_nrpt_dns_unblock,
+                            args=(logger,),
+                            daemon=True,
+                            name="NovaNrptSettingsApply"
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=remove_nrpt_dns_unblock,
+                            args=(logger, True),
+                            daemon=True,
+                            name="NovaNrptSettingsRemove"
+                        ).start()
+                except Exception as e:
+                    logger(f"[NRPT] Ошибка динамического применения DNS: {e}")
+
             logger(
                 "[Routing] Настройки сохранены: "
                 + ", ".join(
                     f"{label}={get_routing_group_mode(key, saved)}"
                     for key, label in routing_group_rows
                 )
-                + f", OperaRegion={desired_opera_region}"
+                + f", OperaRegion={new_opera}"
             )
             return saved
 

@@ -1,4 +1,4 @@
-# version: 1.25
+# version: 1.26
 1337x.to
 1e100cdn.net
 7tv.app
@@ -88,12 +88,14 @@ fsdn.com
 fubgun.com
 funpay.com
 g2g.com
+ggpht.com
 glbgpt.com
 goentri.com
 gokino.su
 good-proxies.ru
 google.dev
 google.ru
+googlevideo.com
 greasyfork.org
 grokusercontent.com
 groq.com
@@ -153,6 +155,8 @@ play.google.com
 playlist.ttvnw.net
 pobb.in
 pocketnet.app
+poe2wiki.net
+poecdn.com
 poedb.tw
 pornolab.net
 proton.me
@@ -188,6 +192,7 @@ speedtest.net
 squarespace-cdn.com
 squarespace.com
 st.com
+static-cdn.jtvnw.net
 surfshark.com
 symantecliveupdate.com
 systeminformer.com
@@ -204,6 +209,7 @@ trustpilot.net
 twimg.com
 twitter.com
 unpkg.com
+upload.youtube.com
 userscript.zone
 vecpea.com
 vector.im
@@ -223,6 +229,9 @@ x.com
 xv-ru.com
 xvideos-cdn.com
 xvideos.com
+youtube-nocookie.com
+youtube.com
+ytimg.com
 z-lib.sk
 z-library.sk
 zendesk.com

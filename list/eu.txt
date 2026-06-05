@@ -1,4 +1,4 @@
-# version: 1.25
+# version: 1.26
 4pda.to
 alkalimakersuite-pa.clients6.google.com
 analog.com
@@ -73,6 +73,7 @@ people.googleapis.com
 plati.io
 plati.market
 puter.com
+qoder.com
 qt.io
 ru-board.com
 rutor.info
