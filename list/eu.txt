@@ -1,6 +1,6 @@
-# version: 1.26
+# version: 1.27
 4pda.to
-alkalimakersuite-pa.clients6.google.com
+accounts.google.com
 analog.com
 anthropic.com
 apihub.googleapis.com
@@ -32,8 +32,6 @@ etsy.com
 flibusta.is
 g2a.com
 gamsgo.com
-gemini.google
-gemini.google.com
 generativelanguage.googleapis.com
 geolocation.onetrust.com
 githubcopilot.com
@@ -49,6 +47,7 @@ invideo.io
 jules.google.com
 kilo.ai
 kodikplayer.com
+lh3.googleusercontent.com
 lpsg.com
 meta.ai
 microchip.com
@@ -70,6 +69,7 @@ otzyvmarketing.ru
 paddle.com
 parklogic.com
 people.googleapis.com
+performance.radar.cloudflare.com
 plati.io
 plati.market
 puter.com

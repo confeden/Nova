@@ -1,4 +1,4 @@
-# version: 1.26
+# version: 1.27
 1c-bitrix.ru
 akamaihd.net
 apteka-april.ru
@@ -31,6 +31,7 @@ gov.ru
 gu-st.ru
 imgsmail.ru
 kaspersky.com
+megafon.ru
 mozilla.cloudflare-dns.com
 ok.me
 ok.ru
@@ -81,6 +82,7 @@ vkvideo.ru
 wb-bank.ru
 wb.ru
 wbbasket.ru
+wbcontent.net
 wbpay.ru
 wbstatic.net
 wibes.com

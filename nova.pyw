@@ -4779,16 +4779,14 @@ try:
                             parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
                         elif not strict and opera_active:
                             parts.append("PROXY 127.0.0.1:1371")
-                        parts.append("SOCKS5 127.0.0.1:1" if strict or parts else "DIRECT")
-                        return "; ".join(_dedupe_route_parts(parts))
+                        return "; ".join(_dedupe_route_parts(parts)) if parts else "DIRECT"
                     if target == "opera":
                         parts = []
                         if opera_active:
                             parts.append("PROXY 127.0.0.1:1371")
                         elif not strict and warp_active:
                             parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
-                        parts.append("SOCKS5 127.0.0.1:1" if strict or parts else "DIRECT")
-                        return "; ".join(_dedupe_route_parts(parts))
+                        return "; ".join(_dedupe_route_parts(parts)) if parts else "DIRECT"
                     return "DIRECT"
 
                 def _route_for_app_mode(mode, default_route):
@@ -4819,12 +4817,17 @@ try:
                     except:
                         pass
                 
-                # Routing strings for EU domains: STRICTLY Opera VPN only (1371).
-                # No fallback to WARP to ensure specific geo-routing.
-                if opera_active:
+                # Routing strings for EU domains: Opera VPN preferred when active,
+                # WARP fallback.  PROXY 1371 is only included when opera_active
+                # so that a dead/alive-but-broken Opera never poisons the chain.
+                if warp_active and opera_active:
+                    eu_route = f"PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:{self.warp_port}"
+                elif warp_active:
+                    eu_route = f"SOCKS5 127.0.0.1:{self.warp_port}"
+                elif opera_active:
                     eu_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
                 else:
-                    # Kill-switch for EU domains if Opera is down.
+                    # Kill-switch for EU domains if both Opera and WARP are down.
                     eu_route = "SOCKS5 127.0.0.1:1"
 
                 # Routing strings for RU domains: browser PAC should not enter a stale
@@ -4837,7 +4840,7 @@ try:
                         ru_route_parts.append("PROXY 127.0.0.1:1371")
                     # NO DIRECT fallback for RU to prevent IP leak. Use a blackhole proxy.
                     ru_route_parts.append("SOCKS5 127.0.0.1:1") 
-                    ru_route = "; ".join(ru_route_parts)
+                    ru_route = "; ".join(ru_route_parts) if ru_route_parts else "SOCKS5 127.0.0.1:1"
                 else:
                     # Warp down: use Opera if available, otherwise Blackhole (No direct leak)
                     ru_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
@@ -4850,7 +4853,7 @@ try:
                     if opera_active:
                         discord_route_parts.append("PROXY 127.0.0.1:1371")
                     discord_route_parts.append("SOCKS5 127.0.0.1:1")
-                    discord_route = "; ".join(discord_route_parts)
+                    discord_route = "; ".join(discord_route_parts) if discord_route_parts else "SOCKS5 127.0.0.1:1"
                 else:
                     discord_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
 
@@ -5037,12 +5040,12 @@ try:
     if (matchDomain(user_ru, host)) return "{ru_route}";
     if (matchDomain(user_eu, host)) return "{eu_route}";
     if (matchDomain(exclude, host)) return "DIRECT";
+    if (matchDomain(eu, host)) return "{eu_route}";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
     if (matchDomain(telegram, host)) return "{telegram_route}";
     if (matchDomain(whatsapp, host)) return "{whatsapp_route}";
     if (matchDomain(ide, host)) return "{ide_route}";
-    if (matchDomain(eu, host)) return "{eu_route}";
     // Cloudflare IP routing is a fallback for unknown domains only.
     // Explicit domain lists above must keep their selected geography.
     if (!isIpV4 && !isIpV6 && anyIpMatches(resolveHostIps(host), cloudflare_ips)) return "{ru_route}";
@@ -5507,6 +5510,7 @@ try:
             self._current_attempt_mode = ""
             self._current_bootstrap_proxy = ""
             self._current_override_endpoint = ""
+            self._forced_warp_proxy = ""
 
         def configure_country(self, country):
             try:
@@ -5623,14 +5627,81 @@ try:
                 warp_port = int(getattr(wm, "port", 1370) or 1370)
                 tester = getattr(wm, "_test_socks5_internet", None)
                 if callable(tester):
+                    # Two attempts: fast (1.5s) then slower (2.5s) to avoid false negatives
+                    # from transient SOCKS5 port contention or slow test endpoints.
                     try:
                         if not bool(tester(warp_port, timeout=1.5)):
-                            return None
+                            try:
+                                if not bool(tester(warp_port, timeout=2.5)):
+                                    return None
+                            except:
+                                return None
                     except:
                         return None
                 return f"socks5://127.0.0.1:{warp_port}"
             except:
                 return None
+
+        def force_restart(self, warp_proxy=None):
+            """Force-kill the current process and restart. Bypasses locks.
+            If warp_proxy is provided (e.g. socks5://127.0.0.1:1370), force it
+            into the new start() so we don't re-probe WARP (which can flap)."""
+            # Kill by PID
+            try:
+                _proc = getattr(self, "process", None)
+                if _proc and _proc.poll() is None:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(_proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+            except:
+                pass
+            # Kill by name as fallback
+            for proc_name in ["opera-proxy.windows-amd64.exe", "opera-proxy.windows-amd64", "opera-proxy.exe"]:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", proc_name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except:
+                    pass
+            # Reset all state
+            self.process = None
+            self.owns_process = False
+            self._startup_grace_deadline = 0.0
+            self._started_at_ts = 0.0
+            self._current_attempt_mode = ""
+            self._current_bootstrap_proxy = ""
+            self._current_override_endpoint = ""
+            self._start_in_progress = False
+            try:
+                self._start_lock.release()
+            except:
+                pass
+            # Store warp_proxy so start() uses it directly without re-probing.
+            self._forced_warp_proxy = str(warp_proxy or "")
+            # Wait for the killed process to actually release the port.
+            # Without this, start() may find the port still open and adopt it
+            # as an external proxy, making it unmanageable by the watchdog.
+            _port = int(getattr(self, "port", 1371) or 1371)
+            for _ in range(10):
+                if is_closing:
+                    return
+                try:
+                    import socket
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+                        _s.settimeout(0.5)
+                        if _s.connect_ex(("127.0.0.1", _port)) != 0:
+                            break
+                except:
+                    break
+                time.sleep(0.5)
+            # Now start fresh
+            self.start()
 
         def _sync_pac_state(self, force=False):
             """Refresh PAC when 1371 readiness changes, so browser routing never gets stale."""
@@ -5825,15 +5896,41 @@ try:
                 self.log_file = os.path.join(log_dir, "opera.log")
 
                 cached_endpoint = self._load_cached_endpoint()
-                warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                # Use forced warp_proxy from force_restart() if available,
+                # otherwise probe WARP freshness. This avoids flapping when
+                # _get_warp_bootstrap_proxy() briefly fails during restart.
+                warp_bootstrap_proxy = getattr(self, "_forced_warp_proxy", "") or ""
+                if not warp_bootstrap_proxy:
+                    warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                # If WARP not ready yet, wait up to 8s for it (avoids useless direct-start).
+                # Only on fresh starts (not force_restart which already has the proxy).
+                if not warp_bootstrap_proxy and not getattr(self, "_forced_warp_proxy", ""):
+                    _warp_wait_start = time.time()
+                    while time.time() - _warp_wait_start < 8.0:
+                        if is_closing or not is_service_active:
+                            break
+                        warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                        if warp_bootstrap_proxy:
+                            if IS_DEBUG_MODE:
+                                self.log_func(f"[EU] [Diag] WARP стал доступен через {time.time() - _warp_wait_start:.1f}s ожидания.")
+                            break
+                        time.sleep(1.0)
+                self._forced_warp_proxy = ""
+
+                # ISP blocks all SurfEasy/Opera IPs (77.111.x.x, api2.sec-tunnel.com).
+                # When WARP is available, route ALL traffic through it using -proxy.
+                # This bypasses both registration API and data tunnel ISP blocks.
+                use_full_warp_proxy = bool(warp_bootstrap_proxy)
+
+                # When using WARP proxy, skip cached endpoint (it's a direct SurfEasy
+                # address blocked by ISP). Start fresh with WARP-routed discovery.
+                if use_full_warp_proxy:
+                    cached_endpoint = None
+
                 attempts = []
                 if cached_endpoint:
-                    # Prefer the last known-good endpoint before asking SurfEasy for a
-                    # fresh EU region. This keeps 1371 alive when discover(EU) returns
-                    # "No Available Proxies for Region", while still allowing later
-                    # fallback to discover if the cached node is stale.
                     attempts.append(("cached", cached_endpoint, 2.5, None))
-                if warp_bootstrap_proxy:
+                if use_full_warp_proxy:
                     attempts.append(("discover-warp", None, 4.0, warp_bootstrap_proxy))
                 attempts.append(("discover", None, 6.5, None))
 
@@ -5842,14 +5939,15 @@ try:
                         self.exe_path,
                         "-bind-address", f"127.0.0.1:{self.port}",
                         "-country", self.country,
-                        # Keep 1371 startup independent from the public benchmark URL
-                        # used by opera-proxy's default fastest selector.
                         "-server-selection", "first",
                     ]
                     if base_proxy:
-                        cmd.extend(["-proxy", base_proxy, "-api-proxy", base_proxy])
+                        # Route ALL opera-proxy traffic through WARP to bypass ISP blocks.
+                        # -proxy routes both registration API and data tunnel through WARP.
+                        cmd.extend(["-proxy", base_proxy])
+                        cmd.extend(["-proxy-bypass", "127.0.0.1", "-proxy-bypass", "localhost"])
                         if IS_DEBUG_MODE:
-                            self.log_func(f"[EU] [Diag] Bootstrap Opera через {base_proxy}.")
+                            self.log_func(f"[EU] [Diag] Opera через WARP (full proxy): {base_proxy}.")
                     if override_endpoint:
                         cmd.extend(["-override-proxy-address", override_endpoint])
                         self.log_func(f"[EU] [Diag] Пробуем кэшированный endpoint {override_endpoint}.")
@@ -5867,7 +5965,7 @@ try:
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
                     self._started_at_ts = time.time()
-                    self._startup_grace_deadline = self._started_at_ts + 120.0
+                    self._startup_grace_deadline = self._started_at_ts + 30.0
 
                     run_id = SERVICE_RUN_ID
                     ready = False
@@ -5905,8 +6003,11 @@ try:
                         return
 
                     if self.process and self.process.poll() is not None:
+                        rc = self.process.returncode
                         if IS_DEBUG_MODE:
-                            self.log_func(f"[EU] Процесс завершился сразу после запуска (код: {self.process.returncode}).")
+                            self.log_func(f"[EU] Процесс завершился сразу после запуска (код: {rc}).")
+                        elif base_proxy:
+                            self.log_func(f"[EU] Opera завершился сразу (код: {rc}). Full-proxy через WARP не сработал. Пробуем следующий вариант...")
                         self.process = None
                         self._startup_grace_deadline = 0.0
                         self._started_at_ts = 0.0
@@ -8944,8 +9045,8 @@ try:
             "discord.txt": "discord.media\n",
             "telegram.txt": "telegram.org\nt.me\ntelegra.ph\ntdesktop.com\n",
             "whatsapp.txt": "whatsapp.com\nwhatsapp.net\nwa.me\n",
-            "ide.txt": "api.openai.com\nauth.openai.com\nchatgpt.com\noaistatic.com\n",
-            "opencode.txt": "api.openai.com\nauth.openai.com\nchatgpt.com\noaistatic.com\n",
+            "ide.txt": "",
+            "opencode.txt": "",
             "cloudflare.txt": "",
             "general.txt": "twitter.com\ninstagram.com\n",
             "exclude.txt": "",
@@ -9860,6 +9961,149 @@ try:
         except: pass
 
 
+    # ================= МОДУЛЬ: NRPT DNS UNBLOCK =================
+    # Selective DNS routing for Google/AI domains via xbox-dns.ru NRPT rules.
+    # This allows Gemini and other region-locked Google AI services to resolve
+    # to non-blocked IPs without proxying all traffic.
+
+    NOVA_NRPT_TAG = "NOVA_DNS_UNBLOCK"
+    NOVA_NRPT_NAMESPACES = (
+        ".googleapis.com",
+        ".googleusercontent.com",
+        "lh3.googleusercontent.com",
+        "accounts.google.com",
+        ".google.com",
+        ".googletagmanager.com",
+        ".gstatic.com",
+        "gemini.google.com",
+        ".gemini.google.com",
+        "gemini.google",
+        ".gemini.google",
+        "aistudio.google.com",
+        ".aistudio.google.com",
+        "ai.google.dev",
+        ".ai.google.dev",
+        "generativelanguage.googleapis.com",
+        ".clients6.google.com",
+        "gemini.gstatic.com",
+        "play.google.com",
+        # OpenAI / ChatGPT
+        "openai.com",
+        ".openai.com",
+        "chatgpt.com",
+        ".chatgpt.com",
+        # Anthropic / Claude
+        "claude.ai",
+        ".claude.ai",
+        "claude.com",
+        ".claude.com",
+        "anthropic.com",
+        ".anthropic.com",
+        # Microsoft Copilot
+        "copilot.microsoft.com",
+        ".copilot.microsoft.com",
+    )
+    # xbox-dns.ru servers (v4 + v6)
+    NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
+
+    def _check_nrpt_rules_applied(log_func=None):
+        """Check if all required NRPT rules with NOVA_DNS_UNBLOCK tag are already applied."""
+        try:
+            cmd = (
+                f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
+                f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
+                f"| Select-Object -ExpandProperty Namespace"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            if result.returncode != 0:
+                return False
+            existing = set()
+            for line in result.stdout.strip().splitlines():
+                ns = line.strip()
+                if ns:
+                    existing.add(ns)
+            required = set(NOVA_NRPT_NAMESPACES)
+            if required.issubset(existing):
+                if log_func:
+                    log_func(f"[NRPT] DNS-правила уже применены ({len(existing)} правил).")
+                return True
+            if log_func:
+                missing = required - existing
+                log_func(f"[NRPT] Отсутствуют правила: {', '.join(sorted(missing))}")
+            return False
+        except Exception as e:
+            if log_func:
+                log_func(f"[NRPT] Ошибка проверки правил: {e}")
+            return False
+
+    def setup_nrpt_dns_unblock(log_func=None):
+        """Setup NRPT rules for Google/AI DNS unblocking. Idempotent: skips if already applied."""
+        try:
+            if _check_nrpt_rules_applied(log_func=log_func):
+                return True
+            # Remove any stale rules with our tag first
+            remove_nrpt_dns_unblock(log_func=log_func, silent=True)
+            errors = []
+            for namespace in NOVA_NRPT_NAMESPACES:
+                cmd = (
+                    f"Add-DnsClientNrptRule -Namespace '{namespace}' "
+                    f"-NameServers @({NOVA_NRPT_NAMESERVERS}) "
+                    f"-Comment '{NOVA_NRPT_TAG}' "
+                    f"-DisplayName 'Nova DNS Unblock' "
+                    f"-ErrorAction Stop"
+                )
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                    capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.strip()
+                    if "denied" in stderr.lower() or "elevation" in stderr.lower():
+                        if log_func:
+                            log_func("[NRPT] Требуются права администратора для DNS-правил.")
+                        return False
+                    errors.append(f"{namespace}: {stderr[:80]}")
+            # Flush DNS cache
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Clear-DnsClientCache -ErrorAction SilentlyContinue"],
+                capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            if errors:
+                if log_func:
+                    log_func(f"[NRPT] Частичные ошибки: {'; '.join(errors[:3])}")
+                return False
+            if log_func:
+                log_func(f"[NRPT] DNS-правила для Gemini/Google AI применены ({len(NOVA_NRPT_NAMESPACES)} правил).")
+            return True
+        except Exception as e:
+            if log_func:
+                log_func(f"[NRPT] Ошибка настройки DNS: {e}")
+            return False
+
+    def remove_nrpt_dns_unblock(log_func=None, silent=False):
+        """Remove all NRPT rules tagged with NOVA_DNS_UNBLOCK."""
+        try:
+            cmd = (
+                f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
+                f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
+                f"| Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; "
+                f"Clear-DnsClientCache -ErrorAction SilentlyContinue"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            if log_func and not silent:
+                log_func("[NRPT] DNS-правила удалены.")
+        except Exception as e:
+            if log_func and not silent:
+                log_func(f"[NRPT] Ошибка удаления DNS-правил: {e}")
+
+
     def is_ip_address(s):
         return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", s.strip()))
 
@@ -9955,8 +10199,8 @@ try:
                     # During restart, wait for old process to exit and free mutex.
                     time.sleep(0.25)
                     continue
+                window_restored = False
                 try:
-                    # Пытаемся найти окно по частичному соответствию заголовка
                     def enum_windows_proc(hwnd, lParam):
                         window_text = ctypes.create_unicode_buffer(512)
                         ctypes.windll.user32.GetWindowTextW(hwnd, window_text, 512)
@@ -9967,9 +10211,15 @@ try:
                         return True
                     
                     EnumWindows = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-                    ctypes.windll.user32.EnumWindows(EnumWindows(enum_windows_proc), 0)
+                    result = ctypes.windll.user32.EnumWindows(EnumWindows(enum_windows_proc), 0)
+                    # EnumWindows returns FALSE when callback returns FALSE (window found)
+                    window_restored = (result == 0)
+                except Exception:
+                    pass
+                
+                if window_restored:
+                    # Exit cleanly — the existing window was brought to front
                     sys.exit(0)
-                except: pass
                 
                 time.sleep(0.3)
                 continue
@@ -10559,6 +10809,8 @@ try:
         if line.startswith("[Repair] Start type WinDivert нормализован"):
             return "info"
         if "[warning]" in text_lower or "[warn]" in text_lower:
+            return "warning"
+        if "[VPN Detector]" in line and "Обнаружен" in line:
             return "warning"
         if "[StrategyBuilder]" in line: return "info"
         if "[DomainCleaner]" in line:
@@ -12808,6 +13060,8 @@ try:
                 "isatap",
                 "6to4",
                 "loopback pseudo-interface",
+                # AmneziaWG — Nova's own WireGuard adapter, not external VPN.
+                "amnezia",
             ]
 
             for adapter in adapters:
@@ -18896,6 +19150,8 @@ try:
             return "info"
         if "[warning]" in text_lower or "[warn]" in text_lower:
             return "warning"
+        if "[VPN Detector]" in line and "Обнаружен" in line:
+            return "warning"
         if "[StrategyBuilder]" in line: return "info"
         if "[DomainCleaner]" in line:
             return "info"
@@ -18928,6 +19184,7 @@ try:
             return "info"
             
         return "normal"
+
 
     # ================= МОДУЛЬ: NOVA_AUTOTUNE (необходимые функции) =================
     def get_direct_source_ip():
@@ -21235,6 +21492,10 @@ try:
             os._exit(0)
 
     def request_installer_update():
+        is_compiled = getattr(sys, "frozen", False) or sys.argv[0].lower().endswith(".exe")
+        if not is_compiled:
+            return
+
         state = get_update_state()
         if state.get("installing") or state.get("checking"):
             native_message_box("Проверка или загрузка обновления уже выполняется.", "Nova - Обновление", 0x40)
@@ -21250,29 +21511,6 @@ try:
 
             if not manifest.get("available"):
                 native_message_box(f"У вас уже актуальная версия Nova ({CURRENT_VERSION}).", "Nova - Обновление", 0x40)
-                return
-
-            is_compiled = getattr(sys, "frozen", False) or sys.argv[0].lower().endswith(".exe")
-            if not is_compiled:
-                release_url = manifest.get("release_url")
-                if release_url:
-                    answer = native_message_box(
-                        f"Доступна новая версия Nova {manifest['version']}.\n\nВы запущены из nova.pyw, поэтому установщик не будет запущен автоматически.\n\nОткрыть страницу релиза?",
-                        "Nova - Режим разработки",
-                        0x24,
-                    )
-                    if answer == 6:
-                        try:
-                            import webbrowser
-                            webbrowser.open(release_url)
-                        except Exception as e:
-                            native_message_box(f"Не удалось открыть страницу релиза.\n\n{e}", "Nova - Обновление", 0x10)
-                else:
-                    native_message_box(
-                        f"Доступна новая версия Nova {manifest['version']}.\n\nВы запущены из nova.pyw, поэтому установщик не будет запущен автоматически.",
-                        "Nova - Режим разработки",
-                        0x40,
-                    )
                 return
 
             answer = native_message_box(
@@ -21450,7 +21688,18 @@ try:
                     # INTERNET_OPTION_SETTINGS_CHANGED calls can tear down active
                     # browser connections on every domain append.
                     if pac_manager:
-                        pac_manager.generate_pac()
+                        # Pass last-known proxy states as overrides to prevent live
+                        # re-probing of warp/opera. Without overrides, generate_pac()
+                        # re-checks proxy ports via network sockets; a transient
+                        # difference flips route_signature, triggering the aggressive
+                        # INTERNET_OPTION_SETTINGS_CHANGED inside generate_pac().
+                        _warp_ov = None
+                        _opera_ov = None
+                        _sig = pac_manager._last_route_signature
+                        if _sig is not None:
+                            _warp_ov = bool(_sig[0])
+                            _opera_ov = bool(_sig[1])
+                        pac_manager.generate_pac(warp_override=_warp_ov, opera_override=_opera_ov)
                         pac_manager.refresh_pac_runtime()
                         log_func("[PAC] Списки VPN обновлены")
                         
@@ -21596,6 +21845,7 @@ try:
         opera_next_restart_ts = 0.0
         opera_last_port_down_log_ts = 0.0
         opera_last_recover_fail_log_ts = 0.0
+        opera_country_fail_count = 0
         warp_bad_proxy_streak = 0
         warp_last_good_ts = 0.0
         warp_next_recovery_ts = 0.0
@@ -21738,6 +21988,7 @@ try:
                         opera_last_good_ts = now
                         opera_last_port_down_log_ts = 0.0
                         opera_last_recover_fail_log_ts = 0.0
+                        opera_country_fail_count = 0
                         try:
                             if opera_owned and hasattr(opera_proxy_manager, "_ensure_cached_endpoint_persisted"):
                                 opera_proxy_manager._ensure_cached_endpoint_persisted(wait_timeout=0.0)
@@ -21751,7 +22002,7 @@ try:
                     # Debounce short health-check glitches on 1371 to prevent flapping.
                     opera_usable = bool(opera_port_alive and opera_proxy_alive)
                     if (not opera_usable) and opera_port_alive:
-                        if (now - opera_last_good_ts) < 45 and opera_bad_proxy_streak < 5:
+                        if (now - opera_last_good_ts) < 15 and opera_bad_proxy_streak < 4:
                             opera_usable = True
 
                     need_restart = False
@@ -21782,39 +22033,56 @@ try:
                         last_opera_issue_state = "port_down"
                         need_restart = True
                     elif not opera_proxy_alive:
-                        startup_grace_deadline = float(getattr(opera_proxy_manager, "_startup_grace_deadline", 0.0) or 0.0)
-                        in_startup_grace = bool(opera_owned and opera_proc and opera_proc.poll() is None and now < startup_grace_deadline)
-                        recent_activity = False
-                        try:
-                            recent_activity = bool(getattr(opera_proxy_manager, "_has_recent_log_activity", lambda **_: False)(max_age_sec=60))
-                        except:
-                            recent_activity = False
-
-                        # In grace mode (fresh managed start) or during short transient glitches, avoid restarts.
-                        if in_startup_grace or opera_usable or (opera_owned and opera_proc and recent_activity):
-                            if in_startup_grace and last_opera_issue_state != "proxy_warmup" and IS_DEBUG_MODE:
-                                log_func(f"[EU] Инициализация прокси {opera_port} продолжается (grace).")
-                            if in_startup_grace or (opera_owned and opera_proc and recent_activity):
-                                last_opera_issue_state = "proxy_warmup"
-                            else:
-                                last_opera_issue_state = None
-                            need_restart = False
-                        # For adopted external proxy never force restart/takeover from watchdog.
-                        elif opera_external and not opera_owned:
-                            if last_opera_issue_state != "proxy_bad_external":
-                                log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
-                            last_opera_issue_state = "proxy_bad_external"
-                            need_restart = False
-                        # Managed proxy: if local parser is alive but CONNECT upstream stays dead
-                        # for several checks, perform a controlled restart with backoff.
-                        elif opera_bad_proxy_streak >= 5:
-                            if last_opera_issue_state != "proxy_bad":
-                                log_func(f"[EU] Порт {opera_port} открыт, но прокси не отвечает корректно.")
-                            last_opera_issue_state = "proxy_bad"
-                            enough_time_since_good = (now - opera_last_good_ts) >= 45.0 if opera_last_good_ts else True
-                            need_restart = bool(opera_owned and not recent_activity and enough_time_since_good)
+                        # FIX: If WARP is now available but Opera was started without -proxy
+                        # (race condition at startup), force restart immediately.
+                        # This bypasses grace period and backoff since the proxy is useless
+                        # without WARP when ISP blocks all SurfEasy endpoints.
+                        started_without_warp_proxy = not bool(getattr(opera_proxy_manager, "_current_bootstrap_proxy", "") or "")
+                        warp_proxy_upgrade = bool(warp_usable and started_without_warp_proxy and opera_owned and opera_proc and opera_proc.poll() is None)
+                        if warp_proxy_upgrade:
+                            if last_opera_issue_state != "warp_proxy_upgrade":
+                                log_func(f"[EU] WARP доступен, но Opera запущена без -proxy. Перезапуск через WARP...")
+                            last_opera_issue_state = "warp_proxy_upgrade"
+                            need_restart = True
                         else:
-                            need_restart = False
+                            startup_grace_deadline = float(getattr(opera_proxy_manager, "_startup_grace_deadline", 0.0) or 0.0)
+                            in_startup_grace = bool(opera_owned and opera_proc and opera_proc.poll() is None and now < startup_grace_deadline)
+                            recent_activity = False
+                            try:
+                                recent_activity = bool(getattr(opera_proxy_manager, "_has_recent_log_activity", lambda **_: False)(max_age_sec=60))
+                            except:
+                                recent_activity = False
+
+                            # In grace mode (fresh managed start) or during short transient glitches, avoid restarts.
+                            # Use raw proxy health (without debounce) for restart decision.
+                            opera_proxy_healthy = bool(opera_port_alive and opera_proxy_alive)
+                            if in_startup_grace or opera_proxy_healthy or (opera_owned and opera_proc and recent_activity):
+                                if in_startup_grace and last_opera_issue_state != "proxy_warmup" and IS_DEBUG_MODE:
+                                    log_func(f"[EU] Инициализация прокси {opera_port} продолжается (grace).")
+                                if in_startup_grace or (opera_owned and opera_proc and recent_activity):
+                                    last_opera_issue_state = "proxy_warmup"
+                                else:
+                                    last_opera_issue_state = None
+                                need_restart = False
+                            # For adopted external proxy never force restart/takeover from watchdog.
+                            elif opera_external and not opera_owned:
+                                if last_opera_issue_state != "proxy_bad_external":
+                                    log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
+                                last_opera_issue_state = "proxy_bad_external"
+                                need_restart = False
+                            # Managed proxy: if local parser is alive but CONNECT upstream stays dead
+                            # for several checks, perform a controlled restart with backoff.
+                            # Threshold lowered from 5→2 so recovery kicks in within seconds.
+                            elif opera_bad_proxy_streak >= 4:
+                                if last_opera_issue_state != "proxy_bad":
+                                    log_func(f"[EU] Порт {opera_port} открыт, но прокси не отвечает корректно ({opera_bad_proxy_streak} проверок подряд). Восстановление...")
+                                last_opera_issue_state = "proxy_bad"
+                                enough_time_since_good = (now - opera_last_good_ts) >= 15.0 if opera_last_good_ts else True
+                                # Don't restart Opera if WARP is also unhealthy — the tunnel
+                                # failure is caused by WARP, not Opera. Restarting won't help.
+                                need_restart = bool(opera_owned and enough_time_since_good and warp_usable)
+                            else:
+                                need_restart = False
                     elif opera_proc is None:
                         # For adopted external proxy, never force local start/takeover from watchdog.
                         # Otherwise we can get PAC flapping and endless restart attempts.
@@ -21839,9 +22107,22 @@ try:
                         if now < opera_next_restart_ts:
                             need_restart = False
                         else:
+                            # Rotate country after 3 consecutive failures to try different endpoints.
+                            if opera_country_fail_count >= 3:
+                                current_country = str(getattr(opera_proxy_manager, "country", "EU") or "EU").upper()
+                                new_country = "AM" if current_country == "EU" else "EU"
+                                opera_proxy_manager.configure_country(new_country)
+                                with contextlib.suppress(Exception):
+                                    opera_proxy_manager._clear_cached_endpoint()
+                                log_func(f"[EU] Смена региона после {opera_country_fail_count} неудач: {current_country} → {new_country}.")
+                                opera_country_fail_count = 0
                             retry_timestamps.append(now)
                             time.sleep(RETRY_PAUSE)
-                            opera_proxy_manager.start()
+                            # Track if this is a warp_proxy_upgrade restart (race condition, not endpoint failure).
+                            _is_warp_upgrade = bool(last_opera_issue_state == "warp_proxy_upgrade")
+                            # Pass confirmed WARP proxy URL so start() doesn't re-probe.
+                            _warp_proxy_url = f"socks5://127.0.0.1:{warp_port}" if warp_usable else None
+                            opera_proxy_manager.force_restart(warp_proxy=_warp_proxy_url)
                             opera_port_alive = is_local_port_open(opera_port)
                             opera_proxy_alive = is_local_http_proxy_alive(opera_port) if opera_port_alive else False
                             opera_usable = bool(opera_port_alive and opera_proxy_alive)
@@ -21851,12 +22132,17 @@ try:
                                 opera_next_restart_ts = 0.0
                                 opera_last_port_down_log_ts = 0.0
                                 opera_last_recover_fail_log_ts = 0.0
+                                opera_country_fail_count = 0
                                 log_func(f"[EU] Порт {opera_port} восстановлен.")
                                 last_opera_issue_state = None
                             else:
-                                # Backoff to avoid rapid restart loops when upstream registration is failing.
-                                # During the first startup window we retry faster to reduce EU cold-start latency.
-                                opera_next_restart_ts = now + (5.0 if now < startup_fast_retry_until else 30.0)
+                                # warp_proxy_upgrade restarts are race-condition retries, not real endpoint failures.
+                                # Use shorter backoff and don't count toward country rotation.
+                                if _is_warp_upgrade:
+                                    opera_next_restart_ts = now + 5.0
+                                else:
+                                    opera_next_restart_ts = now + (5.0 if now < startup_fast_retry_until else 15.0)
+                                    opera_country_fail_count += 1
                                 if (now - opera_last_recover_fail_log_ts) >= 45.0:
                                     log_func(f"[EU] Не удалось восстановить порт {opera_port}.")
                                     opera_last_recover_fail_log_ts = now
@@ -22002,10 +22288,9 @@ try:
             log_func("[Update] Автообновление отключено пользователем (--no-update).")
             return
 
-        log_func("[Update] Запуск проверки обновлений установщика...")
         is_compiled = getattr(sys, "frozen", False) or sys.argv[0].lower().endswith(".exe")
         if not is_compiled:
-            log_func("[Update] Режим разработки: nova.pyw только проверяет новую версию, без запуска установщика.")
+            return
 
         # Capture Run ID to die if Service restarts
         my_run_id = SERVICE_RUN_ID
@@ -22470,6 +22755,24 @@ try:
                 if not silent:
                     logger("[Init] WinDivert service отсутствует до запуска ядра. Создаём до старта winws.")
                 repair_windivert_driver(logger if not silent else None, exit_code=1060)
+            elif _windivert_state["exists"] and not _windivert_state["disabled"]:
+                _current_driver_path = os.path.join(get_bin_dir(), "WinDivert64.sys")
+                try:
+                    import winreg
+                    _reg_key = winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE,
+                        r"SYSTEM\CurrentControlSet\Services\WinDivert",
+                        0, winreg.KEY_READ
+                    )
+                    _reg_image_path = winreg.QueryValueEx(_reg_key, "ImagePath")[0]
+                    winreg.CloseKey(_reg_key)
+                    _normalized = _reg_image_path.replace("\\??\\", "").replace("/", "\\")
+                    if os.path.normcase(os.path.normpath(_normalized)) != os.path.normcase(os.path.normpath(_current_driver_path)):
+                        if not silent:
+                            logger(f"[Init] WinDivert ImagePath устарел: {_normalized} → {_current_driver_path}. Обновляем...")
+                        repair_windivert_driver(logger if not silent else None, exit_code=34)
+                except Exception:
+                    pass
         except:
             pass
 
@@ -22513,6 +22816,21 @@ try:
             except Exception as _e:
                 if IS_DEBUG_MODE and not silent:
                     logger(f"[Init] Ошибка раннего запуска WARP: {_e}")
+
+        # Apply NRPT DNS rules for Gemini/Google AI unblocking
+        def _setup_nrpt_async():
+            try:
+                settings = current_routing_settings or load_routing_settings()
+                sys_settings = settings.get("system") or {}
+                ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
+                if ai_unlock_enabled:
+                    setup_nrpt_dns_unblock(log_func=logger if not silent else None)
+                else:
+                    remove_nrpt_dns_unblock(log_func=logger if not silent else None, silent=True)
+            except Exception as e:
+                if not silent:
+                    logger(f"[Init] NRPT setup error: {e}")
+        threading.Thread(target=_setup_nrpt_async, daemon=True, name="NovaNrptSetup").start()
         
         # AUTO-RECOVERY: If windivert driver is stuck (commands timed out),
         # force config update instead of deleting (since we lack admin rights to recreate).
@@ -23646,6 +23964,9 @@ try:
         # Иначе браузер не сможет подключиться к сайтам после остановки Nova
         if not restart_mode:
             try:
+                remove_nrpt_dns_unblock(silent=True)
+            except: pass
+            try:
                 if pac_manager:
                     pac_manager.restore_system_proxy()
                     pac_manager.stop_server()
@@ -23870,6 +24191,10 @@ try:
                 if pac_manager:
                     pac_manager.restore_system_proxy()
                     pac_manager.stop_server()
+            except: pass
+
+            try:
+                remove_nrpt_dns_unblock(silent=True)
             except: pass
             
             try:
@@ -26059,6 +26384,9 @@ try:
 
             def _worker():
                 last_state = None
+                pending_state = None
+                pending_count = 0
+                DEBOUNCE_THRESHOLD = 2
                 while not is_closing:
                     warp_ok = False
                     opera_ok = False
@@ -26078,22 +26406,31 @@ try:
 
                     try:
                         opm = globals().get("opera_proxy_manager")
-                        opera_port = int(getattr(opm, "port", 1371)) if opm else 1371
-                        opera_ok = bool(is_local_http_proxy_responsive(port=opera_port, timeout=1.0))
+                        opera_ok = bool(is_local_http_proxy_tunnel_ready(port=opera_port, timeout=0.8))
                     except:
                         opera_ok = False
 
                     current_state = (warp_ok, opera_ok)
-                    if current_state != last_state:
-                        try:
-                            if root:
-                                root.after(
-                                    0,
-                                    lambda state=current_state: apply_main_connection_indicator_state(state[0], state[1]),
-                                )
-                        except:
-                            pass
-                        last_state = current_state
+                    if current_state == last_state:
+                        pending_state = None
+                        pending_count = 0
+                    elif current_state == pending_state:
+                        pending_count += 1
+                        if pending_count >= DEBOUNCE_THRESHOLD:
+                            last_state = current_state
+                            pending_state = None
+                            pending_count = 0
+                            try:
+                                if root:
+                                    root.after(
+                                        0,
+                                        lambda state=current_state: apply_main_connection_indicator_state(state[0], state[1]),
+                                    )
+                            except:
+                                pass
+                    else:
+                        pending_state = current_state
+                        pending_count = 1
 
                     for _ in range(6):
                         if is_closing:

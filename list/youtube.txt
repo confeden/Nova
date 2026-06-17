@@ -1,17 +1,17 @@
-# version: 1.26
-yt3.ggpht.com
-yt4.ggpht.com
-yt3.googleusercontent.com
+# version: 1.27
 googlevideo.com
 jnn-pa.googleapis.com
 wide-youtube.l.google.com
+youtu.be
 youtube-nocookie.com
 youtube-ui.l.google.com
 youtube.com
 youtubeembeddedplayer.googleapis.com
-youtubekids.com
 youtubei.googleapis.com
-youtu.be
+youtubekids.com
 yt-video-upload.l.google.com
+yt3.ggpht.com
+yt3.googleusercontent.com
+yt4.ggpht.com
 ytimg.com
 ytimg.l.google.com

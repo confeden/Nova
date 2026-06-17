@@ -1,4 +1,4 @@
-# version: 1.26
+# version: 1.27
 1337x.to
 1e100cdn.net
 7tv.app
@@ -36,6 +36,7 @@ chartbeat.com
 chess.com
 chesscomfiles.com
 clawbot.ai
+cloudflare-dns.com
 cloudflare-ech.com
 cloudflare.com
 cloudflare.dev
@@ -127,6 +128,8 @@ microsoft.com
 mmcdn.com
 mobi-films.com
 modrinth.com
+moonshot.cn
+muapi.ai
 myanimelist.net
 mynoise.world
 namecheap.com
@@ -166,6 +169,7 @@ puter.chat
 puter.site
 recaptcha.net
 receive-sms.io
+redav.online
 rezka.ag
 romexsoftware.com
 roundproxies.com
@@ -204,8 +208,13 @@ telesco.pe
 thepiratebay.org
 tiktokcdn-us.com
 timeanddate.com
+topdns.com
 torrindex.net
 trustpilot.net
+tuta.com
+tuta.io
+tutamail.com
+tutanota.com
 twimg.com
 twitter.com
 unpkg.com

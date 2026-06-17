@@ -1,5 +1,5 @@
-# version: 1.26
-telegram.org
+# version: 1.27
 t.me
-telegra.ph
 tdesktop.com
+telegra.ph
+telegram.org
