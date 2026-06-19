@@ -6515,18 +6515,6 @@ try:
 
         def notify_warp_route_usable(self):
             try:
-                try:
-                    redirect_mgr = globals().get("novadivert_redirect_manager")
-                    tcp_proxy_mgr = globals().get("novadivert_tcp_proxy_manager")
-                    if (
-                        redirect_mgr
-                        and bool(getattr(redirect_mgr, "is_ready", lambda: False)())
-                        and tcp_proxy_mgr
-                        and bool(getattr(tcp_proxy_mgr, "is_ready", lambda: False)())
-                    ):
-                        return
-                except Exception:
-                    pass
                 with self._extra_reconnect_lock:
                     now = time.monotonic()
                     if now < float(self._extra_reconnect_until or 0.0):
@@ -6542,31 +6530,7 @@ try:
 
         def _warp_route_reconnect_wave(self):
             try:
-                try:
-                    redirect_mgr = globals().get("novadivert_redirect_manager")
-                    tcp_proxy_mgr = globals().get("novadivert_tcp_proxy_manager")
-                    if (
-                        redirect_mgr
-                        and bool(getattr(redirect_mgr, "is_ready", lambda: False)())
-                        and tcp_proxy_mgr
-                        and bool(getattr(tcp_proxy_mgr, "is_ready", lambda: False)())
-                    ):
-                        return
-                except Exception:
-                    pass
                 time.sleep(0.8)
-                try:
-                    redirect_mgr = globals().get("novadivert_redirect_manager")
-                    tcp_proxy_mgr = globals().get("novadivert_tcp_proxy_manager")
-                    if (
-                        redirect_mgr
-                        and bool(getattr(redirect_mgr, "is_ready", lambda: False)())
-                        and tcp_proxy_mgr
-                        and bool(getattr(tcp_proxy_mgr, "is_ready", lambda: False)())
-                    ):
-                        return
-                except Exception:
-                    pass
                 reset_count = self._force_remote_tcp_reconnect_for_telegram()
                 if reset_count > 0:
                     self.log_func(
