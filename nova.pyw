@@ -11408,10 +11408,7 @@ try:
                 continue
             add(domain)
 
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_click)
-        self._render()
+
 
         for domain in CANONICAL_YOUTUBE_DOMAINS:
             add(domain)
