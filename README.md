@@ -1,6 +1,8 @@
 # 🌌 Nova
 Программа для обхода большинства блокировок. Бесплатная и безопасная, без телеметрии.
-# <img width="362" height="302" alt="image" src="https://github.com/user-attachments/assets/59ec654b-0448-4624-9b32-1ef901b95b22" />
+# <img width="357" height="298" alt="image" src="https://github.com/user-attachments/assets/41e6f640-1282-4870-aba9-538ccba1bb59" />
+
+
 
 [Скачать NovaSetup.exe из Releases](https://github.com/confeden/Nova/releases)
 
