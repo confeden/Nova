@@ -546,6 +546,8 @@ class NovaWfpTcpProxy:
             return "ide"
         if any(token in lower for token in ("opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe")):
             return "cli"
+        if any(token in lower for token in ("obs64.exe", "obs32.exe", "obs-studio")):
+            return "obs"
         if "pathofexile" in lower:
             return "games"
         return ""
@@ -886,6 +888,8 @@ class NovaWfpTcpProxy:
             route_mode_key = "ide"
         elif app_family == "cli":
             route_mode_key = "cli"
+        elif app_family == "obs":
+            route_mode_key = "obs"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
         if route_mode == "auto":
             exclude_domains = _load_domain_list("exclude")

@@ -22,7 +22,7 @@ from .config import (
     start_cfproxy_domain_refresh,
 )
 from .raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
-from .transport import open_stream, open_tls_stream, set_upstream_provider
+from .transport import open_stream, open_tls_stream, set_upstream_provider, get_upstream_attempts
 
 
 log = logging.getLogger("nova.telegram.relay")
@@ -446,6 +446,12 @@ def _is_telegram_domain(host: str) -> bool:
 def _wss_candidate(target_host: str, target_ip: str, target_port: int) -> bool:
     if int(target_port or 0) not in TG_TCP_PORTS:
         return False
+    try:
+        attempts = get_upstream_attempts()
+        if attempts and attempts[0].get("kind") != "direct":
+            return False
+    except Exception:
+        pass
     return _is_telegram_ip(target_ip) or _is_telegram_domain(target_host)
 
 
@@ -683,7 +689,7 @@ async def _bridge_ws(reader, writer, ws: RawWebSocket, splitter: Optional[Transp
 
 
 class TelegramTransparentRelayServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 1376, log_func=None, upstream_provider=None, warp_bootstrap_waiter=None):
+    def __init__(self, host: str = "127.0.0.1", port: int = 1372, log_func=None, upstream_provider=None, warp_bootstrap_waiter=None):
         self.host = host
         self.port = int(port)
         self.log_func = log_func or (lambda msg: log.info(msg))
@@ -950,7 +956,7 @@ class TelegramTransparentRelayServer:
                 cached_dc_hint = _target_dc_hint(target_ip)
                 cached_is_media = _likely_media_target(target_ip, target_port, cached_dc_hint)
                 if not cached_is_media:
-                    init_packet = await self._read_probe(reader, want=64, timeout=0.05, initial=prefetched)
+                    init_packet = await self._read_probe(reader, want=64, timeout=0.25, initial=prefetched)
                     if await self._try_cf_bootstrap_non_media(
                         reader,
                         writer,
@@ -990,7 +996,7 @@ class TelegramTransparentRelayServer:
             # anyway. Keep a near-zero probe there; retain longer probing only
             # for likely media sockets where WSS path can still matter.
             if not predicted_is_media:
-                probe_timeout = 0.02
+                probe_timeout = 0.25
             else:
                 probe_timeout = 0.15 if int(target_port or 0) == 80 else 0.6
             init_packet = await self._read_probe(reader, want=64, timeout=probe_timeout, initial=prefetched)
@@ -1179,6 +1185,8 @@ class TelegramTransparentRelayServer:
         dc_hint: int,
         proto_label: str = "raw",
     ) -> bool:
+        if not init_packet or len(init_packet) < 64:
+            return False
         try:
             dc_hint = int(dc_hint or 0)
             target_port = int(target_port or 0)
@@ -1494,6 +1502,16 @@ class TelegramTransparentRelayServer:
         if dc_hint <= 0:
             return None, ""
 
+        try:
+            await self._maybe_wait_for_warp_bootstrap(
+                target_ip,
+                443,
+                media_hint=bool(is_media),
+                dc_hint=dc_hint,
+            )
+        except Exception:
+            pass
+
         custom_media_cf_only = bool(is_media) and _has_custom_cfproxy_domain()
         if CF_FALLBACK_ENABLED and self._cf_first(dc_hint, is_media):
             if custom_media_cf_only:
@@ -1566,9 +1584,11 @@ class TelegramTransparentRelayServer:
             return pooled_ws, pooled_label
         for domain in ordered:
             try:
-                timeout = 1.25 if (primary_only and not bool(is_media)) else 7.0
+                timeout = 3.5 if (primary_only and not bool(is_media)) else 7.0
                 ws, upstream_label = await _connect_websocket_target(domain, domain, timeout=timeout)
-                if str(upstream_label or "").strip().lower() != "warp-socks":
+                attempts = get_upstream_attempts()
+                preferred_label = str(attempts[0].get("label") or "").strip().lower() if attempts else "warp-socks"
+                if preferred_label and str(upstream_label or "").strip().lower() != preferred_label:
                     with contextlib.suppress(Exception):
                         await ws.close()
                     continue
@@ -1617,7 +1637,9 @@ class TelegramTransparentRelayServer:
             for domain in ordered:
                 try:
                     ws, upstream_label = await _connect_websocket_target(domain, domain, timeout=1.5)
-                    if str(upstream_label or "").strip().lower() != "warp-socks":
+                    attempts = get_upstream_attempts()
+                    preferred_label = str(attempts[0].get("label") or "").strip().lower() if attempts else "warp-socks"
+                    if preferred_label and str(upstream_label or "").strip().lower() != preferred_label:
                         with contextlib.suppress(Exception):
                             await ws.close()
                         continue

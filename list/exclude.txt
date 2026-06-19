@@ -25,7 +25,6 @@ g.co
 github.com
 github.io
 githubassets.com
-githubusercontent.com
 gosuslugi.ru
 gov.ru
 gu-st.ru

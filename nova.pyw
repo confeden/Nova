@@ -285,6 +285,24 @@ from nova_console_logging import (
     get_default_session_console_log_path,
 )
 from nova_metadata import CURRENT_VERSION, UPDATE_URL, WINWS_FILENAME
+
+# FIX: In compiled (PyInstaller) builds, CURRENT_VERSION is frozen at build time.
+# If the installer overwrites nova_metadata.py on disk with a newer version,
+# the frozen module still has the old value. Re-read from the source file on disk
+# so the running process always uses the version the installer placed.
+if getattr(sys, 'frozen', False):
+    try:
+        import nova_metadata as _nova_meta
+        _exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        _meta_path = os.path.join(_exe_dir, "nova_metadata.py")
+        if os.path.isfile(_meta_path):
+            with open(_meta_path, "r", encoding="utf-8") as _f:
+                _match = re.search(r'CURRENT_VERSION\s*=\s*"([^"]+)"', _f.read())
+            if _match:
+                CURRENT_VERSION = _match.group(1)
+                _nova_meta.CURRENT_VERSION = CURRENT_VERSION
+    except Exception:
+        pass
 from nova_platform import is_windows_admin
 from nova_routing_profiles import get_default_app_routing_profiles, match_app_by_process_path
 from nova_routing_backends import (
@@ -831,8 +849,6 @@ try:
     import random
     import requests  # FIX: Ensure requests is included in Nuitka build
     import hashlib
-    import tempfile
-    import xml.etree.ElementTree as ET
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from collections import deque
     from tkinter import font as tkfont
@@ -909,6 +925,8 @@ try:
             icon_path = get_internal_path("icon.ico")
             if os.path.exists(icon_path):
                 window.iconbitmap(icon_path)
+                try: window.iconbitmap(default=icon_path)
+                except: pass
                 return True
         except Exception:
             pass
@@ -1001,8 +1019,9 @@ try:
         """
         if not is_local_http_proxy_responsive(port=port, timeout=min(float(timeout), 1.0)):
             return False
-        hosts = list(connect_hosts or ("www.gstatic.com:443", "thisismyip.com:443"))
-        per_host_timeout = max(0.8, float(timeout) / max(1, len(hosts)))
+        # Use a single reliable host to maximize the time available for the proxy to respond
+        hosts = list(connect_hosts or ("www.gstatic.com:443",))
+        per_host_timeout = max(1.5, float(timeout) / max(1, len(hosts)))
         for connect_host in hosts:
             try:
                 import socket
@@ -1673,6 +1692,7 @@ try:
     hotswap_pause_event = threading.Event() # Пауза checker/evolution на время hot-restart ядра
     last_strategy_check_time = 0.0  # Время последней проверки стратегий (для изоляции DNS-проверок)
     is_service_active = False # Флаг активности сервиса (STOP/START)
+    has_connected_once = False
     is_restarting = False # Флаг перезапуска (Hot Swap)
     is_vpn_active = False
     was_service_active_before_vpn = False
@@ -3728,7 +3748,7 @@ try:
 
             _add(self.port)
             _add(self.port_legacy)
-            for p in (1370, 1372, 1374, 1080, 10808):
+            for p in (1370, 1376, 1374, 1080, 10808):
                 _add(p)
 
             raw = str(os.environ.get("NOVA_WARP_PORT_CANDIDATES", "")).strip()
@@ -4705,6 +4725,7 @@ try:
                 ide_domains = self._load_domain_list(os.path.join(base, "list", "ide.txt"))
                 if not ide_domains:
                     ide_domains = self._load_domain_list(os.path.join(base, "list", "opencode.txt"))
+                telegram_ips = self._load_ip_list(os.path.join(base, "ip", "telegram.txt"))
                 user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_ru.txt"))
                 user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_eu.txt"))
                 ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
@@ -4821,7 +4842,7 @@ try:
                 # WARP fallback.  PROXY 1371 is only included when opera_active
                 # so that a dead/alive-but-broken Opera never poisons the chain.
                 if warp_active and opera_active:
-                    eu_route = f"PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:{self.warp_port}"
+                    eu_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
                 elif warp_active:
                     eu_route = f"SOCKS5 127.0.0.1:{self.warp_port}"
                 elif opera_active:
@@ -4858,6 +4879,10 @@ try:
                     discord_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
 
                 telegram_route = _route_for_app_mode(get_routing_app_mode("telegram", routing_settings), ru_route)
+                tgrelay_port = 1372
+                tgrelay_active = self.is_port_open(tgrelay_port)
+                if tgrelay_active:
+                    telegram_route = f"SOCKS5 127.0.0.1:{tgrelay_port}"
                 discord_route = _route_for_app_mode(get_routing_app_mode("discord", routing_settings), discord_route)
                 whatsapp_route = _route_for_app_mode(get_routing_app_mode("whatsapp", routing_settings), ru_route)
                 ide_route = _route_for_app_mode(get_routing_app_mode("ide", routing_settings), eu_route)
@@ -4880,6 +4905,7 @@ try:
                 eu_js = "{" + ",".join(f'"{d}":1' for d in eu_domains) + "}"
                 discord_js = "{" + ",".join(f'"{d}":1' for d in discord_domains) + "}"
                 telegram_js = "{" + ",".join(f'"{d}":1' for d in telegram_domains) + "}"
+                telegram_ips_js = json.dumps(telegram_ips)
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in whatsapp_domains) + "}"
                 ide_js = "{" + ",".join(f'"{d}":1' for d in ide_domains) + "}"
                 
@@ -4907,6 +4933,7 @@ try:
     var eu = {eu_js};
     var discord = {discord_js};
     var telegram = {telegram_js};
+    var telegram_ips = {telegram_ips_js};
     var whatsapp = {whatsapp_js};
     var ide = {ide_js};
     var user_ru_ips = {user_ru_ips_js};
@@ -5031,6 +5058,21 @@ try:
                 if (typeof isInNetEx === 'function') {{
                     if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
                         return "{eu_route}";
+                    }}
+                }}
+            }}
+        }}
+        for (var i = 0; i < telegram_ips.length; i++) {{
+            var entry = telegram_ips[i];
+            var ver = entry[2];
+            if (ver === 4 && isIpV4) {{
+                if (isInNet(host, entry[0], entry[1])) {{
+                    return "{telegram_route}";
+                }}
+            }} else if (ver === 6 && isIpV6) {{
+                if (typeof isInNetEx === 'function') {{
+                    if (isInNetEx(host, entry[0] + "/" + entry[1])) {{
+                        return "{telegram_route}";
                     }}
                 }}
             }}
@@ -5659,19 +5701,19 @@ try:
             except:
                 pass
             # Kill by name as fallback
-            for proc_name in ["opera-proxy.windows-amd64.exe", "opera-proxy.windows-amd64", "opera-proxy.exe"]:
-                try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/IM", proc_name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                except:
-                    pass
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "opera-proxy*"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            except:
+                pass
             # Reset all state
             self.process = None
             self.owns_process = False
+            self.using_external = False
             self._startup_grace_deadline = 0.0
             self._started_at_ts = 0.0
             self._current_attempt_mode = ""
@@ -5840,6 +5882,18 @@ try:
                     self.log_func("[EU] Файл не найден!")
                     return
 
+                # FIX: Force kill any orphan processes of our bundled proxy BEFORE checking the port.
+                # This prevents adopting zombie processes from previous crashes as "external proxies".
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "opera-proxy*"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except:
+                    pass
+
                 # If port is already listening:
                 # - adopt only healthy external proxy
                 # - otherwise try to recover by launching managed proxy
@@ -5862,22 +5916,13 @@ try:
                         self.log_func(f"[EU] Порт {self.port} открыт, но прокси не отвечает. Попытка перезапуска локального proxy...")
                 self.using_external = False
 
-                # FIX: Force kill any orphan processes to free the port (bind error 10048)
-                for proc_name in [
-                    "opera-proxy.windows-amd64.exe",
-                    "opera-proxy.windows-amd64",
-                    "opera-proxy.exe",
-                    "opera-proxy",
-                ]:
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/IM", proc_name],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                        )
-                    except:
-                        pass
+                # If unknown process still keeps the port, we cannot bind here.
+                # (We already killed orphan opera-proxy* above).
+                for _ in range(8):
+                    if not self._is_port_open_local():
+                        break
+                    time.sleep(0.25)
+
                 # If unknown process still keeps the port, we cannot bind here.
                 if self._is_port_open_local():
                     self.owns_process = False
@@ -6078,21 +6123,15 @@ try:
 
             # Failsafe cleanup for orphaned proxy processes.
             if owned_before_stop:
-                for proc_name in [
-                    "opera-proxy.windows-amd64.exe",
-                    "opera-proxy.windows-amd64",
-                    "opera-proxy.exe",
-                    "opera-proxy",
-                ]:
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/IM", proc_name],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                        )
-                    except:
-                        pass
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "opera-proxy*"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except:
+                    pass
 
             try:
                 if self.f_log:
@@ -6106,7 +6145,7 @@ try:
     class LocalTransparentRelayManager:
         """Shared lifecycle for local public TCP relay services."""
 
-        def __init__(self, *, relay_key, relay_name, log_prefix, log_func=None, port=1376):
+        def __init__(self, *, relay_key, relay_name, log_prefix, log_func=None, port=1372):
             self.relay_key = str(relay_key or "").strip().lower()
             self.relay_name = str(relay_name or self.relay_key or "relay").strip()
             self.log_prefix = str(log_prefix or "[Relay]").strip() or "[Relay]"
@@ -6221,7 +6260,7 @@ try:
     class TelegramRelayManager(LocalTransparentRelayManager):
         """Telegram/AyuGram TCP relay via local SOCKS5 + WSS backend."""
 
-        def __init__(self, log_func=None, port=1376):
+        def __init__(self, log_func=None, port=1372):
             super().__init__(
                 relay_key="telegram",
                 relay_name="Telegram relay",
@@ -6292,21 +6331,30 @@ try:
 
         def _wait_for_warp_bootstrap_window(self, target_host="", target_port=0, media_hint=False, dc_hint=0):
             def _warp_transport_ready():
+                now_mono = time.monotonic()
+                if now_mono - getattr(self, "_last_warp_ready_ts", 0.0) < 0.5:
+                    return bool(getattr(self, "_last_warp_ready_val", False))
                 try:
                     wm = globals().get("warp_manager")
                     if not wm:
-                        return False
-                    if not bool(getattr(wm, "is_connected", False)):
-                        return False
-                    port = int(getattr(wm, "port", 1370) or 1370)
-                    if not is_local_port_open_quick(port, timeout=0.25):
-                        return False
-                    tester = getattr(wm, "_test_socks5_internet", None)
-                    if callable(tester):
-                        return bool(tester(port, timeout=1.2))
-                    return True
+                        res = False
+                    elif not bool(getattr(wm, "is_connected", False)):
+                        res = False
+                    else:
+                        port = int(getattr(wm, "port", 1370) or 1370)
+                        if not is_local_port_open_quick(port, timeout=0.25):
+                            res = False
+                        else:
+                            tester = getattr(wm, "_test_socks5_internet", None)
+                            if callable(tester):
+                                res = bool(tester(port, timeout=1.2))
+                            else:
+                                res = True
                 except Exception:
-                    return False
+                    res = False
+                self._last_warp_ready_ts = now_mono
+                self._last_warp_ready_val = res
+                return res
 
             def _awg_bootstrap_in_progress():
                 try:
@@ -6332,10 +6380,8 @@ try:
             except Exception:
                 dc_hint = 0
             media_hint = bool(media_hint)
-            # Only delay the early Telegram bootstrap/control path. Calls are already
-            # fast and media sockets should not be artificially stalled here.
-            if media_hint:
-                return 0.0
+            # Both control and media paths must wait for WARP bootstrap during cold-start
+            # to avoid instant WSS route failures and plain-TCP fallbacks.
             if target_port not in (80, 443, 5222, 5228):
                 return 0.0
             started_mono = float(getattr(self, "_started_monotonic", 0.0) or 0.0)
@@ -6360,7 +6406,7 @@ try:
                         break
                     if not bool(self.server and getattr(self.server, "running", False)):
                         break
-                    time.sleep(0.20)
+                    time.sleep(0.10)
             try:
                 if _warp_transport_ready():
                     return 0.0
@@ -6385,7 +6431,7 @@ try:
                     break
                 if not bool(self.server and getattr(self.server, "running", False)):
                     break
-                time.sleep(0.20)
+                time.sleep(0.10)
             return 0.0
 
         def _schedule_runtime_adaptation(self):
@@ -6648,7 +6694,7 @@ try:
                     continue
                 remote_port = _port_host_order(row.dwRemotePort)
                 local_port = _port_host_order(row.dwLocalPort)
-                if remote_port in {1370, 1371, 1376, 17870} or local_port in {1370, 1371, 1376, 17870}:
+                if remote_port in {1370, 1371, 1372, 17870} or local_port in {1370, 1371, 1372, 17870}:
                     continue
                 kill_row = MIB_TCPROW(
                     dwState=MIB_TCP_STATE_DELETE_TCB,
@@ -7644,6 +7690,15 @@ try:
                 pass
             return 0
 
+        def _resolve_telegram_relay_port(self):
+            try:
+                mgr = globals().get("telegram_relay_manager")
+                if mgr:
+                    return int(getattr(mgr, "port", 1372) or 1372)
+            except:
+                pass
+            return 1372
+
         def start(self):
             try:
                 if self.process and self.process.poll() is None:
@@ -7665,6 +7720,7 @@ try:
                 self.log_func("[NovaDivert] Redirect отложен: TCP proxy не готов.")
                 return False
             udp_proxy_port = self._resolve_udp_proxy_port()
+            telegram_relay_port = self._resolve_telegram_relay_port()
             try:
                 os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
                 os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
@@ -7691,6 +7747,7 @@ try:
                             "--map", str(self.map_path),
                             "--tcp-proxy-port", str(self.tcp_proxy_port),
                             "--udp-proxy-port", str(udp_proxy_port),
+                            "--telegram-relay-port", str(telegram_relay_port),
                         ],
                         cwd=get_base_dir(),
                         env=env,
@@ -9346,11 +9403,30 @@ try:
             if should_update:
                 try:
                     print(f"[Config] Updating {filename}...")
-                    if os.path.exists(fpath):
-                        os.remove(fpath)
+                    # FIX: Merge existing strategies with defaults instead of overwriting.
+                    # On version bump, preserve user's working strategies and only fill missing keys.
+                    merged_data = dict(default_data) if isinstance(default_data, dict) else default_data
+                    if os.path.exists(fpath) and isinstance(merged_data, dict):
+                        try:
+                            with open(fpath, "r", encoding="utf-8") as f:
+                                existing = json.load(f)
+                            if isinstance(existing, dict):
+                                for key, value in existing.items():
+                                    if key == "version":
+                                        continue
+                                    # Keep existing strategy if it has real content
+                                    if isinstance(value, list) and value:
+                                        merged_data[key] = value
+                                    elif isinstance(value, dict) and value.get("args"):
+                                        merged_data[key] = value
+                        except Exception:
+                            pass
+                    # Update version stamp
+                    if isinstance(merged_data, dict):
+                        merged_data["version"] = CURRENT_VERSION
                     
                     with open(fpath, "w", encoding="utf-8") as f:
-                        json.dump(default_data, f, indent=4, ensure_ascii=False)
+                        json.dump(merged_data, f, indent=4, ensure_ascii=False)
                     print(f"[Config] {filename} updated successfully.")
                 except Exception as e:
                     print(f"Error updating {filename}: {e}")
@@ -9522,9 +9598,9 @@ try:
             os.replace(temp_path, filepath)
         except: pass
 
-    ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
-    LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
-    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli", "games")
+    ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
+    LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
+    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli", "games", "obs")
     ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
     OPERA_REGION_VALUES = {"EU", "US"}
     ROUTING_GROUP_ALIASES = {
@@ -9547,6 +9623,9 @@ try:
         "pwsh": "cli",
         "cmd": "cli",
         "gemini": "cli",
+        "obs": "obs",
+        "obs64": "obs",
+        "obs32": "obs",
     }
     DEFAULT_ROUTING_SETTINGS = {
         "version": CURRENT_VERSION,
@@ -9559,6 +9638,7 @@ try:
             "ide": "direct",
             "cli": "direct",
             "games": "auto",
+            "obs": "direct",
         },
         "system": {
             "suppress_game_overlay": False,
@@ -9679,8 +9759,8 @@ try:
     def save_routing_settings(data):
         payload = normalize_routing_settings(data)
         save_json_safe(ROUTING_SETTINGS_PATH, payload)
-        # Redirect helpers run outside the GUI module and still read the
-        # runtime copy from temp. Keep it in sync with the durable settings.
+        # Also write to the legacy root path for backward compatibility
+        # with older installations and external tools.
         save_json_safe(LEGACY_ROUTING_SETTINGS_PATH, payload)
         return payload
 
@@ -10932,10 +11012,12 @@ try:
     COLOR_BLUEBERRY_YOGURT = "#DCD0FF"
     COLOR_BG = "#F0F0F0"
     MAIN_COLOR_TEXT_NORMAL = "#13A10E"
+    MAIN_COLOR_TEXT_WARNING = "#FFA500"
     MAIN_COLOR_TEXT_ERROR = "#FFA500"
     MAIN_COLOR_TEXT_INFO = "#AAAAAA"
     MAIN_COLOR_TEXT_FAIL = "#FF4444"
     COLOR_TEXT_NORMAL = MAIN_COLOR_TEXT_NORMAL
+    COLOR_TEXT_WARNING = MAIN_COLOR_TEXT_WARNING
     COLOR_TEXT_ERROR = MAIN_COLOR_TEXT_ERROR
     COLOR_TEXT_INFO = MAIN_COLOR_TEXT_INFO
     COLOR_TEXT_FAIL = MAIN_COLOR_TEXT_FAIL
@@ -11325,6 +11407,11 @@ try:
             if domain in ("googleusercontent.com", "ggpht.com", "gstatic.com", "www.youtube.com", "i.ytimg.com", "redirector.googlevideo.com"):
                 continue
             add(domain)
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        self._render()
 
         for domain in CANONICAL_YOUTUBE_DOMAINS:
             add(domain)
@@ -11783,40 +11870,23 @@ try:
             # print(f"Align error: {e}")
             pass
 
-    AUTOSTART_TASK_BASE_NAME = "NovaAutoStart"
+    AUTOSTART_SHORTCUT_NAME = "Nova.lnk"
     AUTOSTART_REG_VALUE_NAME = "NovaApplication"
 
-    def _normalize_autostart_path(path):
+    def _get_startup_dir():
         try:
-            value = str(path or "").strip().strip('"')
-            if not value:
-                return ""
-            return os.path.normcase(os.path.abspath(os.path.expandvars(os.path.expanduser(value))))
+            appdata = os.environ.get("APPDATA", "")
+            if not appdata:
+                return None
+            return os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs\Startup")
         except:
-            return ""
+            return None
 
-    def _get_current_user_identity():
-        try:
-            result = subprocess.run(
-                ["whoami", "/user", "/fo", "csv", "/nh"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                text=True
-            )
-            if result.returncode != 0:
-                return None, None
-            line = str(result.stdout or "").strip().splitlines()
-            if not line:
-                return None, None
-            row = next(csv.reader([line[-1]]), [])
-            if len(row) >= 2:
-                account = row[0].strip()
-                sid = row[1].strip()
-                return account or None, sid or None
-        except:
-            pass
-        return None, None
+    def _get_startup_shortcut_path():
+        startup_dir = _get_startup_dir()
+        if not startup_dir:
+            return None
+        return os.path.join(startup_dir, AUTOSTART_SHORTCUT_NAME)
 
     def _build_autostart_launch_spec():
         exe_path = os.path.abspath(sys.executable)
@@ -11824,7 +11894,6 @@ try:
 
         if getattr(sys, 'frozen', False):
             arguments = "--minimized"
-            registry_cmd = subprocess.list2cmdline([exe_path, "--minimized"])
         else:
             try:
                 script_path = os.path.abspath(__file__)
@@ -11832,28 +11901,51 @@ try:
                 script_path = os.path.abspath(sys.argv[0])
             working_dir = os.path.dirname(script_path)
             arguments = subprocess.list2cmdline([script_path, "--minimized"])
-            registry_cmd = subprocess.list2cmdline([exe_path, script_path, "--minimized"])
 
-        account, sid = _get_current_user_identity()
-        task_name = f"{AUTOSTART_TASK_BASE_NAME}-{sid}" if sid else AUTOSTART_TASK_BASE_NAME
         return {
             "command": exe_path,
             "arguments": arguments,
             "working_dir": working_dir,
-            "registry_cmd": registry_cmd,
-            "account": account,
-            "sid": sid,
-            "task_name": task_name,
         }
 
-    def _get_autostart_task_names():
-        spec = _build_autostart_launch_spec()
-        names = [spec.get("task_name"), AUTOSTART_TASK_BASE_NAME]
-        unique = []
-        for name in names:
-            if name and name not in unique:
-                unique.append(name)
-        return unique
+    def _create_startup_shortcut(spec):
+        try:
+            startup_dir = _get_startup_dir()
+            if not startup_dir or not os.path.isdir(startup_dir):
+                return False, "Startup folder not found"
+            shortcut_path = os.path.join(startup_dir, AUTOSTART_SHORTCUT_NAME)
+            
+            ps_script = (
+                f"$wshell = New-Object -ComObject WScript.Shell; "
+                f"$s = $wshell.CreateShortcut('{shortcut_path}'); "
+                f"$s.TargetPath = '{spec['command']}'; "
+                f"$s.Arguments = '{spec['arguments']}'; "
+                f"$s.WorkingDirectory = '{spec['working_dir']}'; "
+                f"$s.IconLocation = '{spec['command']},0'; "
+                f"$s.Save()"
+            )
+            
+            import subprocess
+            CREATE_NO_WINDOW = 0x08000000
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+            )
+            if os.path.isfile(shortcut_path):
+                return True, shortcut_path
+            return False, f"PowerShell failed: {res.stderr.strip()}"
+        except Exception as e:
+            return False, str(e)
+
+    def _delete_startup_shortcut():
+        shortcut_path = _get_startup_shortcut_path()
+        if shortcut_path and os.path.isfile(shortcut_path):
+            try:
+                os.remove(shortcut_path)
+                return True
+            except:
+                pass
+        return False
 
     def _read_registry_autostart_cmd():
         try:
@@ -11868,17 +11960,6 @@ try:
         except OSError:
             return None
 
-    def _write_registry_autostart_cmd(cmd_value):
-        try:
-            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run")
-            try:
-                winreg.SetValueEx(key, AUTOSTART_REG_VALUE_NAME, 0, winreg.REG_SZ, str(cmd_value))
-            finally:
-                winreg.CloseKey(key)
-            return True, ""
-        except Exception as e:
-            return False, str(e)
-
     def _delete_registry_autostart_cmd():
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_WRITE)
@@ -11892,171 +11973,13 @@ try:
         except OSError:
             return False
 
-    def _registry_autostart_matches_spec(cmd_value, spec):
-        try:
-            current = str(cmd_value or "").strip().lower()
-            expected = str(spec.get("registry_cmd") or "").strip().lower()
-            return bool(current and expected and current == expected)
-        except:
-            return False
-
-    def _query_scheduled_task_xml(task_name):
-        try:
-            result = subprocess.run(
-                ["schtasks", "/query", "/tn", task_name, "/xml"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                text=True
-            )
-            if result.returncode == 0 and str(result.stdout or "").strip():
-                return result.stdout
-        except:
-            pass
-        return None
-
-    def _parse_scheduled_task_exec(xml_text):
-        try:
-            root = ET.fromstring(xml_text)
-            ns_uri = ""
-            if isinstance(root.tag, str) and root.tag.startswith("{"):
-                ns_uri = root.tag.split("}", 1)[0][1:]
-            ns = {"t": ns_uri} if ns_uri else {}
-            prefix = "t:" if ns_uri else ""
-
-            def _findtext(path):
-                node = root.find(path, ns)
-                if node is None or node.text is None:
-                    return ""
-                return node.text.strip()
-
-            return {
-                "command": _findtext(f".//{prefix}Exec/{prefix}Command"),
-                "arguments": _findtext(f".//{prefix}Exec/{prefix}Arguments"),
-                "working_dir": _findtext(f".//{prefix}Exec/{prefix}WorkingDirectory"),
-                "run_level": _findtext(f".//{prefix}Principal/{prefix}RunLevel"),
-                "user_id": _findtext(f".//{prefix}Principal/{prefix}UserId"),
-            }
-        except:
-            return None
-
-    def _scheduled_task_matches_spec(xml_text, spec):
-        task_info = _parse_scheduled_task_exec(xml_text)
-        if not task_info:
-            return False
-
-        if _normalize_autostart_path(task_info.get("command")) != _normalize_autostart_path(spec.get("command")):
-            return False
-        if str(task_info.get("arguments") or "").strip() != str(spec.get("arguments") or "").strip():
-            return False
-        if _normalize_autostart_path(task_info.get("working_dir")) != _normalize_autostart_path(spec.get("working_dir")):
-            return False
-
-        run_level = str(task_info.get("run_level") or "").strip().lower()
-        if run_level not in ("highestavailable", "highest"):
-            return False
-        return True
-
-    def _delete_scheduled_autostart_task(task_name):
-        try:
-            result = subprocess.run(
-                ["schtasks", "/delete", "/tn", task_name, "/f"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                text=True
-            )
-            if result.returncode == 0:
-                return True
-            err_text = f"{result.stdout}\n{result.stderr}".lower()
-            if "cannot find the file specified" in err_text or "не удается найти указанный файл" in err_text:
-                return False
-        except:
-            pass
-        return False
-
-    def _create_scheduled_autostart_task(spec):
-        task = ET.Element("Task", attrib={"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
-        reg_info = ET.SubElement(task, "RegistrationInfo")
-        ET.SubElement(reg_info, "Author").text = spec.get("account") or "Nova"
-        ET.SubElement(reg_info, "Description").text = "Nova autostart entry"
-
-        triggers = ET.SubElement(task, "Triggers")
-        logon_trigger = ET.SubElement(triggers, "LogonTrigger")
-        ET.SubElement(logon_trigger, "Enabled").text = "true"
-        if spec.get("sid"):
-            ET.SubElement(logon_trigger, "UserId").text = spec["sid"]
-
-        principals = ET.SubElement(task, "Principals")
-        principal = ET.SubElement(principals, "Principal", attrib={"id": "Author"})
-        if spec.get("sid"):
-            ET.SubElement(principal, "UserId").text = spec["sid"]
-        ET.SubElement(principal, "LogonType").text = "InteractiveToken"
-        ET.SubElement(principal, "RunLevel").text = "HighestAvailable"
-
-        settings = ET.SubElement(task, "Settings")
-        ET.SubElement(settings, "MultipleInstancesPolicy").text = "IgnoreNew"
-        ET.SubElement(settings, "DisallowStartIfOnBatteries").text = "false"
-        ET.SubElement(settings, "StopIfGoingOnBatteries").text = "false"
-        ET.SubElement(settings, "AllowHardTerminate").text = "false"
-        ET.SubElement(settings, "StartWhenAvailable").text = "true"
-        ET.SubElement(settings, "RunOnlyIfNetworkAvailable").text = "false"
-        idle_settings = ET.SubElement(settings, "IdleSettings")
-        ET.SubElement(idle_settings, "StopOnIdleEnd").text = "false"
-        ET.SubElement(idle_settings, "RestartOnIdle").text = "false"
-        ET.SubElement(settings, "AllowStartOnDemand").text = "true"
-        ET.SubElement(settings, "Enabled").text = "true"
-        ET.SubElement(settings, "Hidden").text = "false"
-        ET.SubElement(settings, "RunOnlyIfIdle").text = "false"
-        ET.SubElement(settings, "WakeToRun").text = "false"
-        ET.SubElement(settings, "ExecutionTimeLimit").text = "PT0S"
-        ET.SubElement(settings, "Priority").text = "7"
-
-        actions = ET.SubElement(task, "Actions", attrib={"Context": "Author"})
-        exec_node = ET.SubElement(actions, "Exec")
-        ET.SubElement(exec_node, "Command").text = spec.get("command") or ""
-        if spec.get("arguments"):
-            ET.SubElement(exec_node, "Arguments").text = spec["arguments"]
-        if spec.get("working_dir"):
-            ET.SubElement(exec_node, "WorkingDirectory").text = spec["working_dir"]
-
-        temp_dir = os.path.join(get_base_dir(), "temp")
-        os.makedirs(temp_dir, exist_ok=True)
-        fd, xml_path = tempfile.mkstemp(prefix="nova_autostart_", suffix=".xml", dir=temp_dir)
-        os.close(fd)
-        try:
-            ET.ElementTree(task).write(xml_path, encoding="utf-16", xml_declaration=True)
-            result = subprocess.run(
-                ["schtasks", "/create", "/tn", spec["task_name"], "/xml", xml_path, "/f"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                text=True
-            )
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout or f"code {result.returncode}").strip()
-                return False, err or "schtasks create failed"
-
-            xml_after = _query_scheduled_task_xml(spec["task_name"])
-            if not xml_after or not _scheduled_task_matches_spec(xml_after, spec):
-                return False, "Task Scheduler created an unexpected autostart action"
-            return True, spec["task_name"]
-        finally:
-            try:
-                os.remove(xml_path)
-            except:
-                pass
-
     def get_autostart_cmd():
-        """Проверяет состояние автозапуска (Task Scheduler preferred, registry fallback)."""
-        spec = _build_autostart_launch_spec()
-        for task_name in _get_autostart_task_names():
-            xml_text = _query_scheduled_task_xml(task_name)
-            if xml_text and _scheduled_task_matches_spec(xml_text, spec):
-                return f"schtasks:{task_name}"
+        shortcut_path = _get_startup_shortcut_path()
+        if shortcut_path and os.path.isfile(shortcut_path):
+            return f"shortcut:{shortcut_path}"
 
         reg_cmd = _read_registry_autostart_cmd()
-        if reg_cmd and _registry_autostart_matches_spec(reg_cmd, spec):
+        if reg_cmd:
             return reg_cmd
         return None
 
@@ -12112,15 +12035,14 @@ try:
         return bool(value) if value is not None else False
 
     def toggle_startup(log_func=None):
-        """Переключает состояние автозапуска (Task Scheduler with registry fallback)."""
+        """Переключает состояние автозапуска (Startup folder shortcut)."""
         try:
             spec = _build_autostart_launch_spec()
             status = get_startup_status()
 
             if status:
                 removed_any = False
-                for task_name in _get_autostart_task_names():
-                    removed_any = _delete_scheduled_autostart_task(task_name) or removed_any
+                removed_any = _delete_startup_shortcut() or removed_any
                 removed_any = _delete_registry_autostart_cmd() or removed_any
                 if log_func:
                     if removed_any:
@@ -12130,30 +12052,20 @@ try:
                 else:
                     print("[Autostart] Disabled")
             else:
-                for task_name in _get_autostart_task_names():
-                    _delete_scheduled_autostart_task(task_name)
+                _delete_startup_shortcut()
                 _delete_registry_autostart_cmd()
 
-                task_ok, task_msg = _create_scheduled_autostart_task(spec)
-                if task_ok:
+                shortcut_ok, shortcut_msg = _create_startup_shortcut(spec)
+                if shortcut_ok:
                     if log_func:
-                        log_func("[Autostart] Автозапуск включен (Task Scheduler, HighestAvailable)")
+                        log_func("[Autostart] Автозапуск включен (Startup folder shortcut)")
                     else:
-                        print("[Autostart] Enabled via Task Scheduler")
+                        print("[Autostart] Enabled via Startup folder shortcut")
                 else:
-                    reg_ok, reg_err = _write_registry_autostart_cmd(spec["registry_cmd"])
-                    if reg_ok:
-                        if log_func:
-                            log_func(f"[Autostart] Планировщик задач недоступен: {task_msg}")
-                            log_func("[Autostart] Включен fallback через HKCU\\Run.")
-                        else:
-                            print("[Autostart] Enabled via registry fallback")
+                    if log_func:
+                        log_func(f"[Autostart] Ошибка создания ярлыка: {shortcut_msg}")
                     else:
-                        err_text = task_msg
-                        if reg_err:
-                            err_text = f"{task_msg}; registry: {reg_err}" if err_text else reg_err
-                        if log_func:
-                            log_func(f"[Autostart] Ошибка при записи: {err_text}")
+                        print(f"[Autostart] Shortcut creation failed: {shortcut_msg}")
         except Exception as e:
             if log_func: log_func(f"[Autostart] Ошибка системы: {e}")
             else: print(f"[Autostart] Error: {e}")
@@ -21496,6 +21408,9 @@ try:
         if not is_compiled:
             return
 
+        if "--updated" in sys.argv:
+            return
+
         state = get_update_state()
         if state.get("installing") or state.get("checking"):
             native_message_box("Проверка или загрузка обновления уже выполняется.", "Nova - Обновление", 0x40)
@@ -22064,12 +21979,20 @@ try:
                                 else:
                                     last_opera_issue_state = None
                                 need_restart = False
-                            # For adopted external proxy never force restart/takeover from watchdog.
+                            # For adopted external proxy: tolerate short glitches,
+                            # but after persistent failure, release and restart managed.
                             elif opera_external and not opera_owned:
-                                if last_opera_issue_state != "proxy_bad_external":
-                                    log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
-                                last_opera_issue_state = "proxy_bad_external"
-                                need_restart = False
+                                if opera_bad_proxy_streak >= 6:
+                                    log_func(f"[EU] Внешний прокси {opera_port} не отвечает {opera_bad_proxy_streak} проверок. Принудительный перезапуск локального proxy...")
+                                    opera_proxy_manager.using_external = False
+                                    opera_proxy_manager.owns_process = False
+                                    last_opera_issue_state = "proxy_bad_external_takeover"
+                                    need_restart = True
+                                else:
+                                    if last_opera_issue_state != "proxy_bad_external":
+                                        log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
+                                    last_opera_issue_state = "proxy_bad_external"
+                                    need_restart = False
                             # Managed proxy: if local parser is alive but CONNECT upstream stays dead
                             # for several checks, perform a controlled restart with backoff.
                             # Threshold lowered from 5→2 so recovery kicks in within seconds.
@@ -22080,7 +22003,10 @@ try:
                                 enough_time_since_good = (now - opera_last_good_ts) >= 15.0 if opera_last_good_ts else True
                                 # Don't restart Opera if WARP is also unhealthy — the tunnel
                                 # failure is caused by WARP, not Opera. Restarting won't help.
-                                need_restart = bool(opera_owned and enough_time_since_good and warp_usable)
+                                # However, if Opera was launched with a SOCKS proxy (WARP) but WARP is now dead,
+                                # we must restart it to clear the stale proxy flag.
+                                has_stale_proxy = bool(getattr(opera_proxy_manager, "_current_bootstrap_proxy", ""))
+                                need_restart = bool(opera_owned and enough_time_since_good and (warp_usable or has_stale_proxy))
                             else:
                                 need_restart = False
                     elif opera_proc is None:
@@ -22290,6 +22216,10 @@ try:
 
         is_compiled = getattr(sys, "frozen", False) or sys.argv[0].lower().endswith(".exe")
         if not is_compiled:
+            return
+
+        if "--updated" in sys.argv:
+            log_func(f"[Update] Запуск после обновления (v{CURRENT_VERSION}). Первая проверка пропущена.")
             return
 
         # Capture Run ID to die if Service restarts
@@ -22680,7 +22610,9 @@ try:
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
         global is_service_active, process, is_closing, _windivert_broken, is_restarting
         global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
+        global has_connected_once
         
+        has_connected_once = False
         logger = globals().get('log_print', print)
         _windivert_broken = False
         _windivert_unrecoverable_reason = ""
@@ -22860,7 +22792,7 @@ try:
         try: restart_requested_event.clear()
         except: pass
         root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
-        root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
+        root.after(0, lambda: status_label.config(text="ПОДКЛЮЧЕНИЕ", fg=COLOR_TEXT_WARNING))
         
         paths = ensure_structure()
         
@@ -23668,7 +23600,7 @@ try:
 
                         # Update UI Status
                         if not silent and root:
-                            root.after(0, lambda: status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL))
+                            root.after(0, lambda: status_label.config(text="ПОДКЛЮЧЕНИЕ", fg=COLOR_TEXT_WARNING))
                             root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
 
                         try:
@@ -23889,9 +23821,10 @@ try:
                  if IS_DEBUG_MODE: safe_trace("[run_process] Hot-Restart detected, skipping threads launch.")
 
     def stop_nova_service(silent=False, wait_for_cleanup=False, restart_mode=False):
-        global is_service_active, process, is_closing, nova_service_status, SERVICES_RUNNING, SERVICE_RUN_ID
+        global is_service_active, process, is_closing, nova_service_status, SERVICES_RUNNING, SERVICE_RUN_ID, has_connected_once
         managed_opera_owned = False
         if not restart_mode:
+            has_connected_once = False
             try: clear_hotswap_checker_pause(log_resume=False)
             except: pass
             try:
@@ -24039,18 +23972,12 @@ try:
                                      creationflags=subprocess.CREATE_NO_WINDOW,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if managed_opera_owned:
-                        for _proc_name in [
-                            "opera-proxy.windows-amd64.exe",
-                            "opera-proxy.windows-amd64",
-                            "opera-proxy.exe",
-                            "opera-proxy",
-                        ]:
-                            try:
-                                subprocess.run(["taskkill", "/F", "/IM", _proc_name],
-                                             creationflags=subprocess.CREATE_NO_WINDOW,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            except:
-                                pass
+                        try:
+                            subprocess.run(["taskkill", "/F", "/IM", "opera-proxy*"],
+                                         creationflags=subprocess.CREATE_NO_WINDOW,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except:
+                            pass
             except: pass
             
             # FIX: Force Driver Stop to release resources (but do not delete, to avoid startup delay/lock)
@@ -24309,7 +24236,7 @@ try:
             _kill_singbox_processes_best_effort()
 
             for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "wireproxy-awg.exe", "warp-svc.exe", "warp-cli.exe",
-                              "opera-proxy.windows-amd64.exe", "opera-proxy.exe", *_novawfp_service_image_names()]:
+                              "opera-proxy.windows-amd64.exe", "opera-proxy.exe", "opera-proxy*", *_novawfp_service_image_names()]:
                 try:
                     subprocess.run(["taskkill", "/F", "/IM", proc_name],
                                    creationflags=subprocess.CREATE_NO_WINDOW,
@@ -24928,6 +24855,10 @@ try:
             self.bg_id = canvas.create_image(x, y, anchor="center")
             self.bg_image = None
             self.font_spec = font
+            self._animating = False
+            self._anim_labels = []
+            self._anim_dots = 0
+            self._anim_after_id = None
 
             f_family = font[0]
             f_size = font[1]
@@ -25033,6 +24964,48 @@ try:
                     self.canvas.itemconfig(item, state=state)
                 except:
                     pass
+
+        def start_animation(self, labels):
+            self.stop_animation()
+            self._animating = True
+            self._anim_labels = list(labels)
+            self._anim_dots = 0
+            self._tick_animation()
+
+        def _tick_animation(self):
+            if not self._animating or not self._anim_labels:
+                return
+            self._anim_dots = (self._anim_dots % 3) + 1
+            dots = "\u00b7" * self._anim_dots
+            new_segs = [(dots, col) for _, col in self._anim_labels]
+            self.segments = new_segs
+            self._redraw()
+            self.visible = True
+            state = "normal"
+            try:
+                self.canvas.itemconfig(self.bg_id, state=state)
+            except:
+                pass
+            for item in self.text_items:
+                try:
+                    self.canvas.itemconfig(item, state=state)
+                except:
+                    pass
+            try:
+                self._anim_after_id = self.canvas.after(350, self._tick_animation)
+            except:
+                pass
+
+        def stop_animation(self):
+            self._animating = False
+            self._anim_labels = []
+            self._anim_dots = 0
+            if self._anim_after_id:
+                try:
+                    self.canvas.after_cancel(self._anim_after_id)
+                except:
+                    pass
+                self._anim_after_id = None
 
         def pack(self, **kwargs): pass
 
@@ -25683,6 +25656,7 @@ try:
             ("ide", "IDE"),
             ("cli", "CLI"),
             ("games", "Games"),
+            ("obs", "OBS"),
         )
         routing_mode_pill_labels = {
             "auto": "Auto",
@@ -25717,13 +25691,6 @@ try:
                 self._fill_id = self.create_image(self._width // 2, self._height // 2, anchor="center")
                 self._outline_id = self.create_image(self._width // 2, self._height // 2, anchor="center", state="hidden")
                 self._text_id = self.create_text(self._width // 2, self._height // 2, text=text, font=self._base_font)
-                for item in (self, self._fill_id, self._outline_id, self._text_id):
-                    try:
-                        self.tag_bind(item, "<Enter>", self._on_enter)
-                        self.tag_bind(item, "<Leave>", self._on_leave)
-                        self.tag_bind(item, "<Button-1>", self._on_click)
-                    except:
-                        pass
                 self.bind("<Enter>", self._on_enter)
                 self.bind("<Leave>", self._on_leave)
                 self.bind("<Button-1>", self._on_click)
@@ -26369,13 +26336,39 @@ try:
             return "EU"
 
         def apply_main_connection_indicator_state(warp_ok, opera_ok):
+            try:
+                region_indicator_pill.stop_animation()
+            except:
+                pass
             regions = []
+            
+            # WARP indicator
             if warp_ok:
                 regions.append(("WARP", INDICATOR_WARP))
+            else:
+                regions.append(("WARP...", "#777777"))  # Grey and dots for pending/failed
+                
+            # EU indicator
+            eu_label = _get_opera_region_indicator_label()
             if opera_ok:
-                regions.append((_get_opera_region_indicator_label(), INDICATOR_EU))
+                regions.append((eu_label, INDICATOR_EU))
+            else:
+                regions.append((eu_label + "...", "#777777"))
+
             try:
                 region_indicator_pill.set_regions(regions)
+            except:
+                pass
+                
+            try:
+                both_ok = bool(warp_ok and opera_ok)
+                if both_ok:
+                    global has_connected_once
+                    has_connected_once = True
+                    status_label.config(text="АКТИВНО : РАБОТАЕТ", fg=COLOR_TEXT_NORMAL)
+                else:
+                    if not globals().get("has_connected_once", False):
+                        status_label.config(text="ПОДКЛЮЧЕНИЕ", fg=COLOR_TEXT_WARNING)
             except:
                 pass
 
@@ -26406,7 +26399,8 @@ try:
 
                     try:
                         opm = globals().get("opera_proxy_manager")
-                        opera_ok = bool(is_local_http_proxy_tunnel_ready(port=opera_port, timeout=0.8))
+                        _opera_port = int(getattr(opm, "port", 1371) or 1371) if opm else 1371
+                        opera_ok = bool(is_local_http_proxy_tunnel_ready(port=_opera_port, timeout=0.8))
                     except:
                         opera_ok = False
 
@@ -26472,9 +26466,13 @@ try:
         
         # Показываем окно НЕМЕДЛЕННО и ПЛАВНО
         if ARGS_PARSED.get('minimized', False):
+            try: apply_window_icon(root)
+            except: pass
             root.withdraw()
             if IS_DEBUG_MODE: log_print("[Init] Запуск в свернутом режиме (--minimized). Проверьте трей.")
         else:
+            try: apply_window_icon(root)
+            except: pass
             root.deiconify()
             root.attributes("-topmost", True)
             root.lift()

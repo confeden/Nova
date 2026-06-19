@@ -28,7 +28,7 @@ def get_public_relay_specs(backend_mode):
             tcp_backend="telegram-relay",
             component_key="telegram_relay_ready",
             host="127.0.0.1",
-            port=1376,
+            port=1372,
             enabled=telegram_relay_enabled or public_hybrid,
             implementation="tgrelay",
             planned_only=False,

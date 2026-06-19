@@ -82,6 +82,15 @@ def get_default_app_routing_profiles():
             process_path_regex=r"(?i).*[\\/](cmd|powershell|pwsh|windowsterminal|opencode-cli|codex-cli|gemini-cli|gemini)(?:\.exe)?$",
             path_markers=("cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal", "opencode-cli", "codex-cli", "gemini-cli", "gemini.exe"),
         ),
+        "obs": AppRoutingProfile(
+            key="obs",
+            display_name="OBS",
+            process_names=(
+                "obs64.exe", "obs32.exe", "OBS Studio.exe",
+            ),
+            process_path_regex=r"(?i).*[\\/](obs64|obs32|obs-studio)[\\/].*",
+            path_markers=("obs64.exe", "obs32.exe", "obs-studio"),
+        ),
         "games": AppRoutingProfile(
             key="games",
             display_name="Games",

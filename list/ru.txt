@@ -51,7 +51,6 @@ cloudflaressl.com
 cloudflarestatus.com
 cloudflarestorage.com
 cloudflarestream.com
-cloudfront.hls.ttvnw.net
 cloudfront.net
 coinbase.com
 comicbook.com
@@ -74,6 +73,7 @@ element.io
 engagement.ai
 etoneya.su
 evolution-x.org
+ext-twitch.tv
 facebook.com
 farnell.com
 fb.com
@@ -102,6 +102,7 @@ grokusercontent.com
 groq.com
 hdkinoteatr.com
 hexed.it
+hls.ttvnw.net
 ibb.co
 instagram.com
 ip-tracker.org
@@ -145,6 +146,7 @@ nowpayments.io
 ntfy.sh
 nvidia.com
 obmen.one
+obsproject.com
 on.aws
 onorca.dev
 ookla.com
@@ -170,6 +172,7 @@ puter.site
 recaptcha.net
 receive-sms.io
 redav.online
+release-assets.githubusercontent.com
 rezka.ag
 romexsoftware.com
 roundproxies.com
@@ -216,6 +219,8 @@ tuta.io
 tutamail.com
 tutanota.com
 twimg.com
+twitch.tv
+twitchcdn.net
 twitter.com
 unpkg.com
 upload.youtube.com
@@ -227,6 +232,7 @@ verisoul.ai
 vultrusercontent.com
 warp.dev
 warp.plus
+weblate.org
 websiteplanet.com
 whatsapp.com
 whatsapp.net
