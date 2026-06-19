@@ -22749,7 +22749,7 @@ try:
         # Apply NRPT DNS rules for Gemini/Google AI unblocking
         def _setup_nrpt_async():
             try:
-                settings = current_routing_settings or load_routing_settings()
+                settings = load_routing_settings()
                 sys_settings = settings.get("system") or {}
                 ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
                 if ai_unlock_enabled:
