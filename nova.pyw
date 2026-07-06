@@ -4838,17 +4838,12 @@ try:
                     except:
                         pass
                 
-                # Routing strings for EU domains: Opera VPN preferred when active,
-                # WARP fallback.  PROXY 1371 is only included when opera_active
-                # so that a dead/alive-but-broken Opera never poisons the chain.
-                if warp_active and opera_active:
-                    eu_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
-                elif warp_active:
-                    eu_route = f"SOCKS5 127.0.0.1:{self.warp_port}"
-                elif opera_active:
+                # EU domains are Opera-only. Do not fall back to WARP here:
+                # otherwise EU-listed browser traffic can silently use RU/WARP egress.
+                if opera_active:
                     eu_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
                 else:
-                    # Kill-switch for EU domains if both Opera and WARP are down.
+                    # Kill-switch for EU domains if Opera is down.
                     eu_route = "SOCKS5 127.0.0.1:1"
 
                 # Routing strings for RU domains: browser PAC should not enter a stale
@@ -5553,6 +5548,7 @@ try:
             self._current_bootstrap_proxy = ""
             self._current_override_endpoint = ""
             self._forced_warp_proxy = ""
+            self._direct_restart_attempted = False
 
         def configure_country(self, country):
             try:
@@ -5684,10 +5680,57 @@ try:
             except:
                 return None
 
+        def _normalize_opera_api_proxy(self, raw):
+            try:
+                value = str(raw or "").strip().strip('"').strip("'")
+                if not value:
+                    return ""
+                if "://" in value:
+                    return value
+                # opera-proxy treats plain host:port as HTTP. Nova's bootstrap
+                # override is primarily for SOCKS5 exit nodes, so make that explicit.
+                return f"socks5://{value}"
+            except:
+                return ""
+
+        def _get_configured_api_bootstrap_proxy(self):
+            """Return user-configured SurfEasy API proxy, if any."""
+            try:
+                raw = str(os.environ.get("NOVA_OPERA_API_PROXY", "") or "").strip()
+                proxy = self._normalize_opera_api_proxy(raw)
+                if proxy:
+                    return proxy
+            except:
+                pass
+            try:
+                proxy_file = os.path.join(get_base_dir(), "temp", "opera_api_proxy.txt")
+                if os.path.exists(proxy_file):
+                    with open(proxy_file, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            line = str(line or "").strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            proxy = self._normalize_opera_api_proxy(line)
+                            if proxy:
+                                return proxy
+            except:
+                pass
+            return ""
+
+        def _get_api_bootstrap_proxy(self):
+            """Proxy only SurfEasy API discovery/registration; data tunnel stays direct."""
+            configured = self._get_configured_api_bootstrap_proxy()
+            if configured:
+                return configured
+            forced = self._normalize_opera_api_proxy(getattr(self, "_forced_warp_proxy", "") or "")
+            if forced:
+                return forced
+            return self._get_warp_bootstrap_proxy() or ""
+
         def force_restart(self, warp_proxy=None):
             """Force-kill the current process and restart. Bypasses locks.
-            If warp_proxy is provided (e.g. socks5://127.0.0.1:1370), force it
-            into the new start() so we don't re-probe WARP (which can flap)."""
+            If warp_proxy is provided (e.g. socks5://127.0.0.1:1370), use it
+            only for SurfEasy API bootstrap in the next start()."""
             # Kill by PID
             try:
                 _proc = getattr(self, "process", None)
@@ -5719,6 +5762,7 @@ try:
             self._current_attempt_mode = ""
             self._current_bootstrap_proxy = ""
             self._current_override_endpoint = ""
+            self._direct_restart_attempted = False
             self._start_in_progress = False
             try:
                 self._start_lock.release()
@@ -5821,20 +5865,20 @@ try:
                     now_ts = time.time()
                     in_grace = bool(self._startup_grace_deadline and now_ts < self._startup_grace_deadline)
                     if in_grace:
-                        # Upgrade a stuck direct-discover start to WARP bootstrap once WARP becomes ready.
+                        # Upgrade a stuck direct-discover start to API-only bootstrap once a helper proxy is ready.
                         try:
                             proc_age = (now_ts - float(self._started_at_ts or now_ts)) if self._started_at_ts else 0.0
-                            warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                            api_bootstrap_proxy = self._get_api_bootstrap_proxy()
                             direct_discover_stuck = bool(
                                 not port_alive
                                 and str(getattr(self, "_current_attempt_mode", "") or "").strip().lower() == "discover"
                                 and not str(getattr(self, "_current_bootstrap_proxy", "") or "").strip()
                                 and not str(getattr(self, "_current_override_endpoint", "") or "").strip()
-                                and warp_bootstrap_proxy
+                                and api_bootstrap_proxy
                                 and proc_age >= 18.0
                             )
                             if direct_discover_stuck:
-                                _terminate_managed_process("[EU] [Diag] Direct discover застрял до готовности 1371. Перезапуск через WARP bootstrap...")
+                                _terminate_managed_process("[EU] [Diag] Direct discover застрял до готовности 1371. Перезапуск через API bootstrap proxy...")
                             else:
                                 # Keep process alive during bootstrap; health may be unavailable while registration retries.
                                 self.using_external = False
@@ -5851,17 +5895,17 @@ try:
                     if self._has_recent_log_activity(max_age_sec=60):
                         try:
                             proc_age = (now_ts - float(self._started_at_ts or now_ts)) if self._started_at_ts else 0.0
-                            warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
+                            api_bootstrap_proxy = self._get_api_bootstrap_proxy()
                             direct_discover_stuck = bool(
                                 not port_alive
                                 and str(getattr(self, "_current_attempt_mode", "") or "").strip().lower() == "discover"
                                 and not str(getattr(self, "_current_bootstrap_proxy", "") or "").strip()
                                 and not str(getattr(self, "_current_override_endpoint", "") or "").strip()
-                                and warp_bootstrap_proxy
+                                and api_bootstrap_proxy
                                 and proc_age >= 18.0
                             )
                             if direct_discover_stuck:
-                                _terminate_managed_process("[EU] [Diag] Direct discover завис при готовом WARP. Перезапуск через WARP bootstrap...")
+                                _terminate_managed_process("[EU] [Diag] Direct discover завис при готовом API bootstrap proxy. Перезапуск...")
                             else:
                                 self.using_external = False
                                 self.owns_process = True
@@ -5941,42 +5985,29 @@ try:
                 self.log_file = os.path.join(log_dir, "opera.log")
 
                 cached_endpoint = self._load_cached_endpoint()
-                # Use forced warp_proxy from force_restart() if available,
-                # otherwise probe WARP freshness. This avoids flapping when
-                # _get_warp_bootstrap_proxy() briefly fails during restart.
-                warp_bootstrap_proxy = getattr(self, "_forced_warp_proxy", "") or ""
-                if not warp_bootstrap_proxy:
-                    warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
-                # If WARP not ready yet, wait up to 8s for it (avoids useless direct-start).
-                # Only on fresh starts (not force_restart which already has the proxy).
-                if not warp_bootstrap_proxy and not getattr(self, "_forced_warp_proxy", ""):
-                    _warp_wait_start = time.time()
-                    while time.time() - _warp_wait_start < 8.0:
+                # Proxy only SurfEasy API discovery/registration. Do not use
+                # opera-proxy -proxy here: that routes the data tunnel too.
+                api_bootstrap_proxy = self._get_api_bootstrap_proxy()
+                # If no explicit API proxy is configured, wait briefly for WARP
+                # as an API-only bootstrap helper. Runtime Opera egress stays direct.
+                if not api_bootstrap_proxy and not self._get_configured_api_bootstrap_proxy():
+                    _api_wait_start = time.time()
+                    while time.time() - _api_wait_start < 8.0:
                         if is_closing or not is_service_active:
                             break
-                        warp_bootstrap_proxy = self._get_warp_bootstrap_proxy()
-                        if warp_bootstrap_proxy:
+                        api_bootstrap_proxy = self._get_api_bootstrap_proxy()
+                        if api_bootstrap_proxy:
                             if IS_DEBUG_MODE:
-                                self.log_func(f"[EU] [Diag] WARP стал доступен через {time.time() - _warp_wait_start:.1f}s ожидания.")
+                                self.log_func(f"[EU] [Diag] API bootstrap proxy стал доступен через {time.time() - _api_wait_start:.1f}s ожидания.")
                             break
                         time.sleep(1.0)
                 self._forced_warp_proxy = ""
 
-                # ISP blocks all SurfEasy/Opera IPs (77.111.x.x, api2.sec-tunnel.com).
-                # When WARP is available, route ALL traffic through it using -proxy.
-                # This bypasses both registration API and data tunnel ISP blocks.
-                use_full_warp_proxy = bool(warp_bootstrap_proxy)
-
-                # When using WARP proxy, skip cached endpoint (it's a direct SurfEasy
-                # address blocked by ISP). Start fresh with WARP-routed discovery.
-                if use_full_warp_proxy:
-                    cached_endpoint = None
-
                 attempts = []
                 if cached_endpoint:
                     attempts.append(("cached", cached_endpoint, 2.5, None))
-                if use_full_warp_proxy:
-                    attempts.append(("discover-warp", None, 4.0, warp_bootstrap_proxy))
+                if api_bootstrap_proxy:
+                    attempts.append(("discover-api-proxy", None, 6.5, api_bootstrap_proxy))
                 attempts.append(("discover", None, 6.5, None))
 
                 for attempt_mode, override_endpoint, ready_timeout, base_proxy in attempts:
@@ -5984,15 +6015,14 @@ try:
                         self.exe_path,
                         "-bind-address", f"127.0.0.1:{self.port}",
                         "-country", self.country,
-                        "-server-selection", "first",
+                        "-server-selection", "fastest",
+                        "-server-selection-timeout", "10s",
                     ]
                     if base_proxy:
-                        # Route ALL opera-proxy traffic through WARP to bypass ISP blocks.
-                        # -proxy routes both registration API and data tunnel through WARP.
-                        cmd.extend(["-proxy", base_proxy])
-                        cmd.extend(["-proxy-bypass", "127.0.0.1", "-proxy-bypass", "localhost"])
+                        # API-only bootstrap: init/discover via proxy, Opera tunnel direct.
+                        cmd.extend(["-api-proxy", base_proxy])
                         if IS_DEBUG_MODE:
-                            self.log_func(f"[EU] [Diag] Opera через WARP (full proxy): {base_proxy}.")
+                            self.log_func(f"[EU] [Diag] Opera API bootstrap proxy: {base_proxy}.")
                     if override_endpoint:
                         cmd.extend(["-override-proxy-address", override_endpoint])
                         self.log_func(f"[EU] [Diag] Пробуем кэшированный endpoint {override_endpoint}.")
@@ -6052,7 +6082,7 @@ try:
                         if IS_DEBUG_MODE:
                             self.log_func(f"[EU] Процесс завершился сразу после запуска (код: {rc}).")
                         elif base_proxy:
-                            self.log_func(f"[EU] Opera завершился сразу (код: {rc}). Full-proxy через WARP не сработал. Пробуем следующий вариант...")
+                            self.log_func(f"[EU] Opera завершился сразу (код: {rc}). API bootstrap proxy не сработал. Пробуем следующий вариант...")
                         self.process = None
                         self._startup_grace_deadline = 0.0
                         self._started_at_ts = 0.0
@@ -6061,8 +6091,8 @@ try:
                         self._clear_cached_endpoint()
                         _terminate_managed_process("[EU] [Diag] Кэшированный endpoint не поднялся вовремя. Переходим к следующему варианту...")
                         continue
-                    elif attempt_mode == "discover-warp":
-                        _terminate_managed_process("[EU] [Diag] Bootstrap через WARP не поднялся вовремя. Пробуем direct discover...")
+                    elif attempt_mode == "discover-api-proxy":
+                        _terminate_managed_process("[EU] [Diag] API bootstrap proxy не поднял 1371 вовремя. Пробуем direct discover...")
                         continue
                     else:
                         # Keep managed process alive: opera registration may need >15s with retries.
@@ -21909,67 +21939,52 @@ try:
                         last_opera_issue_state = "port_down"
                         need_restart = True
                     elif not opera_proxy_alive:
-                        # FIX: If WARP is now available but Opera was started without -proxy
-                        # (race condition at startup), force restart immediately.
-                        # This bypasses grace period and backoff since the proxy is useless
-                        # without WARP when ISP blocks all SurfEasy endpoints.
-                        started_without_warp_proxy = not bool(getattr(opera_proxy_manager, "_current_bootstrap_proxy", "") or "")
-                        warp_proxy_upgrade = bool(warp_usable and started_without_warp_proxy and opera_owned and opera_proc and opera_proc.poll() is None)
-                        if warp_proxy_upgrade:
-                            if last_opera_issue_state != "warp_proxy_upgrade":
-                                log_func(f"[EU] WARP доступен, но Opera запущена без -proxy. Перезапуск через WARP...")
-                            last_opera_issue_state = "warp_proxy_upgrade"
-                            need_restart = True
-                        else:
-                            startup_grace_deadline = float(getattr(opera_proxy_manager, "_startup_grace_deadline", 0.0) or 0.0)
-                            in_startup_grace = bool(opera_owned and opera_proc and opera_proc.poll() is None and now < startup_grace_deadline)
+                        startup_grace_deadline = float(getattr(opera_proxy_manager, "_startup_grace_deadline", 0.0) or 0.0)
+                        in_startup_grace = bool(opera_owned and opera_proc and opera_proc.poll() is None and now < startup_grace_deadline)
+                        recent_activity = False
+                        try:
+                            recent_activity = bool(getattr(opera_proxy_manager, "_has_recent_log_activity", lambda **_: False)(max_age_sec=60))
+                        except:
                             recent_activity = False
-                            try:
-                                recent_activity = bool(getattr(opera_proxy_manager, "_has_recent_log_activity", lambda **_: False)(max_age_sec=60))
-                            except:
-                                recent_activity = False
 
-                            # In grace mode (fresh managed start) or during short transient glitches, avoid restarts.
-                            # Use raw proxy health (without debounce) for restart decision.
-                            opera_proxy_healthy = bool(opera_port_alive and opera_proxy_alive)
-                            if in_startup_grace or opera_proxy_healthy or (opera_owned and opera_proc and recent_activity):
-                                if in_startup_grace and last_opera_issue_state != "proxy_warmup" and IS_DEBUG_MODE:
-                                    log_func(f"[EU] Инициализация прокси {opera_port} продолжается (grace).")
-                                if in_startup_grace or (opera_owned and opera_proc and recent_activity):
-                                    last_opera_issue_state = "proxy_warmup"
-                                else:
-                                    last_opera_issue_state = None
-                                need_restart = False
-                            # For adopted external proxy: tolerate short glitches,
-                            # but after persistent failure, release and restart managed.
-                            elif opera_external and not opera_owned:
-                                if opera_bad_proxy_streak >= 6:
-                                    log_func(f"[EU] Внешний прокси {opera_port} не отвечает {opera_bad_proxy_streak} проверок. Принудительный перезапуск локального proxy...")
-                                    opera_proxy_manager.using_external = False
-                                    opera_proxy_manager.owns_process = False
-                                    last_opera_issue_state = "proxy_bad_external_takeover"
-                                    need_restart = True
-                                else:
-                                    if last_opera_issue_state != "proxy_bad_external":
-                                        log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
-                                    last_opera_issue_state = "proxy_bad_external"
-                                    need_restart = False
-                            # Managed proxy: if local parser is alive but CONNECT upstream stays dead
-                            # for several checks, perform a controlled restart with backoff.
-                            # Threshold lowered from 5→2 so recovery kicks in within seconds.
-                            elif opera_bad_proxy_streak >= 4:
-                                if last_opera_issue_state != "proxy_bad":
-                                    log_func(f"[EU] Порт {opera_port} открыт, но прокси не отвечает корректно ({opera_bad_proxy_streak} проверок подряд). Восстановление...")
-                                last_opera_issue_state = "proxy_bad"
-                                enough_time_since_good = (now - opera_last_good_ts) >= 15.0 if opera_last_good_ts else True
-                                # Don't restart Opera if WARP is also unhealthy — the tunnel
-                                # failure is caused by WARP, not Opera. Restarting won't help.
-                                # However, if Opera was launched with a SOCKS proxy (WARP) but WARP is now dead,
-                                # we must restart it to clear the stale proxy flag.
-                                has_stale_proxy = bool(getattr(opera_proxy_manager, "_current_bootstrap_proxy", ""))
-                                need_restart = bool(opera_owned and enough_time_since_good and (warp_usable or has_stale_proxy))
+                        # In grace mode (fresh managed start) or during short transient glitches, avoid restarts.
+                        # Use raw proxy health (without debounce) for restart decision.
+                        opera_proxy_healthy = bool(opera_port_alive and opera_proxy_alive)
+                        if in_startup_grace or opera_proxy_healthy or (opera_owned and opera_proc and recent_activity):
+                            if in_startup_grace and last_opera_issue_state != "proxy_warmup" and IS_DEBUG_MODE:
+                                log_func(f"[EU] Инициализация прокси {opera_port} продолжается (grace).")
+                            if in_startup_grace or (opera_owned and opera_proc and recent_activity):
+                                last_opera_issue_state = "proxy_warmup"
                             else:
+                                last_opera_issue_state = None
+                            need_restart = False
+                        # For adopted external proxy: tolerate short glitches,
+                        # but after persistent failure, release and restart managed.
+                        elif opera_external and not opera_owned:
+                            if opera_bad_proxy_streak >= 6:
+                                log_func(f"[EU] Внешний прокси {opera_port} не отвечает {opera_bad_proxy_streak} проверок. Принудительный перезапуск локального proxy...")
+                                opera_proxy_manager.using_external = False
+                                opera_proxy_manager.owns_process = False
+                                last_opera_issue_state = "proxy_bad_external_takeover"
+                                need_restart = True
+                            else:
+                                if last_opera_issue_state != "proxy_bad_external":
+                                    log_func(f"[EU] Порт {opera_port} открыт, но внешний прокси не отвечает корректно.")
+                                last_opera_issue_state = "proxy_bad_external"
                                 need_restart = False
+                        # Managed proxy: if local parser is alive but CONNECT upstream stays dead
+                        # for several checks, perform a controlled restart with backoff.
+                        elif opera_bad_proxy_streak >= 4:
+                            if last_opera_issue_state != "proxy_bad":
+                                log_func(f"[EU] Порт {opera_port} открыт, но прокси не отвечает корректно ({opera_bad_proxy_streak} проверок подряд). Восстановление...")
+                            last_opera_issue_state = "proxy_bad"
+                            enough_time_since_good = (now - opera_last_good_ts) >= 15.0 if opera_last_good_ts else True
+                            if opera_owned and enough_time_since_good:
+                                with contextlib.suppress(Exception):
+                                    opera_proxy_manager._clear_cached_endpoint()
+                            need_restart = bool(opera_owned and enough_time_since_good)
+                        else:
+                            need_restart = False
                     elif opera_proc is None:
                         # For adopted external proxy, never force local start/takeover from watchdog.
                         # Otherwise we can get PAC flapping and endless restart attempts.
@@ -22005,11 +22020,7 @@ try:
                                 opera_country_fail_count = 0
                             retry_timestamps.append(now)
                             time.sleep(RETRY_PAUSE)
-                            # Track if this is a warp_proxy_upgrade restart (race condition, not endpoint failure).
-                            _is_warp_upgrade = bool(last_opera_issue_state == "warp_proxy_upgrade")
-                            # Pass confirmed WARP proxy URL so start() doesn't re-probe.
-                            _warp_proxy_url = f"socks5://127.0.0.1:{warp_port}" if warp_usable else None
-                            opera_proxy_manager.force_restart(warp_proxy=_warp_proxy_url)
+                            opera_proxy_manager.force_restart()
                             opera_port_alive = is_local_port_open(opera_port)
                             opera_proxy_alive = is_local_http_proxy_alive(opera_port) if opera_port_alive else False
                             opera_usable = bool(opera_port_alive and opera_proxy_alive)
@@ -22023,13 +22034,8 @@ try:
                                 log_func(f"[EU] Порт {opera_port} восстановлен.")
                                 last_opera_issue_state = None
                             else:
-                                # warp_proxy_upgrade restarts are race-condition retries, not real endpoint failures.
-                                # Use shorter backoff and don't count toward country rotation.
-                                if _is_warp_upgrade:
-                                    opera_next_restart_ts = now + 5.0
-                                else:
-                                    opera_next_restart_ts = now + (5.0 if now < startup_fast_retry_until else 15.0)
-                                    opera_country_fail_count += 1
+                                opera_next_restart_ts = now + (5.0 if now < startup_fast_retry_until else 15.0)
+                                opera_country_fail_count += 1
                                 if (now - opera_last_recover_fail_log_ts) >= 45.0:
                                     log_func(f"[EU] Не удалось восстановить порт {opera_port}.")
                                     opera_last_recover_fail_log_ts = now
@@ -26361,7 +26367,7 @@ try:
                     try:
                         opm = globals().get("opera_proxy_manager")
                         _opera_port = int(getattr(opm, "port", 1371) or 1371) if opm else 1371
-                        opera_ok = bool(is_local_http_proxy_tunnel_ready(port=_opera_port, timeout=0.8))
+                        opera_ok = bool(is_local_http_proxy_responsive(port=_opera_port, timeout=1.0))
                     except:
                         opera_ok = False
 

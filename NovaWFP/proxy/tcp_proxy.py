@@ -548,7 +548,7 @@ class NovaWfpTcpProxy:
             return "cli"
         if any(token in lower for token in ("obs64.exe", "obs32.exe", "obs-studio")):
             return "obs"
-        if "pathofexile" in lower:
+        if "pathofexile" in lower or "path of exile" in lower or " poe" in lower or lower.endswith("\\poe") or "client.exe" in lower:
             return "games"
         return ""
 
@@ -766,6 +766,14 @@ class NovaWfpTcpProxy:
                 "first_byte_timeout": 2.4,
             },
             "direct": {"kind": "direct", "label": "direct", "timeout": 8.0, "first_byte_timeout": 8.0},
+            "opera-bootstrap-socks": {
+                "kind": "socks5",
+                "host": "192.168.0.148",
+                "port": 8080,
+                "label": "opera-bootstrap-socks",
+                "timeout": 4.0,
+                "first_byte_timeout": 3.0,
+            },
         }
         return dict(mapping[label]) if label in mapping else None
 
@@ -891,6 +899,7 @@ class NovaWfpTcpProxy:
         elif app_family == "obs":
             route_mode_key = "obs"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
+        is_eu_route_target = False
         if route_mode == "auto":
             exclude_domains = _load_domain_list("exclude")
             if _match_domain(target_host, exclude_domains):
@@ -905,6 +914,7 @@ class NovaWfpTcpProxy:
                     u_eu_domains = _load_domain_list("u_eu")
                     if _match_domain(target_host, eu_domains) or _match_domain(target_host, u_eu_domains):
                         route_mode = "opera"
+                        is_eu_route_target = True
                     else:
                         ru_ips = _load_ip_list("ru")
                         u_ru_ips = _load_ip_list("u_ru")
@@ -919,11 +929,14 @@ class NovaWfpTcpProxy:
                             u_eu_ips = _load_ip_list("u_eu")
                             if _match_ip(target_host, eu_ips) or _match_ip(target_host, u_eu_ips):
                                 route_mode = "opera"
+                                is_eu_route_target = True
         if route_mode != "auto":
             for label in ("warp-socks", "opera-http", "direct"):
                 if label not in attempts:
                     attempts.append(label)
             attempts = _reorder_route_labels(route_mode, attempts)
+            if is_eu_route_target and route_mode == "opera":
+                attempts = ["opera-http"]
 
         cached_label = self._route_label_cache_get(target_host, target_port, route_scope=route_scope)
         if cached_label in attempts:
