@@ -21373,7 +21373,8 @@ try:
             log_func("[Update] Установщик загружен. Запускаю мастер обновления...")
 
         try:
-            subprocess.Popen([installer_path], cwd=os.path.dirname(installer_path))
+            # 0x00000008 = DETACHED_PROCESS. Ensures the installer survives the parent process termination.
+            subprocess.Popen([installer_path], cwd=os.path.dirname(installer_path), creationflags=0x00000008)
         except Exception as e:
             set_update_state(installing=False)
             if log_func:
