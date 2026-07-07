@@ -54,9 +54,12 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 FIRST_BYTE_STALL_RETRY = _env_bool("NOVA_TG_RELAY_FIRST_BYTE_RETRY", False)
 FALLBACK_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_FALLBACK_LOG_INTERVAL", 8.0, minimum=1.0)
 CF_FALLBACK_ENABLED = _env_bool("NOVA_TG_RELAY_CF_FALLBACK", True)
+CF_EMPTY_DOMAIN_TTL = _env_float("NOVA_TG_RELAY_CF_EMPTY_DOMAIN_TTL", 8.0, minimum=2.0)
+CF_EMPTY_RECENT_GOOD_TTL = _env_float("NOVA_TG_RELAY_CF_EMPTY_RECENT_GOOD_TTL", 2.0, minimum=0.5)
+CF_RECENT_GOOD_TTL = _env_float("NOVA_TG_RELAY_CF_RECENT_GOOD_TTL", 900.0, minimum=30.0)
 CF_FIRST_DCS = {
     int(item)
-    for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "1,5") or "").replace(";", ",").split(",")
+    for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "1,2,3,4,5,203") or "").replace(";", ",").split(",")
     if item.strip().isdigit()
 }
 CF_FIRST_MEDIA_DCS = {
@@ -71,6 +74,8 @@ _TG_EXACT_TARGETS: Dict[str, Tuple[int, bool]] = {
     "149.154.175.51": (1, False),
     "149.154.175.53": (1, False),
     "149.154.175.54": (1, False),
+    "149.154.175.55": (1, False),
+    "149.154.175.59": (1, False),
     "149.154.175.52": (1, True),
     # DC2
     "149.154.167.35": (2, False),
@@ -126,8 +131,11 @@ _TG_IPV6_PREFIXES = [
 ]
 
 _TG_WS_REDIRECT_IPS: Dict[int, str] = {
+    1: "149.154.174.100",
     2: "149.154.167.220",
+    3: "149.154.174.100",
     4: "149.154.167.220",
+    5: "149.154.170.100",
     203: "149.154.167.220",
 }
 
@@ -286,15 +294,15 @@ def _ws_domains(dc: int, is_media: bool) -> List[str]:
 
 
 def _cf_ws_domains_for_bases(dc: int, bases: List[str], is_media: bool = False) -> List[str]:
+    if int(dc or 0) == 203:
+        dc = 2
     domains: List[str] = []
     for base in bases:
         domain_base = str(base or "").strip().lower()
         if not domain_base:
             continue
-        # For custom/user CF domains Flowseal's own guide uses only kwsN
-        # records. Keep kwsN-1 for Telegram-owned web.telegram.org domains,
-        # but do not require separate kwsN-1 records on user domains.
-        if is_media and domain_base.endswith(".web.telegram.org"):
+        # Allow kwsN-1 for media on custom CF domains as well
+        if is_media:
             domains.append(f"kws{int(dc)}-1.{domain_base}")
         domains.append(f"kws{int(dc)}.{domain_base}")
     seen = set()
@@ -383,6 +391,8 @@ def _target_dc_hint(target_ip: str, is_media: bool = False) -> int:
             return 2
         if addr in ipaddress.ip_network("149.154.167.0/24"):
             return 2
+        if addr in ipaddress.ip_network("149.154.175.48/28"):
+            return 1
         if addr == ipaddress.ip_address("149.154.175.50"):
             return 1
         if addr == ipaddress.ip_address("149.154.175.100"):
@@ -446,13 +456,54 @@ def _is_telegram_domain(host: str) -> bool:
 def _wss_candidate(target_host: str, target_ip: str, target_port: int) -> bool:
     if int(target_port or 0) not in TG_TCP_PORTS:
         return False
-    try:
-        attempts = get_upstream_attempts()
-        if attempts and attempts[0].get("kind") != "direct":
-            return False
-    except Exception:
-        pass
     return _is_telegram_ip(target_ip) or _is_telegram_domain(target_host)
+
+
+def _cfproxy_upstream_attempts() -> List[Dict[str, object]]:
+    try:
+        attempts = list(get_upstream_attempts() or [])
+    except Exception:
+        attempts = []
+    allow_direct = bool(
+        attempts
+        and isinstance(attempts[0], dict)
+        and str(attempts[0].get("kind") or "").strip().lower() == "direct"
+    )
+    selected_attempts = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        rendered = dict(attempt)
+        if str(rendered.get("kind") or "").strip().lower() == "direct":
+            if not allow_direct:
+                continue
+            rendered.setdefault("timeout", 1.2)
+        selected_attempts.append(rendered)
+    if selected_attempts:
+        return selected_attempts
+    if allow_direct:
+        return [{"kind": "direct", "label": "direct", "timeout": 1.2}]
+    return []
+
+
+def _telegram_upstream_attempts(base_attempts=None) -> List[Dict[str, object]]:
+    try:
+        attempts = list(base_attempts if base_attempts is not None else (get_upstream_attempts() or []))
+    except Exception:
+        attempts = []
+    allow_direct = bool(
+        attempts
+        and isinstance(attempts[0], dict)
+        and str(attempts[0].get("kind") or "").strip().lower() == "direct"
+    )
+    rendered: List[Dict[str, object]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        if str(attempt.get("kind") or "").strip().lower() == "direct" and not allow_direct:
+            continue
+        rendered.append(dict(attempt))
+    return rendered
 
 
 async def _resolve_ip(host: str) -> str:
@@ -481,8 +532,14 @@ async def _resolve_ip(host: str) -> str:
     return await asyncio.to_thread(_resolve)
 
 
-async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0):
-    reader, writer, upstream_label = await open_tls_stream(host, 443, server_hostname=domain, timeout=timeout)
+async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0, attempts=None):
+    reader, writer, upstream_label = await open_tls_stream(
+        host,
+        443,
+        server_hostname=domain,
+        timeout=timeout,
+        attempts=attempts,
+    )
     set_sock_opts(writer.transport, proxy_config.buffer_size)
     ws_key = struct.pack("!QQ", int(time.time() * 1000), int(time.perf_counter_ns() & 0xFFFFFFFFFFFFFFFF))
     import base64
@@ -570,12 +627,18 @@ class _TelegramWsPool:
             needed = max(0, int(getattr(proxy_config, "pool_size", 4) or 4) - len(bucket))
             if needed <= 0:
                 return
+            ws_attempts = _telegram_upstream_attempts()
             for _ in range(needed):
                 ws = None
                 route_label = ""
                 for domain in domains:
                     try:
-                        ws, upstream_label = await _connect_websocket_target(target_ip, domain, timeout=6.0)
+                        ws, upstream_label = await _connect_websocket_target(
+                            target_ip,
+                            domain,
+                            timeout=6.0,
+                            attempts=ws_attempts,
+                        )
                         route_label = f"{domain}@{target_ip} via {upstream_label}"
                         break
                     except WsHandshakeError as exc:
@@ -598,44 +661,143 @@ class _TelegramWsPool:
 _WS_POOL = _TelegramWsPool()
 
 
-async def _bridge_streams(reader1, writer1, reader2, writer2):
+async def _traffic_stats_loop(counters: Dict[str, int], started: float, label: str, log_func, interval: float = 8.0):
+    if not label or not callable(log_func):
+        return
+    last_up = 0
+    last_down = 0
+    try:
+        while True:
+            await asyncio.sleep(max(2.0, float(interval or 8.0)))
+            up = int(counters.get("up", 0) or 0)
+            down = int(counters.get("down", 0) or 0)
+            delta_up = up - last_up
+            delta_down = down - last_down
+            if delta_up <= 0 and delta_down <= 0:
+                continue
+            elapsed = max(0.001, time.monotonic() - float(started or time.monotonic()))
+            log_func(
+                f"[TgRelay] traffic {label} duration_s={elapsed:.1f} "
+                f"up={up} down={down} rate_up={delta_up / interval:.0f}B/s rate_down={delta_down / interval:.0f}B/s"
+            )
+            last_up = up
+            last_down = down
+    except asyncio.CancelledError:
+        return
+
+
+async def _bridge_streams(
+    reader1,
+    writer1,
+    reader2,
+    writer2,
+    stats_label: str = "",
+    log_func=None,
+    first_down_timeout: float = 0.0,
+):
+    counters = {"up": 0, "down": 0}
+    started = time.monotonic()
+    first_down = asyncio.Event()
+    first_down_timed_out = False
+
     async def _pipe(src, dst):
         try:
             while True:
                 data = await src.read(65536)
                 if not data:
                     break
+                if src is reader1:
+                    counters["up"] += len(data)
+                else:
+                    counters["down"] += len(data)
+                    first_down.set()
                 dst.write(data)
                 await dst.drain()
         finally:
             with contextlib.suppress(Exception):
                 dst.close()
 
+    async def _first_down_timeout():
+        nonlocal first_down_timed_out
+        timeout = float(first_down_timeout or 0.0)
+        if timeout <= 0.0:
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(first_down.wait(), timeout=timeout)
+        if counters["down"] <= 0:
+            first_down_timed_out = True
+            for w in (writer1, writer2):
+                with contextlib.suppress(Exception):
+                    transport = getattr(w, "transport", None)
+                    if transport is not None and hasattr(transport, "abort"):
+                        transport.abort()
+                    else:
+                        w.close()
+            return
+        await asyncio.Future()
+
     tasks = [asyncio.create_task(_pipe(reader1, writer2)), asyncio.create_task(_pipe(reader2, writer1))]
+    if float(first_down_timeout or 0.0) > 0.0:
+        tasks.append(asyncio.create_task(_first_down_timeout()))
+    if stats_label and callable(log_func):
+        tasks.append(asyncio.create_task(_traffic_stats_loop(counters, started, stats_label, log_func)))
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
     for task in done:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+    return counters["up"], counters["down"], int((time.monotonic() - started) * 1000)
 
 
-async def _bridge_ws(reader, writer, ws: RawWebSocket, splitter: Optional[TransparentMsgSplitter]):
-    async def _close_ws():
+async def _bridge_ws(
+    reader,
+    writer,
+    ws: RawWebSocket,
+    splitter: Optional[TransparentMsgSplitter],
+    replay_limit: int = 0,
+    close_writer: bool = True,
+    first_down_timeout: float = 0.0,
+    stats_label: str = "",
+    log_func=None,
+    first_down_callback=None,
+):
+    counters = {"up": 0, "down": 0}
+    started = time.monotonic()
+    replay_buf = bytearray()
+    replay_complete = True
+    replay_enabled = int(replay_limit or 0) > 0
+    first_down = asyncio.Event()
+    first_down_timed_out = False
+
+    def _abort_ws_transport() -> None:
         with contextlib.suppress(Exception):
-            close_fn = getattr(ws, "close", None)
-            if callable(close_fn):
-                result = close_fn()
-                if asyncio.iscoroutine(result):
-                    await result
-                return
+            setattr(ws, "_closed", True)
+        ws_writer = getattr(ws, "writer", None)
+        if ws_writer is not None:
+            with contextlib.suppress(Exception):
+                transport = getattr(ws_writer, "transport", None)
+                if transport is not None and hasattr(transport, "abort"):
+                    transport.abort()
+                else:
+                    ws_writer.close()
+            return
+        with contextlib.suppress(Exception):
             close_fn = getattr(ws, "Close", None)
             if callable(close_fn):
                 close_fn()
 
+    async def _close_ws():
+        _abort_ws_transport()
+        ws_writer = getattr(ws, "writer", None)
+        if ws_writer is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ws_writer.wait_closed(), timeout=0.25)
+
     async def _client_to_ws():
+        nonlocal replay_complete
         try:
             while True:
                 data = await reader.read(65536)
@@ -648,6 +810,13 @@ async def _bridge_ws(reader, writer, ws: RawWebSocket, splitter: Optional[Transp
                             else:
                                 await ws.send_batch(tail)
                     return
+                counters["up"] += len(data)
+                if replay_enabled and counters["down"] <= 0:
+                    if len(replay_buf) + len(data) <= int(replay_limit or 0):
+                        replay_buf.extend(data)
+                    else:
+                        replay_complete = False
+                        replay_buf.clear()
                 if splitter:
                     parts = splitter.split(data)
                     if not parts:
@@ -669,23 +838,50 @@ async def _bridge_ws(reader, writer, ws: RawWebSocket, splitter: Optional[Transp
                     return
                 if not payload:
                     continue
+                if counters["down"] <= 0:
+                    replay_buf.clear()
+                    if callable(first_down_callback):
+                        with contextlib.suppress(Exception):
+                            first_down_callback(len(payload))
+                counters["down"] += len(payload)
+                first_down.set()
                 writer.write(payload)
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError):
             return
         finally:
-            with contextlib.suppress(Exception):
-                writer.close()
+            if close_writer:
+                with contextlib.suppress(Exception):
+                    writer.close()
+
+    async def _first_down_timeout():
+        nonlocal first_down_timed_out
+        timeout = float(first_down_timeout or 0.0)
+        if timeout <= 0.0:
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(first_down.wait(), timeout=timeout)
+        if counters["down"] <= 0:
+            first_down_timed_out = True
+            _abort_ws_transport()
+            return
+        await asyncio.Future()
 
     tasks = [asyncio.create_task(_client_to_ws()), asyncio.create_task(_ws_to_client())]
+    if replay_enabled and float(first_down_timeout or 0.0) > 0.0:
+        tasks.append(asyncio.create_task(_first_down_timeout()))
+    if stats_label and callable(log_func):
+        tasks.append(asyncio.create_task(_traffic_stats_loop(counters, started, stats_label, log_func)))
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
     for task in done:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+    replay = bytes(replay_buf) if replay_enabled and replay_complete and (counters["down"] <= 0 or first_down_timed_out) else b""
+    return counters["up"], counters["down"], int((time.monotonic() - started) * 1000), replay
 
 
 class TelegramTransparentRelayServer:
@@ -707,13 +903,134 @@ class TelegramTransparentRelayServer:
         self._route_preference_until: Dict[Tuple[str, int], Tuple[str, float]] = {}
         self._last_fallback_log: Dict[Tuple[str, str, int, str], float] = {}
         self._last_wss_route_log: Dict[Tuple[int, str, bool], float] = {}
+        self._last_probe_diag_log: Dict[Tuple[str, int, str], float] = {}
         self._cf_bootstrap_probe_logged: Dict[int, float] = {}
         self._cf_last_good_domain: Dict[Tuple[int, bool], Tuple[str, float]] = {}
+        self._cf_bad_domain_until: Dict[str, float] = {}
+        self._cf_domain_score: Dict[str, Tuple[float, float]] = {}
+        self._cf_health_cache_last_save = 0.0
         self._cf_prewarm_started: Dict[Tuple[int, bool], float] = {}
         self._cf_idle: Dict[Tuple[int, bool, bool], deque] = {}
         self._cf_refilling = set()
+        self._route_scoring: Dict[Tuple[int, str], float] = {}  # (dc, route_label_type): score
+        self._wss_first_byte_fail: Dict[Tuple[int, bool], Tuple[int, float]] = {}
+        self._wss_first_byte_disabled_until: Dict[Tuple[int, bool], float] = {}
+        self._active_clients = {}
+        self._last_client_mode_seen = {"socks": 0.0, "divert": 0.0}
+        self._last_mode_switch_close = 0.0
         self._start_mono = 0.0
         self._last_startup_timeout_log = 0.0
+        self._cf_health_cache_load()
+
+    def _cf_health_cache_path(self) -> str:
+        return os.path.join(APP_ROOT, "temp", "tgrelay_cf_health.json")
+
+    @staticmethod
+    def _cache_wall_from_mono(mono_seen: float) -> float:
+        try:
+            return time.time() - max(0.0, time.monotonic() - float(mono_seen or 0.0))
+        except Exception:
+            return time.time()
+
+    def _cf_health_cache_load(self) -> None:
+        path = self._cf_health_cache_path()
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return
+            now_wall = time.time()
+            now_mono = time.monotonic()
+
+            scores = payload.get("scores")
+            if isinstance(scores, dict):
+                for domain, item in scores.items():
+                    domain = str(domain or "").strip().lower()
+                    if not domain or not isinstance(item, dict):
+                        continue
+                    try:
+                        score = max(0.0, min(100.0, float(item.get("score") or 0.0)))
+                        seen_wall = float(item.get("seen") or 0.0)
+                    except Exception:
+                        continue
+                    age = max(0.0, now_wall - seen_wall)
+                    if score > 0.0 and age <= CF_RECENT_GOOD_TTL:
+                        self._cf_domain_score[domain] = (score, now_mono - age)
+
+            last_good = payload.get("last_good")
+            if isinstance(last_good, dict):
+                for key_text, item in last_good.items():
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        dc_text, media_text = str(key_text).split(":", 1)
+                        dc = int(dc_text)
+                        is_media = media_text in ("1", "true", "True")
+                        domain = str(item.get("domain") or "").strip().lower()
+                        seen_wall = float(item.get("seen") or 0.0)
+                    except Exception:
+                        continue
+                    age = max(0.0, now_wall - seen_wall)
+                    if dc > 0 and domain and age <= CF_RECENT_GOOD_TTL:
+                        self._cf_last_good_domain[(dc, bool(is_media))] = (
+                            domain,
+                            now_mono + max(30.0, CF_RECENT_GOOD_TTL - age),
+                        )
+        except Exception:
+            return
+
+    def _cf_health_cache_save(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - float(self._cf_health_cache_last_save or 0.0)) < 3.0:
+            return
+        self._cf_health_cache_last_save = now
+        path = self._cf_health_cache_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            now_mono = time.monotonic()
+            scores = {}
+            for domain, (score, seen_mono) in list(self._cf_domain_score.items()):
+                try:
+                    if (now_mono - float(seen_mono or 0.0)) > CF_RECENT_GOOD_TTL:
+                        continue
+                    if float(score or 0.0) <= 0.0:
+                        continue
+                    scores[str(domain)] = {
+                        "score": round(float(score or 0.0), 3),
+                        "seen": self._cache_wall_from_mono(float(seen_mono or 0.0)),
+                    }
+                except Exception:
+                    continue
+
+            last_good = {}
+            for (dc, is_media), (domain, until_mono) in list(self._cf_last_good_domain.items()):
+                try:
+                    if float(until_mono or 0.0) <= now_mono:
+                        continue
+                    key = f"{int(dc)}:{1 if bool(is_media) else 0}"
+                    score_item = scores.get(str(domain))
+                    last_good[key] = {
+                        "domain": str(domain),
+                        "seen": float(score_item.get("seen")) if isinstance(score_item, dict) else time.time(),
+                    }
+                except Exception:
+                    continue
+
+            payload = {
+                "version": 1,
+                "saved": time.time(),
+                "ttl": CF_RECENT_GOOD_TTL,
+                "scores": scores,
+                "last_good": last_good,
+            }
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp_path, path)
+        except Exception:
+            pass
 
     def _divert_state_path(self) -> str:
         return str(
@@ -732,10 +1049,17 @@ class TelegramTransparentRelayServer:
             peer_port = int(peer[1])
         except Exception:
             return None
+        is_loopback_peer = False
+        try:
+            is_loopback_peer = bool(ipaddress.ip_address(peer_host).is_loopback)
+        except Exception:
+            if peer_host in {"localhost"}:
+                is_loopback_peer = True
         path = self._divert_state_path()
         if not path or not os.path.exists(path):
             return None
-        for _attempt in range(40):
+        attempts = 3 if is_loopback_peer else 40
+        for _attempt in range(attempts):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     payload = json.load(f)
@@ -750,11 +1074,11 @@ class TelegramTransparentRelayServer:
                         if not isinstance(value, dict):
                             continue
                         try:
-                            if int(value.get("local_port") or 0) == peer_port:
+                            if int(value.get("local_port") or 0) == peer_port and int(value.get("service_port") or self.port) == int(self.port):
                                 candidates.append(value)
                         except Exception:
                             continue
-                if not candidates:
+                if not candidates and not is_loopback_peer:
                     nearby = []
                     for value in entries.values():
                         if not isinstance(value, dict):
@@ -808,6 +1132,51 @@ class TelegramTransparentRelayServer:
                 await asyncio.sleep(0.05)
         return None
 
+    def _register_client(self, writer, mode: str):
+        key = id(writer)
+        try:
+            self._active_clients[key] = (writer, str(mode or ""), time.monotonic())
+        except Exception:
+            pass
+        return key
+
+    def _unregister_client(self, key) -> None:
+        try:
+            self._active_clients.pop(key, None)
+        except Exception:
+            pass
+
+    async def _close_clients_by_mode(self, mode: str, reason: str) -> None:
+        mode = str(mode or "").strip().lower()
+        if not mode:
+            return
+        items = []
+        try:
+            items = [
+                (key, writer)
+                for key, (writer, client_mode, _started) in list(self._active_clients.items())
+                if str(client_mode or "").strip().lower() == mode
+            ]
+        except Exception:
+            items = []
+        closed = 0
+        for key, writer in items:
+            try:
+                self._active_clients.pop(key, None)
+                writer.close()
+                await writer.wait_closed()
+                closed += 1
+            except Exception:
+                pass
+        if closed:
+            self.log_func(f"[TgRelay] mode-switch: closed {closed} stale {mode} client(s) ({reason}).")
+
+    async def _note_client_mode(self, mode: str) -> None:
+        mode = str(mode or "").strip().lower()
+        if mode not in ("socks", "divert"):
+            return
+        self._last_client_mode_seen[mode] = time.monotonic()
+
     def start(self, timeout: float = 8.0) -> bool:
         if self.thread and self.thread.is_alive():
             return True
@@ -830,6 +1199,29 @@ class TelegramTransparentRelayServer:
         self.server = None
         self.stop_event = None
         self.running = False
+
+    def notify_route_usable(self) -> None:
+        try:
+            if self.loop and self.running:
+                self.loop.call_soon_threadsafe(self._on_route_usable)
+        except Exception:
+            pass
+
+    def _on_route_usable(self) -> None:
+        try:
+            self._no_probe_until.clear()
+        except Exception:
+            pass
+        try:
+            self._wss_first_byte_fail.clear()
+            self._wss_first_byte_disabled_until.clear()
+        except Exception:
+            pass
+        try:
+            if _has_custom_cfproxy_domain():
+                asyncio.create_task(self._schedule_cf_bootstrap_prewarm_wave(0.05))
+        except Exception:
+            pass
 
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
@@ -893,12 +1285,8 @@ class TelegramTransparentRelayServer:
             pass
         try:
             if _has_custom_cfproxy_domain():
-                warmup_dcs = sorted({1, 2, 5, *CF_FIRST_DCS})
-                for index, dc in enumerate(warmup_dcs):
-                    self._schedule_cf_bootstrap_prewarm(int(dc), is_media=False, delay=(0.35 + (0.18 * index)))
-                media_warmup_dcs = sorted(set(CF_FIRST_MEDIA_DCS))
-                for index, dc in enumerate(media_warmup_dcs):
-                    self._schedule_cf_bootstrap_prewarm(int(dc), is_media=True, delay=(0.55 + (0.22 * index)))
+                for wave_delay in (0.35, 3.0, 8.0, 15.0):
+                    asyncio.create_task(self._schedule_cf_bootstrap_prewarm_wave(wave_delay))
         except Exception:
             pass
 
@@ -927,23 +1315,79 @@ class TelegramTransparentRelayServer:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await serve_task
 
+    async def _schedule_cf_bootstrap_prewarm_wave(self, delay: float = 0.0) -> None:
+        try:
+            await asyncio.sleep(max(0.0, float(delay or 0.0)))
+            warmup_dcs = sorted({*CF_FIRST_DCS, *_TG_TCP_FALLBACK_IPS.keys()})
+            for index, dc in enumerate(warmup_dcs):
+                self._schedule_cf_bootstrap_prewarm(int(dc), is_media=False, delay=(0.05 + (0.12 * index)))
+            media_warmup_dcs = sorted(set(CF_FIRST_MEDIA_DCS))
+            for index, dc in enumerate(media_warmup_dcs):
+                self._schedule_cf_bootstrap_prewarm(int(dc), is_media=True, delay=(0.10 + (0.14 * index)))
+        except Exception:
+            pass
+
+    def _wss_first_byte_disabled(self, dc_hint: int, is_media: bool) -> bool:
+        if _has_custom_cfproxy_domain():
+            return False
+        try:
+            until = float(self._wss_first_byte_disabled_until.get((int(dc_hint or 0), bool(is_media)), 0.0) or 0.0)
+            return until > time.monotonic()
+        except Exception:
+            return False
+
+    def _note_wss_first_byte_result(self, dc_hint: int, is_media: bool, down: int) -> None:
+        key = (int(dc_hint or 0), bool(is_media))
+        if key[0] <= 0:
+            return
+        now = time.monotonic()
+        try:
+            if int(down or 0) > 0:
+                self._wss_first_byte_fail.pop(key, None)
+                self._wss_first_byte_disabled_until.pop(key, None)
+                return
+            count, first_seen = self._wss_first_byte_fail.get(key, (0, now))
+            if (now - float(first_seen or now)) > 45.0:
+                count = 0
+                first_seen = now
+            count += 1
+            self._wss_first_byte_fail[key] = (count, first_seen)
+            has_recent_good = self._cf_has_recent_good(key[0], key[1], max_age=180.0)
+            has_cf = _has_custom_cfproxy_domain()
+            threshold = 4 if has_recent_good else (3 if has_cf else 2)
+            if count >= threshold:
+                ttl = 3.0 if has_recent_good else (8.0 if bool(is_media) else 15.0)
+                self._wss_first_byte_disabled_until[key] = now + ttl
+                self._wss_first_byte_fail[key] = (0, now)
+                self.log_func(
+                    f"[TgRelay] WSS first-byte circuit: dc={key[0]} media={bool(is_media)} "
+                    f"disabled_for={int(ttl)}s; using TCP fallback via WARP."
+                )
+        except Exception:
+            pass
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
         label = f"{peer[0]}:{peer[1]}" if peer else "?"
         prefetched_ws_task = None
+        client_key = None
         try:
             prefetched = await asyncio.wait_for(reader.readexactly(1), timeout=5.0)
             divert_context = await self._lookup_divert_context(peer)
             if divert_context:
+                client_mode = "divert"
                 target_host = str(divert_context.get("target_host") or "").strip()
                 target_port = int(divert_context.get("target_port") or 0)
                 if not target_host or target_port <= 0:
                     return
             else:
+                client_mode = "socks"
                 target_host, target_port = await self._socks_handshake(reader, writer, prefetched=prefetched)
                 prefetched = b""
             if not target_host:
                 return
+            client_key = self._register_client(writer, client_mode)
+            await self._note_client_mode(client_mode)
             target_ip = await _resolve_ip(target_host)
             if not _wss_candidate(target_host, target_ip, target_port):
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, prefetched, label, media_hint=None)
@@ -956,7 +1400,7 @@ class TelegramTransparentRelayServer:
                 cached_dc_hint = _target_dc_hint(target_ip)
                 cached_is_media = _likely_media_target(target_ip, target_port, cached_dc_hint)
                 if not cached_is_media:
-                    init_packet = await self._read_probe(reader, want=64, timeout=0.25, initial=prefetched)
+                    init_packet = await self._read_probe(reader, want=64, timeout=1.2, initial=prefetched)
                     if await self._try_cf_bootstrap_non_media(
                         reader,
                         writer,
@@ -996,7 +1440,7 @@ class TelegramTransparentRelayServer:
             # anyway. Keep a near-zero probe there; retain longer probing only
             # for likely media sockets where WSS path can still matter.
             if not predicted_is_media:
-                probe_timeout = 0.25
+                probe_timeout = 0.25 if _has_custom_cfproxy_domain() else 0.25
             else:
                 probe_timeout = 0.15 if int(target_port or 0) == 80 else 0.6
             init_packet = await self._read_probe(reader, want=64, timeout=probe_timeout, initial=prefetched)
@@ -1004,79 +1448,32 @@ class TelegramTransparentRelayServer:
             if init_info is None:
                 dc_hint = _target_dc_hint(target_ip)
                 is_media = _likely_media_target(target_ip, target_port, dc_hint)
-                if not is_media:
-                    if await self._try_cf_bootstrap_non_media(
-                        reader,
-                        writer,
-                        target_ip=target_ip,
-                        target_port=target_port,
-                        init_packet=init_packet,
-                        label=label,
-                        dc_hint=dc_hint,
-                    ):
-                        return
-                    if prefetched_ws_task is not None:
-                        prefetched_ws_task.cancel()
-                        with contextlib.suppress(Exception):
-                            await prefetched_ws_task
-                    await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
-                    return
-                ws_capable = int(dc_hint or 0) in _TG_WS_REDIRECT_IPS or (
-                    CF_FALLBACK_ENABLED and bool(_cf_ws_domains(int(dc_hint or 0), bool(predicted_is_media)))
-                )
-                if ws_capable:
-                    ws = None
-                    route_label = ""
-                    if (
-                        prefetched_ws_task is not None
-                        and int(predicted_dc or 0) == int(dc_hint or 0)
-                        and bool(predicted_is_media) == bool(is_media)
-                    ):
-                        try:
-                            ws, route_label = await asyncio.wait_for(asyncio.shield(prefetched_ws_task), timeout=0.35)
-                        except Exception:
-                            ws = None
-                            route_label = ""
-                    elif prefetched_ws_task is not None:
-                        prefetched_ws_task.cancel()
-                        with contextlib.suppress(Exception):
-                            await prefetched_ws_task
-                    if ws is None:
-                        ws, route_label = await self._connect_ws_route(dc_hint, target_ip, is_media, label)
-                    if ws is not None:
-                        try:
-                            self._no_probe_until.pop(probe_key, None)
-                        except Exception:
-                            pass
-                        try:
-                            if init_packet:
-                                await ws.send(init_packet)
-                        except Exception:
-                            with contextlib.suppress(Exception):
-                                await ws.close()
-                            await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=is_media)
-                            return
-                        self.log_func(
-                            f"[TgRelay] Подключено: proto=raw dc={dc_hint or '?'} media={is_media} route={route_label} target={target_ip}:{target_port}"
-                        )
-                        await _bridge_ws(reader, writer, ws, None)
-                        return
                 if prefetched_ws_task is not None:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
                 if int(target_port or 0) == 80:
-                    # Repeated :80 connects to the same Telegram host rarely benefit
-                    # from waiting for a full MTProto init. Cache that knowledge and
-                    # send the next connections straight to fallback.
                     cache_for = 45.0 if not init_packet else 20.0
                     self._no_probe_until[probe_key] = time.monotonic() + cache_for
-                await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=None)
+                self._log_probe_diag(
+                    "unparsed-init-no-wss",
+                    target_ip,
+                    target_port,
+                    len(init_packet or b""),
+                    dc_hint,
+                )
+                if _has_custom_cfproxy_domain():
+                    self.log_func(f"[TgRelay] Skipping TCP fallback for unparsed-init-no-wss (ISP throttled)")
+                    return
+                await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=is_media)
                 return
 
             dc_hint = init_info.dc or _target_dc_hint(target_ip)
             is_media = bool(init_info.is_media or _likely_media_target(target_ip, target_port, dc_hint))
             if not is_media:
+                if self._wss_first_byte_disabled(dc_hint, False):
+                    await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
+                    return
                 if await self._try_cf_bootstrap_non_media(
                     reader,
                     writer,
@@ -1086,12 +1483,23 @@ class TelegramTransparentRelayServer:
                     label=label,
                     dc_hint=dc_hint,
                     proto_label=_proto_label(init_info.proto),
+                    proto=init_info.proto,
                 ):
                     return
                 if prefetched_ws_task is not None:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
+                self._log_probe_diag(
+                    "parsed-non-media-cf-failed",
+                    target_ip,
+                    target_port,
+                    len(init_packet or b""),
+                    dc_hint,
+                )
+                if _has_custom_cfproxy_domain():
+                    self.log_func(f"[TgRelay] Skipping TCP fallback for parsed-non-media-cf-failed (ISP throttled)")
+                    return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
                 return
             ws_capable = int(dc_hint or 0) in _TG_WS_REDIRECT_IPS
@@ -1100,7 +1508,17 @@ class TelegramTransparentRelayServer:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
+                if _has_custom_cfproxy_domain():
+                    self.log_func(f"[TgRelay] Skipping TCP fallback for non-ws-capable DC{dc_hint} (ISP throttled)")
+                    return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
+                return
+            if self._wss_first_byte_disabled(dc_hint, is_media):
+                if prefetched_ws_task is not None:
+                    prefetched_ws_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await prefetched_ws_task
+                await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=is_media)
                 return
             ws = None
             route_label = ""
@@ -1122,6 +1540,8 @@ class TelegramTransparentRelayServer:
             if ws is None:
                 ws, route_label = await self._connect_ws_route(dc_hint, target_ip, is_media, label)
             if ws is None:
+                if _has_custom_cfproxy_domain():
+                    return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=True)
                 return
             try:
@@ -1146,7 +1566,90 @@ class TelegramTransparentRelayServer:
             self.log_func(
                 f"[TgRelay] Подключено: proto={_proto_label(init_info.proto)} dc={dc_hint or '?'} media={is_media} route={route_label} target={target_ip}:{target_port}"
             )
-            await _bridge_ws(reader, writer, ws, splitter)
+            stats_label = (
+                f"path=wss proto={_proto_label(init_info.proto)} dc={dc_hint or '?'} "
+                f"media={is_media} route={route_label} target={target_ip}:{target_port}"
+            )
+            up, down, duration_ms, _replay = await _bridge_ws(
+                reader,
+                writer,
+                ws,
+                splitter,
+                replay_limit=1048576,
+                close_writer=False,
+                first_down_timeout=(2.0 if is_media else 1.0),
+                stats_label=stats_label,
+                log_func=self.log_func,
+                first_down_callback=lambda down_len, rl=route_label, dc=dc_hint, media=is_media: self._cf_note_good_route_label(
+                    rl,
+                    dc,
+                    media,
+                    down_len,
+                ),
+            )
+            self.log_func(
+                f"[TgRelay] Закрыто: proto={_proto_label(init_info.proto)} dc={dc_hint or '?'} media={is_media} "
+                f"route={route_label} target={target_ip}:{target_port} duration_ms={duration_ms} up={up + len(init_packet)} down={down}"
+            )
+            if int(down or 0) > 0:
+                self._cf_note_good_route_label(route_label, dc_hint, is_media, down)
+                self._note_wss_first_byte_result(dc_hint, is_media, down)
+                return
+            if int(down or 0) <= 0:
+                pending_replay = bytes(_replay or b"")
+                replay_initial = bytes(init_packet or b"") + pending_replay
+                if self._cf_note_bad_route_label(
+                    route_label,
+                    is_media,
+                    ttl=self._cf_empty_route_ttl(route_label, dc_hint, is_media),
+                ):
+                    self.log_func(
+                        f"[TgRelay] WSS custom first-byte timeout; retrying Telegram Web WSS: "
+                        f"proto={_proto_label(init_info.proto)} dc={dc_hint or '?'} media={is_media} "
+                        f"target={target_ip}:{target_port} route={route_label}"
+                    )
+                    retried, retry_replay = await self._retry_web_ws_after_empty(
+                        reader,
+                        writer,
+                        dc_hint=dc_hint,
+                        is_media=is_media,
+                        target_ip=target_ip,
+                        target_port=target_port,
+                        init_packet=init_packet,
+                        pending_replay=pending_replay,
+                        label=label,
+                        proto=init_info.proto,
+                        proto_label=_proto_label(init_info.proto),
+                        replay_limit=1048576,
+                        first_down_timeout=(2.0 if is_media else 1.0),
+                    )
+                    if retried:
+                        return
+                    replay_initial = retry_replay
+                self._note_wss_first_byte_result(dc_hint, is_media, 0)
+                # Skip TCP fallback when CF domains are available — ISP throttles
+                # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
+                if _has_custom_cfproxy_domain():
+                    self.log_func(
+                        f"[TgRelay] WSS first-byte timeout; skipping TCP fallback (ISP throttled): proto={_proto_label(init_info.proto)} "
+                        f"dc={dc_hint or '?'} media={is_media} target={target_ip}:{target_port} "
+                        f"replay={len(replay_initial)} duration_ms={duration_ms}"
+                    )
+                    return
+                self.log_func(
+                    f"[TgRelay] WSS first-byte timeout; TCP fallback: proto={_proto_label(init_info.proto)} "
+                    f"dc={dc_hint or '?'} media={is_media} target={target_ip}:{target_port} "
+                    f"replay={len(replay_initial)} duration_ms={duration_ms}"
+                )
+                await self._handle_plain_tunnel(
+                    reader,
+                    writer,
+                    target_ip,
+                    target_port,
+                    replay_initial,
+                    label,
+                    media_hint=is_media,
+                )
         except asyncio.IncompleteReadError:
             pass
         except Exception as exc:
@@ -1163,6 +1666,8 @@ class TelegramTransparentRelayServer:
                 pass
             self.log_func(f"[TgRelay] Ошибка клиента {label}: {exc}")
         finally:
+            if client_key is not None:
+                self._unregister_client(client_key)
             if prefetched_ws_task is not None:
                 try:
                     if not prefetched_ws_task.done():
@@ -1184,8 +1689,11 @@ class TelegramTransparentRelayServer:
         label: str,
         dc_hint: int,
         proto_label: str = "raw",
+        proto: int = 0,
     ) -> bool:
         if not init_packet or len(init_packet) < 64:
+            return False
+        if not _valid_proto(int(proto or 0)):
             return False
         try:
             dc_hint = int(dc_hint or 0)
@@ -1196,19 +1704,9 @@ class TelegramTransparentRelayServer:
             return False
         if not CF_FALLBACK_ENABLED or not _has_custom_cfproxy_domain():
             return False
-        if not _cf_ws_domains(dc_hint, False):
+        if self._wss_first_byte_disabled(dc_hint, False):
             return False
-        if target_port == 80:
-            # First cold-start :80 control sockets are often disposable probes.
-            # Once a DC already has a proven CF/WSS route, however, reusing that
-            # last-good domain is faster than repeating plain canonical-443
-            # bootstrap for every next chat/control open.
-            try:
-                last_good_domain, last_good_until = self._cf_last_good_domain.get((dc_hint, False), ("", 0.0))
-            except Exception:
-                last_good_domain, last_good_until = ("", 0.0)
-            if last_good_until <= time.monotonic() or not last_good_domain:
-                return False
+        # Treat all Telegram connections as CF/WSS bootstrap candidates when a custom domain is configured.
         try:
             await self._maybe_wait_for_warp_bootstrap(
                 target_ip,
@@ -1225,12 +1723,17 @@ class TelegramTransparentRelayServer:
             self.log_func(
                 f"[TgRelay] Bootstrap CF/WSS probe: dc={dc_hint} target={target_ip}:{target_port} domain=nova-app.eu"
             )
-        ws, route_label = await self._connect_cf_ws_route(dc_hint, False, primary_only=True)
+        ws, route_label = await self._connect_cf_ws_route(dc_hint, False, primary_only=False)
         if ws is None:
             return False
         try:
-            if init_packet:
-                await ws.send(init_packet)
+            await ws.send(init_packet)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await ws.close()
+            return False
+        try:
+            splitter = TransparentMsgSplitter(init_packet, int(proto or 0))
         except Exception:
             with contextlib.suppress(Exception):
                 await ws.close()
@@ -1238,7 +1741,89 @@ class TelegramTransparentRelayServer:
         self.log_func(
             f"[TgRelay] Подключено: proto={proto_label} dc={dc_hint} media=False route={route_label} target={target_ip}:{target_port}"
         )
-        await _bridge_ws(reader, writer, ws, None)
+        up, down, duration_ms, replay = await _bridge_ws(
+            reader,
+            writer,
+            ws,
+            splitter,
+            replay_limit=524288,
+            close_writer=False,
+            first_down_timeout=1.2,
+            stats_label=f"path=wss proto={proto_label} dc={dc_hint} media=False route={route_label} target={target_ip}:{target_port}",
+            log_func=self.log_func,
+            first_down_callback=lambda down_len, rl=route_label, dc=dc_hint: self._cf_note_good_route_label(
+                rl,
+                dc,
+                False,
+                down_len,
+            ),
+        )
+        self.log_func(
+            f"[TgRelay] Закрыто: proto={proto_label} dc={dc_hint} media=False route={route_label} "
+            f"target={target_ip}:{target_port} duration_ms={duration_ms} up={up + len(init_packet)} down={down}"
+        )
+        if int(down or 0) > 0:
+            self._cf_note_good_route_label(route_label, dc_hint, False, down)
+            self._note_wss_first_byte_result(dc_hint, False, down)
+            return True
+        if int(down or 0) <= 0:
+            pending_replay = bytes(replay or b"")
+            replay_initial = bytes(init_packet or b"") + pending_replay
+            if self._cf_note_bad_route_label(
+                route_label,
+                False,
+                ttl=self._cf_empty_route_ttl(route_label, dc_hint, False),
+            ):
+                self.log_func(
+                    f"[TgRelay] WSS custom empty; retrying Telegram Web WSS: proto={proto_label} "
+                    f"dc={dc_hint} target={target_ip}:{target_port} route={route_label}"
+                )
+                retried, retry_replay = await self._retry_web_ws_after_empty(
+                    reader,
+                    writer,
+                    dc_hint=dc_hint,
+                    is_media=False,
+                    target_ip=target_ip,
+                    target_port=target_port,
+                    init_packet=init_packet,
+                    pending_replay=pending_replay,
+                    label=label,
+                    proto=proto,
+                    proto_label=proto_label,
+                    replay_limit=524288,
+                    first_down_timeout=1.2,
+                )
+                if retried:
+                    return True
+                replay_initial = retry_replay
+            self._note_wss_first_byte_result(dc_hint, False, 0)
+            if int(target_port or 0) == 80 and self._cf_has_recent_good(dc_hint, False, max_age=180.0):
+                self.log_func(
+                    f"[TgRelay] WSS recent-good dc={dc_hint}; closing empty bootstrap target={target_ip}:{target_port} "
+                    f"instead of raw TCP fallback."
+                )
+                return True
+            # Skip TCP fallback when CF domains are available — ISP throttles
+            # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
+            if _has_custom_cfproxy_domain():
+                self.log_func(
+                    f"[TgRelay] WSS empty response; skipping TCP fallback (ISP throttled): proto={proto_label} dc={dc_hint} "
+                    f"target={target_ip}:{target_port} replay={len(replay_initial)} duration_ms={duration_ms}"
+                )
+                return True
+            self.log_func(
+                f"[TgRelay] WSS empty response; TCP fallback: proto={proto_label} dc={dc_hint} "
+                f"target={target_ip}:{target_port} replay={len(replay_initial)} duration_ms={duration_ms}"
+            )
+            await self._handle_plain_tunnel(
+                reader,
+                writer,
+                target_ip,
+                target_port,
+                replay_initial,
+                label,
+                media_hint=False,
+            )
         return True
 
     async def _socks_handshake(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, prefetched: bytes = b"") -> Tuple[Optional[str], Optional[int]]:
@@ -1352,7 +1937,7 @@ class TelegramTransparentRelayServer:
         attempts = None
         try:
             from .transport import get_upstream_attempts
-            base_attempts = list(get_upstream_attempts() or [])
+            base_attempts = _telegram_upstream_attempts(get_upstream_attempts() or [])
             if base_attempts:
                 pref_key = (str(effective_host or "").strip(), int(effective_port or 0))
                 pref_route, pref_until = self._route_preference_until.get(pref_key, ("", 0.0))
@@ -1424,7 +2009,7 @@ class TelegramTransparentRelayServer:
                 retry_attempts = None
                 try:
                     from .transport import get_upstream_attempts
-                    base_attempts = list(get_upstream_attempts() or [])
+                    base_attempts = _telegram_upstream_attempts(get_upstream_attempts() or [])
                     direct_attempts = [a for a in base_attempts if str(a.get("kind") or "").strip().lower() == "direct"]
                     warp_attempts = [a for a in base_attempts if str(a.get("label") or "").strip().lower() == "warp-socks"]
                     other_attempts = [a for a in base_attempts if a not in direct_attempts and a not in warp_attempts]
@@ -1456,7 +2041,23 @@ class TelegramTransparentRelayServer:
         if prefetched_reply:
             writer.write(prefetched_reply)
             await writer.drain()
-        await _bridge_streams(reader, writer, upstream_reader, upstream_writer)
+        stats_label = (
+            f"path=tcp-fallback route={route_label} target={effective_host}:{effective_port}"
+            f"{route_suffix} media={bool(media_hint)}"
+        )
+        up, down, duration_ms = await _bridge_streams(
+            reader,
+            writer,
+            upstream_reader,
+            upstream_writer,
+            stats_label=stats_label,
+            log_func=self.log_func,
+            first_down_timeout=(1.15 if bootstrap_canonical else 0.0),
+        )
+        self.log_func(
+            f"[TgRelay] TCP fallback closed route={route_label} target={effective_host}:{effective_port}"
+            f"{route_suffix} duration_ms={duration_ms} up={up + len(initial or b'')} down={down + len(prefetched_reply or b'')}"
+        )
 
     def _log_fallback(self, route_label: str, effective_host: str, effective_port: int, route_suffix: str) -> None:
         try:
@@ -1497,7 +2098,130 @@ class TelegramTransparentRelayServer:
             f"[TgRelay] WSS path unavailable for DC{dc_hint} target={target_ip} media={is_media}; switching to TCP fallback."
         )
 
-    async def _connect_ws_route(self, dc_hint: int, target_ip: str, is_media: bool, label: str):
+    def _log_probe_diag(self, reason: str, target_ip: str, target_port: int, init_len: int = 0, dc_hint: int = 0) -> None:
+        try:
+            key = (str(target_ip or "").strip().lower(), int(target_port or 0), str(reason or ""))
+            now = time.monotonic()
+            last = float(self._last_probe_diag_log.get(key, 0.0) or 0.0)
+            if (now - last) < 8.0:
+                return
+            self._last_probe_diag_log[key] = now
+        except Exception:
+            pass
+        self.log_func(
+            f"[TgRelay] probe diag: reason={reason} dc={dc_hint or '?'} target={target_ip}:{target_port} init_len={int(init_len or 0)}"
+        )
+
+    def _cf_note_bad_route_label(self, route_label: str, is_media: bool = False, ttl: float = 120.0) -> bool:
+        domain = str(route_label or "").split(" via ", 1)[0].split("@", 1)[0].strip().lower()
+        if not domain:
+            return False
+        try:
+            bases = _cf_ws_domain_bases(primary_only=False)
+        except Exception:
+            bases = []
+        for base in bases:
+            base = str(base or "").strip().lower()
+            if base and (domain == base or domain.endswith("." + base)):
+                self._cf_note_bad_domain(domain, bool(is_media), ttl=ttl)
+                return True
+        return False
+
+    def _cf_empty_route_ttl(self, route_label: str, dc_hint: int, is_media: bool) -> float:
+        domain = str(route_label or "").split(" via ", 1)[0].split("@", 1)[0].strip().lower()
+        if domain:
+            try:
+                last_domain, last_until = self._cf_last_good_domain.get((int(dc_hint or 0), bool(is_media)), ("", 0.0))
+                if domain == str(last_domain or "").strip().lower() and float(last_until or 0.0) > time.monotonic():
+                    return CF_EMPTY_RECENT_GOOD_TTL
+            except Exception:
+                pass
+        if bool(is_media):
+            return min(max(CF_EMPTY_DOMAIN_TTL, 4.0), 12.0)
+        return min(max(CF_EMPTY_DOMAIN_TTL, 2.0), 8.0)
+
+    async def _retry_web_ws_after_empty(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        dc_hint: int,
+        is_media: bool,
+        target_ip: str,
+        target_port: int,
+        init_packet: bytes,
+        pending_replay: bytes,
+        label: str,
+        proto: int,
+        proto_label: str,
+        replay_limit: int,
+        first_down_timeout: float,
+    ) -> Tuple[bool, bytes]:
+        ws = None
+        route_label = ""
+        if CF_FALLBACK_ENABLED and _has_custom_cfproxy_domain():
+            ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=False)
+        if ws is None:
+            ws, route_label = await self._connect_ws_route(dc_hint, target_ip, is_media, label, allow_cf=False)
+        if ws is None:
+            return False, bytes(init_packet or b"") + bytes(pending_replay or b"")
+        try:
+            splitter = TransparentMsgSplitter(init_packet, int(proto or 0))
+            await ws.send(init_packet)
+            if pending_replay:
+                parts = splitter.split(pending_replay)
+                if parts:
+                    if len(parts) == 1:
+                        await ws.send(parts[0])
+                    else:
+                        await ws.send_batch(parts)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await ws.close()
+            return False, bytes(init_packet or b"") + bytes(pending_replay or b"")
+
+        self.log_func(
+            f"[TgRelay] WSS retry: proto={proto_label} dc={dc_hint or '?'} media={bool(is_media)} "
+            f"route={route_label} target={target_ip}:{target_port}"
+        )
+        stats_label = (
+            f"path=wss-retry proto={proto_label} dc={dc_hint or '?'} media={bool(is_media)} "
+            f"route={route_label} target={target_ip}:{target_port}"
+        )
+        up, down, duration_ms, replay = await _bridge_ws(
+            reader,
+            writer,
+            ws,
+            splitter,
+            replay_limit=int(replay_limit or 0),
+            close_writer=False,
+            first_down_timeout=float(first_down_timeout or 0.0),
+            stats_label=stats_label,
+            log_func=self.log_func,
+            first_down_callback=lambda down_len, rl=route_label, dc=dc_hint, media=is_media: self._cf_note_good_route_label(
+                rl,
+                dc,
+                media,
+                down_len,
+            ),
+        )
+        self.log_func(
+            f"[TgRelay] WSS retry closed: proto={proto_label} dc={dc_hint or '?'} media={bool(is_media)} "
+            f"route={route_label} target={target_ip}:{target_port} duration_ms={duration_ms} "
+            f"up={up + len(init_packet or b'') + len(pending_replay or b'')} down={down}"
+        )
+        self._note_wss_first_byte_result(dc_hint, is_media, down)
+        if int(down or 0) > 0:
+            self._cf_note_good_route_label(route_label, dc_hint, is_media, down)
+            return True, b""
+        self._cf_note_bad_route_label(
+            route_label,
+            is_media,
+            ttl=self._cf_empty_route_ttl(route_label, dc_hint, is_media),
+        )
+        return False, bytes(init_packet or b"") + bytes(pending_replay or b"") + bytes(replay or b"")
+
+    async def _connect_ws_route(self, dc_hint: int, target_ip: str, is_media: bool, label: str, allow_cf: bool = True):
         dc_hint = int(dc_hint or 0)
         if dc_hint <= 0:
             return None, ""
@@ -1512,20 +2236,23 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
 
-        custom_media_cf_only = bool(is_media) and _has_custom_cfproxy_domain()
-        if CF_FALLBACK_ENABLED and self._cf_first(dc_hint, is_media):
-            if custom_media_cf_only:
-                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=True)
-                if ws is not None:
-                    return ws, route_label
-            if not custom_media_cf_only:
-                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media)
-                if ws is not None:
-                    return ws, route_label
+        custom_cf_first = bool(allow_cf and CF_FALLBACK_ENABLED and _has_custom_cfproxy_domain())
+        tried_cf_route = False
+        if allow_cf and CF_FALLBACK_ENABLED and custom_cf_first:
+            tried_cf_route = True
+            ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=False)
+            if ws is not None:
+                return ws, route_label
+        elif allow_cf and CF_FALLBACK_ENABLED and self._cf_first(dc_hint, is_media):
+            tried_cf_route = True
+            ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=False)
+            if ws is not None:
+                return ws, route_label
 
         redirect_target = _TG_WS_REDIRECT_IPS.get(dc_hint)
         if redirect_target:
             domains = _ws_domains(dc_hint, is_media)
+            ws_attempts = _telegram_upstream_attempts()
             try:
                 pooled_ws, pooled_label = await _WS_POOL.get(dc_hint, is_media, redirect_target, domains)
                 if pooled_ws is not None:
@@ -1534,7 +2261,12 @@ class TelegramTransparentRelayServer:
                 pass
             for domain in domains:
                 try:
-                    ws, upstream_label = await _connect_websocket_target(redirect_target, domain, timeout=6.0)
+                    ws, upstream_label = await _connect_websocket_target(
+                        redirect_target,
+                        domain,
+                        timeout=6.0,
+                        attempts=ws_attempts,
+                    )
                     _WS_POOL._schedule_refill((int(dc_hint), bool(is_media)), redirect_target, domains)
                     return ws, f"{domain}@{redirect_target} via {upstream_label}"
                 except WsHandshakeError as exc:
@@ -1544,14 +2276,11 @@ class TelegramTransparentRelayServer:
                 except Exception:
                     break
 
-        if CF_FALLBACK_ENABLED:
-            if custom_media_cf_only:
-                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=True)
+        if allow_cf and CF_FALLBACK_ENABLED:
+            if not tried_cf_route:
+                ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=False)
                 if ws is not None:
                     return ws, route_label
-            ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media)
-            if ws is not None:
-                return ws, route_label
 
         self._log_wss_route_unavailable(dc_hint, target_ip, is_media)
         return None, ""
@@ -1562,48 +2291,143 @@ class TelegramTransparentRelayServer:
             dc = int(dc_hint or 0)
         except Exception:
             return False
+
+        env_val = str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "") or "").strip().upper()
+        if env_val in ("*", "ALL"):
+            return True
+
         if bool(is_media):
             return dc in CF_FIRST_MEDIA_DCS
         return dc in CF_FIRST_DCS
 
     async def _connect_cf_ws_route(self, dc_hint: int, is_media: bool = False, primary_only: bool = False):
         dc_hint = int(dc_hint or 0)
-        ordered = _cf_ws_domains_for_bases(dc_hint, _cf_ws_domain_bases(primary_only=primary_only), bool(is_media))
+        ordered = self._cf_order_domains(
+            dc_hint,
+            bool(is_media),
+            _cf_ws_domains_for_bases(dc_hint, _cf_ws_domain_bases(primary_only=primary_only), bool(is_media)),
+        )
+        if not ordered:
+            return None, ""
+        pool_key = (int(dc_hint or 0), bool(is_media), bool(primary_only))
+        pooled_ws, pooled_label = await self._cf_pool_get(pool_key, ordered)
+        if pooled_ws is not None:
+            return pooled_ws, pooled_label
+        cf_attempts = _cfproxy_upstream_attempts()
+        for domain in ordered:
+            try:
+                timeout = 3.5 if (primary_only and not bool(is_media)) else 7.0
+                ws, upstream_label = await _connect_websocket_target(
+                    domain,
+                    domain,
+                    timeout=timeout,
+                    attempts=cf_attempts,
+                )
+                return ws, f"{domain} via {upstream_label}"
+            except Exception:
+                self._cf_note_bad_domain(domain, bool(is_media))
+                continue
+        return None, ""
+
+    def _cf_order_domains(self, dc_hint: int, is_media: bool, domains: List[str]) -> List[str]:
+        ordered = self._cf_filter_bad_domains(domains)
+        if not ordered:
+            return []
+        now = time.monotonic()
         pref_key = (int(dc_hint or 0), bool(is_media))
         try:
             last_good_domain, last_good_until = self._cf_last_good_domain.get(pref_key, ("", 0.0))
         except Exception:
             last_good_domain, last_good_until = ("", 0.0)
-        if last_good_until <= time.monotonic():
+        last_good_domain = str(last_good_domain or "").strip().lower()
+        if last_good_until <= now:
             last_good_domain = ""
-        if last_good_domain and last_good_domain in ordered:
-            ordered = [last_good_domain] + [item for item in ordered if item != last_good_domain]
-        pool_key = (int(dc_hint or 0), bool(is_media), bool(primary_only))
-        pooled_ws, pooled_label = await self._cf_pool_get(pool_key, ordered)
-        if pooled_ws is not None:
-            return pooled_ws, pooled_label
-        for domain in ordered:
-            try:
-                timeout = 3.5 if (primary_only and not bool(is_media)) else 7.0
-                ws, upstream_label = await _connect_websocket_target(domain, domain, timeout=timeout)
-                attempts = get_upstream_attempts()
-                preferred_label = str(attempts[0].get("label") or "").strip().lower() if attempts else "warp-socks"
-                if preferred_label and str(upstream_label or "").strip().lower() != preferred_label:
-                    with contextlib.suppress(Exception):
-                        await ws.close()
-                    continue
-                try:
-                    self._cf_last_good_domain[pref_key] = (str(domain), time.monotonic() + 600.0)
-                except Exception:
-                    pass
-                return ws, f"{domain} via {upstream_label}"
-            except Exception:
-                continue
-        return None, ""
+
+        def _score(domain: str) -> Tuple[int, float, int]:
+            name = str(domain or "").strip().lower()
+            score, seen = self._cf_domain_score.get(name, (0.0, 0.0))
+            fresh_score = float(score or 0.0) if (now - float(seen or 0.0)) <= CF_RECENT_GOOD_TTL else 0.0
+            return (1 if name == last_good_domain else 0, fresh_score, -ordered.index(domain))
+
+        return sorted(ordered, key=_score, reverse=True)
+
+    def _cf_filter_bad_domains(self, domains: List[str]) -> List[str]:
+        ordered = list(domains or [])
+        if not ordered:
+            return ordered
+        now = time.monotonic()
+        filtered = [
+            domain
+            for domain in ordered
+            if float(self._cf_bad_domain_until.get(str(domain or "").strip().lower(), 0.0) or 0.0) <= now
+        ]
+        return filtered
+
+    def _cf_note_bad_domain(self, domain: str, is_media: bool = False, ttl: Optional[float] = None) -> None:
+        domain = str(domain or "").strip().lower()
+        if not domain:
+            return
+        ttl = float(ttl if ttl is not None else (45.0 if bool(is_media) and "-1." in domain else 12.0))
+        try:
+            self._cf_bad_domain_until[domain] = time.monotonic() + ttl
+            score, _seen = self._cf_domain_score.get(domain, (0.0, 0.0))
+            self._cf_domain_score[domain] = (max(0.0, float(score or 0.0) * 0.5), time.monotonic())
+        except Exception:
+            pass
+
+    def _cf_note_good_route_label(self, route_label: str, dc_hint: int, is_media: bool, down: int) -> bool:
+        domain = str(route_label or "").split(" via ", 1)[0].split("@", 1)[0].strip().lower()
+        if not domain or int(down or 0) <= 0:
+            return False
+        try:
+            bases = _cf_ws_domain_bases(primary_only=False)
+        except Exception:
+            bases = []
+        is_custom = False
+        for base in bases:
+            base = str(base or "").strip().lower()
+            if base and (domain == base or domain.endswith("." + base)):
+                is_custom = True
+                break
+        if not is_custom:
+            return False
+        now = time.monotonic()
+        try:
+            self._cf_bad_domain_until.pop(domain, None)
+            prev_score, _seen = self._cf_domain_score.get(domain, (0.0, 0.0))
+            gain = min(25.0, 2.0 + (int(down or 0).bit_length() / 2.0))
+            self._cf_domain_score[domain] = (min(100.0, float(prev_score or 0.0) + gain), now)
+            self._cf_last_good_domain[(int(dc_hint or 0), bool(is_media))] = (domain, now + CF_RECENT_GOOD_TTL)
+            self._cf_health_cache_save()
+        except Exception:
+            pass
+        return True
+
+    def _cf_has_recent_good(self, dc_hint: int, is_media: bool, max_age: float = 180.0) -> bool:
+        try:
+            domain, until = self._cf_last_good_domain.get((int(dc_hint or 0), bool(is_media)), ("", 0.0))
+            if not domain:
+                return False
+            return float(until or 0.0) > (time.monotonic() + (CF_RECENT_GOOD_TTL - float(max_age)))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _warp_preferred_now() -> bool:
+        try:
+            attempts = _telegram_upstream_attempts()
+            if not attempts:
+                return False
+            first = attempts[0]
+            return str(first.get("label") or "").strip().lower() == "warp-socks"
+        except Exception:
+            return False
 
     async def _cf_pool_get(self, key, ordered: List[str]):
         now = time.monotonic()
         bucket = self._cf_idle.setdefault(key, deque())
+        prefer_warp = self._warp_preferred_now()
+        ordered_set = {str(item or "").strip().lower() for item in ordered}
         while bucket:
             ws, created, route_label = bucket.popleft()
             age = now - created
@@ -1611,7 +2435,19 @@ class TelegramTransparentRelayServer:
                 transport_closing = bool(ws.writer.transport.is_closing())
             except Exception:
                 transport_closing = True
+            try:
+                pooled_domain = str(route_label or "").split(" via ", 1)[0].split("@", 1)[0].strip().lower()
+            except Exception:
+                pooled_domain = ""
             if age > WS_POOL_MAX_AGE or getattr(ws, "_closed", False) or transport_closing:
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                continue
+            if ordered and pooled_domain and pooled_domain not in ordered_set:
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                continue
+            if prefer_warp and " via opera-http" in str(route_label or "").lower():
                 with contextlib.suppress(Exception):
                     await ws.close()
                 continue
@@ -1634,18 +2470,23 @@ class TelegramTransparentRelayServer:
             bucket = self._cf_idle.setdefault(key, deque())
             if len(bucket) >= 1:
                 return
-            for domain in ordered:
+            cf_attempts = _cfproxy_upstream_attempts()
+            try:
+                is_media = bool(key[1])
+            except Exception:
+                is_media = False
+            for domain in self._cf_filter_bad_domains(ordered):
                 try:
-                    ws, upstream_label = await _connect_websocket_target(domain, domain, timeout=1.5)
-                    attempts = get_upstream_attempts()
-                    preferred_label = str(attempts[0].get("label") or "").strip().lower() if attempts else "warp-socks"
-                    if preferred_label and str(upstream_label or "").strip().lower() != preferred_label:
-                        with contextlib.suppress(Exception):
-                            await ws.close()
-                        continue
+                    ws, upstream_label = await _connect_websocket_target(
+                        domain,
+                        domain,
+                        timeout=1.5,
+                        attempts=cf_attempts,
+                    )
                     bucket.append((ws, time.monotonic(), f"{domain} via {upstream_label}"))
                     return
                 except Exception:
+                    self._cf_note_bad_domain(domain, is_media)
                     continue
         finally:
             self._cf_refilling.discard(key)
@@ -1672,14 +2513,11 @@ class TelegramTransparentRelayServer:
                     media_hint=is_media,
                     dc_hint=dc_hint,
                 )
-            ordered = _cf_ws_domains_for_bases(int(dc_hint or 0), _cf_ws_domain_bases(primary_only=True), bool(is_media))
-            pref_key = (int(dc_hint or 0), bool(is_media))
-            try:
-                last_good_domain, last_good_until = self._cf_last_good_domain.get(pref_key, ("", 0.0))
-            except Exception:
-                last_good_domain, last_good_until = ("", 0.0)
-            if last_good_until > time.monotonic() and last_good_domain and last_good_domain in ordered:
-                ordered = [last_good_domain] + [item for item in ordered if item != last_good_domain]
+            ordered = self._cf_order_domains(
+                int(dc_hint or 0),
+                bool(is_media),
+                _cf_ws_domains_for_bases(int(dc_hint or 0), _cf_ws_domain_bases(primary_only=True), bool(is_media)),
+            )
             self._schedule_cf_refill((int(dc_hint or 0), bool(is_media), True), ordered)
             await asyncio.sleep(0.05)
         except Exception:

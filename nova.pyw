@@ -12581,7 +12581,7 @@ try:
         try:
             ll = str(string).lower()
             if not IS_DEBUG_MODE and "[tgrelay]" in ll:
-                if "подключено:" in ll or "bootstrap" in ll or "probe" in ll:
+                if "подключено:" in ll or "bootstrap" in ll or "probe" in ll or "traffic path=" in ll:
                     return
         except:
             pass
