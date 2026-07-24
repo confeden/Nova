@@ -97,13 +97,12 @@ def get_default_app_routing_profiles():
             process_names=(
                 "PathOfExile.exe", "pathofexile.exe",
                 "PathOfExile_x64.exe", "pathofexile_x64.exe",
-                "PathOfExileSteam.exe", "pathofexilesteam.exe",
-                "PathOfExile_x64Steam.exe", "pathofexile_x64steam.exe",
                 "PathOfExile_KG.exe", "pathofexile_kg.exe",
                 "PathOfExile_x64_KG.exe", "pathofexile_x64_kg.exe",
+                "Client.exe", "client.exe",
             ),
-            process_path_regex=r"(?i).*(pathofexile).*(?:\.exe)?$",
-            path_markers=("pathofexile",),
+            process_path_regex=r"(?i).*(path[- ]?of[- ]?exile|poe).*(?:\.exe)?$",
+            path_markers=("pathofexile", "path of exile", "poe"),
         ),
     }
 
@@ -112,6 +111,9 @@ def match_app_by_process_path(process_path):
     path_value = str(process_path or "").strip().lower()
     if not path_value:
         return None
+    process_name = path_value.replace("/", "\\").rsplit("\\", 1)[-1]
+    if process_name in {"pathofexilesteam.exe", "pathofexile_x64steam.exe"}:
+        return "GamesDirect"
     for profile in get_default_app_routing_profiles().values():
         for marker in profile.path_markers:
             if marker and marker in path_value:

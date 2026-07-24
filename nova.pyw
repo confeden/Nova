@@ -285,6 +285,7 @@ from nova_console_logging import (
     get_default_session_console_log_path,
 )
 from nova_metadata import CURRENT_VERSION, UPDATE_URL, WINWS_FILENAME
+from nova_opera_failover import OperaFailoverController, build_full_dial_proxy_args
 
 # FIX: In compiled (PyInstaller) builds, CURRENT_VERSION is frozen at build time.
 # If the installer overwrites nova_metadata.py on disk with a newer version,
@@ -5543,18 +5544,34 @@ try:
             self._started_at_ts = 0.0
             self._start_lock = threading.Lock()
             self._start_in_progress = False
+            self._last_tunnel_health_ts = 0.0
+            self._last_tunnel_health_ok = False
             self.endpoint_cache_file = os.path.join(get_base_dir(), "temp", "opera_endpoint_cache.json")
             self._current_attempt_mode = ""
             self._current_bootstrap_proxy = ""
             self._current_override_endpoint = ""
             self._forced_warp_proxy = ""
+            self._forced_full_proxy = ""
             self._direct_restart_attempted = False
+            self.failover = OperaFailoverController(self.country)
 
         def configure_country(self, country):
             try:
                 self.country = str(country or "EU").strip().upper() or "EU"
             except:
                 self.country = "EU"
+            self.failover.set_desired_country(self.country)
+            self._forced_full_proxy = ""
+
+        def apply_failover_decision(self, decision):
+            self.country = str(getattr(decision, "country", self.country) or self.country).strip().upper()
+            self._forced_full_proxy = str(getattr(decision, "full_proxy", "") or "").strip()
+
+        def get_runtime_region_label(self):
+            try:
+                return self.failover.runtime_label()
+            except:
+                return "US" if str(self.country or "EU").upper() == "AM" else "EU"
 
         def _is_port_open_local(self):
             try:
@@ -5566,7 +5583,20 @@ try:
                 return False
 
         def _is_http_proxy_alive(self, timeout=1.5):
-            return is_local_http_proxy_tunnel_ready(port=self.port, timeout=timeout)
+            try:
+                result = bool(is_local_http_proxy_tunnel_ready(port=self.port, timeout=timeout))
+            except:
+                result = False
+            self._last_tunnel_health_ts = time.monotonic()
+            self._last_tunnel_health_ok = result
+            return result
+
+        def is_tunnel_ready_cached(self, max_age=6.0):
+            try:
+                age = time.monotonic() - float(self._last_tunnel_health_ts or 0.0)
+                return bool(age <= max(0.5, float(max_age)) and self._last_tunnel_health_ok)
+            except:
+                return False
 
         def _has_recent_log_activity(self, max_age_sec=45):
             """True when opera.log is being updated recently (proxy is still progressing)."""
@@ -5727,10 +5757,11 @@ try:
                 return forced
             return self._get_warp_bootstrap_proxy() or ""
 
-        def force_restart(self, warp_proxy=None):
+        def force_restart(self, warp_proxy=None, full_proxy=None):
             """Force-kill the current process and restart. Bypasses locks.
             If warp_proxy is provided (e.g. socks5://127.0.0.1:1370), use it
-            only for SurfEasy API bootstrap in the next start()."""
+            only for SurfEasy API bootstrap in the next start(). If full_proxy
+            is provided, route all Opera dial-outs through it."""
             # Kill by PID
             try:
                 _proc = getattr(self, "process", None)
@@ -5770,6 +5801,7 @@ try:
                 pass
             # Store warp_proxy so start() uses it directly without re-probing.
             self._forced_warp_proxy = str(warp_proxy or "")
+            self._forced_full_proxy = str(full_proxy or "")
             # Wait for the killed process to actually release the port.
             # Without this, start() may find the port still open and adopt it
             # as an external proxy, making it unmanageable by the watchdog.
@@ -5892,9 +5924,9 @@ try:
                             return
                     # Even after grace, do not kill an active process while it keeps progressing in log.
                     # discover/registration retries can legitimately exceed initial grace on bad routes.
-                    if self._has_recent_log_activity(max_age_sec=60):
+                    proc_age = (now_ts - float(self._started_at_ts or now_ts)) if self._started_at_ts else 0.0
+                    if proc_age <= 45.0 and self._has_recent_log_activity(max_age_sec=60):
                         try:
-                            proc_age = (now_ts - float(self._started_at_ts or now_ts)) if self._started_at_ts else 0.0
                             api_bootstrap_proxy = self._get_api_bootstrap_proxy()
                             direct_discover_stuck = bool(
                                 not port_alive
@@ -5985,12 +6017,19 @@ try:
                 self.log_file = os.path.join(log_dir, "opera.log")
 
                 cached_endpoint = self._load_cached_endpoint()
-                # Proxy only SurfEasy API discovery/registration. Do not use
-                # opera-proxy -proxy here: that routes the data tunnel too.
-                api_bootstrap_proxy = self._get_api_bootstrap_proxy()
+                full_dial_proxy = self._normalize_opera_api_proxy(
+                    getattr(self, "_forced_full_proxy", "") or ""
+                )
+                # Normal mode proxies only SurfEasy API discovery/registration.
+                # EU-over-WARP deliberately uses -proxy for every Opera dial-out.
+                api_bootstrap_proxy = "" if full_dial_proxy else self._get_api_bootstrap_proxy()
                 # If no explicit API proxy is configured, wait briefly for WARP
                 # as an API-only bootstrap helper. Runtime Opera egress stays direct.
-                if not api_bootstrap_proxy and not self._get_configured_api_bootstrap_proxy():
+                if (
+                    not full_dial_proxy
+                    and not api_bootstrap_proxy
+                    and not self._get_configured_api_bootstrap_proxy()
+                ):
                     _api_wait_start = time.time()
                     while time.time() - _api_wait_start < 8.0:
                         if is_closing or not is_service_active:
@@ -6018,6 +6057,7 @@ try:
                         "-server-selection", "fastest",
                         "-server-selection-timeout", "10s",
                     ]
+                    cmd.extend(build_full_dial_proxy_args(full_dial_proxy))
                     if base_proxy:
                         # API-only bootstrap: init/discover via proxy, Opera tunnel direct.
                         cmd.extend(["-api-proxy", base_proxy])
@@ -6300,6 +6340,10 @@ try:
             )
             self._extra_reconnect_lock = threading.Lock()
             self._extra_reconnect_until = 0.0
+            self._warp_ready_probe_lock = threading.Lock()
+            self._last_warp_ready_ts = 0.0
+            self._last_warp_ready_val = False
+            self._warp_route_usable_until = 0.0
 
         def _create_server(self):
             from tgrelay.transparent_relay import TelegramTransparentRelayServer
@@ -6362,40 +6406,71 @@ try:
         def _wait_for_warp_bootstrap_window(self, target_host="", target_port=0, media_hint=False, dc_hint=0):
             def _warp_transport_ready():
                 now_mono = time.monotonic()
-                if now_mono - getattr(self, "_last_warp_ready_ts", 0.0) < 0.5:
-                    return bool(getattr(self, "_last_warp_ready_val", False))
+                if now_mono < float(getattr(self, "_warp_route_usable_until", 0.0) or 0.0):
+                    return True
+                cached_val = bool(getattr(self, "_last_warp_ready_val", False))
+                cached_ts = float(getattr(self, "_last_warp_ready_ts", 0.0) or 0.0)
+                cache_ttl = 5.0 if cached_val else 0.35
+                if now_mono - cached_ts < cache_ttl:
+                    return cached_val
+                probe_lock = getattr(self, "_warp_ready_probe_lock", None)
+                if probe_lock is not None and not probe_lock.acquire(blocking=False):
+                    # Another relay connection is already running the relatively
+                    # expensive curl-based AWG probe. Its result will be cached.
+                    return False
                 try:
-                    wm = globals().get("warp_manager")
-                    if not wm:
-                        res = False
-                    elif not bool(getattr(wm, "is_connected", False)):
-                        res = False
-                    else:
-                        port = int(getattr(wm, "port", 1370) or 1370)
-                        if not is_local_port_open_quick(port, timeout=0.25):
+                    try:
+                        # Recheck after acquiring the single-flight probe lock.
+                        now_mono = time.monotonic()
+                        if now_mono < float(getattr(self, "_warp_route_usable_until", 0.0) or 0.0):
+                            return True
+                        cached_val = bool(getattr(self, "_last_warp_ready_val", False))
+                        cached_ts = float(getattr(self, "_last_warp_ready_ts", 0.0) or 0.0)
+                        cache_ttl = 5.0 if cached_val else 0.35
+                        if now_mono - cached_ts < cache_ttl:
+                            return cached_val
+                        wm = globals().get("warp_manager")
+                        if not wm:
+                            res = False
+                        elif not bool(getattr(wm, "is_connected", False)):
                             res = False
                         else:
-                            tester = getattr(wm, "_test_socks5_internet", None)
-                            if callable(tester):
-                                res = bool(tester(port, timeout=1.2))
+                            port = int(getattr(wm, "port", 1370) or 1370)
+                            if not is_local_port_open_quick(port, timeout=0.25):
+                                res = False
                             else:
-                                res = True
-                except Exception:
-                    res = False
-                self._last_warp_ready_ts = now_mono
-                self._last_warp_ready_val = res
-                return res
+                                tester = getattr(wm, "_test_socks5_internet", None)
+                                if callable(tester):
+                                    res = bool(tester(port, timeout=1.2))
+                                else:
+                                    res = True
+                    except Exception:
+                        res = False
+                    completed_mono = time.monotonic()
+                    self._last_warp_ready_ts = completed_mono
+                    self._last_warp_ready_val = res
+                    if res:
+                        self._warp_route_usable_until = max(
+                            float(getattr(self, "_warp_route_usable_until", 0.0) or 0.0),
+                            completed_mono + 5.0,
+                        )
+                    return res
+                finally:
+                    if probe_lock is not None:
+                        probe_lock.release()
 
             def _awg_bootstrap_in_progress():
                 try:
                     wm = globals().get("warp_manager")
                     if not wm:
                         return False
-                    awg_proc = getattr(wm, "awg_process", None)
-                    if awg_proc and awg_proc.poll() is None:
+                    if bool(getattr(wm, "is_connected", False)):
+                        return False
+                    if bool(getattr(wm, "_is_starting_now", False)) or bool(getattr(wm, "_is_recovering_now", False)):
                         return True
+                    awg_proc = getattr(wm, "awg_process", None)
                     active_backend = getattr(wm, "active_backend", "")
-                    if active_backend == "awg" and not bool(getattr(wm, "is_connected", False)):
+                    if active_backend == "awg" and awg_proc and awg_proc.poll() is None:
                         return True
                     return False
                 except Exception:
@@ -6419,14 +6494,17 @@ try:
                 return 0.0
             now = time.monotonic()
             age = now - started_mono
-            startup_grace = 45.0
+            # AWG/WARP cold start in the field can legitimately take about a
+            # minute. Keep Telegram WSS from burning CF attempts and marking
+            # healthy domains bad just before SOCKS becomes usable.
+            startup_grace = 75.0
             if age >= startup_grace:
                 return 0.0
             wm = globals().get("warp_manager")
             if not wm:
                 return 0.0
             if _awg_bootstrap_in_progress():
-                wait_cap = min(20.0, max(0.0, startup_grace - age))
+                wait_cap = min(30.0, max(0.0, startup_grace - age))
                 if wait_cap <= 0.0:
                     return 0.0
                 started_wait = time.monotonic()
@@ -6442,7 +6520,7 @@ try:
                     return 0.0
             except Exception:
                 return 0.0
-            wait_cap = min(15.0, max(0.0, startup_grace - age))
+            wait_cap = min(25.0, max(0.0, startup_grace - age))
             if wait_cap <= 0.0:
                 return 0.0
             started_wait = time.monotonic()
@@ -6545,8 +6623,19 @@ try:
 
         def notify_warp_route_usable(self):
             try:
+                now = time.monotonic()
+                # The route watchdog calls this only after a successful SOCKS
+                # internet probe. Release all bootstrap waiters without making
+                # every Telegram connection repeat the same curl probe.
+                self._last_warp_ready_ts = now
+                self._last_warp_ready_val = True
+                self._warp_route_usable_until = now + 10.0
+                try:
+                    if self.server and hasattr(self.server, "notify_route_usable"):
+                        self.server.notify_route_usable()
+                except Exception:
+                    pass
                 with self._extra_reconnect_lock:
-                    now = time.monotonic()
                     if now < float(self._extra_reconnect_until or 0.0):
                         return
                     self._extra_reconnect_until = now + 20.0
@@ -7659,6 +7748,7 @@ try:
             self.script_path = get_internal_path(os.path.join("NovaDivert", "windivert_redirect.py"))
             self.tcp_proxy_port = 17870
             self.udp_proxy_port = 17871
+            self._start_lock = threading.Lock()
 
         def _kill_stale(self):
             _terminate_helper_pid(self.pid_path)
@@ -7694,6 +7784,14 @@ try:
             return 1372
 
         def start(self):
+            if not self._start_lock.acquire(blocking=False):
+                return self.is_ready()
+            try:
+                return self._start_impl()
+            finally:
+                self._start_lock.release()
+
+        def _start_impl(self):
             try:
                 if self.process and self.process.poll() is None:
                     return True
@@ -8902,6 +9000,7 @@ try:
             self.pid_path = os.path.join(get_base_dir(), "temp", "NovaDivertUdpProxy.pid")
             self.process = None
             self._adopted_pid_logged = False
+            self._start_lock = threading.Lock()
             self.script_path = get_internal_path(os.path.join("NovaWFP", "proxy", "udp_proxy.py"))
             self.host = "0.0.0.0"
             self.port = 17871
@@ -8951,6 +9050,12 @@ try:
                 return False
 
         def start(self):
+            # Initial startup and the recovery loop may overlap. Serialize them
+            # so they do not repeatedly terminate each other's helper process.
+            with self._start_lock:
+                return self._start_locked()
+
+        def _start_locked(self):
             try:
                 if self.process and self.process.poll() is None:
                     if self._port_owned_by_self():
@@ -9001,7 +9106,7 @@ try:
                 self.process = None
                 self.log_func(f"[NovaDivert][UDP] Не удалось запустить UDP proxy: {e}")
                 return False
-            deadline = time.time() + 3.0
+            deadline = time.time() + 8.0
             while time.time() < deadline:
                 try:
                     if self._adopt_listener_if_ready():
@@ -9021,7 +9126,12 @@ try:
                 pass
             rc = None
             try:
-                rc = self.process.returncode if self.process else None
+                if self.process and self.process.poll() is None:
+                    with contextlib.suppress(Exception):
+                        self.process.terminate()
+                    with contextlib.suppress(Exception):
+                        self.process.wait(timeout=2.0)
+                rc = self.process.poll() if self.process else None
             except:
                 rc = None
             self.process = None
@@ -10876,8 +10986,29 @@ try:
             return "примерная причина: драйвер WinDivert не инициализирован."
         return ""
 
+    def _transient_runtime_log_tag(line):
+        """Downgrade expected startup churn without masking persistent faults."""
+        text_lower = str(line or "").lower()
+        if "[tgrelay]" in text_lower:
+            if "probe diag:" in text_lower or "skipping tcp fallback" in text_lower:
+                return "info"
+            if "wss path unavailable" in text_lower or "first-byte timeout" in text_lower:
+                return "warning"
+            if "timed out" in text_lower:
+                return "warning"
+        if "[nrpt]" in text_lower and "timed out after" in text_lower:
+            return "warning"
+        if "[novadivert][udp]" in text_lower and "udp proxy" in text_lower and "none" in text_lower:
+            return "warning"
+        return None
+
+
     def get_line_tag(line):
         text_lower = line.lower()
+
+        transient_tag = _transient_runtime_log_tag(line)
+        if transient_tag:
+            return transient_tag
 
         if line.startswith("!!! [AUTO]"): return "normal"
         if line.startswith("[Repair] Start type WinDivert нормализован"):
@@ -10899,7 +11030,7 @@ try:
             if any(x in text_lower for x in ["ошибка", "error", "fail", "не удается", "не найден", "не удалось", "exception", "warning", "warn", "остановка", "падение"]):
                 return "error"
 
-        if any(x in text_lower for x in ["err:", "error", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено", "repair", "ремонт"]):
+        if any(x in text_lower for x in ["err:", "error", "ошибка", "исключение", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено", "repair", "ремонт"]):
             return "error"
         # Detect WinDivert-related codes only as standalone diagnostics (avoid false matches in IP:port like :3478).
         if re.search(r'(?<!\d)(177|34)(?!\d)', text_lower) and any(k in text_lower for k in ["код", "code", "exit", "windivert", "driver"]):
@@ -10918,6 +11049,19 @@ try:
             return "info"
             
         return "normal"
+
+
+    TGRELAY_UI_ALERT_TAGS = frozenset(("warning", "error", "fail"))
+
+    def should_hide_tgrelay_in_ui(line, tag=None):
+        """Hide routine TgRelay chatter from the window, but keep alert-colored lines."""
+        try:
+            text = str(line or "").lstrip()
+            if not text.lower().startswith("[tgrelay]"):
+                return False
+            return (tag or get_line_tag(text)) not in TGRELAY_UI_ALERT_TAGS
+        except:
+            return False
 
 
     # ================= МОДУЛЬ: NOVA_PAYLOAD_GEN =================
@@ -11725,14 +11869,19 @@ try:
                 self.thumb_color = "#9CC8A5"
                 self.hover_color = "#79B487"
             
-            super().__init__(master, bg=self.bg_color, width=12, highlightthickness=0, **kwargs)
+            super().__init__(master, bg=self.bg_color, width=18, highlightthickness=0, cursor="sb_v_double_arrow", **kwargs)
             self.command = command
             self.y_lo = 0.0
             self.y_hi = 1.0
             self.is_hover = False
+            self._dragging = False
+            self._drag_offset_y = 0.0
+            self._thumb_y1 = 0.0
+            self._thumb_y2 = 0.0
             
             self.bind("<Button-1>", self._on_click)
             self.bind("<B1-Motion>", self._on_drag)
+            self.bind("<ButtonRelease-1>", self._on_release)
             self.bind("<Enter>", self._on_enter)
             self.bind("<Leave>", self._on_leave)
             self.bind("<Configure>", self._draw)
@@ -11743,25 +11892,58 @@ try:
 
         def _draw(self, event=None):
             self.delete("all"); w = self.winfo_width(); h = self.winfo_height()
-            if h == 0: return
-            thumb_h = max(20, h * (self.y_hi - self.y_lo))
-            thumb_y = h * self.y_lo
-            pad = 3; x1 = pad; x2 = w - pad; y1 = thumb_y; y2 = thumb_y + thumb_h
-            if y2 > h: y2 = h; y1 = max(0, y2 - thumb_h)
+            if h <= 0 or w <= 0: return
+            view_span = min(1.0, max(0.0, self.y_hi - self.y_lo))
+            thumb_h = min(float(h), max(24.0, h * view_span))
+            travel = max(0.0, h - thumb_h)
+            max_lo = max(0.0, 1.0 - view_span)
+            thumb_y = travel * (min(max(self.y_lo, 0.0), max_lo) / max_lo) if max_lo else 0.0
+            pad = 2; x1 = pad; x2 = w - pad; y1 = thumb_y; y2 = thumb_y + thumb_h
+            self._thumb_y1, self._thumb_y2 = y1, y2
             color = self.hover_color if self.is_hover else self.thumb_color
-            r = (x2 - x1) / 2
+            r = min((x2 - x1) / 2, (y2 - y1) / 2)
             self.create_oval(x1, y1, x2, y1 + 2*r, fill=color, outline=color)
             self.create_oval(x1, y2 - 2*r, x2, y2, fill=color, outline=color)
             self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=color, outline=color)
 
         def _on_click(self, event):
-            h = self.winfo_height(); 
-            if h == 0: return
-            if event.y / h < self.y_lo: self.command("scroll", -1, "pages") if self.command else None
-            elif event.y / h > self.y_hi: self.command("scroll", 1, "pages") if self.command else None
-            else: self._drag_start_y = event.y; self._drag_start_lo = self.y_lo
+            if not self.command:
+                return
+            if self._thumb_y1 <= event.y <= self._thumb_y2:
+                self._dragging = True
+                self._drag_offset_y = event.y - self._thumb_y1
+            else:
+                self._dragging = False
+                self.command("scroll", -1 if event.y < self._thumb_y1 else 1, "pages")
+                self._mark_manual_scroll()
+
         def _on_drag(self, event):
-            if hasattr(self, '_drag_start_y') and self.command: self.command("moveto", self._drag_start_lo + (event.y - self._drag_start_y) / self.winfo_height())
+            if not self._dragging or not self.command:
+                return
+            h = float(self.winfo_height())
+            thumb_h = max(0.0, self._thumb_y2 - self._thumb_y1)
+            travel = max(0.0, h - thumb_h)
+            view_span = min(1.0, max(0.0, self.y_hi - self.y_lo))
+            max_lo = max(0.0, 1.0 - view_span)
+            if travel <= 0.0 or max_lo <= 0.0:
+                return
+            thumb_y = min(travel, max(0.0, event.y - self._drag_offset_y))
+            self.command("moveto", (thumb_y / travel) * max_lo)
+            self._mark_manual_scroll()
+
+        def _on_release(self, event):
+            if self._dragging:
+                self._mark_manual_scroll()
+            self._dragging = False
+
+        def _mark_manual_scroll(self):
+            try:
+                state = globals().get("LOG_SCROLL_STATE")
+                if isinstance(state, dict):
+                    state["user_scrolled"] = self.y_hi < 0.99
+            except:
+                pass
+
         def _on_enter(self, e): self.is_hover = True; self._draw()
         def _on_leave(self, e): self.is_hover = False; self._draw()
 
@@ -12578,13 +12760,9 @@ try:
         global early_log_buffer
         if should_suppress_strategy_noise(string):
             return
-        try:
-            ll = str(string).lower()
-            if not IS_DEBUG_MODE and "[tgrelay]" in ll:
-                if "подключено:" in ll or "bootstrap" in ll or "probe" in ll or "traffic path=" in ll:
-                    return
-        except:
-            pass
+        tag = get_line_tag(string)
+        if should_hide_tgrelay_in_ui(string, tag):
+            return
         string = mask_ips_in_text(string)
         lw_exists = log_window and tk.Toplevel.winfo_exists(log_window)
         
@@ -12595,8 +12773,6 @@ try:
                 
                 if int(log_text_widget.index('end-1c').split('.')[0]) > LOG_MAX_LINES:
                     log_text_widget.delete('1.0', '101.0')
-                
-                tag = get_line_tag(string)
                 
                 ts = time.strftime("%H:%M:%S")
                 log_text_widget.insert(tk.END, f"{ts} {string.strip()}\n", tag)
@@ -12627,6 +12803,8 @@ try:
             string = mask_ips_in_text(string)
             if should_suppress_strategy_noise(string): return
             if should_ignore(string): return
+            tag = get_line_tag(string)
+            if should_hide_tgrelay_in_ui(string, tag): return
             
             # === TIMESTAMP ADDED ===
             ts = time.strftime("%H:%M:%S")
@@ -12635,7 +12813,6 @@ try:
                 try:
                     if int(log_text_widget.index('end-1c').split('.')[0]) > LOG_MAX_LINES:
                         log_text_widget.delete('1.0', '101.0')
-                    tag = get_line_tag(string_to_insert)
                     if "could not read" in string_to_insert.lower():
                         tag = "error"
                     log_text_widget.insert(tk.END, string_to_insert, tag)
@@ -13454,10 +13631,11 @@ try:
     restart_postponed = False
 
     def perform_restart_sequence():
-        global last_restart_time, restart_scheduled, nova_service_status
+        global last_restart_time, restart_scheduled, nova_service_status, is_restarting
         if is_closing: return
         
         nova_service_status = "Restarting"
+        is_restarting = True
         if IS_DEBUG_MODE: log_print("[Auto-Restart-Debug] Start perform_restart_sequence")
         if not process:
             if IS_DEBUG_MODE: log_print("[Auto-Restart-Debug] No process, returning")
@@ -13467,14 +13645,26 @@ try:
         log_print("[Auto-Restart] Применение новых правил (exclude_auto)...")
         stop_nova_service(silent=True, restart_mode=True)
         if IS_DEBUG_MODE: log_print("[Auto-Restart-Debug] Stop command sent")
+
+        def _start_after_crash():
+            global restart_scheduled
+            try:
+                if not is_closing:
+                    start_nova_service(silent=True, restart_mode=True)
+            finally:
+                restart_scheduled = False
+
         if root: 
-            root.after(1500, lambda: start_nova_service(silent=True))
+            root.after(1500, _start_after_crash)
             if IS_DEBUG_MODE: log_print("[Auto-Restart-Debug] Start scheduled in 1500ms")
         else:
-            log_print("[Auto-Restart-Debug] Root is None, cannot schedule start")
+            threading.Thread(
+                target=lambda: (time.sleep(1.5), _start_after_crash()),
+                daemon=True,
+                name="NovaCrashRestart",
+            ).start()
         
         last_restart_time = time.time()
-        restart_scheduled = False
         if IS_DEBUG_MODE: log_print("[Auto-Restart-Debug] End perform_restart_sequence")
 
     def schedule_smart_restart():
@@ -19048,6 +19238,10 @@ try:
     def get_line_tag(line):
         text_lower = line.lower()
 
+        transient_tag = _transient_runtime_log_tag(line)
+        if transient_tag:
+            return transient_tag
+
         if line.startswith("!!! [AUTO]"): return "normal"
         if line.startswith("[Repair] Start type WinDivert нормализован"):
             return "info"
@@ -19068,7 +19262,7 @@ try:
             if any(x in text_lower for x in ["ошибка", "error", "fail", "не удается", "не найден", "не удалось", "exception", "warning", "warn", "остановка", "падение"]):
                 return "error"
 
-        if any(x in text_lower for x in ["err:", "error", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено", "repair", "ремонт"]):
+        if any(x in text_lower for x in ["err:", "error", "ошибка", "исключение", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено", "repair", "ремонт"]):
             return "error"
         # Detect WinDivert-related codes only as standalone diagnostics (avoid false matches in IP:port like :3478).
         if re.search(r'(?<!\d)(177|34)(?!\d)', text_lower) and any(k in text_lower for k in ["код", "code", "exit", "windivert", "driver"]):
@@ -20362,6 +20556,7 @@ try:
     _unsupported_winws_args = set()  # Global cache of unsupported winws options
     _repair_advice_shown = False  # Prevent duplicate advice messages
     _windivert_last_repair_success_ts = 0.0
+    _windivert_registration_reset_attempted = False
     def _decode_console_bytes(data):
         if data is None:
             return ""
@@ -20714,6 +20909,151 @@ try:
         finally:
             winreg.CloseKey(key)
 
+    def _is_windivert_invalid_name_open_failure(exit_code, output):
+        """Match the confirmed stale-service failure without touching healthy drivers."""
+        try:
+            if int(exit_code) != 123:
+                return False
+        except Exception:
+            return False
+        return "error opening filter" in str(output or "").lower()
+
+    def _probe_windivert_minimal_open_error():
+        """Return WinDivertOpen's error for a known-valid filter, or 0 on success."""
+        if os.name != "nt":
+            return None
+        handle = None
+        try:
+            dll_path = os.path.join(get_bin_dir(), "WinDivert.dll")
+            dll = ctypes.WinDLL(dll_path, use_last_error=True)
+            dll.WinDivertOpen.argtypes = [ctypes.c_char_p, ctypes.c_uint, ctypes.c_int16, ctypes.c_uint64]
+            dll.WinDivertOpen.restype = wintypes.HANDLE
+            dll.WinDivertClose.argtypes = [wintypes.HANDLE]
+            dll.WinDivertClose.restype = wintypes.BOOL
+            ctypes.set_last_error(0)
+            handle = dll.WinDivertOpen(b"false", 0, 0, 0)
+            if handle in (None, 0, ctypes.c_void_p(-1).value):
+                return ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
+            return 0
+        except OSError as e:
+            return getattr(e, "winerror", None)
+        except Exception:
+            return None
+        finally:
+            if handle not in (None, 0, ctypes.c_void_p(-1).value):
+                with contextlib.suppress(Exception):
+                    dll.WinDivertClose(handle)
+
+    def _reset_windivert_registration_once(log_func=None):
+        """Stop/delete/recreate WinDivert once after a confirmed WinDivertOpen error 123."""
+        global _repair_in_progress, _windivert_broken
+        global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
+        global _windivert_last_repair_success_ts, _windivert_registration_reset_attempted
+
+        if _windivert_registration_reset_attempted:
+            if log_func:
+                log_func("[Repair] Повторный сброс регистрации WinDivert пропущен: попытка уже выполнялась в этом цикле запуска.")
+            return False
+
+        if not _repair_lock.acquire(timeout=10.0):
+            if log_func:
+                log_func("[Repair] Сброс регистрации WinDivert не начат: другая процедура восстановления не завершилась.")
+            return False
+
+        _windivert_registration_reset_attempted = True
+        _repair_in_progress = True
+        try:
+            driver_path = os.path.abspath(os.path.join(get_bin_dir(), "WinDivert64.sys"))
+            driver_image_path = f"\\??\\{driver_path}"
+            if not os.path.isfile(driver_path):
+                if log_func:
+                    log_func(f"[Repair] Сброс регистрации WinDivert отменён: драйвер не найден: {driver_path}")
+                return False
+
+            if log_func:
+                log_func("[Repair] Подтверждён WinDivertOpen error 123. Выполняем однократный сброс регистрации службы.")
+
+            # Release every WinDivert handle owned by Nova before asking SCM to delete the service.
+            for pid_name in (
+                "NovaDivertObserver.pid",
+                "NovaDivertRedirect.pid",
+            ):
+                with contextlib.suppress(Exception):
+                    _terminate_helper_pid(os.path.join(get_base_dir(), "temp", pid_name))
+            for image_name in ("winws.exe", "winws_test.exe"):
+                with contextlib.suppress(Exception):
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", image_name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        timeout=4,
+                    )
+
+            _run_hidden_sc("stop", "windivert", timeout=6)
+            delete_rc, delete_out, delete_err = _run_hidden_sc("delete", "windivert", timeout=6)
+            delete_text = "\n".join(
+                part for part in (delete_out.strip(), delete_err.strip()) if part
+            ).strip()
+            if delete_rc != 0 and not _is_sc_service_missing_text(delete_text) and not _is_windivert_pending_delete_text(delete_text):
+                if log_func:
+                    log_func(f"[Repair] sc delete WinDivert не выполнен: {delete_text or f'код {delete_rc}'}")
+                return False
+
+            deadline = time.time() + 12.0
+            last_state = _query_windivert_service_state()
+            while time.time() < deadline:
+                if last_state.get("missing") or (
+                    not last_state.get("exists") and not last_state.get("registry_exists")
+                ):
+                    break
+                time.sleep(0.25)
+                last_state = _query_windivert_service_state()
+            else:
+                _windivert_broken = True
+                _windivert_unrecoverable_reason = "pending_delete_stuck"
+                _windivert_unrecoverable_detail = last_state.get("text") or delete_text
+                if log_func:
+                    log_func("[Repair] WinDivert не освободился после sc delete; повторный сброс в этом цикле запуска запрещён.")
+                return False
+
+            create_rc, create_out, create_err = _run_hidden_sc(
+                "create", "windivert",
+                "type=", "kernel",
+                "start=", "demand",
+                "binPath=", driver_image_path,
+                timeout=6,
+            )
+            create_text = "\n".join(
+                part for part in (create_out.strip(), create_err.strip()) if part
+            ).strip()
+            if create_rc != 0:
+                if log_func:
+                    log_func(f"[Repair] sc create WinDivert не выполнен: {create_text or f'код {create_rc}'}")
+                return False
+
+            _write_windivert_registry(driver_image_path)
+            final_state = _query_windivert_service_state()
+            if final_state.get("missing") or final_state.get("pending_delete") or final_state.get("disabled"):
+                if log_func:
+                    log_func(f"[Repair] Регистрация WinDivert после пересоздания не готова: {final_state.get('text') or final_state}")
+                return False
+
+            _windivert_broken = False
+            _windivert_unrecoverable_reason = ""
+            _windivert_unrecoverable_detail = ""
+            _windivert_last_repair_success_ts = time.time()
+            if log_func:
+                log_func("[Repair] Регистрация WinDivert пересоздана. Повторяем запуск ядра один раз.")
+            return True
+        except Exception as e:
+            if log_func:
+                log_func(f"[Repair] Ошибка однократного сброса регистрации WinDivert: {e}")
+            return False
+        finally:
+            _repair_in_progress = False
+            _repair_lock.release()
+
     def _normalize_windivert_start_mode(driver_image_path, log_func=None):
         last_state = {}
         for attempt in range(2):
@@ -20778,7 +21118,7 @@ try:
             return False
             return False
 
-    def repair_windivert_driver(log_func=None, exit_code=None):
+    def repair_windivert_driver(log_func=None, exit_code=None, pending_delete_timeout=45.0):
         """
         Attempts to repair broken WinDivert driver installation.
         Fixes Code 34/177, disabled service state, and "service marked for deletion".
@@ -20787,6 +21127,10 @@ try:
         global _repair_in_progress, _windivert_broken, _repair_advice_shown
         global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
         global _windivert_last_repair_success_ts
+        try:
+            pending_delete_timeout = max(0.0, float(pending_delete_timeout))
+        except:
+            pending_delete_timeout = 45.0
 
         # If another thread is already repairing, just wait for it
         if _repair_in_progress:
@@ -20882,8 +21226,11 @@ try:
                             log_func("[Repair] DeleteFlag снят. Служба снова доступна для конфигурации.")
                 if config_probe["pending_delete"] or svc_state["pending_delete"]:
                     if log_func:
-                        log_func("[Repair] Служба WinDivert помечена на удаление. Ждём до 45с освобождения SCM без перезагрузки...")
-                    released, config_probe, svc_state = _wait_for_windivert_pending_delete_clear(driver_image_path, timeout=45.0)
+                        log_func(f"[Repair] Служба WinDivert помечена на удаление. Ждём до {pending_delete_timeout:g}с освобождения SCM без перезагрузки...")
+                    released, config_probe, svc_state = _wait_for_windivert_pending_delete_clear(
+                        driver_image_path,
+                        timeout=pending_delete_timeout,
+                    )
                     if released:
                         if log_func:
                             log_func("[Repair] Пометка удаления снята. Продолжаем восстановление службы.")
@@ -20925,7 +21272,10 @@ try:
                         if _is_windivert_pending_delete_text(sc_msg):
                             if log_func:
                                 log_func("[Repair] sc create вернул pending-delete. Ждём полного удаления службы и пробуем ещё раз.")
-                            released, config_probe, svc_state = _wait_for_windivert_pending_delete_clear(driver_image_path, timeout=45.0)
+                            released, config_probe, svc_state = _wait_for_windivert_pending_delete_clear(
+                                driver_image_path,
+                                timeout=pending_delete_timeout,
+                            )
                             if released:
                                 rc, out, err = _run_hidden_sc(
                                     "create", "windivert",
@@ -21752,7 +22102,6 @@ try:
         opera_next_restart_ts = 0.0
         opera_last_port_down_log_ts = 0.0
         opera_last_recover_fail_log_ts = 0.0
-        opera_country_fail_count = 0
         warp_bad_proxy_streak = 0
         warp_last_good_ts = 0.0
         warp_next_recovery_ts = 0.0
@@ -21887,7 +22236,7 @@ try:
                     opera_proc_dead = bool(opera_proc and opera_proc.poll() is not None)
                     opera_starting = bool(getattr(opera_proxy_manager, "_start_in_progress", False))
                     opera_port_alive = is_local_port_open(opera_port)
-                    opera_proxy_alive = is_local_http_proxy_alive(opera_port) if opera_port_alive else False
+                    opera_proxy_alive = opera_proxy_manager._is_http_proxy_alive(timeout=1.5) if opera_port_alive else False
                     opera_owned = bool(getattr(opera_proxy_manager, "owns_process", False))
                     opera_external = bool(getattr(opera_proxy_manager, "using_external", False))
                     if opera_port_alive and opera_proxy_alive:
@@ -21895,7 +22244,10 @@ try:
                         opera_last_good_ts = now
                         opera_last_port_down_log_ts = 0.0
                         opera_last_recover_fail_log_ts = 0.0
-                        opera_country_fail_count = 0
+                        try:
+                            opera_proxy_manager.failover.record_success(now)
+                        except:
+                            pass
                         try:
                             if opera_owned and hasattr(opera_proxy_manager, "_ensure_cached_endpoint_persisted"):
                                 opera_proxy_manager._ensure_cached_endpoint_persisted(wait_timeout=0.0)
@@ -21913,6 +22265,7 @@ try:
                             opera_usable = True
 
                     need_restart = False
+                    restart_decision = None
                     if opera_starting:
                         last_opera_issue_state = "starting"
                         need_restart = False
@@ -21948,13 +22301,20 @@ try:
                         except:
                             recent_activity = False
 
+                        managed_activity_grace = bool(
+                            opera_owned
+                            and opera_proc
+                            and recent_activity
+                            and opera_bad_proxy_streak < 4
+                        )
+
                         # In grace mode (fresh managed start) or during short transient glitches, avoid restarts.
                         # Use raw proxy health (without debounce) for restart decision.
                         opera_proxy_healthy = bool(opera_port_alive and opera_proxy_alive)
-                        if in_startup_grace or opera_proxy_healthy or (opera_owned and opera_proc and recent_activity):
+                        if in_startup_grace or opera_proxy_healthy or managed_activity_grace:
                             if in_startup_grace and last_opera_issue_state != "proxy_warmup" and IS_DEBUG_MODE:
                                 log_func(f"[EU] Инициализация прокси {opera_port} продолжается (grace).")
-                            if in_startup_grace or (opera_owned and opera_proc and recent_activity):
+                            if in_startup_grace or managed_activity_grace:
                                 last_opera_issue_state = "proxy_warmup"
                             else:
                                 last_opera_issue_state = None
@@ -21993,7 +22353,7 @@ try:
                             try:
                                 opera_proxy_manager.start()
                                 opera_port_alive = is_local_port_open(opera_port)
-                                opera_proxy_alive = is_local_http_proxy_alive(opera_port) if opera_port_alive else False
+                                opera_proxy_alive = opera_proxy_manager._is_http_proxy_alive(timeout=1.5) if opera_port_alive else False
                                 opera_usable = bool(opera_port_alive and opera_proxy_alive)
                                 opera_owned = bool(getattr(opera_proxy_manager, "owns_process", False))
                                 opera_external = bool(getattr(opera_proxy_manager, "using_external", False))
@@ -22006,24 +22366,72 @@ try:
                     else:
                         last_opera_issue_state = None
 
+                    # AM is only a temporary safety route. Retry the user's desired
+                    # region on an exponential cooldown, starting with direct EU.
+                    try:
+                        failover = opera_proxy_manager.failover
+                        if (
+                            not need_restart
+                            and opera_usable
+                            and opera_owned
+                            and failover.desired_retry_due(now)
+                        ):
+                            restart_decision = failover.begin_desired_retry()
+                            opera_proxy_manager.apply_failover_decision(restart_decision)
+                            with contextlib.suppress(Exception):
+                                opera_proxy_manager._clear_cached_endpoint()
+                            log_func("[EU] Повторная попытка желаемого региона EU после временного AM fallback.")
+                            need_restart = True
+                    except Exception as e:
+                        safe_trace(f"[EU] desired-region retry state error: {e}")
+
                     if need_restart and not opera_starting:
                         if now < opera_next_restart_ts:
                             need_restart = False
                         else:
-                            # Rotate country after 3 consecutive failures to try different endpoints.
-                            if opera_country_fail_count >= 3:
-                                current_country = str(getattr(opera_proxy_manager, "country", "EU") or "EU").upper()
-                                new_country = "AM" if current_country == "EU" else "EU"
-                                opera_proxy_manager.configure_country(new_country)
-                                with contextlib.suppress(Exception):
-                                    opera_proxy_manager._clear_cached_endpoint()
-                                log_func(f"[EU] Смена региона после {opera_country_fail_count} неудач: {current_country} → {new_country}.")
-                                opera_country_fail_count = 0
+                            if restart_decision is None:
+                                failover = opera_proxy_manager.failover
+                                previous_country = str(failover.current_country or "EU").upper()
+                                previous_transport = str(failover.transport or "direct").lower()
+                                full_warp_proxy = (
+                                    f"socks5://127.0.0.1:{int(warp_port)}" if warp_usable else ""
+                                )
+                                restart_decision = failover.next_after_failure(
+                                    now,
+                                    warp_usable=bool(warp_usable),
+                                    warp_proxy=full_warp_proxy,
+                                )
+                                opera_proxy_manager.apply_failover_decision(restart_decision)
+                                current_country = str(restart_decision.country or "EU").upper()
+                                current_transport = str(restart_decision.transport or "direct").lower()
+                                if current_country != previous_country:
+                                    with contextlib.suppress(Exception):
+                                        opera_proxy_manager._clear_cached_endpoint()
+                                if restart_decision.reason == "periodic-desired-retry":
+                                    log_func("[EU] Повторная попытка желаемого региона EU после временного AM fallback.")
+                                elif restart_decision.reason == "desired-eu-over-warp":
+                                    log_func(
+                                        f"[EU] Direct EU недоступен. Пробуем EU-over-WARP через 127.0.0.1:{int(warp_port)}."
+                                    )
+                                elif current_country == "AM" and previous_country != "AM":
+                                    retry_in = max(
+                                        0,
+                                        int(failover.next_desired_retry_ts - now),
+                                    )
+                                    log_func(
+                                        f"[EU] EU direct/EU-over-WARP недоступны. Временный fallback EU → AM; повтор EU через {retry_in}с."
+                                    )
+                                elif current_transport != previous_transport and IS_DEBUG_MODE:
+                                    log_func(
+                                        f"[EU] Смена транспорта: {previous_transport} → {current_transport}."
+                                    )
                             retry_timestamps.append(now)
                             time.sleep(RETRY_PAUSE)
-                            opera_proxy_manager.force_restart()
+                            opera_proxy_manager.force_restart(
+                                full_proxy=str(getattr(restart_decision, "full_proxy", "") or "")
+                            )
                             opera_port_alive = is_local_port_open(opera_port)
-                            opera_proxy_alive = is_local_http_proxy_alive(opera_port) if opera_port_alive else False
+                            opera_proxy_alive = opera_proxy_manager._is_http_proxy_alive(timeout=1.5) if opera_port_alive else False
                             opera_usable = bool(opera_port_alive and opera_proxy_alive)
                             if opera_usable:
                                 opera_bad_proxy_streak = 0
@@ -22031,12 +22439,14 @@ try:
                                 opera_next_restart_ts = 0.0
                                 opera_last_port_down_log_ts = 0.0
                                 opera_last_recover_fail_log_ts = 0.0
-                                opera_country_fail_count = 0
+                                try:
+                                    opera_proxy_manager.failover.record_success(now)
+                                except:
+                                    pass
                                 log_func(f"[EU] Порт {opera_port} восстановлен.")
                                 last_opera_issue_state = None
                             else:
                                 opera_next_restart_ts = now + (5.0 if now < startup_fast_retry_until else 15.0)
-                                opera_country_fail_count += 1
                                 if (now - opera_last_recover_fail_log_ts) >= 45.0:
                                     log_func(f"[EU] Не удалось восстановить порт {opera_port}.")
                                     opera_last_recover_fail_log_ts = now
@@ -22578,6 +22988,7 @@ try:
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
         global is_service_active, process, is_closing, _windivert_broken, is_restarting
         global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
+        global _windivert_registration_reset_attempted
         global has_connected_once
         
         has_connected_once = False
@@ -22585,6 +22996,8 @@ try:
         _windivert_broken = False
         _windivert_unrecoverable_reason = ""
         _windivert_unrecoverable_detail = ""
+        if not restart_mode:
+            _windivert_registration_reset_attempted = False
         _warp_early_started = False
         set_core_backend_health(False, "starting")
         
@@ -23461,6 +23874,19 @@ try:
                             except: pass
                             combined_output = "".join(captured_output)
                             current_windivert_state = _query_windivert_service_state()
+
+                            if _is_windivert_invalid_name_open_failure(exit_code, combined_output):
+                                 probe_error = _probe_windivert_minimal_open_error()
+                                 if probe_error == 123:
+                                     logger("[Error] WinDivertOpen вернул ошибку 123 даже для минимального фильтра. Сбрасываем повреждённую регистрацию службы...")
+                                     if _reset_windivert_registration_once(logger):
+                                         time.sleep(1.0)
+                                         continue
+                                     logger("[Error] Однократный сброс WinDivert не помог; исходная ошибка запуска сохранена в логе.")
+                                     _start_degraded_mode(exit_code, failed_lines=captured_output)
+                                     return
+                                 if IS_DEBUG_MODE:
+                                     logger(f"[Init] [Diag] Сброс WinDivert пропущен: минимальный WinDivertOpen вернул {probe_error!r}, а не 123.")
         
                             if current_windivert_state["pending_delete"] or _is_windivert_pending_delete_text(combined_output):
                                  if not silent: log_print("[Error] Служба WinDivert помечена на удаление. Пытаемся восстановить без перезагрузки...")
@@ -23581,12 +24007,14 @@ try:
                                 def _start_tcp_proxy_with_retries():
                                     retry_delays = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0]
                                     for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        if is_closing or is_restarting:
+                                            return
                                         try:
                                             if ntpm.start():
                                                 return
                                         except:
                                             pass
-                                        if is_closing:
+                                        if is_closing or is_restarting:
                                             return
                                         if _attempt < len(retry_delays):
                                             time.sleep(_delay)
@@ -23596,12 +24024,14 @@ try:
                                 def _start_udp_proxy_with_retries():
                                     retry_delays = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0]
                                     for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        if is_closing or is_restarting:
+                                            return
                                         try:
                                             if nupm.start():
                                                 return
                                         except:
                                             pass
-                                        if is_closing:
+                                        if is_closing or is_restarting:
                                             return
                                         if _attempt < len(retry_delays):
                                             time.sleep(_delay)
@@ -23611,12 +24041,14 @@ try:
                                 def _start_observer_with_retries():
                                     retry_delays = [2.0, 3.0, 5.0, 8.0, 12.0, 15.0]
                                     for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        if is_closing or is_restarting:
+                                            return
                                         try:
                                             if ndm.start():
                                                 return
                                         except:
                                             pass
-                                        if is_closing:
+                                        if is_closing or is_restarting:
                                             return
                                         if _attempt < len(retry_delays):
                                             time.sleep(_delay)
@@ -23626,12 +24058,14 @@ try:
                                 def _start_redirect_with_retries():
                                     retry_delays = [2.0, 3.0, 5.0, 8.0, 12.0, 15.0]
                                     for _attempt, _delay in enumerate(retry_delays, start=1):
+                                        if is_closing or is_restarting:
+                                            return
                                         try:
                                             if nrm.start():
                                                 return
                                         except:
                                             pass
-                                        if is_closing:
+                                        if is_closing or is_restarting:
                                             return
                                         if _attempt < len(retry_delays):
                                             time.sleep(_delay)
@@ -24336,6 +24770,27 @@ try:
         Не останавливает GUI и потоки проверок.
         """
         global process, is_service_active
+
+        # root.after callbacks execute on Tk's UI thread. SCM/WinDivert repair can
+        # legitimately wait, so always move the complete restart path off that
+        # thread and coalesce duplicate UI requests.
+        if root and threading.current_thread() is threading.main_thread():
+            if getattr(perform_hot_restart_backend, "_dispatch_pending", False):
+                return
+            perform_hot_restart_backend._dispatch_pending = True
+
+            def _dispatch_worker():
+                try:
+                    perform_hot_restart_backend()
+                finally:
+                    perform_hot_restart_backend._dispatch_pending = False
+
+            threading.Thread(
+                target=_dispatch_worker,
+                daemon=True,
+                name="NovaHotSwapDispatch",
+            ).start()
+            return
         
         # Debouncing: Prevent rapid restarts that overload WinDivert driver (Code 177 fix)
         now = time.time()
@@ -24364,7 +24819,11 @@ try:
                 except:
                     pass
                 try:
-                    repair_windivert_driver(log_print if 'log_print' in globals() else None, exit_code=34)
+                    repair_windivert_driver(
+                        log_print if 'log_print' in globals() else None,
+                        exit_code=34,
+                        pending_delete_timeout=3.0,
+                    )
                 except:
                     pass
                 time.sleep(1.5)
@@ -26296,14 +26755,16 @@ try:
 
         def _get_opera_region_indicator_label():
             try:
+                opm = globals().get("opera_proxy_manager")
+                if opm and hasattr(opm, "get_runtime_region_label"):
+                    return str(opm.get_runtime_region_label() or "EU")
                 region = _normalize_opera_region(get_routing_opera_region(load_routing_settings()), "EU")
-                if region == "US":
-                    return "US"
+                return "US" if region == "US" else "EU"
             except:
                 pass
             return "EU"
 
-        def apply_main_connection_indicator_state(warp_ok, opera_ok):
+        def apply_main_connection_indicator_state(warp_ok, opera_ok, opera_label=None):
             try:
                 region_indicator_pill.stop_animation()
             except:
@@ -26317,7 +26778,7 @@ try:
                 regions.append(("WARP...", "#777777"))  # Grey and dots for pending/failed
                 
             # EU indicator
-            eu_label = _get_opera_region_indicator_label()
+            eu_label = str(opera_label or _get_opera_region_indicator_label())
             if opera_ok:
                 regions.append((eu_label, INDICATOR_EU))
             else:
@@ -26351,6 +26812,7 @@ try:
                 while not is_closing:
                     warp_ok = False
                     opera_ok = False
+                    opera_label = _get_opera_region_indicator_label()
                     backend_ok = False
                     try:
                         backend_ok = bool(is_core_backend_ready())
@@ -26367,12 +26829,16 @@ try:
 
                     try:
                         opm = globals().get("opera_proxy_manager")
-                        _opera_port = int(getattr(opm, "port", 1371) or 1371) if opm else 1371
-                        opera_ok = bool(is_local_http_proxy_responsive(port=_opera_port, timeout=1.0))
+                        opera_ok = bool(
+                            opm
+                            and getattr(opm, "is_tunnel_ready_cached", lambda max_age=6.0: False)(max_age=6.0)
+                        )
+                        if opm and hasattr(opm, "get_runtime_region_label"):
+                            opera_label = str(opm.get_runtime_region_label() or opera_label)
                     except:
                         opera_ok = False
 
-                    current_state = (warp_ok, opera_ok)
+                    current_state = (warp_ok, opera_ok, opera_label)
                     if current_state == last_state:
                         pending_state = None
                         pending_count = 0
@@ -26386,7 +26852,9 @@ try:
                                 if root:
                                     root.after(
                                         0,
-                                        lambda state=current_state: apply_main_connection_indicator_state(state[0], state[1]),
+                                        lambda state=current_state: apply_main_connection_indicator_state(
+                                            state[0], state[1], state[2]
+                                        ),
                                     )
                             except:
                                 pass

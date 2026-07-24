@@ -532,6 +532,9 @@ class NovaWfpTcpProxy:
     @staticmethod
     def _app_family_from_app_id(app_id: str) -> str:
         lower = str(app_id or "").replace("/", "\\").lower()
+        process_name = lower.rsplit("\\", 1)[-1]
+        if process_name in {"pathofexilesteam.exe", "pathofexile_x64steam.exe"}:
+            return "games-steam-direct"
         if any(token in lower for token in ("telegram.exe", "ayugram.exe", "telegram desktop")):
             return "telegram"
         if any(token in lower for token in ("discord.exe", "discordcanary.exe", "discordptb.exe", "discord\\update.exe", "discordcanary\\update.exe", "discordptb\\update.exe")):
@@ -841,6 +844,9 @@ class NovaWfpTcpProxy:
         route_scope: str = "",
     ) -> List[dict]:
         app_family = str(app_family or "").strip().lower()
+        if app_family == "games-steam-direct":
+            direct_attempt = self._attempt_by_label("direct")
+            return [direct_attempt] if direct_attempt else []
         is_discord_target = self._is_discord_target(target_host) or app_family == "discord"
         is_telegram_target = self._is_telegram_target(target_host)
         is_telegram_app = app_family == "telegram"
@@ -899,12 +905,16 @@ class NovaWfpTcpProxy:
         elif app_family == "obs":
             route_mode_key = "obs"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
+        games_auto_warp = route_mode_key == "games" and route_mode == "auto"
         is_eu_route_target = False
         if route_mode == "auto":
-            exclude_domains = _load_domain_list("exclude")
-            if _match_domain(target_host, exclude_domains):
-                route_mode = "direct"
+            if games_auto_warp:
+                route_mode = "warp"
             else:
+                exclude_domains = _load_domain_list("exclude")
+            if route_mode == "auto" and _match_domain(target_host, exclude_domains):
+                route_mode = "direct"
+            elif route_mode == "auto":
                 ru_domains = _load_domain_list("ru")
                 u_ru_domains = _load_domain_list("u_ru")
                 if _match_domain(target_host, ru_domains) or _match_domain(target_host, u_ru_domains):
@@ -937,6 +947,31 @@ class NovaWfpTcpProxy:
             attempts = _reorder_route_labels(route_mode, attempts)
             if is_eu_route_target and route_mode == "opera":
                 attempts = ["opera-http"]
+
+        # Games/Auto TCP is strict-WARP while the local WARP SOCKS listener is
+        # active. Launcher and gameplay retries must not silently escape through
+        # Opera/direct or inherit a transient bad-route decision.
+        if games_auto_warp and self._warp_socks_available():
+            attempts = ["warp-socks"]
+            try:
+                for cache_port in (int(target_port or 0), 0):
+                    self._route_label_cache_pop(target_host, cache_port, route_scope=route_scope)
+                    self._bad_route_cache.pop(
+                        self._bad_route_key(
+                            target_host,
+                            cache_port,
+                            "warp-socks",
+                            route_scope=route_scope,
+                        ),
+                        None,
+                    )
+            except Exception:
+                pass
+
+        if (is_telegram_target or is_telegram_app) and route_mode != "direct":
+            attempts = [label for label in attempts if label != "direct"]
+            if not attempts:
+                attempts = ["warp-socks", "opera-http"]
 
         cached_label = self._route_label_cache_get(target_host, target_port, route_scope=route_scope)
         if cached_label in attempts:
@@ -1370,6 +1405,14 @@ class NovaWfpTcpProxy:
             if ws is not None:
                 return ws, route_label
         domains = list(_ws_domains(dc, bool(is_media)) or [])
+        ws_attempts = self._build_attempts_for_target(
+            redirect_target,
+            443,
+            preferred_egress=1,
+            telegram_media=bool(is_media),
+            app_family="telegram",
+            route_scope="telegram|egress:1",
+        )
         for domain in domains:
             if self._tg_ws_bad(dc, is_media, domain, redirect_target):
                 continue
@@ -1379,6 +1422,7 @@ class NovaWfpTcpProxy:
                     redirect_target,
                     domain,
                     timeout=self._tg_ws_handshake_timeout(is_media),
+                    attempts=ws_attempts,
                 )
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 return ws, f"{domain}@{redirect_target} via {upstream_label} ws_ms={elapsed_ms}"
@@ -1515,6 +1559,14 @@ class NovaWfpTcpProxy:
     async def _open_tg_ws_cf_route(self, dc: int, is_media: bool, primary_only: bool = False):
         if not TG_WS_CF_FALLBACK_ENABLED:
             return None, ""
+        ws_attempts = self._build_attempts_for_target(
+            "kws%s.%s" % (int(dc or 0), "nova-app.eu"),
+            443,
+            preferred_egress=1,
+            telegram_media=bool(is_media),
+            app_family="telegram",
+            route_scope="telegram|egress:1",
+        )
         for base_domain in self._tg_ws_cf_domains(primary_only=primary_only):
             candidates = [f"kws{dc}-1.{base_domain}", f"kws{dc}.{base_domain}"] if bool(is_media) else [f"kws{dc}.{base_domain}"]
             for domain in candidates:
@@ -1525,7 +1577,8 @@ class NovaWfpTcpProxy:
                     ws, upstream_label = await _connect_websocket_target(
                         domain,
                         domain,
-                        timeout=max(5.0, self._tg_ws_handshake_timeout(is_media) + 0.5),
+                        timeout=max(3.5, self._tg_ws_handshake_timeout(is_media)),
+                        attempts=ws_attempts,
                     )
                     elapsed_ms = int((time.monotonic() - started) * 1000)
                     return ws, f"{domain} via {upstream_label} cf_ws_ms={elapsed_ms}"
@@ -1812,7 +1865,8 @@ class NovaWfpTcpProxy:
                     and int(bootstrap_dc_hint or 0) in TG_WS_CF_FIRST_DCS
                     and not telegram_media_tcp
                 ):
-                    preferred_egress = 3
+                    if _get_app_route_mode("telegram") == "direct":
+                        preferred_egress = 3
             route_attempts = self._build_attempts_for_target(
                 target_host,
                 int(target_port),

@@ -1,4 +1,4 @@
-# version: 1.27
+# version: 1.29
 1337x.to
 3dn.ru
 7tv.app

@@ -182,17 +182,21 @@ def build_public_app_transport_plan(
     warp_manager=None,
     opera_proxy_manager=None,
 ):
+    route_mode = _get_app_route_mode(app_key)
+    normalized_app = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
+    include_direct = True
+    if normalized_app == "telegram" and route_mode != "direct":
+        include_direct = False
     attempts = build_public_tcp_upstream_attempts(
         warp_manager=warp_manager,
         opera_proxy_manager=opera_proxy_manager,
-        include_direct=True,
+        include_direct=include_direct,
     )
     by_label = {
         str((attempt or {}).get("label") or (attempt or {}).get("kind") or "").strip().lower(): attempt
         for attempt in attempts
         if isinstance(attempt, dict)
     }
-    route_mode = _get_app_route_mode(app_key)
     ordered_labels = _reorder_labels(
         route_mode,
         [str((attempt or {}).get("label") or (attempt or {}).get("kind") or "").strip().lower() for attempt in attempts],
@@ -201,7 +205,7 @@ def build_public_app_transport_plan(
     if ordered_attempts:
         attempts = ordered_attempts
     return {
-        "app": ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser"),
+        "app": normalized_app,
         "tcp_attempts": attempts,
         "tcp_chain": [str(item.get("label") or item.get("kind") or "unknown") for item in attempts],
     }

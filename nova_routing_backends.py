@@ -152,14 +152,14 @@ def build_app_transport_decisions(
     telegram_include_udp_rules = True
     telegram_keep_tcp_catchall = True
     telegram_include_tcp_rules = True
-    if novawfp_telegram_redirect_ready:
-        telegram_tcp_backend = "novawfp"
-        telegram_keep_tcp_catchall = False
-        telegram_include_tcp_rules = False
-    elif telegram_public_relay_ready:
+    if telegram_public_relay_ready:
         telegram_tcp_backend = "telegram-relay"
         telegram_tcp_tag = "telegram-relay"
         # In relay mode Telegram TCP stays out of legacy TUN/runtime rules.
+        telegram_keep_tcp_catchall = False
+        telegram_include_tcp_rules = False
+    elif novawfp_telegram_redirect_ready:
+        telegram_tcp_backend = "novawfp"
         telegram_keep_tcp_catchall = False
         telegram_include_tcp_rules = False
 
