@@ -84,6 +84,18 @@ REPO_SOURCE_FILES = (
     Path("tgrelay") / "transparent_relay.py",
 )
 NON_EMPTY_DIRS = ("bin", "fake", "ip", "list", "strat", "awg")
+# nova.pyw bootstraps its own dependencies when run from source (see the
+# `sys.frozen` guard around _ensure_pip), and PyInstaller cannot see that the
+# code is dead in a frozen build - it just follows `import pip` and bundles the
+# installer machinery. None of these are reachable at runtime.
+PYI_EXCLUDED_MODULES = (
+    "pip", "ensurepip", "setuptools", "pkg_resources", "distutils",
+    # Pulled in transitively by developer tooling in the build environment.
+    "paramiko", "bcrypt", "nacl",
+    # Never imported by Nova; excluded so a fat build environment cannot leak in.
+    "numpy", "nuitka", "PyInstaller", "pytest", "_pytest", "rich", "pygments",
+    "docutils", "nh3", "zstandard", "IPython", "matplotlib", "pandas",
+)
 IGNORED_PATTERNS = ("*.old", "*.tmp", "__pycache__", "old", "warp_official")
 USER_OVERRIDE_HEADER_DEFAULTS = {
     ("list", "u_ru.txt"): "# user WARP override domains\n",
@@ -636,10 +648,10 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         "--hidden-import=tkinter.messagebox",
         "--hidden-import=tkinter.scrolledtext",
         "--hidden-import=tkinter.font",
-        "--exclude-module=setuptools",
         "--collect-data=certifi",
         str(main_script),
     ]
+    cmd[-1:-1] = [f"--exclude-module={name}" for name in PYI_EXCLUDED_MODULES]
 
     print(f"{'=' * 60}")
     print(f"[BUILD] PyInstaller onedir for v{version}")
@@ -756,9 +768,33 @@ def build_installer(base_dir: Path) -> None:
         pass
 
 
+def ensure_complete_interpreter() -> None:
+    """Re-run the build under a full CPython if the current one is incomplete.
+
+    The py launcher may default to an install that has python.exe but no Lib.
+    Such an interpreter limps along by picking up whatever Lib\\site-packages
+    sits next to the working directory, which makes the contents of the build
+    depend on where it was started from.
+    """
+    if os.environ.get("NOVA_BUILD_REEXEC") == "1":
+        return
+    if (Path(sys.base_prefix) / "Lib" / "os.py").is_file():
+        return
+
+    root = find_python_runtime_root()
+    exe = root / "python.exe"
+    print(f"[BUILD] Incomplete interpreter: {sys.executable} (no stdlib at {sys.base_prefix})")
+    print(f"[BUILD] Re-running the build under {exe}")
+    env = dict(os.environ, NOVA_BUILD_REEXEC="1")
+    completed = subprocess.run([str(exe), str(Path(__file__).resolve()), *sys.argv[1:]],
+                               env=env)
+    raise SystemExit(completed.returncode)
+
+
 def main() -> int:
     base_dir = Path(__file__).resolve().parent
     try:
+        ensure_complete_interpreter()
         build_installer(base_dir)
         return 0
     except subprocess.CalledProcessError as exc:
