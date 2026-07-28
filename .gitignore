@@ -1,7 +1,12 @@
-Inno.py
-NovaInstaller.iss
+# Inno.py and NovaInstaller.iss are deliberately NOT ignored: the build script
+# being unversioned is how the copy_python_runtime() call was silently lost,
+# which left clean installs without an interpreter for the proxy helpers.
+
+# WireGuard/AmneziaWG profiles contain private keys - never commit these.
 awg/
 awg_profiles/
+
+# Visual Studio artifacts from the NovaWFP C++ project
 NovaWFP/build/
 NovaWFP/.vs/
 *.user

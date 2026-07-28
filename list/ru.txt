@@ -1,4 +1,4 @@
-# version: 1.29
+# version: 1.30
 1337x.to
 1e100cdn.net
 7tv.app
@@ -70,6 +70,7 @@ discord.gg
 discordapp.com
 discourse-cdn.com
 dropboxstatic.com
+dw.com
 ecosyste.ms
 edgee.ai
 element.io
@@ -123,8 +124,6 @@ live-video.net
 live.com
 llimonix.dev
 llimonix.pw
-login.pathofexile.com
-login.pathofexile2.com
 lostfilm.tv
 lumalabs.ai
 mangamirai.com
@@ -132,6 +131,7 @@ mate.tools
 matrix.org
 mcpmarket.com
 media-amazon.com
+meduza.io
 meet.google.com
 meshworld.in
 microsoft.com
@@ -175,7 +175,6 @@ playlist.ttvnw.net
 pobb.in
 pocketnet.app
 poe2wiki.net
-poecdn.com
 poedb.tw
 proton.me
 proxyliberty.com
@@ -185,6 +184,8 @@ puter.site
 recaptcha.net
 receive-sms.io
 redav.online
+redditspace.com
+redgifs.com
 release-assets.githubusercontent.com
 rezka.ag
 romexsoftware.com

@@ -1,4 +1,4 @@
-# version: 1.29
+# version: 1.30
 4pda.to
 analog.com
 anthropic.com
@@ -58,6 +58,7 @@ mozilla.org
 msys2.org
 mtraf.io
 netflix.com
+nitter.net
 notebooklm.google.com
 ntc.party
 nxp.com
