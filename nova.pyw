@@ -5528,7 +5528,16 @@ try:
 
     class OperaProxyManager:
         """Manages opera-proxy process for HTTP proxy."""
-        
+
+        # SurfEasy returns a different set of tunnel endpoints depending on where
+        # the discover request comes from, and the set handed to Russian clients
+        # is unreachable from Russia. These relays move only the API calls to
+        # Sweden; the tunnel itself still dials out directly from the user's IP.
+        API_RELAYS = (
+            "https://nova:tsp-DNCCowezyUQMgYqS8q-tPYfCI8vV@relay.nova-app.eu:8443",
+            "https://nova:tsp-DNCCowezyUQMgYqS8q-tPYfCI8vV@relay.nova-app.eu:2053",
+        )
+
         def __init__(self, log_func=None, port=1371, country="EU"):
             self.log_func = log_func or print
             self.port = port
@@ -5747,15 +5756,38 @@ try:
                 pass
             return ""
 
+        def _get_api_bootstrap_candidates(self):
+            """Ordered proxies for SurfEasy API only; the data tunnel stays direct.
+
+            Nova's own relays come before WARP: they are reachable even when WARP
+            is blocked, which is the case that broke the EU/US regions.
+            """
+            candidates = []
+
+            def add(raw):
+                proxy = self._normalize_opera_api_proxy(raw)
+                if proxy and proxy not in candidates:
+                    candidates.append(proxy)
+
+            add(self._get_configured_api_bootstrap_proxy())
+            add(getattr(self, "_forced_warp_proxy", "") or "")
+            if not self._api_relays_disabled():
+                for relay in self.API_RELAYS:
+                    add(relay)
+            add(self._get_warp_bootstrap_proxy() or "")
+            return candidates
+
+        @staticmethod
+        def _api_relays_disabled():
+            try:
+                return str(os.environ.get("NOVA_OPERA_DISABLE_RELAYS", "")).strip() == "1"
+            except:
+                return False
+
         def _get_api_bootstrap_proxy(self):
-            """Proxy only SurfEasy API discovery/registration; data tunnel stays direct."""
-            configured = self._get_configured_api_bootstrap_proxy()
-            if configured:
-                return configured
-            forced = self._normalize_opera_api_proxy(getattr(self, "_forced_warp_proxy", "") or "")
-            if forced:
-                return forced
-            return self._get_warp_bootstrap_proxy() or ""
+            """Highest-priority API bootstrap proxy, or an empty string."""
+            candidates = self._get_api_bootstrap_candidates()
+            return candidates[0] if candidates else ""
 
         def force_restart(self, warp_proxy=None, full_proxy=None):
             """Force-kill the current process and restart. Bypasses locks.
@@ -6022,20 +6054,21 @@ try:
                 )
                 # Normal mode proxies only SurfEasy API discovery/registration.
                 # EU-over-WARP deliberately uses -proxy for every Opera dial-out.
-                api_bootstrap_proxy = "" if full_dial_proxy else self._get_api_bootstrap_proxy()
-                # If no explicit API proxy is configured, wait briefly for WARP
-                # as an API-only bootstrap helper. Runtime Opera egress stays direct.
+                api_bootstrap_proxies = [] if full_dial_proxy else self._get_api_bootstrap_candidates()
+                # The built-in relays make this list non-empty in practice, so the
+                # wait below only matters when they are disabled and WARP is the
+                # only bootstrap helper left. Runtime Opera egress stays direct.
                 if (
                     not full_dial_proxy
-                    and not api_bootstrap_proxy
+                    and not api_bootstrap_proxies
                     and not self._get_configured_api_bootstrap_proxy()
                 ):
                     _api_wait_start = time.time()
                     while time.time() - _api_wait_start < 8.0:
                         if is_closing or not is_service_active:
                             break
-                        api_bootstrap_proxy = self._get_api_bootstrap_proxy()
-                        if api_bootstrap_proxy:
+                        api_bootstrap_proxies = self._get_api_bootstrap_candidates()
+                        if api_bootstrap_proxies:
                             if IS_DEBUG_MODE:
                                 self.log_func(f"[EU] [Diag] API bootstrap proxy стал доступен через {time.time() - _api_wait_start:.1f}s ожидания.")
                             break
@@ -6045,8 +6078,8 @@ try:
                 attempts = []
                 if cached_endpoint:
                     attempts.append(("cached", cached_endpoint, 2.5, None))
-                if api_bootstrap_proxy:
-                    attempts.append(("discover-api-proxy", None, 6.5, api_bootstrap_proxy))
+                for _api_proxy in api_bootstrap_proxies:
+                    attempts.append(("discover-api-proxy", None, 6.5, _api_proxy))
                 attempts.append(("discover", None, 6.5, None))
 
                 for attempt_mode, override_endpoint, ready_timeout, base_proxy in attempts:
