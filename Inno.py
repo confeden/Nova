@@ -202,16 +202,55 @@ def sanitize_user_override_files(staging_dir: Path) -> None:
         target.write_text(header, encoding="utf-8")
 
 
-def copy_python_runtime(dst_root: Path) -> None:
-    python_exe = Path(sys.executable).resolve()
-    runtime_root = python_exe.parent
-    if not python_exe.exists() or python_exe.name.lower() != "python.exe":
-        python_exe = runtime_root / "python.exe"
-        
-    if not python_exe.exists():
-        runtime_root = Path(sys.base_prefix).resolve()
-        python_exe = runtime_root / "python.exe"
+def find_python_runtime_root() -> Path:
+    """Locate a real CPython installation to copy into the bundle.
 
+    sys.executable is not enough: inside a venv it points at Scripts\\, and a
+    Microsoft Store install points at a WindowsApps shim. Neither directory has
+    Lib\\ or DLLs\\, so copying from it produces an interpreter that dies with
+    "Failed to import encodings module". sys.base_prefix is the real prefix in
+    both cases, so try it first and confirm the stdlib is actually there.
+    """
+    candidates = [Path(sys.base_prefix), Path(sys.prefix), Path(sys.executable).parent]
+    # The py launcher may default to a broken install (python.exe and DLLs but
+    # no Lib), so fall back to whatever full interpreter is on PATH.
+    for name in ("python", "python3"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found).parent)
+
+    checked, usable = [], []
+    for candidate in candidates:
+        try:
+            root = candidate.resolve()
+        except Exception:
+            continue
+        if root in checked:
+            continue
+        checked.append(root)
+        if (root / "Lib" / "os.py").is_file() and any(root.glob("python*.exe")):
+            usable.append(root)
+
+    # Prefer a root matching the running interpreter: the bundled cryptography
+    # extension is compiled against one specific CPython version.
+    version_dll = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+    for root in usable:
+        if (root / version_dll).is_file():
+            return root
+    if usable:
+        return usable[0]
+
+    raise RuntimeError(
+        "No usable CPython installation to bundle. Looked for Lib\\os.py plus "
+        "python*.exe in:\n - " + "\n - ".join(str(p) for p in checked)
+        + f"\nRun the build with a full Python installation (current: {sys.executable})."
+    )
+
+
+def copy_python_runtime(dst_root: Path) -> None:
+    runtime_root = find_python_runtime_root()
+    print(f"[BUILD] Bundling helper runtime from: {runtime_root}")
+    python_exe = runtime_root / "python.exe"
     if not python_exe.exists():
         raise RuntimeError(f"Bundled helper runtime source not found: {python_exe}")
 
@@ -251,6 +290,16 @@ def copy_python_runtime(dst_root: Path) -> None:
 
     if not copied_any:
         raise RuntimeError(f"Embedded Python runtime copy failed from: {runtime_root}")
+
+    missing = [rel for rel in ("python.exe", "Lib/encodings/__init__.py", "DLLs")
+               if not (target_root / rel).exists()]
+    if not any(target_root.glob("python*.dll")):
+        missing.append("python<XY>.dll")
+    if missing:
+        raise RuntimeError(
+            f"Bundled helper runtime is incomplete (source: {runtime_root}). "
+            "Missing: " + ", ".join(missing)
+        )
 
     write_helper_runtime_path_file(target_root)
     verify_helper_runtime(target_root)
