@@ -1,0 +1,169 @@
+import logging
+import os
+import string
+import random
+import socket as _socket
+import threading
+
+from dataclasses import dataclass, field
+from typing import Dict, List
+from urllib.request import Request, urlopen
+
+log = logging.getLogger('tg-mtproto-proxy')
+
+CFPROXY_DOMAINS_URL = (
+    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main"
+    "/.github/cfproxy-domains.txt"
+)
+
+_CFPROXY_ENC: List[str] = ['virkgj.com', 'vmmzovy.com', 'mkuosckvso.com', 'zaewayzmplad.com', 'twdmbzcm.com']
+_S = ''.join(chr(c) for c in (46, 99, 111, 46, 117, 107))
+
+
+def _dd(s: str) -> str:
+    """Only for decoding CF proxy domains"""
+    if not s[-4:] == '.com':
+        return s
+    p, n = s[:-4], sum(c.isalpha() for c in s[:-4])
+    return ''.join(
+        chr((ord(c) - (97 if c > '`' else 65) - n) % 26 + (97 if c > '`' else 65))
+        if c.isalpha() else c for c in p
+    ) + _S
+
+
+CFPROXY_DEFAULT_DOMAINS: List[str] = [_dd(d) for d in _CFPROXY_ENC]
+NOVA_CFPROXY_PRIMARY_DOMAINS: List[str] = ["nova-app.eu"]
+
+
+@dataclass
+class ProxyConfig:
+    port: int = 1443
+    host: str = '127.0.0.1'
+    secret: str = field(default_factory=lambda: os.urandom(16).hex())
+    dc_redirects: Dict[int, str] = field(default_factory=lambda: {2: '149.154.167.220', 4: '149.154.167.220'})
+    buffer_size: int = 256 * 1024
+    pool_size: int = 4
+    fallback_cfproxy: bool = True
+    fallback_cfproxy_priority: bool = True
+    cfproxy_user_domain: str = ''
+    cfproxy_domains: List[str] = field(default_factory=lambda: list(CFPROXY_DEFAULT_DOMAINS))
+    active_cfproxy_domain: str = field(default_factory=lambda: random.choice(CFPROXY_DEFAULT_DOMAINS))
+    fake_tls_domain: str = ''
+    proxy_protocol: bool = False
+
+
+proxy_config = ProxyConfig()
+
+
+def _split_domains(raw: str) -> List[str]:
+    return [
+        item.strip().strip(".").lower()
+        for item in str(raw or "").replace(";", ",").split(",")
+        if item.strip().strip(".")
+    ]
+
+
+def _dedupe_domains(*groups: List[str]) -> List[str]:
+    seen = set()
+    merged: List[str] = []
+    for group in groups:
+        for item in group or []:
+            domain = str(item or "").strip().strip(".").lower()
+            if not domain or domain in seen:
+                continue
+            seen.add(domain)
+            merged.append(domain)
+    return merged
+
+
+def get_cfproxy_domains(*env_names: str, fallback_pool: List[str] | None = None) -> List[str]:
+    configured: List[str] = []
+    configured.extend(_split_domains(os.environ.get("NOVA_TG_CF_DOMAINS", "")))
+    for env_name in env_names:
+        configured.extend(_split_domains(os.environ.get(str(env_name), "")))
+    if proxy_config.cfproxy_user_domain:
+        configured.append(str(proxy_config.cfproxy_user_domain))
+    configured.extend(list(NOVA_CFPROXY_PRIMARY_DOMAINS))
+    pool = list(fallback_pool) if fallback_pool is not None else list(proxy_config.cfproxy_domains or CFPROXY_DEFAULT_DOMAINS)
+    return _dedupe_domains(configured, pool, list(CFPROXY_DEFAULT_DOMAINS))
+
+
+def get_cfproxy_primary_domains(*env_names: str) -> List[str]:
+    configured: List[str] = []
+    configured.extend(_split_domains(os.environ.get("NOVA_TG_CF_DOMAINS", "")))
+    for env_name in env_names:
+        configured.extend(_split_domains(os.environ.get(str(env_name), "")))
+    if proxy_config.cfproxy_user_domain:
+        configured.append(str(proxy_config.cfproxy_user_domain))
+    configured.extend(list(NOVA_CFPROXY_PRIMARY_DOMAINS))
+    return _dedupe_domains(configured)
+
+
+def get_cfproxy_public_domains(fallback_pool: List[str] | None = None) -> List[str]:
+    pool = list(fallback_pool) if fallback_pool is not None else list(proxy_config.cfproxy_domains or CFPROXY_DEFAULT_DOMAINS)
+    public = [item for item in pool if str(item or "").strip().lower() not in set(get_cfproxy_primary_domains())]
+    if public:
+        return _dedupe_domains(public)
+    return _dedupe_domains(list(CFPROXY_DEFAULT_DOMAINS))
+
+
+def _fetch_cfproxy_domain_list() -> List[str]:
+    try:
+        req = Request(CFPROXY_DOMAINS_URL + "?" + "".join(random.choices(string.ascii_letters, k=7)),
+                       headers={'User-Agent': 'tg-ws-proxy'})
+        with urlopen(req, timeout=10) as resp:
+            text = resp.read().decode('utf-8', errors='replace')
+        encoded = [
+            line.strip() for line in text.splitlines()
+            if line.strip() and not line.startswith('#')
+        ]
+        return [_dd(d) for d in encoded]
+    except Exception as exc:
+        log.warning("Failed to fetch CF proxy domain list: %s", exc)
+        return []
+
+
+def refresh_cfproxy_domains() -> None:
+    fetched = _fetch_cfproxy_domain_list()
+
+    if fetched:
+        pool = _dedupe_domains(fetched)
+        log.info("CF proxy domain pool updated from GitHub (%d domains)", len(pool))
+    else:
+        pool = list(proxy_config.cfproxy_domains) or list(CFPROXY_DEFAULT_DOMAINS)
+
+    proxy_config.cfproxy_domains = get_cfproxy_domains(fallback_pool=pool)
+    proxy_config.active_cfproxy_domain = proxy_config.cfproxy_domains[0] if proxy_config.cfproxy_domains else ""
+
+
+_refresh_stop: threading.Event = threading.Event()
+
+
+def start_cfproxy_domain_refresh() -> None:
+    global _refresh_stop
+    _refresh_stop.set()
+    _refresh_stop = threading.Event()
+    stop = _refresh_stop
+
+    def _loop():
+        refresh_cfproxy_domains()
+        while not stop.wait(timeout=3600):
+            refresh_cfproxy_domains()
+
+    threading.Thread(target=_loop, daemon=True, name='cfproxy-domains-refresh').start()
+
+
+def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:
+    dc_redirects: Dict[int, str] = {}
+    for entry in dc_ip_list:
+        if ':' not in entry:
+            raise ValueError(
+                f"Invalid --dc-ip format {entry!r}, expected DC:IP")
+        dc_s, ip_s = entry.split(':', 1)
+        try:
+            dc_n = int(dc_s)
+            _socket.inet_aton(ip_s)
+        except (ValueError, OSError):
+            raise ValueError(f"Invalid --dc-ip {entry!r}")
+        dc_redirects[dc_n] = ip_s
+    return dc_redirects

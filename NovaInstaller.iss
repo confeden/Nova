@@ -92,6 +92,13 @@ Type: filesandordirs; Name: "{app}\licenses"
 Type: filesandordirs; Name: "{app}\NovaWFP"
 Type: filesandordirs; Name: "{app}\NovaDivert"
 Type: filesandordirs; Name: "{app}\tgrelay"
+; Runs before the new files are extracted. Without this, upgrades keep the old
+; helper runtime forever - the pre-1.30 copy carried the whole build machine's
+; site-packages and weighed ~122 MB.
+Type: filesandordirs; Name: "{app}\resources\pyruntime"
+Type: filesandordirs; Name: "{app}\resources\setuptools"
+Type: filesandordirs; Name: "{app}\resources\*.dist-info"
+Type: filesandordirs; Name: "{app}\resources\__pycache__"
 
 [Icons]
 Name: "{autoprograms}\Nova"; Filename: "{app}\Nova.exe"
@@ -104,6 +111,9 @@ Filename: "{app}\Nova.exe"; Parameters: "--updated"; Description: "Запуст�
 Type: files; Name: "{autodesktop}\Nova.lnk"
 Type: files; Name: "{userstartup}\Nova.lnk"
 Type: filesandordirs; Name: "{app}\temp"
+; The helpers compile .pyc caches next to their scripts at runtime, so the
+; directory is not empty by the time Inno removes what it installed.
+Type: filesandordirs; Name: "{app}\resources"
 
 [Code]
 var
