@@ -69,8 +69,7 @@ Nova не требует настройки. После запуска она с
    виду.
 3. **Настройки DNS.** Страница «Доступ к сайту ограничен законом РФ» означает,
    что DNS-запросы обрабатываются оператором связи. Укажите публичный
-   DNS-сервер — `8.8.8.8` — либо его защищённый вариант в браузере:
-   `https://dns.google/dns-query` (в Chrome — `chrome://settings/security`).
+   DNS-сервер — `8.8.8.8` или `1.1.1.1` в настройках windows.
 4. **Реклама на Twitch.** Вместе с высоким качеством возвращается и реклама.
    Устраняется расширением [AdGuard Exta](https://chromewebstore.google.com/detail/adguard-extra/gkeojjjcdcopjkbelgbcpckplegclfeg?hl=ru).
 
