@@ -71,7 +71,7 @@ Nova не требует настройки. После запуска она с
    DNS-сервер — `8.8.8.8` — либо его защищённый вариант в браузере:
    `https://dns.google/dns-query` (в Chrome — `chrome://settings/security`).
 4. **Реклама на Twitch.** Вместе с высоким качеством возвращается и реклама.
-   Устраняется расширением [AdGuard](https://chromewebstore.google.com/detail/adguard-%D0%B0%D0%BD%D1%82%D0%B8%D0%B1%D0%B0%D0%BD%D0%BD%D0%B5%D1%80/bgnkhhnnamicmpeenaelnjfhikgbkllg?hl=ru).
+   Устраняется расширением [AdGuard Exta](https://chromewebstore.google.com/detail/adguard-extra/gkeojjjcdcopjkbelgbcpckplegclfeg?hl=ru).
 
 Если ничего не помогло — напишите в [группу](https://t.me/nova_txt), разберёмся
 вместе.
