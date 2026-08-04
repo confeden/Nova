@@ -6,7 +6,7 @@ import asyncio
 import socket as _socket
 
 from typing import List, Optional, Tuple
-from .config import proxy_config
+from .config import cf_ws_subprotocol_header, proxy_config
 
 
 _st_BB = struct.Struct('>BB')
@@ -95,7 +95,7 @@ class RawWebSocket:
             f'Connection: Upgrade\r\n'
             f'Sec-WebSocket-Key: {ws_key}\r\n'
             f'Sec-WebSocket-Version: 13\r\n'
-            f'Sec-WebSocket-Protocol: binary\r\n'
+            f'Sec-WebSocket-Protocol: {cf_ws_subprotocol_header(domain)}\r\n'
             f'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             f'AppleWebKit/537.36 (KHTML, like Gecko) '
             f'Chrome/131.0.0.0 Safari/537.36\r\n'

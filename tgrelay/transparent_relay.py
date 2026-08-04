@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .config import (
     CFPROXY_DEFAULT_DOMAINS,
+    cf_ws_subprotocol_header,
     get_cfproxy_domains,
     get_cfproxy_primary_domains,
     proxy_config,
@@ -74,6 +75,9 @@ CF_MEDIA_BAD_TTL = _env_float(
 FALLBACK_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_FALLBACK_LOG_INTERVAL", 8.0, minimum=1.0)
 SKIP_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_SKIP_LOG_INTERVAL", 300.0, minimum=1.0)
 CF_FALLBACK_ENABLED = _env_bool("NOVA_TG_RELAY_CF_FALLBACK", True)
+# How long a target stays marked as "Telegram is racing its HTTP transport
+# here". Cleared early whenever a route becomes usable again.
+HTTP_TRANSPORT_DROP_TTL = _env_float("NOVA_TG_RELAY_HTTP_TRANSPORT_TTL", 60.0, minimum=5.0)
 CF_EMPTY_DOMAIN_TTL = _env_float("NOVA_TG_RELAY_CF_EMPTY_DOMAIN_TTL", 30.0, minimum=5.0)
 CF_EMPTY_RECENT_GOOD_TTL = _env_float("NOVA_TG_RELAY_CF_EMPTY_RECENT_GOOD_TTL", 45.0, minimum=10.0)
 CF_EMPTY_PRIMARY_TTL = _env_float("NOVA_TG_RELAY_CF_EMPTY_PRIMARY_TTL", 60.0, minimum=10.0)
@@ -269,6 +273,21 @@ def _new_ctr(key: bytes, iv: bytes):
 
 def _valid_proto(proto: int) -> bool:
     return proto in (PROTO_ABRIDGED, PROTO_INTERMEDIATE, PROTO_PADDED_INTERMEDIATE)
+
+
+# Telegram Desktop races an obfuscated TCP transport against a plain HTTP one.
+# The HTTP transport opens port 80 and starts with a real request line, so its
+# first 64 bytes never decrypt into a protocol tag. Such a socket cannot be
+# carried over ``/apiws`` and must not be rewritten to the canonical MTProto
+# port either — the DC answers HTTP only on the port the client picked.
+_HTTP_TRANSPORT_PREFIXES = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ")
+
+
+def _looks_like_http_request(data: bytes) -> bool:
+    if not data:
+        return False
+    head = bytes(data[:8])
+    return any(head.startswith(prefix) for prefix in _HTTP_TRANSPORT_PREFIXES)
 
 
 def _proto_label(proto: int) -> str:
@@ -597,7 +616,7 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {base64.b64encode(ws_key).decode()}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
-        "Sec-WebSocket-Protocol: binary\r\n"
+        f"Sec-WebSocket-Protocol: {cf_ws_subprotocol_header(domain)}\r\n"
         "Origin: https://web.telegram.org\r\n"
         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
         "\r\n"
@@ -974,6 +993,7 @@ class TelegramTransparentRelayServer:
         self.running = False
         self._cf_started = False
         self._no_probe_until: Dict[Tuple[str, int], float] = {}
+        self._http_transport_until: Dict[Tuple[str, int], float] = {}
         self._prefer_direct_until: Dict[Tuple[int, str], float] = {}
         self._route_preference_until: Dict[Tuple[str, int], Tuple[str, float]] = {}
         self._last_fallback_log: Dict[Tuple[str, str, int, str], float] = {}
@@ -1289,6 +1309,10 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
         try:
+            self._http_transport_until.clear()
+        except Exception:
+            pass
+        try:
             self._wss_first_byte_fail.clear()
             self._wss_first_byte_disabled_until.clear()
         except Exception:
@@ -1510,6 +1534,20 @@ class TelegramTransparentRelayServer:
 
             probe_key = (str(target_ip or target_host or "").strip(), int(target_port or 0))
             now_mono = time.monotonic()
+            # A socket already known to carry Telegram's HTTP transport for a
+            # WSS-capable DC gets closed without even reading the probe: the
+            # payload cannot go over /apiws, and the DC itself is unreachable
+            # over the proxied egress, so any tunnel here only stalls until the
+            # first-byte timeout while Telegram waits on it.
+            if float(self._http_transport_until.get(probe_key, 0.0) or 0.0) > now_mono:
+                self._log_skipping_fallback(
+                    "http-transport-cached",
+                    target_ip,
+                    target_port,
+                    _target_dc_hint(target_ip),
+                    False,
+                )
+                return
             no_probe_until = float(self._no_probe_until.get(probe_key, 0.0) or 0.0)
             if no_probe_until > now_mono:
                 cached_dc_hint = _target_dc_hint(target_ip)
@@ -1570,14 +1608,32 @@ class TelegramTransparentRelayServer:
                 if int(target_port or 0) == 80:
                     cache_for = 45.0 if not init_packet else 20.0
                     self._no_probe_until[probe_key] = time.monotonic() + cache_for
+                http_transport = _looks_like_http_request(init_packet)
                 self._log_probe_diag(
-                    "unparsed-init-no-wss",
+                    "unparsed-init-http-transport" if http_transport else "unparsed-init-no-wss",
                     target_ip,
                     target_port,
                     len(init_packet or b""),
                     dc_hint,
                 )
-                if _has_custom_cfproxy_domain():
+                # Telegram's HTTP transport cannot be carried over ``/apiws``,
+                # and on a WSS-capable DC it is redundant: the same data centre
+                # is reachable through the Worker. Tunnelling it anyway only
+                # parks the socket on an egress that never answers, so Telegram
+                # sits on a dead transport for the whole first-byte timeout.
+                # Close at once so its transport race commits to TCP, which is
+                # the leg that WSS can actually serve.
+                if http_transport and int(dc_hint or 0) in _TG_WS_REDIRECT_IPS:
+                    self._http_transport_until[probe_key] = time.monotonic() + HTTP_TRANSPORT_DROP_TTL
+                    self._log_skipping_fallback(
+                        "unparsed-init-http-transport",
+                        target_ip,
+                        target_port,
+                        dc_hint,
+                        is_media,
+                    )
+                    return
+                if _has_custom_cfproxy_domain() and not http_transport:
                     self._log_skipping_fallback(
                         "unparsed-init-no-wss",
                         target_ip,
@@ -2089,7 +2145,7 @@ class TelegramTransparentRelayServer:
             if media_hint is None:
                 media_hint = _likely_media_target(target_ip, target_port, 0)
             dc_hint = _target_dc_hint(target_ip, bool(media_hint))
-            if dc_hint and (bool(media_hint) or int(target_port or 0) == 80):
+            if dc_hint and (bool(media_hint) or int(target_port or 0) == 80) and not _looks_like_http_request(initial):
                 fallback_host = _TG_TCP_FALLBACK_IPS.get(int(dc_hint))
                 if fallback_host:
                     effective_host = fallback_host

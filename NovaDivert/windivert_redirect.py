@@ -1229,7 +1229,14 @@ class RedirectService:
                                 if meta.get("app_family") == "telegram" and not self._is_telegram_target(parsed["dst_ip"]):
                                     self.state.count("bypassed_udp")
                                     continue
-                                proxy_host = "127.0.0.1"
+                                # Same rule as the TCP branch above: rewrite to
+                                # the packet's own local interface, never to
+                                # 127.0.0.1. A datagram with src=<LAN ip> and
+                                # dst=127.0.0.1 reinjected on a non-loopback
+                                # interface is dropped by the Windows stack as a
+                                # martian, so the proxy never sees it and voice
+                                # traffic dies silently.
+                                proxy_host = str(parsed.get("src_ip") or "").strip() or "127.0.0.1"
                                 modified = _rewrite_ipv4_udp(
                                     packet,
                                     dst_ip=proxy_host,

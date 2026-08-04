@@ -1,4 +1,4 @@
-# version: 1.31
+# version: 1.31.1
 1337x.to
 1e100cdn.net
 7tv.app

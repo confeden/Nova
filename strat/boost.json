@@ -1,5 +1,5 @@
 {
-    "version": "1.31",
+    "version": "1.31.1",
     "strategies": [
         {
             "name": "boost_1",

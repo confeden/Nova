@@ -35,6 +35,97 @@ CFPROXY_DEFAULT_DOMAINS: List[str] = [_dd(d) for d in _CFPROXY_ENC]
 NOVA_CFPROXY_PRIMARY_DOMAINS: List[str] = ["nova-app.eu"]
 
 
+# --- Access token for the owned Cloudflare Worker ---------------------------
+#
+# The Worker on the owned domains is an open Telegram WSS proxy for anyone who
+# learns the hostname. Nova signs every handshake so the Worker can tell its own
+# client from an unrelated program pointed at the same subdomain.
+#
+# The signature travels as an extra WebSocket subprotocol next to ``binary``:
+#
+#     Sec-WebSocket-Protocol: binary, nova1.<window>.<hmac>
+#
+# ``window`` is the Unix time divided by CF_WS_TOKEN_WINDOW, so a captured token
+# stops working within minutes. The Worker recomputes the HMAC over
+# ``"<window>|<hostname>"``, which also stops a token minted for one subdomain
+# from being replayed against another.
+#
+# The secret is read from NOVA_TG_CF_SECRET, then from tgrelay/cf_ws.key. That
+# file sits next to this module so the installer ships it with the rest of the
+# package, while the publication rules keep it out of git: only ``tgrelay/*.py``
+# is whitelisted there. The built-in constant below is the public fallback — a
+# clone of this repository still produces well-formed tokens, they just do not
+# match the secret configured on the owner's Worker.
+CF_WS_TOKEN_VERSION = "nova1"
+CF_WS_TOKEN_WINDOW = 120
+_CF_WS_TOKEN_PUBLIC_SECRET = "nova-public-fallback"
+_CF_WS_SECRET_CACHE: List[str] = []
+
+
+def _read_cf_ws_secret_file() -> str:
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_ws.key"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "awg", "cf_ws.key"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                secret = handle.read().strip()
+            if secret:
+                return secret
+        except Exception:
+            continue
+    return ""
+
+
+def get_cf_ws_secret() -> str:
+    if _CF_WS_SECRET_CACHE:
+        return _CF_WS_SECRET_CACHE[0]
+    secret = str(os.environ.get("NOVA_TG_CF_SECRET", "") or "").strip()
+    if not secret:
+        secret = _read_cf_ws_secret_file()
+    if not secret:
+        secret = _CF_WS_TOKEN_PUBLIC_SECRET
+    _CF_WS_SECRET_CACHE.append(secret)
+    return secret
+
+
+def is_owned_cf_domain(host: str) -> bool:
+    """True for hostnames served by the Worker Nova itself controls."""
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    for base in NOVA_CFPROXY_PRIMARY_DOMAINS:
+        base = str(base or "").strip().lower()
+        if base and (host == base or host.endswith("." + base)):
+            return True
+    return False
+
+
+def build_cf_ws_token(host: str, now: float = 0.0) -> str:
+    """Signed subprotocol entry for `host`, or '' if the host is not ours."""
+    import hashlib
+    import hmac
+    import time as _time
+
+    host = str(host or "").strip().lower().rstrip(".")
+    if not is_owned_cf_domain(host):
+        return ""
+    window = int((now or _time.time()) // CF_WS_TOKEN_WINDOW)
+    digest = hmac.new(
+        get_cf_ws_secret().encode("utf-8"),
+        f"{window}|{host}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    return f"{CF_WS_TOKEN_VERSION}.{window}.{digest}"
+
+
+def cf_ws_subprotocol_header(host: str) -> str:
+    """Value for Sec-WebSocket-Protocol: always 'binary', signed when ours."""
+    token = build_cf_ws_token(host)
+    return f"binary, {token}" if token else "binary"
+
+
 @dataclass
 class ProxyConfig:
     port: int = 1443
