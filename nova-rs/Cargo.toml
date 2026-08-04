@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/nova-core", "crates/nova-learn", "crates/nova-cloudflare", "crates/nova-health", "crates/nova-zapret", "crates/nova-cli"]
+
+[workspace.package]
+version = "1.31.0"
+edition = "2024"
+rust-version = "1.90"
+authors = ["Brent"]
+license = "LicenseRef-Nova-Proprietary"
+repository = "https://github.com/confeden/Nova"
+
+[workspace.dependencies]
+nova-core = { path = "crates/nova-core" }
+nova-config = { path = "crates/nova-config" }
+nova-zapret = { path = "crates/nova-zapret" }
+nova-probe = { path = "crates/nova-probe" }
+nova-learn = { path = "crates/nova-learn" }
+nova-cloudflare = { path = "crates/nova-cloudflare" }
+nova-health = { path = "crates/nova-health" }
+nova-routing = { path = "crates/nova-routing" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+
+[profile.release]
+# opt-level 3, not "z". Nova classifies packets and runs handshakes on machines
+# as old as an AMD FX, where users already report the strategy checker pinning
+# the CPU. Trading throughput for a few hundred KB of binary is the wrong side
+# of that deal.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Unwind, not abort. The supervisor runs probe workers alongside a tray UI and
+# live winws child processes; a panic in one probe must not take down the
+# process that is responsible for stopping winws and restoring the system proxy
+# settings. Aborting there would leave the machine's networking mid-surgery.
+panic = "unwind"
+strip = "symbols"
+
+[profile.dev]
+debug = 1

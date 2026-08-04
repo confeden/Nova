@@ -37,13 +37,18 @@ def get_default_app_routing_profiles():
             process_names=(
                 "Telegram.exe", "Telegram", "telegram.exe", "telegram",
                 "AyuGram.exe", "AyuGram", "ayugram.exe", "ayugram",
+                "NovaGram.exe", "NovaGram", "novagram.exe", "novagram",
                 "telegram desktop.exe", "telegram desktop",
             ),
-            process_path_regex=r"(?i).*[\\/](telegram|ayugram|telegram desktop)[\\/].*",
-            updater_path_regex=r"(?i).*[\\/](telegram|ayugram|telegram desktop)[\\/]updater\.exe$",
+            process_path_regex=r"(?i).*[\\/](telegram|ayugram|novagram|telegram desktop)[\\/].*",
+            updater_path_regex=r"(?i).*[\\/](telegram|ayugram|novagram|telegram desktop)[\\/]updater\.exe$",
             ip_glob_patterns=("telegram*.txt", "ip_telegram*.txt"),
             domain_glob_patterns=("telegram*.txt",),
-            path_markers=("telegram", "ayugram", "tdesktop"),
+            # "novagram" is not a substring of any other marker here, and no
+            # other marker is a substring of it, so a NovaGram install matches
+            # this profile and nothing else. In particular it does not collide
+            # with Nova's own Nova.exe.
+            path_markers=("telegram", "ayugram", "novagram", "tdesktop"),
         ),
         "whatsapp": AppRoutingProfile(
             key="whatsapp",

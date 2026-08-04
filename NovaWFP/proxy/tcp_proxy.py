@@ -535,7 +535,7 @@ class NovaWfpTcpProxy:
         process_name = lower.rsplit("\\", 1)[-1]
         if process_name in {"pathofexilesteam.exe", "pathofexile_x64steam.exe"}:
             return "games-steam-direct"
-        if any(token in lower for token in ("telegram.exe", "ayugram.exe", "telegram desktop")):
+        if any(token in lower for token in ("telegram.exe", "ayugram.exe", "novagram.exe", "telegram desktop")):
             return "telegram"
         if any(token in lower for token in ("discord.exe", "discordcanary.exe", "discordptb.exe", "discord\\update.exe", "discordcanary\\update.exe", "discordptb\\update.exe")):
             return "discord"

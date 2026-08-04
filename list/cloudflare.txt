@@ -1,1 +1,66 @@
-# version: 1.30
+# version: 1.31
+#
+# Domains served from Cloudflare's edge, so they need the Cloudflare strategy
+# pool rather than the general one, and so they still have a winws strategy
+# when the VPN they are normally routed through is unavailable.
+#
+# Not compiled from brand knowledge: every entry below was confirmed on
+# 2026-08-04 by reading a cf-ray header off a live response over WARP. cf-ray
+# is an edge trace id present on every Cloudflare response and nothing else,
+# which makes it a fact rather than an assumption. Sites move on and off the
+# CDN, so rerun temp/cf_detect.py rather than editing by hand.
+#
+# 48 of the 100 domains in list/rkn.txt turned out to be Cloudflare-fronted.
+amnesty.org
+censor.net
+charter97.org
+chathamhouse.org
+chess.com
+cloudflare-dns.com
+cloudflare.com
+csis.org
+cyberghostvpn.com
+delfi.lt
+documentcloud.org
+doxa.team
+freedomhouse.org
+gmfus.org
+graniru.org
+holod.media
+ivacy.com
+jamestown.org
+lantern.io
+marathonbet.com
+mbk.news
+medium.com
+meduza.io
+metacritic.com
+ndi.org
+novayagazeta.eu
+occrp.org
+pages.dev
+privateinternetaccess.com
+proekt.media
+purevpn.com
+rsf.org
+rus.err.ee
+rusi.org
+semnasem.org
+sotaproject.com
+spankbang.com
+streamtape.com
+surfshark.com
+svtv.org
+thebell.io
+theins.ru
+themoscowtimes.com
+tvrain.tv
+unian.net
+verstka.media
+workers.dev
+www.cloudflare.com
+xv-ru.com
+zello.com
+zenmate.com
+zerkalo.io
+zona.media

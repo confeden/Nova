@@ -1,6 +1,37 @@
 {
-    "version": "1.30",
+    "version": "1.31",
     "strategies": [
+        {
+            "name": "cloudflare_MFB3",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=fake,hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+                "--dpi-desync-fooling=md5sig,badseq",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fake-tls=fake/fake_tls_3.bin"
+            ]
+        },
+        {
+            "name": "cloudflare_M59B",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=fake,hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+                "--dpi-desync-fooling=md5sig,badseq",
+                "--dpi-desync-ttl=4"
+            ]
+        },
+        {
+            "name": "cloudflare_M068",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=fake,hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-ttl=4"
+            ]
+        },
         {
             "name": "cloudflare_1",
             "args": [

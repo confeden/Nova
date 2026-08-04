@@ -150,10 +150,12 @@ begin
     'if ($procs -or ($svc -and $svc.State -eq ''Running'')) { ' +
     '  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); ' +
     '  if (-not $isAdmin) { ' +
-    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM opera-proxy* /IM warp-cli.exe /IM warp.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
+    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
+    '    Start-Process sc.exe -ArgumentList ''stop CloudflareWARP'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '    Start-Process sc.exe -ArgumentList ''stop WinDivert'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '  } else { ' +
-    '    taskkill /F /IM Nova.exe /IM winws.exe /IM opera-proxy* /IM warp-cli.exe /IM warp.exe; ' +
+    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe; ' +
+    '    sc.exe stop CloudflareWARP; ' +
     '    sc.exe stop WinDivert; ' +
     '  } ' +
     '}';

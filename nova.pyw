@@ -1349,6 +1349,31 @@ try:
             return hash_func.hexdigest()
         except: return None
 
+    # Компоненты прежних поставок, которые больше не нужны. Список явный, а не
+    # "удалить всё, чего нет в бандле": вслепую подчищать bin опасно, туда могут
+    # попадать файлы, которых сборка не знает.
+    #
+    # Каждый файл удаляется только при наличии страховочного файла - признака
+    # того, что замена действительно легла на диск. Без этого условия обновление
+    # ломалось бы в неудачном порядке: если warp-svc.exe окажется занят службой и
+    # не перезапишется, старый warp-svc остался бы на диске уже без своей
+    # aws_lc_fips_0_13_7_crypto.dll, и WARP перестал бы работать совсем. Лучше
+    # оставить лишние 7 МБ, чем выключить пользователю VPN.
+    OBSOLETE_BIN_GUARD = "aws_lc_fips_0_13_14_crypto.dll"
+    OBSOLETE_BIN_FILES = (
+        # Cloudflare WARP 2026.7 линкует часть crypto статически и переименовал
+        # оставшуюся библиотеку.
+        "aws_lc_fips_0_13_7_crypto.dll",
+        "aws_lc_fips_0_13_7_rust_wrapper.dll",
+        # libcronet и warp_ipc в поставке WARP больше не существуют, а
+        # rust_bridge.dll принадлежал Flutter-интерфейсу WARP, который Nova не
+        # поставляет. Ни warp-cli.exe, ни warp-svc.exe их не импортируют -
+        # проверено по таблицам импорта.
+        "libcronet.dll",
+        "warp_ipc.dll",
+        "rust_bridge.dll",
+    )
+
     def deploy_infrastructure():
         """
         Развертывает папки из EXE.
@@ -1499,28 +1524,47 @@ try:
                 except: pass
 
             elif folder == "bin":
-                 # BIN: Проверяем winws.exe на размер, остальное не трогаем если есть
+                 # BIN: содержимое решает, а не размер. zapret v72.12 и v72.13 весят
+                 # ровно одинаково (223232 байта), поэтому прежняя проверка размера
+                 # молча пропускала обновление winws, а всё остальное копировалось
+                 # только при отсутствии - то есть warp-cli/warp-svc не обновлялись
+                 # никогда. Эта ветка выполняется только при смене версии Nova, так
+                 # что хеширование здесь не влияет на обычный запуск.
                  try:
                     updated_bins = 0
                     for item in os.listdir(internal_source):
                         s = os.path.join(internal_source, item)
                         d = os.path.join(target_folder_path, item)
-                        
-                        is_winws = (item.lower() == WINWS_FILENAME.lower())
-                        
-                        if is_winws:
-                            # Hard Update for winws.exe (Size Check)
-                            if os.path.exists(d):
+
+                        if not os.path.exists(d):
+                            shutil.copy2(s, d)
+                            continue
+                        try:
+                            if os.path.getsize(s) != os.path.getsize(d):
+                                shutil.copy2(s, d)
+                                updated_bins += 1
+                            elif calculate_file_hash(s) != calculate_file_hash(d):
+                                # Тот же размер, другое содержимое - ровно случай
+                                # v72.12 -> v72.13.
+                                shutil.copy2(s, d)
+                                updated_bins += 1
+                        except Exception:
+                            # Файл занят запущенным процессом. Он будет обновлён на
+                            # следующем старте, когда Nova уже остановит winws/warp.
+                            pass
+
+                    # Чистим только когда замена уже на диске. См. комментарий у
+                    # OBSOLETE_BIN_GUARD: иначе неудачный порядок обновления
+                    # оставил бы старый warp-svc без его crypto-библиотеки.
+                    if os.path.exists(os.path.join(target_folder_path, OBSOLETE_BIN_GUARD)):
+                        for stale in OBSOLETE_BIN_FILES:
+                            stale_path = os.path.join(target_folder_path, stale)
+                            if os.path.exists(stale_path) and not os.path.exists(os.path.join(internal_source, stale)):
                                 try:
-                                    if os.path.getsize(s) != os.path.getsize(d):
-                                        shutil.copy2(s, d)
-                                        updated_bins += 1
-                                except: pass
-                            else: shutil.copy2(s, d)
-                        else:
-                            # Soft Update for DLLs/Drivers (Only add missing)
-                            if not os.path.exists(d): shutil.copy2(s, d)
-                                
+                                    os.remove(stale_path)
+                                    logs.append(f"Bin: удалён устаревший компонент {stale}")
+                                except Exception: pass
+
                     if updated_bins > 0: logs.append(f"Bin: обновлено {updated_bins} исполняемых файлов")
                  except: pass
 
@@ -6742,6 +6786,8 @@ try:
                 "telegram desktop",
                 "ayugram.exe",
                 "ayugram",
+                "novagram.exe",
+                "novagram",
             }
             target_pids = set()
             snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -13868,26 +13914,17 @@ try:
                         if d: special_strategy_domains.add(d)
             except: pass
         
-        # Загружаем домены из hard_X стратегий (они тоже специализированные)
-        for i in range(1, 13):
-            hard_name = f"hard_{i}"
-            domains = load_hard_strategy_domains(hard_name)
-            for d in domains:
+        # Домены, назначенные персональным профилям (лестница и boost).
+        # Имена берутся из конфига: прежние циклы 1..12 не совпадали ни с одним
+        # реальным boost-слотом, потому что те названы по технике, а не номером.
+        for slot_name in get_per_domain_slot_names():
+            for d in load_hard_strategy_domains(slot_name):
                 if d not in special_strategy_domains:
                     special_strategy_domains.add(d)
                     count += 1
-        
-        # Загружаем домены из boost_X стратегий
-        for i in range(1, 13):
-            boost_name = f"boost_{i}"
-            domains = load_hard_strategy_domains(boost_name) # Используем ту же функцию загрузки
-            for d in domains:
-                if d not in special_strategy_domains:
-                    special_strategy_domains.add(d)
-                    count += 1
-        
+
         if log_func and count > 0:
-            log_func(f"[Init] Загружено {count} защищенных доменов из спец. стратегий и hard_X.")
+            log_func(f"[Init] Загружено {count} защищённых доменов из спец. стратегий и лестницы.")
 
     def init_checker_system(log_func):
         global check_cache
@@ -13895,7 +13932,9 @@ try:
         load_special_strategy_domains(log_func)
         
         load_exclude_auto_checked() # Загружаем прогресс проверки исключений
-        # Загружаем и очищаем hard_X стратегии
+        # Разовая миграция: слоты hard_* выведены из обращения в 1.31.
+        retire_legacy_hard_slots(log_func)
+        invalidate_scores_on_panel_change(log_func)
         cleanup_hard_lists(log_func)
         
         check_cache = load_json_robust(CHECK_CACHE_FILE, {})
@@ -14415,10 +14454,313 @@ try:
                 time.sleep(3600)
 
 
+    # ============ ЛЕСТНИЦА ЗАПАСНЫХ СТРАТЕГИЙ (замена hard_1..hard_12) ============
+    #
+    # Раньше слоты hard_1..hard_12 заполнялись первой дюжиной по счёту. Это давало
+    # двенадцать почти одинаковых профилей: замер по 3316 оценённым стратегиям
+    # показал средние 30.4-36.9 и максимумы 85-98 по всем двенадцати слотам, то
+    # есть слоты статистически неразличимы. Причина в том, что мутация меняет
+    # ровно один ген относительно родителя, а родителями берётся топ по счёту, -
+    # восхождение по градиенту без давления на разнообразие всегда сходится.
+    #
+    # Цена была не только в месте: HardMatcher последовательно запускал
+    # winws_test.exe для каждого слота на каждый заблокированный домен. Двенадцать
+    # запусков процесса, чтобы проверить двенадцать вариантов одной идеи.
+    #
+    # Теперь слот получает лучшего представителя каждой *ниши*. Ниша описывает,
+    # чем стратегия атакует DPI, а не насколько хорошо она набрала очков.
+    # Подробности и цифры - в docs/adr/0002-diversity-over-rank.md; тот же
+    # классификатор реализован в nova-rs/crates/nova-zapret/src/diversity.rs.
+
+    ALT_SLOT_PREFIX = "alt_"
+    ALT_SLOT_LIMIT = 8
+    LEGACY_HARD_SLOT_COUNT = 12
+
+    # ==================== БЮДЖЕТ ФОНОВОЙ РАБОТЫ ====================
+    #
+    # Обучение должно идти постоянно, а не всплесками раз в неделю: DPI меняется
+    # непрерывно, и стратегия, найденная в марте, к августу может уже не работать.
+    # Но постоянная работа имеет смысл только под жёстким потолком, иначе она
+    # превращается в фоновую нагрузку, которую пользователь чувствует.
+    #
+    # Потолок задан явно и в двух измерениях, потому что дороги обе величины:
+    # процессы winws_test (каждый ставит фильтр WinDivert) и одновременные
+    # сетевые соединения. Прежний бюджет был 4x7 = 28 соединений в пике.
+    BACKGROUND_MAX_PROCESSES = 3
+    BACKGROUND_MAX_PORTS = 5
+    BACKGROUND_MAX_CONNECTIONS = BACKGROUND_MAX_PROCESSES * BACKGROUND_MAX_PORTS  # 15
+
+    # Пауза между фоновыми проходами. Двадцать минут - это примерно 70 проходов
+    # в сутки при доле пула 20% за проход, то есть весь пул успевает
+    # пересматриваться несколько раз в день, оставаясь при этом почти невидимым.
+    BACKGROUND_PASS_INTERVAL = 20 * 60
+
+    # Доля пула, берущаяся в один фоновый проход. Полная проверка использует
+    # 60/40/20 по этапам; фон работает только на нижней ступени.
+    BACKGROUND_POOL_FRACTION = 0.2
+
+    # Пулы, которые улучшаются в фоне наравне с general.
+    #
+    # До 1.31 эволюционировал только youtube. cloudflare и discord проверялись
+    # один раз при запуске и дальше не трогались, хотя правила DPI для них
+    # меняются так же, как для остальных: стратегия, найденная в марте, к августу
+    # может уже не работать, и узнать об этом было неоткуда.
+    #
+    # Пул реально попадает в работу, только если у него есть непустой список
+    # доменов: без панели измерять нечем, и добавление сюда ничего не стоит.
+    EVOLVING_SERVICES = ("youtube", "cloudflare", "discord")
+
+    # Насколько сильно техника перестраивает соединение. Порядок задан явно:
+    # именно доминирующий режим определяет, чем стратегия будет побеждена.
+    _TECHNIQUE_BY_MODE = {
+        "fake": ("inject", 1), "fakeknown": ("inject", 1), "rst": ("inject", 1), "rstack": ("inject", 1),
+        "ipfrag1": ("fragment", 2), "ipfrag2": ("fragment", 2), "hopbyhop": ("fragment", 2),
+        "destopt": ("fragment", 2), "udplen": ("fragment", 2),
+        "multisplit": ("segment", 3), "split": ("segment", 3), "split2": ("segment", 3),
+        "multidisorder": ("segment", 3), "disorder": ("segment", 3), "tamper": ("segment", 3),
+        "fakedsplit": ("decoy-segment", 4), "fakeddisorder": ("decoy-segment", 4),
+        "hostfakesplit": ("relocate", 5), "syndata": ("relocate", 5), "synack": ("relocate", 5),
+    }
+
+    # Почему получатель игнорирует фейк: испорченный пакет отбрасывает стек или
+    # NIC, пакет вне окна отбрасывает TCP. Это разные классы DPI.
+    _MALFORMED_FOOLING = {"badsum", "md5sig", "hopbyhop", "hopbyhop2"}
+    _OUT_OF_ORDER_FOOLING = {"badseq", "ts", "datanoack"}
+
+    def classify_strategy_niche(args):
+        """Возвращает (техника, дальность, отрицаемость) - грубый портрет атаки.
+
+        Оси намеренно грубые. Точное смещение разреза или число повторов меняют
+        шансы против конкретного DPI, но не класс DPI, и в описателе разбили бы
+        сетку на ячейки, отказывающие одинаково, - ровно та проблема, ради
+        которой всё это и делается.
+        """
+        technique, severity = "other", 0
+        fixed_ttl, has_auto = None, False
+        malformed = out_of_order = False
+
+        for arg in args or []:
+            if not isinstance(arg, str):
+                continue
+            key, _, value = arg.partition("=")
+            if key == "--dpi-desync":
+                for token in value.split(","):
+                    found = _TECHNIQUE_BY_MODE.get(token.strip().lower())
+                    if found and found[1] > severity:
+                        technique, severity = found
+            elif key == "--dpi-desync-ttl":
+                try:
+                    fixed_ttl = int(value)
+                except ValueError:
+                    pass
+            elif key == "--dpi-desync-autottl":
+                has_auto = True
+            elif key == "--dpi-desync-fooling":
+                for token in value.split(","):
+                    token = token.strip().lower()
+                    if token in _MALFORMED_FOOLING:
+                        malformed = True
+                    elif token in _OUT_OF_ORDER_FOOLING:
+                        out_of_order = True
+
+        # autottl перекрывает фиксированный TTL: v1 применяет измеренное число
+        # хопов, а фиксированное значение остаётся запасным, так что поведение на
+        # конкретном соединении - адаптивное.
+        if has_auto:
+            reach = "adaptive"
+        elif fixed_ttl is None:
+            reach = "unbounded"
+        elif fixed_ttl <= 4:
+            reach = "short"
+        elif fixed_ttl <= 8:
+            reach = "medium"
+        else:
+            reach = "long"
+
+        if malformed and out_of_order:
+            deniability = "mixed"
+        elif malformed:
+            deniability = "malformed"
+        elif out_of_order:
+            deniability = "out-of-order"
+        else:
+            deniability = "ttl"
+
+        return (technique, reach, deniability)
+
+    def select_diverse_ladder(ranked_strategies, limit=ALT_SLOT_LIMIT):
+        """Лучший представитель каждой ниши, сильнейшие ниши первыми.
+
+        `ranked_strategies` - список dict со 'args', уже отсортированный по
+        убыванию качества. Возвращается меньше `limit` элементов, если
+        различимых ниш меньше, и это честный ответ: он останавливает вызывающего
+        от траты проб на проверку одной идеи несколько раз.
+        """
+        best_per_niche = {}
+        for entry in ranked_strategies:
+            if not isinstance(entry, dict) or not entry.get("args"):
+                continue
+            niche = classify_strategy_niche(entry["args"])
+            # Список уже отсортирован, поэтому первый встреченный в нише - лучший.
+            if niche not in best_per_niche:
+                best_per_niche[niche] = entry
+            if len(best_per_niche) >= limit:
+                break
+        return list(best_per_niche.values())
+
+    def retire_legacy_hard_slots(log_func=None):
+        """Убирает hard_1..hard_12 из конфига и с диска.
+
+        Разовая миграция. Домены, если они были назначены, возвращаются в очередь
+        подбора: их стратегия исчезла, и правильный ответ - подобрать заново, а не
+        молча оставить их на профиле, которого больше нет.
+        """
+        base_dir = get_base_dir()
+        strat_path = os.path.join(base_dir, "strat", "strategies.json")
+        list_dir = os.path.join(base_dir, "list")
+        removed_keys, requeued = 0, 0
+
+        try:
+            data = load_json_robust(strat_path, {})
+            legacy = [k for k in data if k.startswith("hard_")]
+            if legacy:
+                for key in legacy:
+                    data.pop(key, None)
+                save_json_safe(strat_path, data)
+                removed_keys = len(legacy)
+        except Exception as e:
+            if log_func:
+                log_func(f"[Migrate] Не удалось очистить hard_* в strategies.json: {e}")
+
+        for i in range(1, LEGACY_HARD_SLOT_COUNT + 1):
+            path = os.path.join(list_dir, f"hard_{i}.txt")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    domains = [l.split("#")[0].strip() for l in f if l.strip() and not l.startswith("#")]
+                for domain in domains:
+                    if domain:
+                        add_to_hard_list_safe(domain)
+                        requeued += 1
+                os.remove(path)
+            except Exception:
+                pass
+
+        if log_func and (removed_keys or requeued):
+            log_func(
+                f"[Migrate] Слоты hard_* выведены из обращения: удалено ключей {removed_keys}, "
+                f"доменов возвращено в подбор {requeued}."
+            )
+        return removed_keys
+
+    # Доля панели, ниже которой стратегия считается негодной и выбывает из
+    # эволюции. Продублировано на уровне модуля, потому что этим порогом теперь
+    # пользуется не только сама эволюция, но и сверка панелей при запуске.
+    EVOLUTION_THRESHOLD_PERCENT = 0.20
+
+    def invalidate_scores_on_panel_change(log_func=None):
+        """Сбрасывает оценки сервиса, ставшие несопоставимыми с его панелью.
+
+        Оценка - это «сколько доменов из панели открылось», то есть число,
+        осмысленное только вместе с размером панели. Эволюция отбрасывает
+        стратегии, набравшие меньше 20% панели, поэтому выросшая панель делает
+        все старые оценки «слабыми» и пул молча выпадает из обучения навсегда:
+        cloudflare мерился на двух доменах с лучшим результатом 9, а на панели из
+        53 доменов порог уже 10.
+
+        Критерий намеренно прямой, а не «сравнить с прошлым размером»: проверяется
+        ровно тот отказ, который надо предотвратить, поэтому он сработает и при
+        любом будущем изменении панелей, и не тронет пул, которому ничего не
+        грозит.
+        """
+        base_dir = get_base_dir()
+        state_path = os.path.join(base_dir, "temp", "checker_state.json")
+        scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+
+        def panel_size(name):
+            path = os.path.join(base_dir, "list", f"{name}.txt")
+            if not os.path.exists(path):
+                return 0
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return sum(1 for l in f if l.strip() and not l.startswith("#"))
+            except Exception:
+                return 0
+
+        try:
+            scores = load_json_robust(scores_path, {})
+            if not scores:
+                return
+            state = load_json_robust(state_path, {})
+            reset = []
+
+            for svc in EVOLVING_SERVICES:
+                entries = scores.get(svc) or {}
+                size = panel_size(svc)
+                if not entries or size <= 0:
+                    continue
+                best = max((e.get("score") or 0) for e in entries.values() if isinstance(e, dict))
+                threshold = int(size * EVOLUTION_THRESHOLD_PERCENT)
+                if best < threshold:
+                    reset.append((svc, best, size, "панель выросла, все оценки ниже порога"))
+                elif best > size:
+                    reset.append((svc, best, size, "оценки выше размера панели"))
+
+            if not reset:
+                return
+
+            for svc, best, size, why in reset:
+                scores.pop(svc, None)
+                state.pop(f"{svc}_checked", None)
+                state.pop(f"{svc}_score", None)
+                if log_func:
+                    log_func(
+                        f"[Panel] {svc}: {why} (лучшая оценка {best} при панели {size}). "
+                        f"Оценки сброшены, пул будет измерен заново."
+                    )
+            save_json_safe(scores_path, scores)
+            save_json_safe(state_path, state)
+        except Exception as e:
+            if log_func:
+                log_func(f"[Panel] Не удалось сверить оценки с панелями: {e}")
+
+    def get_alt_slot_names():
+        """Действующие слоты лестницы, сильнейший первым.
+
+        Читается из strategies.json, а не из диапазона чисел: слотов теперь
+        столько, сколько нашлось различимых ниш, и жёсткий `range(1, 13)`
+        заставлял бы вызывающего пробовать несуществующие профили.
+        """
+        try:
+            data = load_json_robust(os.path.join(get_base_dir(), "strat", "strategies.json"), {})
+        except Exception:
+            return []
+
+        def order(key):
+            tail = key[len(ALT_SLOT_PREFIX):]
+            return int(tail) if tail.isdigit() else 999
+
+        return sorted([k for k in data if k.startswith(ALT_SLOT_PREFIX)], key=order)
+
+    def get_per_domain_slot_names():
+        """Все профили, которым можно назначить домен через list/<имя>.txt.
+
+        Лестница плюс boost-профили. Имена берутся из конфига, потому что
+        boost-слоты названы по технике (boost_Slow_DPI и т.п.), а не пронумерованы,
+        и прежние циклы `boost_1..boost_12` не совпадали ни с одним из них.
+        """
+        try:
+            data = load_json_robust(os.path.join(get_base_dir(), "strat", "strategies.json"), {})
+        except Exception:
+            return []
+        boosts = sorted(k for k in data if k.startswith("boost_"))
+        return get_alt_slot_names() + boosts
+
     def sort_and_distribute_results(results, log_func=None):
         """
         Sorts results and redistributes them:
-        1. General pool -> Top 12 to hard_X, rest to general.json (sorted)
+        1. General pool -> лестница разнообразия в alt_X, остальное в general.json
         2. Special pools -> Sort inside service.json
         """
         base_dir = get_base_dir()
@@ -14439,33 +14781,40 @@ try:
                 # Load current main config
                 data = load_json_robust(strat_path, {})
                 
-                # Assign Top 12 to hard_1...hard_12
-                # Note: We overwrite existing hard_X definitions with the new best ones
-                for i in range(12):
-                    h_key = f"hard_{i+1}"
-                    if i < len(gen_results):
-                        # Use args from the best strategy
-                        data[h_key] = gen_results[i][1]['args']
-                    else:
-                        # Keep existing or leave as is if not enough results
-                        pass
-                
-                # Assign remaining to "general" list
-                # Use a set to avoid duplicates
+                # Лестница запасных: лучший в каждой нише, а не первые двенадцать
+                # по счёту. Слотов ровно столько, сколько различимых ниш нашлось.
+                for key in [k for k in data if k.startswith(ALT_SLOT_PREFIX) or k.startswith("hard_")]:
+                    data.pop(key, None)
+
+                ladder = select_diverse_ladder([entry for _, entry in gen_results])
+                ladder_args = set()
+                for i, entry in enumerate(ladder):
+                    data[f"{ALT_SLOT_PREFIX}{i + 1}"] = entry["args"]
+                    ladder_args.add(tuple(entry["args"]))
+
+                # Остальное - в general.json. Стратегии, попавшие в лестницу,
+                # исключаются по аргументам, а не по позиции: раньше отрезались
+                # первые двенадцать, и если среди них были дубликаты, часть пула
+                # терялась ни за что.
                 new_general_list = []
                 seen_args = set()
-                
-                # Start from index 12 (after hard slots)
-                for i in range(12, len(gen_results)):
-                    args = gen_results[i][1]['args']
+                for _, entry in gen_results:
+                    args = entry.get('args')
+                    if not args:
+                        continue
                     t_args = tuple(args)
-                    if t_args not in seen_args:
-                        new_general_list.append(args)
-                        seen_args.add(t_args)
-                
+                    if t_args in ladder_args or t_args in seen_args:
+                        continue
+                    new_general_list.append(args)
+                    seen_args.add(t_args)
+
                 data["general"] = new_general_list
                 save_json_safe(strat_path, data)
-                if log_func: log_func(f"[Sorter] General: Топ-12 стратегий назначены в hard_X, остальные отсортированы.")
+                if log_func:
+                    log_func(
+                        f"[Sorter] General: лестница из {len(ladder)} различимых ниш "
+                        f"(из {len(gen_results)} результатов), остальные отсортированы."
+                    )
             except Exception as e:
                 if log_func: log_func(f"[Sorter] Ошибка сохранения general: {e}")
 
@@ -14673,6 +15022,11 @@ try:
                      continue
                 # =============================
 
+                # Признак того, что этот заход - лёгкий фоновый проход, а не полная
+                # проверка. Сбрасывается в начале каждой итерации: состояние из
+                # предыдущего захода не должно влиять на решение в этом.
+                is_background_pass = False
+
                 # Если идет экстренный подбор, приостанавливаем общую проверку
                 if not urgent_analysis_queue.empty() or matcher_wakeup_event.is_set():
                     time.sleep(2)
@@ -14693,8 +15047,31 @@ try:
                 
                 # Глобальный лимит фоновых задач и управление ресурсами (Max 32 total)
                 # Strategy restricted to 4 concurrent processes (winws)
-                STRATEGY_THREADS = 4 
-                PORTS_PER_STRAT = 7
+                # Прежде оба числа были фиксированными: 4 стратегии по 7 портов =
+                # 28 сетевых потоков, и это на любой машине, включая четырёхмодульные
+                # AMD FX, где двадцать восемь работающих потоков означают семикратную
+                # переподписку и очередь к GIL перед главным потоком Tk.
+                #
+                # os.cpu_count() до этой правки не встречался в файле ни разу.
+                #
+                # PORTS_PER_STRAT обязан оставаться не больше 8: пул портов идёт с
+                # шагом STRATEGY_PORT_STEP = 10, а фильтр занимает port_start +
+                # port_count + 2, так что при девяти слот наложится на соседний.
+                # Масштабирование намеренно консервативное. Основную нагрузку
+                # снял кэш SSL-контекста: раньше каждый из этих потоков держал GIL
+                # по 37.5 мс на пробу, теперь по 0.23 мс, и потоки почти всё время
+                # стоят на сетевом вводе-выводе с отпущенным GIL. Поэтому на
+                # машинах от восьми потоков поведение сохраняется прежним - резать
+                # там пропускную способность значило бы втрое удлинить цикл
+                # проверки ради выигрыша, который уже получен иначе.
+                #
+                # С 1.31 обучение идёт постоянно, а не всплесками, поэтому потолок
+                # задан фиксированной константой, а не долей от числа ядер:
+                # непрерывная работа должна стоить одинаково мало на любой машине,
+                # а не масштабироваться вверх там, где ядер много.
+                _cpu_count = os.cpu_count() or 4
+                STRATEGY_THREADS = max(2, min(BACKGROUND_MAX_PROCESSES, _cpu_count // 2))
+                PORTS_PER_STRAT = max(3, min(BACKGROUND_MAX_PORTS, _cpu_count - 1))
                 WARP_PORT = 1370
                 WARP_PORT_LEGACY = 1370
                 BASE_PORT = 16000 # Range 16000-16500
@@ -16070,6 +16447,32 @@ try:
                 # FIX: Check 'completed' (Total) instead of 'evolution_stage' (Partial).
                 # If checks_completed=True but completed=False, we MUST proceed to Evolution.
                 if not need_check and not IS_EVO_MODE and state.get("completed", False):
+                    # === НЕПРЕРЫВНЫЙ ФОН ===
+                    # Раньше здесь начиналось ожидание длиной до семи суток. Всё это
+                    # время активная стратегия не перепроверялась, и если провайдер
+                    # менял правила на следующий день, узнать об этом было неоткуда,
+                    # пока пользователь сам не заметит.
+                    #
+                    # Перезапускается только эволюционная фаза: checks_completed
+                    # остаётся выставленным, поэтому тяжёлая основная проверка
+                    # пропускается, и проход стоит долю пула, а не пул целиком.
+                    last_background = state.get("last_background_pass", 0) or state.get("last_full_check_time", 0)
+                    if time.time() - last_background >= BACKGROUND_PASS_INTERVAL:
+                        state["last_background_pass"] = time.time()
+                        state["completed"] = False
+                        state["checks_completed"] = True
+                        state["evolution_stage"] = 0
+                        state["resume_pending"] = False
+                        save_state()
+                        need_check = True
+                        is_background_pass = True
+                        log_func(
+                            f"[Check] Фоновый проход обучения "
+                            f"({int(BACKGROUND_POOL_FRACTION * 100)}% пула, "
+                            f"до {BACKGROUND_MAX_CONNECTIONS} соединений)."
+                        )
+
+                if not need_check and not IS_EVO_MODE and state.get("completed", False):
                     # Robust spam protection: Log only once per hour
                     # Use GLOBAL dict to bypass any local scope reset issues
                     tid = threading.get_ident()
@@ -16396,7 +16799,7 @@ try:
                     with open(strat_path, "r", encoding="utf-8") as f:
                         current_strategies_data = json.load(f)
                 except: pass
-                old_hard_strategies = {k: v for k, v in current_strategies_data.items() if k.startswith("hard_")}
+                ladder_strategies = {k: v for k, v in current_strategies_data.items() if k.startswith(ALT_SLOT_PREFIX)}
 
                 # Добавляем в общий пул, если нужна проверка и мы НЕ пропускаем основную проверку
                 # FIX: Always add general tasks if check is running. 
@@ -16412,11 +16815,11 @@ try:
                                 all_tasks.append(("general", {"name": "Current General", "args": general_args}, domains_for_general, strat_path))
                     except: pass
                     
-                    for h_name, h_args in old_hard_strategies.items():
+                    for h_name, h_args in ladder_strategies.items():
                         all_tasks.append(("general", {"name": h_name, "args": h_args}, domains_for_general, strat_path))
 
                     # === FIX: Добавить стратегии из general.json ===
-                    # Проверяем не только hard_1-12, но и эволюционировавшие стратегии из пула
+                    # Проверяем не только лестницу, но и эволюционировавшие стратегии из пула
                     try:
                         gen_pool_path = os.path.join(base_dir, "strat", "general.json")
                         if os.path.exists(gen_pool_path):
@@ -17214,13 +17617,15 @@ try:
                                         if best_strat and "args" in best_strat:
                                             main_data["general"] = best_strat["args"]
                                             updated_active = True
-                                        for i in range(12):
-                                            key = f"hard_{i+1}"
-                                            if i < len(active_candidates):
-                                                s_cand = active_candidates[i]["strat"]
-                                                if "args" in s_cand:
-                                                    main_data[key] = s_cand["args"]
-                                                    updated_active = True
+                                        # Лестница по нишам, а не первые N по счёту.
+                                        for key in [k for k in main_data
+                                                    if k.startswith(ALT_SLOT_PREFIX) or k.startswith("hard_")]:
+                                            main_data.pop(key, None)
+                                            updated_active = True
+                                        ladder = select_diverse_ladder([c["strat"] for c in active_candidates])
+                                        for i, entry in enumerate(ladder):
+                                            main_data[f"{ALT_SLOT_PREFIX}{i + 1}"] = entry["args"]
+                                            updated_active = True
                                     else:
                                         if best_strat and "args" in best_strat:
                                             main_data[svc] = best_strat["args"]
@@ -17531,7 +17936,7 @@ try:
                             
                             # === КОНСТАНТЫ ФИЛЬТРАЦИИ ===
                             # Минимальный порог качества: 20% от общего количества доменов
-                            THRESHOLD_PERCENT = 0.20
+                            THRESHOLD_PERCENT = EVOLUTION_THRESHOLD_PERCENT
                             
                             # Динамический подсчет доменов из list/*.txt файлов
                             def count_domains_in_file(filename):
@@ -17549,6 +17954,7 @@ try:
                                 "general": count_domains_in_file("rkn.txt") or 100,  # fallback to 100
                                 "youtube": count_domains_in_file("youtube.txt") or 16,
                                 "discord": count_domains_in_file("discord.txt") or 23,
+                                "cloudflare": count_domains_in_file("cloudflare.txt") or 12,
                                 "whatsapp": count_domains_in_file("whatsapp.txt") or 3,
                                 "telegram": count_domains_in_file("telegram.txt") or 10
                             }
@@ -17571,6 +17977,12 @@ try:
                                 # === UNIFIED LOGIC: Одна логика для всех режимов ===
                                 # Этап 1: 60%, Этап 2: 40%, Этап 3: 20% (от лимита)
                                 percentage = stages[stage_idx] if stage_idx < len(stages) else 0.2
+                                if is_background_pass:
+                                    # Фоновый проход всегда идёт на нижней ступени:
+                                    # он повторяется каждые 20 минут, и полная доля
+                                    # пула превратила бы «постоянно» в «непрерывно
+                                    # занято».
+                                    percentage = min(percentage, BACKGROUND_POOL_FRACTION)
                                 
                                 # Загружаем strategies.json для доступа к Current
                                 d = load_json_robust(strat_path, {})
@@ -17653,12 +18065,26 @@ try:
                                         taken = len([x for x in strategies_to_evolve if x[1] == "general"])
 
                                     
-                                    # 2. YouTube: из youtube.json
+                                    # 2. Специализированные пулы.
+                                    #
+                                    # Раньше эволюционировал только youtube: cloudflare и
+                                    # discord проверялись один раз при старте и после этого
+                                    # не улучшались никогда, хотя их DPI-правила меняются
+                                    # ровно так же. Пул попадает сюда, если у него есть и
+                                    # файл стратегий, и непустой список доменов, - иначе
+                                    # улучшать нечего и не на чем измерять.
                                     max_special = 12
                                     special_count = int(max_special * percentage)
                                     if special_count < 1: special_count = 1
-                                    
-                                    for svc in ["youtube"]:
+
+                                    evolvable_services = []
+                                    for candidate in EVOLVING_SERVICES:
+                                        pool_file = os.path.join(base_dir, "strat", f"{candidate}.json")
+                                        list_file = os.path.join(base_dir, "list", f"{candidate}.txt")
+                                        if os.path.exists(pool_file) and file_has_noncomment_entries(list_file):
+                                            evolvable_services.append(candidate)
+
+                                    for svc in evolvable_services:
                                         # FIX: Inject Current Strategy first
                                         if svc in d and isinstance(d[svc], list):
                                              strategies_to_evolve.append(({
@@ -18308,18 +18734,19 @@ try:
                 log_func(f"[HardList] Ошибка при сохранении {hard_file}: {e}")
 
     def load_all_hard_domains():
-        """Загружает все домены из всех hard_X.txt файлов."""
+        """Домены, назначенные персональным профилям, по имени профиля."""
         all_domains = {}
-        for i in range(1, 13):
-            hard_name = f"hard_{i}"
-            domains = load_hard_strategy_domains(hard_name)
+        for slot_name in get_per_domain_slot_names():
+            domains = load_hard_strategy_domains(slot_name)
             if domains:
-                all_domains[hard_name] = domains
+                all_domains[slot_name] = domains
         return all_domains
 
     def migrate_hard_domains(old_hard_name, new_hard_name, log_func=None):
-        """Мигрирует домены из одной hard_X стратегии в другую.
-        Например, если hard_5 переименована в hard_7."""
+        """Переносит назначенные домены с одной ступени лестницы на другую.
+
+        Нужно, когда состав лестницы пересобирается и профиль меняет номер слота:
+        домены должны следовать за стратегией, а не за номером."""
         base_dir = get_base_dir()
         
         # Загружаем домены старой стратегии
@@ -18352,8 +18779,8 @@ try:
         list_dir = os.path.join(base_dir, "list")
         
         removed_count = 0
-        for i in range(1, 13):
-            hard_file = os.path.join(list_dir, f"hard_{i}.txt")
+        for slot_name in get_per_domain_slot_names():
+            hard_file = os.path.join(list_dir, f"{slot_name}.txt")
             if os.path.exists(hard_file):
                 try:
                     with open(hard_file, "r", encoding="utf-8") as f:
@@ -18460,13 +18887,11 @@ try:
         return False
 
     def find_hard_strategy_for_domain(domain):
-        """Находит, в какой hard_X стратегии находится домен."""
+        """Имя профиля, которому назначен домен, или None."""
         domain = domain.lower()
-        for i in range(1, 13):
-            hard_name = f"hard_{i}"
-            domains = load_hard_strategy_domains(hard_name)
-            if domain in domains:
-                return hard_name
+        for slot_name in get_per_domain_slot_names():
+            if domain in load_hard_strategy_domains(slot_name):
+                return slot_name
         return None
 
     def add_to_auto_exclude(domain):
@@ -18571,6 +18996,49 @@ try:
             
             self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
+    _probe_ssl_context = None
+    _probe_ssl_context_lock = threading.Lock()
+
+    def get_probe_ssl_context():
+        """Единственный SSL-контекст для всех проб доступности.
+
+        Раньше каждая проба вызывала ssl.create_default_context(). На Windows это
+        каждый раз перечитывает и разбирает системные хранилища сертификатов CA и
+        ROOT - 37.5 мс на замер, - после чего результат немедленно выбрасывался
+        следующей строкой через verify_mode = CERT_NONE. За полный цикл обучения
+        это около 15000 вызовов, то есть порядка 9 минут чистого процессорного
+        времени под GIL на современной машине и заметно больше на старых AMD FX.
+
+        Хуже того, работа не параллелится, а анти-параллелится: 16 вызовов в 4
+        потока измеренно шли в 4.7 раза дольше, чем последовательно, потому что
+        потоки конвоем стоят на GIL. Именно это подвешивало главный поток Tk -
+        задержка отклика доходила до 246 мс в 90-м процентиле уже при четырёх
+        потоках, а Nova запускает двадцать восемь.
+
+        Поведение не меняется: проверка сертификата и раньше была отключена.
+        SSLContext документирован как потокобезопасный для wrap_socket.
+        """
+        global _probe_ssl_context
+        if _probe_ssl_context is None:
+            with _probe_ssl_context_lock:
+                if _probe_ssl_context is None:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    # check_hostname обязан выключаться до verify_mode, иначе
+                    # Python поднимет ValueError.
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    try:
+                        ctx.set_alpn_protocols(['http/1.1'])
+                    except Exception: pass
+                    # Общий контекст означает общий кэш TLS-сессий, а Nova
+                    # измеряет поведение DPI именно на рукопожатии. Возобновлённая
+                    # сессия его пропускает и дала бы ложный успех.
+                    try:
+                        ctx.options |= ssl.OP_NO_TICKET
+                    except Exception: pass
+                    _probe_ssl_context = ctx
+        return _probe_ssl_context
+
     def detect_throttled_load(domain, port=0, priority=False):
         """
         Обнаруживает блокировку и возвращает точный статус.
@@ -18595,13 +19063,8 @@ try:
             if ip is None:
                 return "no_dns", f"dns_manager_{status}"
 
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            try:
-                context.set_alpn_protocols(['http/1.1'])
-            except: pass
-            
+            context = get_probe_ssl_context()
+
             source_addr = ("0.0.0.0", port) if port > 0 else None
             
             conn = RobustHTTPSConnection(
@@ -19016,16 +19479,45 @@ try:
     strategy_domains_cache = set()
     rkn_domains_cache = set()
     last_domains_cache_update = 0
+    # (путь, mtime, размер) отслеживаемых списков на момент последнего разбора.
+    _domain_lists_signature = None
 
     def update_domain_lists_cache():
         """Обновляет кэш доменов из стратегий и RKN."""
-        global strategy_domains_cache, rkn_domains_cache, last_domains_cache_update
-        
+        global strategy_domains_cache, rkn_domains_cache, last_domains_cache_update, _domain_lists_signature
+
         if time.time() - last_domains_cache_update < 60: return
 
         try:
             base_dir = get_base_dir()
-            
+
+            # Прежде истечения минутного TTL было достаточно, чтобы заново прочитать
+            # и разобрать list/general.txt - около 990 КБ и 67 тысяч строк, ~72 мс
+            # под GIL на современной машине и порядка 250 мс на AMD FX. Каждую
+            # минуту, в том потоке, которому не повезло вызвать record_domain_visit.
+            #
+            # Списки меняются крайне редко, поэтому сначала сверяем сигнатуру
+            # (mtime, размер) и при совпадении просто продлеваем TTL.
+            watched = [os.path.join(base_dir, "rkn.txt"), os.path.join(base_dir, "list", "general.txt")]
+            list_dir = os.path.join(base_dir, "list")
+            if os.path.exists(list_dir):
+                watched.extend(
+                    os.path.join(list_dir, f) for f in sorted(os.listdir(list_dir))
+                    if f.endswith(".txt") and f.startswith((ALT_SLOT_PREFIX, "boost_", "hard_"))
+                )
+            try:
+                signature = tuple(
+                    (p, os.path.getmtime(p), os.path.getsize(p)) if os.path.exists(p) else (p, 0, 0)
+                    for p in watched
+                )
+            except OSError:
+                signature = None
+
+            if signature is not None and signature == _domain_lists_signature:
+                last_domains_cache_update = time.time()
+                return
+            _domain_lists_signature = signature
+
             # 1. RKN cache
             new_rkn = set()
             rkn_path = os.path.join(base_dir, "rkn.txt")
@@ -19047,7 +19539,9 @@ try:
             list_dir = os.path.join(base_dir, "list")
             if os.path.exists(list_dir):
                 for fname in os.listdir(list_dir):
-                    if (fname.startswith("hard_") or fname.startswith("boost_")) and fname.endswith(".txt"):
+                    # hard_ остаётся в фильтре до конца миграции: файл может ещё
+                    # лежать на диске у пользователя, обновившегося с 1.30.
+                    if fname.endswith(".txt") and fname.startswith((ALT_SLOT_PREFIX, "boost_", "hard_")):
                         try:
                             with open(os.path.join(list_dir, fname), "r", encoding="utf-8") as f:
                                 new_strat_domains.update(l.strip().split('#')[0].strip().lower() for l in f if l.strip() and not l.startswith("#"))
@@ -20415,7 +20909,7 @@ try:
         """Проверяет домены из list/hard_X.txt если их стратегия была удалена из strategies.json.
         Переносит домены в General стратегию или в temp/hard.txt для подбора новой стратегии."""
         global matcher_wakeup_event
-        last_known_hard_strats = {}  # {hard_name: set(domains)}
+        last_known_hard_strats = {}  # {имя ступени лестницы: set(domains)}
         
         while not is_closing:
             try:
@@ -20473,17 +20967,24 @@ try:
                                     break
                         
                         if not found_strategy:
-                            log_func(f"[HardMatcher] {domain} заблокирован. Пробуем Hard стратегии...")
-                            for i in range(1, 13):
+                            # Каждая ступень лестницы отказывает по-своему, поэтому
+                            # переход к следующей осмыслен. Раньше здесь перебирались
+                            # двенадцать слотов, заполненных первой дюжиной по счёту, -
+                            # то есть двенадцать запусков winws_test.exe и двенадцать
+                            # установок фильтра WinDivert, чтобы проверить одну идею.
+                            ladder_names = [n for n in get_alt_slot_names() if n in strategies]
+                            log_func(
+                                f"[HardMatcher] {domain} заблокирован. "
+                                f"Пробуем лестницу ({len(ladder_names)} ступеней)..."
+                            )
+                            for h_name in ladder_names:
                                 if is_closing: break
-                                h_name = f"hard_{i}"
-                                if h_name in strategies:
-                                    if test_boost_strategy_isolated(strategies[h_name], domain, 16016, base_dir, log_func):
-                                        log_func(f"[HardMatcher] Найдена Hard стратегия: {h_name}")
-                                        add_domain_to_hard_strategy(domain, h_name, log_func)
-                                        remove_from_hard_list_safe(domain)
-                                        found_strategy = h_name
-                                        break
+                                if test_boost_strategy_isolated(strategies[h_name], domain, 16016, base_dir, log_func):
+                                    log_func(f"[HardMatcher] Подошла ступень: {h_name}")
+                                    add_domain_to_hard_strategy(domain, h_name, log_func)
+                                    remove_from_hard_list_safe(domain)
+                                    found_strategy = h_name
+                                    break
                         
                         if found_strategy:
                             if root: root.after(0, perform_hot_restart)
@@ -20500,7 +21001,7 @@ try:
                 strat_path = os.path.join(base_dir, "strat", "strategies.json")
                 strategies = load_json_robust(strat_path, {})
                 
-                current_hard_strats = {k: v for k, v in strategies.items() if k.startswith("hard_")}
+                current_hard_strats = {k: v for k, v in strategies.items() if k.startswith(ALT_SLOT_PREFIX)}
                 deleted_hards = set(last_known_hard_strats.keys()) - set(current_hard_strats.keys())
                 
                 if deleted_hards:
@@ -21398,7 +21899,7 @@ try:
         threading.Thread(target=_start_nova_service_impl, args=(silent, restart_mode), daemon=True).start()
 
     def sync_hard_domains_to_strategies(log_func=None):
-        """Очищает strategies.json от ошибочных --hostlist-exclude для hard_X стратегий."""
+        """Убирает ошибочный --hostlist-exclude, ссылающийся на собственный список ступени."""
         try:
             base_dir = get_base_dir()
             strat_path = os.path.join(base_dir, "strat", "strategies.json")
@@ -21410,8 +21911,7 @@ try:
             except: pass
             
             modified = False
-            for i in range(1, 13):
-                hard_name = f"hard_{i}"
+            for hard_name in get_per_domain_slot_names():
                 if hard_name in strategies:
                     strat_args = strategies[hard_name]
                     new_args = []
@@ -21471,7 +21971,7 @@ try:
                     strategies = json.load(f)
             except: pass
             
-            current_hard_strats = {k: v for k, v in strategies.items() if k.startswith("hard_")}
+            current_hard_strats = {k: v for k, v in strategies.items() if k.startswith(ALT_SLOT_PREFIX)}
             
             # Для каждого домена - проверяем был ли он уже подобран ранее
             domains_found = []
@@ -23122,6 +23622,26 @@ try:
         except:
             pass
 
+        # Preflight: SCM state can look healthy while the registration is corrupted in a way
+        # only WinDivertOpen sees (error 123). Probing here lets us rebuild the service before
+        # winws/redirect ever start, instead of after a crash + 30s restart cycle.
+        try:
+            if not _windivert_registration_reset_attempted:
+                _preflight_open_error = _probe_windivert_minimal_open_error()
+                if _preflight_open_error == 0:
+                    # Probe opened a real handle: the driver just went through a load/unload
+                    # cycle, so winws must wait for the full unload before re-attaching.
+                    _driver_was_running = True
+                elif _preflight_open_error == 123:
+                    if not silent:
+                        logger("[Init] Регистрация WinDivert требует обновления. Пересоздаём службу до запуска ядра...")
+                    if _reset_windivert_registration_once(logger if IS_DEBUG_MODE and not silent else None):
+                        if not silent:
+                            logger("[Init] Регистрация WinDivert обновлена, продолжаем запуск.")
+                        _driver_was_running = True
+        except:
+            pass
+
         sync_hard_domains_to_strategies(log_print if not silent else None)
         # Wait for WinDivert driver to fully unload before winws.exe tries to re-attach.
         # Without this wait, winws may load a partially-released driver instance that
@@ -24436,7 +24956,35 @@ try:
     def perform_hot_restart():
         """Перезапускает только основное ядро, не прерывая тесты и работу сервиса."""
         if not is_service_active: return
-        
+
+        # Оба вызывающих места (HardMatcher) планируют эту функцию через
+        # root.after(0, ...), то есть она исполнялась прямо в UI-потоке Tk, а
+        # внутри - stop_nova_service(wait_for_cleanup=True) с двумя блокирующими
+        # запусками taskkill и записью JSON, плюс time.sleep(1.0). Полторы секунды
+        # намертво замороженного окна на современной машине и порядка трёх-четырёх
+        # на старых AMD FX.
+        #
+        # Ровно такой же перенос в отдельный поток уже есть у
+        # perform_hot_restart_backend ниже; сюда его просто забыли добавить.
+        if root and threading.current_thread() is threading.main_thread():
+            if getattr(perform_hot_restart, "_dispatch_pending", False):
+                return
+            perform_hot_restart._dispatch_pending = True
+
+            def _dispatch_worker():
+                try:
+                    perform_hot_restart()
+                finally:
+                    perform_hot_restart._dispatch_pending = False
+
+            threading.Thread(
+                target=_dispatch_worker,
+                daemon=True,
+                name="NovaHotRestartDispatch",
+            ).start()
+            return
+
+
         # Log to main window if possible
         try:
              log_print("[Auto-Restart] Перезапуск ядра без прерывания тестов...")

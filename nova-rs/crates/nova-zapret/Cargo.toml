@@ -1,0 +1,16 @@
+[package]
+name = "nova-zapret"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Backend-independent DPI-bypass strategy IR with emitters for zapret v1 (winws) and zapret2 (winws2)."
+
+[dependencies]
+nova-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }

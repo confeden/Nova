@@ -1,5 +1,6 @@
-# version: 1.30
+# version: 1.31
 4pda.to
+4pda.ws
 analog.com
 anthropic.com
 apihub.googleapis.com
@@ -12,8 +13,6 @@ cdn.cookielaw.org
 cdnbunny.org
 cerebras.ai
 chatgpt.com
-claude.ai
-claude.com
 cloudcode-pa.googleapis.com
 cloudcode.googleapis.com
 cloudresourcemanager.googleapis.com
@@ -79,6 +78,7 @@ performance.radar.cloudflare.com
 pixabay.com
 plati.io
 plati.market
+play.google.com
 puter.com
 qoder.com
 qt.io

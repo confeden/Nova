@@ -1,0 +1,13 @@
+[package]
+name = "nova-health"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Transport health tracking and flap-damped failover from tunnelled transports to direct DPI bypass."
+
+[dependencies]
+nova-core = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

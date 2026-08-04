@@ -1,0 +1,11 @@
+# version: 1.31
+# Nova PC - Games routing domains (TCP patch/update endpoints)
+#
+# Domains for Path of Exile update/patch/news traffic. The PoE launcher
+# mostly uses hardcoded IPs (see ip/games.txt), but add any hostnames here
+# that should also be forced through WARP for the Games app in "auto" mode.
+# Gameplay UDP is routed separately and stays direct.
+pathofexile.com
+www.pathofexile.com
+patch.pathofexile.com
+login.pathofexile.com

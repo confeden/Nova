@@ -593,7 +593,7 @@ class NovaWfpUdpProxy:
     @staticmethod
     def _app_family_from_app_id(app_id: str) -> str:
         lower = str(app_id or "").replace("/", "\\").lower()
-        if any(token in lower for token in ("telegram.exe", "ayugram.exe", "telegram desktop")):
+        if any(token in lower for token in ("telegram.exe", "ayugram.exe", "novagram.exe", "telegram desktop")):
             return "telegram"
         if any(token in lower for token in ("discord.exe", "discordcanary.exe", "discordptb.exe", "discord\\update.exe", "discordcanary\\update.exe", "discordptb\\update.exe")):
             return "discord"

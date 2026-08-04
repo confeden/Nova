@@ -1,2 +1,27 @@
-# version: 1.30
+# version: 1.31
+#
+# Discord's hosts, duplicated here from CANONICAL_DISCORD_DOMAINS in nova.pyw.
+#
+# Two things read this file and only one of them merged the canonical set in.
+# The winws hostlist is built by get_discord_runtime_domains(), which merges;
+# the strategy checker's probe panel reads this file directly, and was
+# therefore scoring every Discord strategy against a single domain. One domain
+# is a coin flip, not a measurement.
+#
+# Keeping the full set here also means Discord traffic still gets its own winws
+# strategy when the VPN it is normally routed through is unavailable.
+canary.dl2.discordapp.net
+cdn.discordapp.com
+discord.com
+discord.gg
 discord.media
+discordapp.com
+discordapp.net
+dl.discordapp.net
+dl2.discordapp.net
+gateway.discord.gg
+media.discordapp.net
+ptb.dl2.discordapp.net
+stable.dl2.discordapp.net
+status.discord.com
+updates.discord.com

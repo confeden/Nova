@@ -1,0 +1,38 @@
+# version: 1.31
+# Nova PC - Games routing list (TCP patch/update endpoints only)
+#
+# These are the Path of Exile PATCH/UPDATE servers that must go through WARP
+# when the "Games" app route mode is "auto", so provider throttling of the
+# update check/download is bypassed.
+#
+# IMPORTANT: this list must contain ONLY patch/update hosts, NOT gameplay
+# servers. In Games/Auto, process-aware Path of Exile TCP (including gameplay)
+# uses WARP. tcp_proxy.py guards this static IP fallback to patch ports
+# (80/443); other game TCP ports are captured by process metadata. The
+# WinDivert redirect layer uses this list only when the flow observer misses
+# the launcher's early patch connection.
+#
+# Determined empirically by capturing D:\Games\PoE\Client.exe traffic with
+# Wireshark: the launcher uses hardcoded IPs (no DNS) and opens TLS 1.3 to
+# the patching server immediately on launch.
+#
+# --- Verified patch/content endpoints (from live capture) ---
+# These PoE patch CDN hosts ARE reachable via WARP and must go through WARP so
+# provider throttling is bypassed.
+# 94.131.191.1 is intentionally EXCLUDED: WARP times out / blocks it, so it only
+# causes the patch to fail.
+172.65.90.21           # Cloudflare-fronted PoE patch CDN (reachable via WARP)
+172.65.90.23           # Cloudflare-fronted PoE patch CDN mirror (reachable via WARP)
+
+# 77.111.244.0/22 must never appear here. It is Opera/SurfEasy VPN
+# infrastructure, not GGG: 77.111.247.19 is eu2.sec-tunnel.com, 77.111.244.47 is
+# eu1.sec-tunnel.com and 77.111.246.61 is am0.sec-tunnel.com (confirmed against
+# the SurfEasy discover API). The earlier capture attributed Nova's own
+# opera-proxy traffic to the PoE launcher. Routing them as Games sent Opera's
+# tunnel through WARP and broke the EU/US regions.
+
+# --- Optional broader ranges (uncomment if updates still stall) ---
+# 94.131.176.0/20       # Yandex Cloud Kazakhstan - WARP does NOT route this, keep off
+# 185.62.202.0/24       # GGG-associated hosts - unreachable, keep off
+# 111.88.96.0/24
+# 172.64.0.0/13         # all Cloudflare (use ONLY if patch CDN IPs change; risks catching gameplay)

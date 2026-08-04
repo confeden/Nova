@@ -1,4 +1,4 @@
-# version: 1.30
+# version: 1.31
 api.openai.com
 auth.openai.com
 chatgpt.com

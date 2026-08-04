@@ -40,12 +40,11 @@ Third-party Opera proxy component used by Nova. This component remains subject
 to the terms and license conditions of its upstream project and its own
 dependencies.
 
-`bin/warp-cli.exe`, `bin/warp-svc.exe`, `bin/rust_bridge.dll`,
-`bin/aws_lc_fips_0_13_7_crypto.dll`,
-`bin/aws_lc_fips_0_13_7_rust_wrapper.dll`, `bin/wintun.dll`
-Files taken from the official Cloudflare WARP distribution. These files remain
-subject to Cloudflare's terms and to any upstream component licenses applicable
-to the shipped runtime.
+`bin/warp-cli.exe`, `bin/warp-svc.exe`,
+`bin/aws_lc_fips_0_13_14_crypto.dll`, `bin/wintun.dll`
+Files taken from the official Cloudflare WARP distribution (client version
+2026.7.1210.1). These files remain subject to Cloudflare's terms and to any
+upstream component licenses applicable to the shipped runtime.
 Reference links:
 - https://developers.cloudflare.com/warp-client/
 - https://www.wintun.net/
@@ -58,7 +57,8 @@ Reference link:
 - https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
 
 `bin/winws.exe`, `bin/winws_test.exe`
-Derived from the `zapret` / `winws` project:
+Derived from the `zapret` / `winws` project, version v72.13
+(commit `87e058624c72863db53bdaf7fb6f16576dddb6ab`):
 `https://github.com/bol-van/zapret`
 Redistribution or license status should be verified against upstream before
 shipping outside the current project workflow.

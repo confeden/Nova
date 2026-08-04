@@ -1,0 +1,16 @@
+[package]
+name = "nova-learn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Autonomous, context-aware strategy selection: discounted Thompson sampling with change-point driven re-exploration."
+
+[dependencies]
+nova-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
+rand_distr = { version = "0.5", default-features = false }

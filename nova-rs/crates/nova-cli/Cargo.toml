@@ -1,0 +1,21 @@
+[package]
+name = "nova-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Headless driver for the Nova engine: run and observe the learner, the evolver and the strategy emitter without the GUI."
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[dependencies]
+nova-core = { workspace = true }
+nova-learn = { workspace = true }
+nova-zapret = { workspace = true }
+nova-cloudflare = { workspace = true }
+nova-health = { workspace = true }
+serde_json = { workspace = true }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
