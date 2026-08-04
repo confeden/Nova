@@ -180,8 +180,8 @@ Nova собрана из проверенных временем решений:
   выполняющий непосредственное преодоление фильтрации.
 - [WinDivert](https://github.com/basil00/WinDivert), **basil00** — перехват
   сетевых пакетов в Windows.
-- [opera-proxy](https://github.com/Snawoot/opera-proxy), **Snawoot** — благодаря
-  этому решению доступны европейские серверы Opera. Спасибо!
+- [opera-proxy](https://github.com/Alexey71/opera-proxy), **Snawoot** — благодаря
+  этому решению доступны серверы Opera.
 - [Cloudflare WARP](https://one.one.one.one/) и
   [AmneziaWG](https://github.com/amnezia-vpn) — туннелирование трафика.
 
