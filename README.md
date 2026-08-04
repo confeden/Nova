@@ -3,7 +3,8 @@
 Программа для восстановления доступа к сайтам и сервисам, работа которых
 нарушена фильтрацией трафика. Бесплатная, без подписок, рекламы и телеметрии.
 
-<img width="357" height="298" alt="Nova" src="https://github.com/user-attachments/assets/41e6f640-1282-4870-aba9-538ccba1bb59" />
+<img width="374" height="313" alt="image" src="https://github.com/user-attachments/assets/f0c2dec8-083a-40c7-972c-33c9905ac758" />
+
 
 **[⬇️ Скачать NovaSetup.exe](https://github.com/confeden/Nova/releases)**
 
