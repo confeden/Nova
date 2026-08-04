@@ -20,7 +20,12 @@ def get_main_script_path(project_root=None):
 
 def read_project_version(project_root=None, default="Unknown"):
     root = get_project_root(project_root)
+    # Модули Nova лежат в resources/, но вызывающий обычно передаёт корень
+    # проекта — каталог с nova.pyw. Поэтому resources/ проверяется первым, а
+    # корень остаётся в списке: так функция продолжает работать и для установок
+    # прежней раскладки, и для копии, лежащей рядом с nova.pyw.
     candidates = [
+        root / "resources" / "nova_metadata.py",
         root / "nova_metadata.py",
         get_main_script_path(root),
     ]

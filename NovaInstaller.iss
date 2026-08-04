@@ -78,7 +78,7 @@ Source: "{#MySourceDir}\routing_settings.json"; DestDir: "{app}\temp"; Flags: ig
 Source: "{#MyRepoDir}\NovaWFP\proxy\*"; DestDir: "{app}\resources\NovaWFP\proxy"; Excludes: "__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#MyRepoDir}\NovaDivert\*.py"; DestDir: "{app}\resources\NovaDivert"; Flags: ignoreversion
 Source: "{#MyRepoDir}\tgrelay\*"; DestDir: "{app}\resources\tgrelay"; Excludes: "__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#MyRepoDir}\nova_routing_profiles.py"; DestDir: "{app}\resources"; Flags: ignoreversion
+Source: "{#MyRepoDir}\resources\nova_routing_profiles.py"; DestDir: "{app}\resources"; Flags: ignoreversion
 Source: "{#MySourceDir}\README.md"; DestDir: "{app}\resources\docs"; Flags: ignoreversion
 Source: "{#MySourceDir}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}\resources\legal"; Flags: ignoreversion
 Source: "{#MySourceDir}\LICENSE"; DestDir: "{app}\resources\legal"; Flags: ignoreversion

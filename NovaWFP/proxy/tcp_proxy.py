@@ -16,8 +16,11 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# В установленной программе REPO_ROOT уже указывает на каталог resources; при
+# запуске из исходников модули Nova лежат в resources/ рядом с nova.pyw.
+for _root in (REPO_ROOT / "resources", REPO_ROOT):
+    if _root.is_dir() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
 
 from tgrelay.transport import open_stream  # noqa: E402
 try:

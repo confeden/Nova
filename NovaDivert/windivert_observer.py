@@ -13,7 +13,10 @@ import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DIR = os.path.dirname(BASE_DIR)
-for _path in (BASE_DIR, APP_DIR):
+# resources/ - каталог собственных модулей Nova. В установленной программе
+# BASE_DIR сам и есть этот каталог, поэтому лишний кандидат просто не
+# существует и пропускается; при запуске из исходников именно он их и находит.
+for _path in (os.path.join(BASE_DIR, "resources"), BASE_DIR, APP_DIR):
     if _path and _path not in sys.path:
         sys.path.insert(0, _path)
 

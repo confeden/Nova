@@ -9,7 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from nova_metadata import read_project_version
+sys.path.insert(0, str(Path(__file__).resolve().parent / "resources"))
+from nova_metadata import read_project_version  # noqa: E402
 
 try:
     sys.stdout.reconfigure(line_buffering=True, encoding="utf-8")
@@ -55,7 +56,12 @@ PYI_ASSET_DIR = TEMP_ROOT / "embedded_assets"
 
 TOP_LEVEL_DIRS = ("ip", "list", "strat", "fake", "awg", "licenses")
 RESOURCE_DIRS = ("bin",)
+# Nova's own modules live in resources/ in the source tree, which is the same
+# place the installer puts them ({app}/resources). Source layout and installed
+# layout are therefore identical, and the helper processes resolve imports the
+# same way in development as they do on a user's machine.
 RESOURCE_ROOT_FILES = ("nova_routing_profiles.py", "nova_transport_plans.py")
+RESOURCE_SOURCE_DIR = "resources"
 ROOT_DOC_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md")
 # The proxy helpers (NovaWFP\proxy\tcp_proxy.py, udp_proxy.py) run as separate
 # real Python processes - the frozen Nova.exe cannot host them - so the
@@ -73,7 +79,7 @@ HELPER_RUNTIME_DLL_SKIP = ("_tkinter.pyd", "tcl86t.dll", "tk86t.dll", "_testcapi
 # Sources NovaInstaller.iss copies straight from the repo (lines 78-81), which
 # the PyInstaller staging tree never sees.
 REPO_SOURCE_FILES = (
-    Path("nova_routing_profiles.py"),
+    Path("resources") / "nova_routing_profiles.py",
     Path("NovaWFP") / "proxy" / "tcp_proxy.py",
     Path("NovaWFP") / "proxy" / "udp_proxy.py",
     Path("NovaDivert") / "windivert_observer.py",
@@ -639,6 +645,7 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         f"--workpath={PYI_WORK_DIR}",
         f"--specpath={PYI_SPEC_DIR}",
         f"--paths={asset_dir}",
+        f"--paths={BASE_DIR / RESOURCE_SOURCE_DIR}",
         "--hidden-import=embedded_assets",
         "--hidden-import=pystray._win32",
         "--hidden-import=PIL.ImageTk",
@@ -688,7 +695,7 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
     for folder_name in RESOURCE_DIRS:
         copytree_filtered(base_dir / folder_name, resources_root / folder_name)
     for filename in RESOURCE_ROOT_FILES:
-        src_file = base_dir / filename
+        src_file = base_dir / RESOURCE_SOURCE_DIR / filename
         if src_file.exists():
             shutil.copy2(src_file, resources_root / filename)
 

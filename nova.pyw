@@ -279,6 +279,14 @@ def _bootstrap_tk_runtime_env():
 
 _bootstrap_tk_runtime_env()
 
+# Cобственные модули Nova лежат в каталоге resources/ - там же, куда их кладёт
+# установщик, поэтому раскладка исходников и установленной программы совпадает.
+# В сборке PyInstaller они уже внутри exe и эта вставка ничего не меняет; при
+# запуске из исходников без неё импорты ниже не разрешатся.
+_RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
+if os.path.isdir(_RESOURCES_DIR) and _RESOURCES_DIR not in sys.path:
+    sys.path.insert(0, _RESOURCES_DIR)
+
 from nova_console_logging import (
     SessionConsoleLogWriter,
     format_session_console_log_lines,
