@@ -74,7 +74,7 @@ Nova не требует настройки. После запуска она с
    Устраняется расширением [AdGuard Exta](https://chromewebstore.google.com/detail/adguard-extra/gkeojjjcdcopjkbelgbcpckplegclfeg?hl=ru).
 
 Если ничего не помогло — напишите в [группу](https://t.me/nova_txt), разберёмся
-вместе.
+вместе 😉
 
 ---
 
