@@ -9664,7 +9664,11 @@ try:
             
             # 1. Version Check & Cleanup (JSON only)
             # FIX: Exclude persistent data files from aggressive wipe
-            protected_files = ["ip_history.json", "learning_data.json", "checker_state.json"]
+            # window_state.json holds the window position. Wiping it on a
+            # version change means every update drops the user back to the
+            # centre of the screen, so it gets its version stamped in place
+            # like the other files worth carrying across releases.
+            protected_files = ["ip_history.json", "learning_data.json", "checker_state.json", "window_state.json"]
             if os.path.exists(path) and name.endswith(".json"):
                 if name not in protected_files:
                     try:
@@ -26470,6 +26474,50 @@ try:
 
         root.bind("<Button-1>", start_move)
         root.bind("<B1-Motion>", do_move)
+
+        def _persist_geometry():
+            root._geometry_save_job = None
+            if globals().get("is_closing"):
+                return
+            try:
+                if root.state() != "normal":
+                    return
+                geom = root.geometry()
+            except:
+                return
+            # Ignore the transient sizes tkinter reports before the window is
+            # mapped; writing "1x1+0+0" would lose the real position.
+            if not re.match(r"^\d+x\d+\+-?\d+\+-?\d+$", str(geom)) or geom.startswith("1x1"):
+                return
+            state = {"main_geometry": geom}
+            try:
+                if log_window and tk.Toplevel.winfo_exists(log_window) and log_window.state() == "normal":
+                    state["log_size"] = log_window.geometry()
+            except:
+                pass
+            save_window_state(**state)
+
+        def _schedule_geometry_save(event=None):
+            # Position used to be written only by on_closing and by the restart
+            # helper. The updater stops Nova with taskkill /F, so neither runs
+            # and the window came back wherever it was last saved — often the
+            # position from several sessions ago. Persist shortly after the
+            # window settles instead, so no exit path can lose it.
+            if globals().get("is_closing"):
+                return
+            try:
+                pending = getattr(root, "_geometry_save_job", None)
+                if pending:
+                    root.after_cancel(pending)
+            except:
+                pass
+            try:
+                root._geometry_save_job = root.after(1200, _persist_geometry)
+            except:
+                root._geometry_save_job = None
+
+        root.bind("<Configure>", _schedule_geometry_save, add="+")
+        root.bind("<ButtonRelease-1>", _schedule_geometry_save, add="+")
 
         state = load_window_state()
         geom = state.get("main_geometry")
