@@ -2,6 +2,7 @@
 import base64
 import ctypes
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -218,6 +219,29 @@ def sanitize_user_override_files(staging_dir: Path) -> None:
         if not header:
             header = fallback_header
         target.write_text(header, encoding="utf-8")
+
+
+def stage_routing_settings(src: Path, dst: Path) -> None:
+    """Ship a neutral routing file instead of the build machine's own settings.
+
+    The installer hands this file to every new installation, so whatever route
+    the developer happened to have selected silently became everyone's default
+    — that is how Telegram shipped pinned to WARP. ``system`` is worse: it
+    carries game_dvr_capture_backup, a snapshot of *this* machine's registry
+    that Nova restores on uninstall.
+
+    Only the machine-independent keys survive staging. Everything else falls
+    back to DEFAULT_ROUTING_SETTINGS in nova.pyw, which is the single place the
+    defaults should live.
+    """
+    payload = {}
+    try:
+        loaded = json.loads(src.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            payload = {key: loaded[key] for key in ("version", "opera_region") if key in loaded}
+    except Exception:
+        payload = {}
+    dst.write_text(json.dumps(payload, ensure_ascii=False, indent=4), encoding="utf-8")
 
 
 def find_python_runtime_root() -> Path:
@@ -707,7 +731,7 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
 
     routing_settings_src = base_dir / "routing_settings.json"
     if routing_settings_src.exists():
-        shutil.copy2(routing_settings_src, staging_dir / "routing_settings.json")
+        stage_routing_settings(routing_settings_src, staging_dir / "routing_settings.json")
 
     # Strip unnecessary Python packaging artifacts from staging
     for pattern in ("setuptools", "setuptools-*"):

@@ -9827,7 +9827,10 @@ try:
         "opera_region": "EU",
         "routes": {
             "browser": "auto",
-            "telegram": "warp",
+            # Auto, not WARP: the relay picks its own egress per connection now,
+            # and pinning Telegram to WARP means a degraded tunnel takes the
+            # client down with it instead of letting it move to Opera or direct.
+            "telegram": "auto",
             "whatsapp": "warp",
             "discord": "warp",
             "ide": "direct",
@@ -9841,6 +9844,24 @@ try:
             "ai_unlock": True,
         },
     }
+
+    # Releases that still wrote "warp" as the Telegram default.
+    TELEGRAM_AUTO_ROUTE_SINCE = (1, 31, 2)
+
+    def _routing_predates_telegram_auto(stored_version):
+        parts = []
+        try:
+            for chunk in str(stored_version or "").strip().split(".")[:3]:
+                if not chunk.isdigit():
+                    break
+                parts.append(int(chunk))
+        except:
+            parts = []
+        if not parts:
+            return True
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts) < TELEGRAM_AUTO_ROUTE_SINCE
 
     def _normalize_routing_mode(value, default_value="auto"):
         mode = str(value or "").strip().lower()
@@ -9894,6 +9915,13 @@ try:
                             routes.get(route_key),
                             normalized["routes"][route_key],
                         )
+                # Installations made before 1.31.2 carry "warp" because that was
+                # the shipped default, not because anyone picked it. Move them
+                # over once — load_routing_settings persists the result, so the
+                # version stops matching and the setting stays the user's own
+                # from then on.
+                if normalized["routes"].get("telegram") == "warp" and _routing_predates_telegram_auto(data.get("version")):
+                    normalized["routes"]["telegram"] = "auto"
             else:
                 normalized["routes"]["browser"] = _browser_mode_from_legacy_pac(data.get("pac"))
                 apps = data.get("apps") or {}
