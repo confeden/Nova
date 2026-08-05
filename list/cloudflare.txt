@@ -1,4 +1,4 @@
-# version: 1.31.1
+# version: 1.31.2
 #
 # Domains served from Cloudflare's edge, so they need the Cloudflare strategy
 # pool rather than the general one, and so they still have a winws strategy

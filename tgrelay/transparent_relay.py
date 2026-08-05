@@ -598,7 +598,127 @@ async def _resolve_ip(host: str) -> str:
     return await asyncio.to_thread(_resolve)
 
 
+# --- Egress health for the WSS handshake -----------------------------------
+#
+# Reachability of an egress is not a property of the moment it is chosen. WARP
+# in particular keeps answering TCP and TLS long after it has stopped carrying
+# WebSocket upgrades, and there is no way to tell from the connect alone. These
+# few functions remember which egress last failed a handshake so the next call
+# starts somewhere else, and let it back to the front as soon as it works again
+# or after the penalty expires.
+WSS_EGRESS_BAD_TTL = _env_float("NOVA_TG_RELAY_WSS_EGRESS_BAD_TTL", 90.0, minimum=10.0)
+WSS_MIN_ATTEMPT_TIMEOUT = _env_float("NOVA_TG_RELAY_WSS_MIN_ATTEMPT_TIMEOUT", 2.0, minimum=0.5)
+_wss_egress_bad: Dict[str, float] = {}
+_wss_egress_log: Dict[str, float] = {}
+_wss_egress_log_func = None
+
+
+def set_wss_egress_logger(log_func) -> None:
+    global _wss_egress_log_func
+    _wss_egress_log_func = log_func if callable(log_func) else None
+
+
+def _wss_egress_label(attempt) -> str:
+    if not isinstance(attempt, dict):
+        return "unknown"
+    return str(attempt.get("label") or attempt.get("kind") or "unknown").strip() or "unknown"
+
+
+def _mark_wss_egress_bad(label: str, domain: str = "") -> None:
+    label = str(label or "").strip()
+    if not label:
+        return
+    first = label not in _wss_egress_bad or _wss_egress_bad[label] <= time.monotonic()
+    _wss_egress_bad[label] = time.monotonic() + WSS_EGRESS_BAD_TTL
+    if first:
+        # Wording matters: the console tags any line containing "fail" as an
+        # alert and pins it in the window. Switching egress is routine
+        # self-healing, so it belongs in the log file, not in a red banner.
+        _log_wss_egress(f"[TgRelay] WSS egress {label} stopped answering the handshake for {domain or 'CF'}; moved to the back of the queue for {int(WSS_EGRESS_BAD_TTL)}s.")
+
+
+def _mark_wss_egress_good(label: str) -> None:
+    label = str(label or "").strip()
+    if label and _wss_egress_bad.pop(label, None) is not None:
+        _log_wss_egress(f"[TgRelay] WSS egress {label} is healthy again.")
+
+
+def _log_wss_egress(message: str) -> None:
+    # The NovaWFP proxy imports this module without a console of its own, so
+    # fall back to the module logger instead of dropping the line.
+    func = _wss_egress_log_func if callable(_wss_egress_log_func) else log.info
+    now = time.monotonic()
+    last = float(_wss_egress_log.get(message, 0.0) or 0.0)
+    if (now - last) < FALLBACK_LOG_INTERVAL:
+        return
+    _wss_egress_log[message] = now
+    with contextlib.suppress(Exception):
+        func(message)
+
+
+def _log_wss_egress_switch(label: str, domain: str) -> None:
+    _log_wss_egress(f"[TgRelay] WSS handshake for {domain} went through {label} instead of the preferred egress.")
+
+
+def _order_wss_attempts(attempts) -> List[Dict[str, object]]:
+    """Caller's order, with recently failed egresses moved to the back."""
+    try:
+        source = list(attempts) if attempts else list(_cfproxy_upstream_attempts())
+    except Exception:
+        source = []
+    now = time.monotonic()
+    healthy: List[Dict[str, object]] = []
+    penalised: List[Dict[str, object]] = []
+    for attempt in source:
+        if not isinstance(attempt, dict):
+            continue
+        if float(_wss_egress_bad.get(_wss_egress_label(attempt), 0.0) or 0.0) > now:
+            penalised.append(dict(attempt))
+        else:
+            healthy.append(dict(attempt))
+    return healthy + penalised
+
+
 async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0, attempts=None):
+    """Open a Telegram WSS tunnel, moving to another egress if one stops working.
+
+    An egress can accept the TCP connection and complete TLS while silently
+    dropping the WebSocket upgrade — that is exactly how a degraded WARP tunnel
+    behaves. Selecting the egress inside ``open_tls_stream`` cannot notice this,
+    because by then the connection already looks healthy. So the handshake is
+    driven here, one egress at a time, and a failure that leaves us without an
+    HTTP status is charged to the egress rather than to the domain.
+    """
+    ordered = _order_wss_attempts(attempts)
+    if len(ordered) < 2:
+        return await _connect_websocket_once(host, domain, timeout, attempts, ordered[0] if ordered else None)
+
+    # Split the caller's budget so probing a dead egress cannot stretch the
+    # whole attempt past what the CF race is willing to wait for.
+    attempt_timeout = max(WSS_MIN_ATTEMPT_TIMEOUT, float(timeout) / len(ordered))
+    last_error: Optional[BaseException] = None
+    for index, attempt in enumerate(ordered):
+        label = str(attempt.get("label") or attempt.get("kind") or "unknown").strip() or "unknown"
+        try:
+            result = await _connect_websocket_once(host, domain, attempt_timeout, [attempt], attempt)
+            _mark_wss_egress_good(label)
+            if index:
+                _log_wss_egress_switch(label, domain)
+            return result
+        except WsHandshakeError as exc:
+            if int(getattr(exc, "status_code", 0) or 0) > 0:
+                # The egress delivered a real HTTP status: it works, the domain
+                # refused us. Retrying elsewhere would only repeat the refusal.
+                _mark_wss_egress_good(label)
+                raise
+            last_error = exc
+        except (asyncio.TimeoutError, OSError) as exc:
+            last_error = exc
+        _mark_wss_egress_bad(label, domain)
+    raise last_error if last_error is not None else WsHandshakeError(0, "no upstream attempts available")
+
+
+async def _connect_websocket_once(host: str, domain: str, timeout: float, attempts, attempt=None):
     reader, writer, upstream_label = await open_tls_stream(
         host,
         443,
@@ -983,6 +1103,9 @@ class TelegramTransparentRelayServer:
         self.host = host
         self.port = int(port)
         self.log_func = log_func or (lambda msg: log.info(msg))
+        # Egress switching happens in module-level code shared with the NovaWFP
+        # proxy; route it to the same console the rest of the relay writes to.
+        set_wss_egress_logger(self.log_func)
         self.upstream_provider = upstream_provider
         self.warp_bootstrap_waiter = warp_bootstrap_waiter
         self.thread = None
@@ -1310,6 +1433,12 @@ class TelegramTransparentRelayServer:
             pass
         try:
             self._http_transport_until.clear()
+        except Exception:
+            pass
+        try:
+            # A route just came back; give every egress its place in the queue
+            # again instead of making it sit out the rest of its penalty.
+            _wss_egress_bad.clear()
         except Exception:
             pass
         try:
