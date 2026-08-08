@@ -1,0 +1,136 @@
+name: Build TLS terminator
+
+# Собирает nova-tls-terminator.exe из nova-rs/ на серверах GitHub.
+#
+# Зачем: этот бинарник — единственная часть Nova, которой нужен C-тулчейн
+# (BoringSSL, а к нему cmake, MSVC, NASM и LLVM). Держать всё это на машине
+# владельца значит терять возможность собирать релиз после переустановки
+# Windows. Здесь его собирает GitHub, а локально остаётся только скачать
+# готовый файл скриптом fetch_tls_terminator.py.
+#
+# Запуск:
+#   - вручную (Actions -> Build TLS terminator -> Run workflow), с галочкой
+#     publish, если результат нужно положить в релиз;
+#   - автоматически при изменениях в nova-rs/, чтобы поломка сборки нашлась
+#     сразу, а не в день выпуска.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Положить результат в релиз tls-terminator"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "nova-rs/**"
+      - ".github/workflows/build_tls_terminator.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Rust. На раннере он уже есть, но версия плавает, а workspace требует
+      #    1.90+ и edition 2024.
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc -vV
+
+      # 2. NASM. Единственное, чего на раннере нет из нужного BoringSSL:
+      #    cmake и MSVC установлены, LLVM тоже.
+      - name: NASM
+        run: choco install nasm --no-progress -y
+
+      # 3. libclang нужен bindgen внутри boring-sys. Путь на раннере
+      #    стабильный, но проверяем явно — молчаливое отсутствие даёт
+      #    невнятную ошибку в build script.
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $llvm = "C:\Program Files\LLVM"
+          if (-not (Test-Path "$llvm\bin\libclang.dll")) {
+            choco install llvm --no-progress -y
+          }
+          "LIBCLANG_PATH=$llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$env:ProgramFiles\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # 4. Кэш. BoringSSL собирается около полутора минут с нуля; кэш убирает
+      #    это из каждого прогона, но ключ включает Cargo.lock, чтобы смена
+      #    версии зависимости не переиспользовала старые объекты.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            nova-rs/target
+          key: tls-terminator-${{ runner.os }}-${{ hashFiles('nova-rs/Cargo.lock') }}
+          restore-keys: tls-terminator-${{ runner.os }}-
+
+      # 5. Тесты до сборки. Форма ClientHello проверяется офлайн — тест
+      #    поднимает слушателя, снимает наш же хэндшейк и сверяет отпечаток,
+      #    так что сломанная форма не доедет до релиза.
+      - name: Test
+        working-directory: nova-rs
+        run: |
+          cargo test --workspace
+          cargo test -p nova-tls --features shape
+
+      - name: Build
+        working-directory: nova-rs
+        run: cargo build --release -p nova-tls --features shape --bin tls-terminator
+
+      # 6. Имя, под которым его ищет приложение (см. TLS_TERMINATOR_FILENAME
+      #    в nova.pyw), плюс хэш рядом — скрипт загрузки его проверяет.
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item nova-rs/target/release/tls-terminator.exe dist/nova-tls-terminator.exe
+          $hash = (Get-FileHash dist/nova-tls-terminator.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash" | Out-File -FilePath dist/nova-tls-terminator.exe.sha256 -Encoding ascii -NoNewline
+          Write-Host "sha256: $hash"
+          Write-Host "size:   $((Get-Item dist/nova-tls-terminator.exe).Length) bytes"
+
+      # 7. Проверка, что собранное вообще запускается. Отсутствие токена —
+      #    ожидаемый отказ с кодом 2; любой другой исход означает, что бинарник
+      #    нерабочий, и лучше узнать это здесь.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist/nova-tls-terminator.exe -PassThru -Wait -NoNewWindow
+          if ($p.ExitCode -ne 2) {
+            Write-Error "ожидался код 2 (нет токена), получен $($p.ExitCode)"
+            exit 1
+          }
+          Write-Host "бинарник запускается и корректно отказывается работать без токена"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-tls-terminator
+          path: dist/*
+          retention-days: 30
+
+      # 8. Публикация по запросу. Тег движущийся: это не версия продукта, а
+      #    текущий собранный инструмент, и скрипту загрузки нужен постоянный
+      #    адрес, который не надо править при каждом выпуске.
+      - name: Publish to release
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete tls-terminator --yes --cleanup-tag 2>$null
+          gh release create tls-terminator `
+            dist/nova-tls-terminator.exe `
+            dist/nova-tls-terminator.exe.sha256 `
+            --title "TLS terminator (сборка из nova-rs)" `
+            --notes "Собрано из ${{ github.sha }}. Скачивается скриптом fetch_tls_terminator.py в bin/."
