@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import contextlib
 import json
 import os
 import ipaddress
 import logging
+import random
 import socket
 import struct
 import threading
@@ -19,10 +21,18 @@ from .config import (
     cf_ws_subprotocol_header,
     get_cfproxy_domains,
     get_cfproxy_primary_domains,
+    is_owned_cf_domain,
     proxy_config,
     start_cfproxy_domain_refresh,
 )
-from .raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
+from . import persona, phase
+from .raw_websocket import (
+    RawWebSocket,
+    WsHandshakeError,
+    note_deflate_unusable,
+    offers_deflate,
+    set_sock_opts,
+)
 from .transport import open_stream, open_tls_stream, set_upstream_provider, get_upstream_attempts
 
 
@@ -679,6 +689,250 @@ def _order_wss_attempts(attempts) -> List[Dict[str, object]]:
     return healthy + penalised
 
 
+# --- Health of the native MTProto path -------------------------------------
+#
+# WSS exists because the провайдер kills direct MTProto. That is true for a
+# direct socket and for WARP, but not for every egress: an HTTP proxy can carry
+# Telegram's own protocol untouched, and then the WebSocket detour through
+# Cloudflare only adds two network legs. Measured on the target network, the
+# same req_pq/resPQ exchange takes 0.64s natively through Opera against 1.25s
+# over WSS — and since uploads acknowledge every chunk, that ratio is what the
+# user feels when sending a photo.
+#
+# Which of the two works is a property of the network, not something to assume,
+# so it is learned: a tunnel that receives bytes back from Telegram marks the
+# pair (DC, egress) as good, one that stays silent marks it bad.
+NATIVE_GOOD_TTL = _env_float("NOVA_TG_RELAY_NATIVE_GOOD_TTL", 600.0, minimum=30.0)
+NATIVE_BAD_TTL = _env_float("NOVA_TG_RELAY_NATIVE_BAD_TTL", 120.0, minimum=15.0)
+NATIVE_FIRST_ENABLED = _env_bool("NOVA_TG_RELAY_NATIVE_FIRST", True)
+NATIVE_PROBE_INTERVAL = _env_float("NOVA_TG_RELAY_NATIVE_PROBE_INTERVAL", 45.0, minimum=10.0)
+NATIVE_PROBE_RETRY = _env_float("NOVA_TG_RELAY_NATIVE_PROBE_RETRY", 6.0, minimum=2.0)
+# Separate switch from NATIVE_FIRST_ENABLED: media is where the bytes are, so it
+# is the part worth being able to roll back on its own.
+NATIVE_MEDIA_ENABLED = _env_bool("NOVA_TG_RELAY_NATIVE_MEDIA", True)
+_native_health: Dict[Tuple[int, str], Tuple[bool, float]] = {}
+
+
+def _native_record(dc: int, label: str, ok: bool) -> None:
+    label = str(label or "").strip().lower()
+    if not label or int(dc or 0) <= 0:
+        return
+    ttl = NATIVE_GOOD_TTL if ok else NATIVE_BAD_TTL
+    previous = _native_health.get((int(dc), label))
+    _native_health[(int(dc), label)] = (bool(ok), time.monotonic() + ttl)
+    if previous is None or previous[0] != bool(ok):
+        state = "carries Telegram directly" if ok else "stays silent"
+        _log_wss_egress(f"[TgRelay] Native MTProto over {label} {state} for DC{int(dc)}.")
+
+
+def _native_state(dc: int, label: str):
+    entry = _native_health.get((int(dc or 0), str(label or "").strip().lower()))
+    if not entry or entry[1] <= time.monotonic():
+        return None
+    return entry[0]
+
+
+def _native_candidate_labels() -> List[str]:
+    try:
+        return [_wss_egress_label(a) for a in (_telegram_upstream_attempts() or [])]
+    except Exception:
+        return []
+
+
+def _native_preferred(dc: int) -> bool:
+    """True when some egress is proven to carry native MTProto to this DC."""
+    if not NATIVE_FIRST_ENABLED:
+        return False
+    return any(_native_state(dc, label) is True for label in _native_candidate_labels())
+
+
+def _native_worth_trying(dc: int) -> bool:
+    """True while at least one egress is either proven or still untested."""
+    if not NATIVE_FIRST_ENABLED:
+        return False
+    labels = _native_candidate_labels()
+    if not labels:
+        return False
+    return any(_native_state(dc, label) is not False for label in labels)
+
+
+def _build_native_probe(dc: int) -> bytes:
+    """obfuscated2 init plus req_pq_multi, framed for the abridged transport.
+
+    Telegram answers this with resPQ before any authorisation, so it is the
+    cheapest honest question one can ask an egress: not "does TCP open" but
+    "does this data centre talk back through you".
+    """
+    while True:
+        buf = bytearray(os.urandom(64))
+        if buf[0] == 0xEF:
+            continue
+        if struct.unpack("<I", bytes(buf[:4]))[0] in _NATIVE_PROBE_BAD_FIRST:
+            continue
+        if struct.unpack("<I", bytes(buf[4:8]))[0] == 0:
+            continue
+        break
+    buf[56:60] = struct.pack("<I", PROTO_ABRIDGED)
+    buf[60:62] = struct.pack("<h", int(dc))
+    stream = _new_ctr(bytes(buf[8:40]), bytes(buf[40:56]))
+    wire = stream.update(bytes(buf))
+    init = bytes(buf[:56]) + wire[56:64]
+
+    msg_id = (int(time.time()) << 32) & 0x7FFFFFFFFFFFFFFF
+    body = struct.pack("<I", 0xBE7E8EF1) + os.urandom(16)
+    payload = struct.pack("<q", 0) + struct.pack("<q", msg_id) + struct.pack("<i", len(body)) + body
+    framed = bytes([len(payload) // 4]) + payload
+    return init + stream.update(framed)
+
+
+_NATIVE_PROBE_BAD_FIRST = {0x44414548, 0x54534F50, 0x20544547, 0x4954504F, 0xDDDDDDDD, 0xEEEEEEEE, 0x02010316}
+
+
+def _order_native_attempts(attempts, dc: int):
+    """Proven egresses first, untested next, recently silent ones last.
+
+    Without this the tunnel would keep picking WARP — which answers TCP but
+    never delivers a byte from Telegram — and would then record the native path
+    as dead for the whole DC, hiding the egress that actually works.
+    """
+    if not attempts or int(dc or 0) <= 0:
+        return attempts
+    good, unknown, bad = [], [], []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        state = _native_state(dc, _wss_egress_label(attempt))
+        (good if state is True else bad if state is False else unknown).append(attempt)
+    return good + unknown + bad
+
+
+# --- Keeping the route name out of the clear --------------------------------
+#
+# The route has to be named somewhere in the request, and today it is named in
+# the SNI: `kws2.nova-app.eu` travels in plaintext on every tunnel Nova opens.
+# A single rule over `^kws\d+\.` retires the entire domain pool at once, and no
+# amount of work on the TLS fingerprint behind it changes that — the name is
+# read before the fingerprint matters.
+#
+# Cloudflare routes Workers on the Host header, which is inside TLS, and it
+# tolerates the SNI disagreeing with it as long as both names belong to the
+# same zone. Measured against the live Worker: apex, `www.` and `cdn.` in the
+# SNI all reach the same handler as the literal name, while a name from another
+# zone is answered with 403. So the route can keep travelling in the Host
+# header and the SNI can be an unremarkable subdomain of the same zone.
+#
+# Nothing else moves. The domain string stays the health-cache key, the log
+# label, and the value the handshake signature is bound to, so no state
+# migrates and the Worker needs no change at all.
+NEUTRAL_SNI_ENABLED = _env_bool("NOVA_TG_RELAY_NEUTRAL_SNI", True)
+# Only names that actually exist. Cloudflare's edge accepted `cdn.`, `static.`,
+# `assets.` and `img.` too — the zone answers on a wildcard — but a name with no
+# record of its own stops working the moment that wildcard is tightened, and
+# the failure would look like DPI rather than like a DNS change. The apex and
+# `www.` both resolve today and are both inside the universal certificate, so
+# verification can be switched back on later without revisiting this.
+def _cf_neutral_candidates(base: str) -> List[str]:
+    return [base, f"www.{base}"]
+# One name per zone for the life of the process, rather than a fresh one per
+# connection. A client that talks to a single content host looks like every
+# other client; one that sprays five names per minute is its own signature.
+_cf_sni_choice: Dict[str, str] = {}
+_cf_sni_literal_until: Dict[str, float] = {}
+CF_NEUTRAL_SNI_BAD_TTL = _env_float("NOVA_TG_RELAY_NEUTRAL_SNI_BAD_TTL", 900.0, minimum=60.0)
+
+
+def _cf_neutral_sni(domain: str) -> str:
+    """The name to offer in the SNI when connecting to `domain`.
+
+    Returns `domain` unchanged whenever substituting would be a guess: for
+    Telegram's own `kwsN.web.telegram.org`, whose edge really does route on the
+    SNI, and for the third-party Workers in the public pool, where the same
+    measurement has not been made and breaking somebody else's infrastructure
+    on a hunch is worse than a legible name.
+    """
+    domain = str(domain or "").strip().lower()
+    if not NEUTRAL_SNI_ENABLED or not domain:
+        return domain
+    if not is_owned_cf_domain(domain):
+        return domain
+    base = _cf_domain_base(domain) or ""
+    if not base:
+        return domain
+    until = float(_cf_sni_literal_until.get(base, 0.0) or 0.0)
+    if until > time.monotonic():
+        return domain
+    choice = _cf_sni_choice.get(base)
+    if not choice:
+        choice = random.choice(_cf_neutral_candidates(base))
+        _cf_sni_choice[base] = choice
+    return choice
+
+
+def _cf_note_neutral_sni_bad(domain: str) -> None:
+    """Fall back to the literal name for this zone for a while.
+
+    Reached only when a handshake carrying a substituted SNI was ignored or
+    refused. The substitution is an optimisation, not a requirement, so the
+    first sign that a network dislikes it is enough to stop paying for it.
+    """
+    base = _cf_domain_base(str(domain or "").strip().lower()) or ""
+    if not base:
+        return
+    if float(_cf_sni_literal_until.get(base, 0.0) or 0.0) <= time.monotonic():
+        _log_wss_egress(
+            f"[TgRelay] Neutral SNI was not accepted for {base}; using the literal route name "
+            f"for {int(CF_NEUTRAL_SNI_BAD_TTL)}s."
+        )
+    _cf_sni_literal_until[base] = time.monotonic() + CF_NEUTRAL_SNI_BAD_TTL
+
+
+def _note_sni_verdict(exc: BaseException, domain: str, signature: str) -> None:
+    """Retire the substituted SNI if the failure could plausibly be its fault.
+
+    Only two shapes qualify. A handshake that went unanswered is the one window
+    where the name we offered is still a suspect; `421 Misdirected Request` and
+    `403` are what a CDN says when it does not accept the name it was given for
+    the host that was asked for. Everything else happened either before the
+    name was on the wire or after it had already been accepted, and rolling
+    back on those would give up a real gain over unrelated noise.
+    """
+    used = str(getattr(exc, "nova_sni", "") or "")
+    if not used or used == str(domain or "").strip().lower():
+        return
+    if phase.wants_tls_profile_change(signature) or signature == phase.TLS_CERTIFICATE_MISMATCH:
+        _cf_note_neutral_sni_bad(domain)
+        return
+    if isinstance(exc, WsHandshakeError) and int(getattr(exc, "status_code", 0) or 0) in (403, 421):
+        _cf_note_neutral_sni_bad(domain)
+
+
+def _attempt_signature(exc: BaseException) -> str:
+    """Name the gate a failed WSS attempt died at.
+
+    The evidence was recorded on the way up by ``transport.open_tls_stream``
+    and ``_connect_websocket_once``; this only reads it back and applies the
+    shared decision table. When nothing was recorded the default is the gate
+    that used to be assumed for everything, so an untagged path behaves exactly
+    as it did before rather than silently acquiring a new verdict.
+    """
+    reached = phase.reached_from_exception(exc, phase.Reached.RESOLVED)
+    if isinstance(exc, WsHandshakeError) and int(getattr(exc, "status_code", 0) or 0) > 0:
+        ended = phase.Ended.HTTP_STATUS
+        # An HTTP status is itself proof the handshake finished — nobody sends
+        # one before TLS is up. Trusting the annotation over that would let a
+        # missing tag turn a definitive refusal into a blackholed route, and
+        # demote an egress that had just carried a full request and reply.
+        reached = max(reached, int(phase.Reached.HANDSHAKE_DONE))
+    else:
+        ended = phase.ended_from_exception(exc)
+    return phase.classify(
+        reached,
+        ended,
+        since_hello_ms=getattr(exc, "nova_since_hello_ms", None),
+        rtt_ms=None,
+    )
+
+
 async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0, attempts=None):
     """Open a Telegram WSS tunnel, moving to another egress if one stops working.
 
@@ -691,7 +945,11 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
     """
     ordered = _order_wss_attempts(attempts)
     if len(ordered) < 2:
-        return await _connect_websocket_once(host, domain, timeout, attempts, ordered[0] if ordered else None)
+        try:
+            return await _connect_websocket_once(host, domain, timeout, attempts, ordered[0] if ordered else None)
+        except BaseException as exc:
+            _note_sni_verdict(exc, domain, _attempt_signature(exc))
+            raise
 
     # Split the caller's budget so probing a dead egress cannot stretch the
     # whole attempt past what the CF race is willing to wait for.
@@ -710,67 +968,115 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
                 # The egress delivered a real HTTP status: it works, the domain
                 # refused us. Retrying elsewhere would only repeat the refusal.
                 _mark_wss_egress_good(label)
+                signature = _attempt_signature(exc)
+                exc.nova_signature = signature
+                _note_sni_verdict(exc, domain, signature)
                 raise
             last_error = exc
         except (asyncio.TimeoutError, OSError) as exc:
             last_error = exc
+
+        # Which layer just failed decides which layer gets charged. Collapsing
+        # all of these into "this egress is bad" is how a resolver hiccup or a
+        # silent Worker takes down a tunnel that was carrying traffic fine.
+        signature = _attempt_signature(last_error)
+        with contextlib.suppress(Exception):
+            last_error.nova_signature = signature
+        _note_sni_verdict(last_error, domain, signature)
+        if phase.is_not_our_fault(signature):
+            # Nothing here is evidence about this egress, and the next one in
+            # the list will fail identically, so there is also nothing to learn
+            # from marking it and moving on.
+            continue
+        if phase.reached_from_exception(last_error, phase.Reached.RESOLVED) >= phase.Reached.HANDSHAKE_DONE:
+            # TLS completed end to end through this egress and only then did
+            # the far side go quiet. The egress carried a whole handshake; it
+            # is the last thing that deserves the blame.
+            _mark_wss_egress_good(label)
+            continue
         _mark_wss_egress_bad(label, domain)
     raise last_error if last_error is not None else WsHandshakeError(0, "no upstream attempts available")
 
 
 async def _connect_websocket_once(host: str, domain: str, timeout: float, attempts, attempt=None):
-    reader, writer, upstream_label = await open_tls_stream(
-        host,
-        443,
-        server_hostname=domain,
-        timeout=timeout,
-        attempts=attempts,
-    )
-    set_sock_opts(writer.transport, proxy_config.buffer_size)
-    ws_key = struct.pack("!QQ", int(time.time() * 1000), int(time.perf_counter_ns() & 0xFFFFFFFFFFFFFFFF))
-    import base64
-    req = (
-        "GET /apiws HTTP/1.1\r\n"
-        f"Host: {domain}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {base64.b64encode(ws_key).decode()}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        f"Sec-WebSocket-Protocol: {cf_ws_subprotocol_header(domain)}\r\n"
-        "Origin: https://web.telegram.org\r\n"
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
-        "\r\n"
-    ).encode("ascii", "ignore")
-    writer.write(req)
-    await writer.drain()
-
-    response_lines = []
-    while True:
-        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-        if line in (b"\r\n", b"\n", b""):
-            break
-        response_lines.append(line.decode("utf-8", errors="replace").strip())
-    if not response_lines:
-        writer.close()
-        await writer.wait_closed()
-        raise WsHandshakeError(0, "empty response")
-    first_line = response_lines[0]
-    parts = first_line.split(" ", 2)
-    status_code = 0
+    # Timed from here so the reset-timing rule compares against a round trip
+    # rather than against DNS plus TCP setup, which would swamp it.
+    started = time.monotonic()
+    # The route keeps travelling in the Host header below; only the name
+    # offered in the clear changes.
+    sni = _cf_neutral_sni(domain)
     try:
-        if len(parts) >= 2:
-            status_code = int(parts[1])
-    except Exception:
-        status_code = 0
-    if status_code != 101:
-        headers = {}
-        for item in response_lines[1:]:
-            if ":" in item:
-                k, v = item.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-        writer.close()
-        await writer.wait_closed()
-        raise WsHandshakeError(status_code, first_line, headers, location=headers.get("location"))
+        reader, writer, upstream_label = await open_tls_stream(
+            host,
+            443,
+            server_hostname=sni,
+            timeout=timeout,
+            attempts=attempts,
+        )
+    except BaseException as exc:
+        # open_tls_stream already recorded which gate it died at; all that is
+        # missing is how long it took to get there, and which name was on the
+        # wire when it happened.
+        if not hasattr(exc, "nova_since_hello_ms"):
+            exc.nova_since_hello_ms = int((time.monotonic() - started) * 1000)
+        if not hasattr(exc, "nova_sni"):
+            exc.nova_sni = sni
+        raise
+    set_sock_opts(writer.transport, proxy_config.buffer_size)
+    # RFC 6455 wants sixteen random bytes here, and browsers send exactly that.
+    # This used to pack a millisecond clock and a performance counter, which is
+    # both guessable and a pattern that repeats across every connection Nova
+    # opens — the opposite of what the field is for.
+    ws_key = base64.b64encode(os.urandom(16)).decode()
+    req = persona.upgrade_request(
+        "/apiws",
+        domain,
+        ws_key,
+        cf_ws_subprotocol_header(domain),
+        offer_deflate=offers_deflate(domain),
+    )
+    # TLS is up. Everything from here on is past the point where the shape of
+    # our ClientHello could still be the suspect — the far side read it and
+    # agreed to speak.
+    try:
+        writer.write(req)
+        await writer.drain()
+
+        response_lines = []
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            response_lines.append(line.decode("utf-8", errors="replace").strip())
+        if not response_lines:
+            writer.close()
+            await writer.wait_closed()
+            raise WsHandshakeError(0, "empty response")
+        status_code, first_line = persona.status_of(response_lines)
+        headers = persona.parse_headers(response_lines[1:])
+        if status_code != 101:
+            writer.close()
+            await writer.wait_closed()
+            raise WsHandshakeError(status_code, first_line, headers, location=headers.get("location"))
+        # A 101 is not enough on its own: an endpoint that accepted the
+        # compression offer sends deflated frames from here on, and nothing
+        # downstream can inflate them. Withdraw the offer so the retry goes out
+        # without it, and fail this attempt rather than carry bytes we cannot
+        # read into the MTProto path.
+        refusal = persona.rejects_us(headers)
+        if refusal:
+            note_deflate_unusable(domain)
+            writer.close()
+            await writer.wait_closed()
+            raise WsHandshakeError(0, refusal, headers)
+    except BaseException as exc:
+        if not hasattr(exc, "nova_reached"):
+            exc.nova_reached = int(phase.Reached.HANDSHAKE_DONE)
+        if not hasattr(exc, "nova_since_hello_ms"):
+            exc.nova_since_hello_ms = int((time.monotonic() - started) * 1000)
+        if not hasattr(exc, "nova_sni"):
+            exc.nova_sni = sni
+        raise
     return RawWebSocket(reader, writer), upstream_label
 
 
@@ -1117,6 +1423,9 @@ class TelegramTransparentRelayServer:
         self._cf_started = False
         self._no_probe_until: Dict[Tuple[str, int], float] = {}
         self._http_transport_until: Dict[Tuple[str, int], float] = {}
+        # DCs this client actually talks to; the native prober only asks about
+        # these instead of sweeping every data centre Telegram has.
+        self._seen_dcs: set = set()
         self._prefer_direct_until: Dict[Tuple[int, str], float] = {}
         self._route_preference_until: Dict[Tuple[str, int], Tuple[str, float]] = {}
         self._last_fallback_log: Dict[Tuple[str, str, int, str], float] = {}
@@ -1547,6 +1856,10 @@ class TelegramTransparentRelayServer:
                 asyncio.create_task(self._schedule_cf_bootstrap_prewarm_wave(1.5))
         except Exception:
             pass
+        try:
+            asyncio.create_task(self._native_probe_loop())
+        except Exception:
+            pass
 
         self.server = await asyncio.start_server(
             self._handle_client,
@@ -1776,8 +2089,16 @@ class TelegramTransparentRelayServer:
 
             dc_hint = init_info.dc or _target_dc_hint(target_ip)
             is_media = bool(init_info.is_media or _likely_media_target(target_ip, target_port, dc_hint))
+            if int(dc_hint or 0) > 0:
+                self._seen_dcs.add(int(dc_hint))
             if not is_media:
                 if self._wss_first_byte_disabled(dc_hint, False):
+                    await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
+                    return
+                # Native MTProto beats the Worker whenever it gets through: same
+                # data, two fewer network legs, no WebSocket framing. Take it as
+                # soon as it is proven for this DC and leave WSS as the reserve.
+                if _native_preferred(dc_hint):
                     await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
                     return
                 if await self._try_cf_bootstrap_non_media(
@@ -1803,7 +2124,12 @@ class TelegramTransparentRelayServer:
                     len(init_packet or b""),
                     dc_hint,
                 )
-                if _has_custom_cfproxy_domain():
+                # WSS just failed. Dropping the socket used to be the only
+                # option because the native path was assumed dead everywhere;
+                # try it instead unless the last attempts proved it silent for
+                # this DC. Either way the outcome is recorded, so the next
+                # connection decides on evidence rather than on the assumption.
+                if _has_custom_cfproxy_domain() and not _native_worth_trying(dc_hint):
                     self._log_skipping_fallback(
                         "parsed-non-media-cf-failed",
                         target_ip,
@@ -1813,6 +2139,16 @@ class TelegramTransparentRelayServer:
                     )
                     return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=False)
+                return
+            # Media is the bulk of the traffic, so it gets the same rule as the
+            # control sessions: once an egress is proven to carry Telegram's own
+            # protocol to this DC, use it and leave the Worker as the reserve.
+            if is_media and NATIVE_MEDIA_ENABLED and _native_preferred(dc_hint):
+                if prefetched_ws_task is not None:
+                    prefetched_ws_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await prefetched_ws_task
+                await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=True)
                 return
             ws_capable = int(dc_hint or 0) in _TG_WS_REDIRECT_IPS
             if not is_media and not ws_capable:
@@ -2246,6 +2582,84 @@ class TelegramTransparentRelayServer:
             data.extend(chunk)
         return bytes(data)
 
+    async def _probe_native_path(self, dc: int, attempt) -> bool:
+        """Returns True when a verdict was recorded, False when unanswerable."""
+        label = _wss_egress_label(attempt)
+        host = _TG_TCP_FALLBACK_IPS.get(int(dc or 0))
+        if not host:
+            return False
+        try:
+            reader, writer, _used = await open_stream(host, 443, timeout=4.0, attempts=[attempt])
+        except Exception:
+            # The egress itself is not up — right after a restart Opera is still
+            # registering with its API. That says nothing about whether Telegram
+            # answers through it, so record nothing and ask again next sweep.
+            return False
+        ok = False
+        try:
+            writer.write(_build_native_probe(int(dc)))
+            await writer.drain()
+            ok = bool(await asyncio.wait_for(reader.read(64), timeout=4.0))
+        except Exception:
+            ok = False
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
+        _native_record(int(dc), label, ok)
+        return True
+
+    async def _native_probe_loop(self):
+        """Ask, rather than wait for a failure, whether native MTProto works.
+
+        Learning only from broken WSS connections meant the better path stayed
+        invisible while the worse one kept succeeding. A probe costs one short
+        connection per (DC, egress) and only runs while the answer is unknown
+        or has expired, so a settled setup makes no traffic at all.
+        """
+        if not NATIVE_FIRST_ENABLED:
+            return
+        # Start from the DCs the previous session used. Without this the first
+        # sweep has nothing to ask about, live connections reach the decision
+        # first, and each one pays the full first-byte timeout on a dead egress
+        # before anything is learned — which is exactly the stall this loop
+        # exists to prevent.
+        with contextlib.suppress(Exception):
+            self._seed_seen_dcs_from_cache()
+        while not self.stop_event.is_set():
+            delay = NATIVE_PROBE_INTERVAL
+            with contextlib.suppress(Exception):
+                pending = [
+                    (dc, attempt)
+                    for dc in sorted(self._seen_dcs)
+                    for attempt in (_telegram_upstream_attempts() or [])
+                    if _native_state(dc, _wss_egress_label(attempt)) is None
+                ]
+                if pending:
+                    # Concurrently: a sequential sweep over several silent
+                    # egresses would itself take longer than the interval.
+                    results = await asyncio.gather(
+                        *(self._probe_native_path(dc, attempt) for dc, attempt in pending),
+                        return_exceptions=True,
+                    )
+                    # Nothing answerable means the egresses are still coming up
+                    # after a restart; come back quickly instead of leaving the
+                    # relay on WSS for a full interval.
+                    delay = NATIVE_PROBE_INTERVAL if any(r is True for r in results) else NATIVE_PROBE_RETRY
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+
+    def _seed_seen_dcs_from_cache(self) -> None:
+        path = self._cf_health_cache_path()
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        for key in (payload.get("last_good") or {}):
+            dc_text = str(key).split(":", 1)[0].strip()
+            if dc_text.isdigit() and int(dc_text) > 0:
+                self._seen_dcs.add(int(dc_text))
+
     async def _maybe_wait_for_warp_bootstrap(self, target_host: str, target_port: int, media_hint=None, dc_hint: int = 0):
         waiter = getattr(self, "warp_bootstrap_waiter", None)
         if not callable(waiter):
@@ -2328,6 +2742,13 @@ class TelegramTransparentRelayServer:
         connect_timeout = 2.5 if int(dc_hint or 0) in (1, 3, 5) else 6.0
         if bootstrap_canonical:
             connect_timeout = min(connect_timeout, 1.35)
+
+        if not bootstrap_canonical and not _looks_like_http_request(initial):
+            ordered_native = _order_native_attempts(attempts or _telegram_upstream_attempts(), dc_hint)
+            # Never hand open_stream an empty list: that raises instead of
+            # falling back to the provider's own defaults, as attempts=None does.
+            if ordered_native:
+                attempts = ordered_native
 
         upstream_reader, upstream_writer, route_label = await open_stream(
             effective_host,
@@ -2413,12 +2834,25 @@ class TelegramTransparentRelayServer:
             upstream_writer,
             stats_label=stats_label,
             log_func=self.log_func,
-            first_down_timeout=(1.15 if bootstrap_canonical else 0.0),
+            first_down_timeout=(
+                1.15 if bootstrap_canonical
+                # An egress not yet proven for this DC gets a short leash. WARP
+                # answers TCP and then never delivers a byte, and waiting out
+                # the default window on it is what makes a cold start feel dead.
+                else 1.5 if (int(dc_hint or 0) > 0 and _native_state(dc_hint, route_label) is not True)
+                else 0.0
+            ),
         )
+        total_down = down + len(prefetched_reply or b"")
         self.log_func(
             f"[TgRelay] TCP fallback closed route={route_label} target={effective_host}:{effective_port}"
-            f"{route_suffix} duration_ms={duration_ms} up={up + len(initial or b'')} down={down + len(prefetched_reply or b'')}"
+            f"{route_suffix} duration_ms={duration_ms} up={up + len(initial or b'')} down={total_down}"
         )
+        # Only a tunnel that actually carried MTProto tells us anything: the
+        # HTTP transport and the canonical-443 bootstrap are rewritten paths and
+        # their silence says nothing about the native route.
+        if not bootstrap_canonical and not _looks_like_http_request(initial) and int(dc_hint or 0) > 0:
+            _native_record(dc_hint, route_label, total_down > 0)
 
     def _log_fallback(self, route_label: str, effective_host: str, effective_port: int, route_suffix: str) -> None:
         try:

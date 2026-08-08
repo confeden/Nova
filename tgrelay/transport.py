@@ -4,10 +4,31 @@ import socket
 import ssl
 from typing import Callable, Dict, List, Optional, Tuple
 
+from . import terminator
+from .phase import Reached
+
 
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = ssl.CERT_NONE
+
+
+def _tag(exc: BaseException, reached: int) -> BaseException:
+    """Record how far an attempt got, on the exception that ended it.
+
+    Annotating rather than wrapping is deliberate: every caller in the relay
+    catches `OSError` and `asyncio.TimeoutError` by type, and a wrapper would
+    make all of them stop matching. A caller that does not know about the
+    annotation is unaffected; one that does can tell a route that never opened
+    from a ClientHello that nobody answered — which are the same `OSError`
+    today, and want opposite responses.
+    """
+    if not hasattr(exc, "nova_reached"):
+        try:
+            exc.nova_reached = int(reached)
+        except Exception:
+            pass
+    return exc
 
 _upstream_provider = None
 
@@ -175,7 +196,11 @@ def _open_tunnel_socket_sync(
             continue
     if last_error is None:
         last_error = OSError("no upstream attempts available")
-    raise last_error
+    # A name that never became an address and a route that never opened are
+    # both an `OSError` here, and they want different answers: one is the
+    # resolver's problem and must not be charged to a domain or an egress, the
+    # other is exactly what picking another egress is for.
+    raise _tag(last_error, Reached.NOTHING if isinstance(last_error, socket.gaierror) else Reached.RESOLVED)
 
 
 async def open_stream(
@@ -204,6 +229,21 @@ async def open_tls_stream(
     attempts: Optional[List[Dict[str, object]]] = None,
 ):
     chosen_attempts = get_upstream_attempts() if attempts is None else attempts
+
+    # When the shaping helper is running, the handshake happens there instead —
+    # CPython's ClientHello is `t13d181100`, which identifies Nova and nothing
+    # else. The contract is unchanged: same arguments, same three return values,
+    # and failures still arrive as an annotated OSError. Off unless configured,
+    # so this stays a lever rather than a migration.
+    if terminator.is_enabled():
+        return await terminator.open_shaped_stream(
+            target_host,
+            int(target_port),
+            server_hostname=server_hostname,
+            timeout=float(timeout),
+            attempts=chosen_attempts,
+        )
+
     sock, label = await asyncio.to_thread(
         _open_tunnel_socket_sync,
         target_host,
@@ -211,10 +251,20 @@ async def open_tls_stream(
         float(timeout),
         chosen_attempts,
     )
-    reader, writer = await asyncio.open_connection(
-        sock=sock,
-        ssl=_ssl_ctx,
-        server_hostname=(server_hostname or target_host),
-        ssl_handshake_timeout=float(timeout),
-    )
+    try:
+        reader, writer = await asyncio.open_connection(
+            sock=sock,
+            ssl=_ssl_ctx,
+            server_hostname=(server_hostname or target_host),
+            ssl_handshake_timeout=float(timeout),
+        )
+    except BaseException as exc:
+        # TCP is already up at this point, so whatever went wrong went wrong
+        # after our ClientHello was on the wire. This is the only window in the
+        # whole connection where the shape of that hello is a live suspect.
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise _tag(exc, Reached.HELLO_SENT)
     return reader, writer, label

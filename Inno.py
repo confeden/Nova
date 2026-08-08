@@ -86,6 +86,14 @@ REPO_SOURCE_FILES = (
     Path("NovaDivert") / "windivert_observer.py",
     Path("NovaDivert") / "windivert_redirect.py",
     Path("tgrelay") / "__init__.py",
+    # Все четыре несущие для helper-процесса: transport импортирует terminator,
+    # transparent_relay импортирует persona и phase. Отсутствие любого ломает
+    # NovaWFP\proxy у пользователя, а не при сборке.
+    Path("tgrelay") / "config.py",
+    Path("tgrelay") / "persona.py",
+    Path("tgrelay") / "phase.py",
+    Path("tgrelay") / "raw_websocket.py",
+    Path("tgrelay") / "terminator.py",
     Path("tgrelay") / "transport.py",
     Path("tgrelay") / "udp_transport.py",
     Path("tgrelay") / "transparent_relay.py",
@@ -524,6 +532,46 @@ def require_paths(base_dir: Path) -> None:
     if empty:
         raise RuntimeError("Required project directories are empty:\n - "
                            + "\n - ".join(str(base_dir / name) for name in empty))
+
+    ensure_tls_terminator(base_dir)
+
+
+def ensure_tls_terminator(base_dir: Path) -> None:
+    """Привести bin/nova-tls-terminator.exe в соответствие с опубликованной сборкой.
+
+    Терминатор собирается не здесь: он единственная часть Nova, которой нужен
+    C-тулчейн (BoringSSL, а к нему cmake, MSVC, NASM, LLVM), поэтому его печёт
+    GitHub. Сюда он попадает загрузкой, и делается это на месте, а не отдельной
+    командой, которую надо помнить: ручной шаг перед сборкой — это шаг, который
+    однажды забудут, и релиз молча уедет с прежней формой ClientHello.
+    Единственное «тихо», которое здесь допустимо, — когда всё уже актуально.
+
+    Приложение без терминатора работает: релей остаётся на прежнем TLS-пути.
+    Поэтому отсутствие сети при уже скачанном файле — не ошибка, а отсутствие
+    и файла, и сети — ошибка, потому что иначе установщик соберётся не тем,
+    чем его считают.
+    """
+    if os.environ.get("NOVA_SKIP_TLS_TERMINATOR", "") == "1":
+        print("[TLS] NOVA_SKIP_TLS_TERMINATOR=1 — терминатор в сборку не попадёт.")
+        return
+
+    sys.path.insert(0, str(base_dir))
+    try:
+        import fetch_tls_terminator
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось загрузить fetch_tls_terminator.py: {exc}") from exc
+
+    try:
+        path = fetch_tls_terminator.ensure()
+    except fetch_tls_terminator.FetchError as exc:
+        raise RuntimeError(
+            f"Терминатор TLS недоступен: {exc}\n"
+            "  Опубликовать сборку: Actions -> Build TLS terminator, галочка publish\n"
+            "  Собрать без него:    NOVA_SKIP_TLS_TERMINATOR=1"
+        ) from exc
+
+    if not Path(path).exists():
+        raise RuntimeError(f"Терминатор TLS не появился по пути {path}.")
 
 
 def build_embedded_assets_module(base_dir: Path) -> Path:

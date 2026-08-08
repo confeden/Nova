@@ -5,8 +5,24 @@ import struct
 import asyncio
 import socket as _socket
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+from . import persona
 from .config import cf_ws_subprotocol_header, proxy_config
+
+# Endpoints that took us up on the compression offer. Nothing here can decode a
+# deflated frame, so the offer is withdrawn for that endpoint and the next
+# attempt goes out without it, rather than the connection failing forever.
+_no_deflate: Set[str] = set()
+
+
+def offers_deflate(domain: str) -> bool:
+    return str(domain or "").strip().lower() not in _no_deflate
+
+
+def note_deflate_unusable(domain: str) -> None:
+    domain = str(domain or "").strip().lower()
+    if domain:
+        _no_deflate.add(domain)
 
 
 _st_BB = struct.Struct('>BB')
@@ -88,20 +104,13 @@ class RawWebSocket:
 
         ws_key = base64.b64encode(os.urandom(16)).decode()
 
-        req = (
-            f'GET /apiws HTTP/1.1\r\n'
-            f'Host: {domain}\r\n'
-            f'Upgrade: websocket\r\n'
-            f'Connection: Upgrade\r\n'
-            f'Sec-WebSocket-Key: {ws_key}\r\n'
-            f'Sec-WebSocket-Version: 13\r\n'
-            f'Sec-WebSocket-Protocol: {cf_ws_subprotocol_header(domain)}\r\n'
-            f'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            f'AppleWebKit/537.36 (KHTML, like Gecko) '
-            f'Chrome/131.0.0.0 Safari/537.36\r\n'
-            f'\r\n'
-        )
-        writer.write(req.encode())
+        writer.write(persona.upgrade_request(
+            "/apiws",
+            domain,
+            ws_key,
+            cf_ws_subprotocol_header(domain),
+            offer_deflate=offers_deflate(domain),
+        ))
         await writer.drain()
 
         response_lines: list[str] = []
@@ -121,21 +130,20 @@ class RawWebSocket:
             writer.close()
             raise WsHandshakeError(0, 'empty response')
 
-        first_line = response_lines[0]
-        parts = first_line.split(' ', 2)
-        try:
-            status_code = int(parts[1]) if len(parts) >= 2 else 0
-        except ValueError:
-            status_code = 0
+        status_code, first_line = persona.status_of(response_lines)
+        headers = persona.parse_headers(response_lines[1:])
 
         if status_code == 101:
+            # A 101 is not enough on its own: a server that accepted the
+            # compression offer would send deflated frames from here on, and
+            # nothing downstream can inflate them. Withdraw the offer and let
+            # the caller retry rather than hand on bytes we cannot read.
+            refusal = persona.rejects_us(headers)
+            if refusal:
+                note_deflate_unusable(domain)
+                writer.close()
+                raise WsHandshakeError(0, refusal, headers)
             return RawWebSocket(reader, writer)
-
-        headers: dict[str, str] = {}
-        for hl in response_lines[1:]:
-            if ':' in hl:
-                k, v = hl.split(':', 1)
-                headers[k.strip().lower()] = v.strip()
 
         writer.close()
         raise WsHandshakeError(status_code, first_line, headers,
@@ -225,6 +233,15 @@ class RawWebSocket:
 
     async def _read_frame(self) -> Tuple[int, bytes]:
         hdr = await self.reader.readexactly(2)
+        # RSV1..RSV3 are zero unless an extension was negotiated, and no
+        # extension ever is. Reading straight past them is how a deflated frame
+        # gets handed on as though it were MTProto: no exception, no log line,
+        # just a stream of bytes the client cannot parse and cannot explain.
+        if hdr[0] & 0x70:
+            raise ConnectionError(
+                f"WebSocket frame reserved bits set ({hdr[0] & 0x70:#04x}); "
+                "an unnegotiated extension is in use and its payload cannot be decoded"
+            )
         opcode = hdr[0] & 0x0F
         length = hdr[1] & 0x7F
         if length == 126:

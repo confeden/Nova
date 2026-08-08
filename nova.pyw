@@ -1789,6 +1789,7 @@ try:
     
     # === APP RELAY MANAGERS ===
     telegram_relay_manager = None
+    tls_terminator_manager = None
     public_relay_managers = {}
     novawfp_observer_manager = None
     novadivert_observer_manager = None
@@ -5585,10 +5586,52 @@ try:
         # the discover request comes from, and the set handed to Russian clients
         # is unreachable from Russia. These relays move only the API calls to
         # Sweden; the tunnel itself still dials out directly from the user's IP.
-        API_RELAYS = (
-            "https://nova:tsp-DNCCowezyUQMgYqS8q-tPYfCI8vV@relay.nova-app.eu:8443",
-            "https://nova:tsp-DNCCowezyUQMgYqS8q-tPYfCI8vV@relay.nova-app.eu:2053",
+        # The relays are the owner's private infrastructure and are password
+        # protected. The password is read from NOVA_OPERA_RELAY_PASSWORD, then
+        # from awg/opera_relay.key — the same arrangement as the Worker secret
+        # in tgrelay/config.py, and for the same reason: awg/ is shipped by the
+        # installer and hidden by the publication rules, so the file reaches
+        # users without reaching the repository.
+        #
+        # There is deliberately no built-in fallback. A clone without the key
+        # simply does not use these relays and falls through to the other
+        # bootstrap candidates; shipping a placeholder password instead would
+        # spend a round trip and a 401 to learn the same thing.
+        API_RELAY_ENDPOINTS = (
+            ("relay.nova-app.eu", 8443),
+            ("relay.nova-app.eu", 2053),
         )
+        API_RELAY_USER = "nova"
+        _api_relay_password_cache = []
+
+        @classmethod
+        def _api_relay_password(cls):
+            if cls._api_relay_password_cache:
+                return cls._api_relay_password_cache[0]
+            secret = str(os.environ.get("NOVA_OPERA_RELAY_PASSWORD", "") or "").strip()
+            if not secret:
+                try:
+                    with open(os.path.join(get_base_dir(), "awg", "opera_relay.key"),
+                              "r", encoding="utf-8") as handle:
+                        secret = handle.read().strip()
+                except Exception:
+                    secret = ""
+            cls._api_relay_password_cache.append(secret)
+            return secret
+
+        @classmethod
+        def api_relays(cls):
+            """Bootstrap relay URLs, or an empty tuple when no key is present."""
+            password = cls._api_relay_password()
+            if not password:
+                return ()
+            from urllib.parse import quote
+            user = quote(cls.API_RELAY_USER, safe="")
+            secret = quote(password, safe="")
+            return tuple(
+                "https://{}:{}@{}:{}".format(user, secret, host, port)
+                for host, port in cls.API_RELAY_ENDPOINTS
+            )
 
         def __init__(self, log_func=None, port=1371, country="EU"):
             self.log_func = log_func or print
@@ -5824,7 +5867,7 @@ try:
             add(self._get_configured_api_bootstrap_proxy())
             add(getattr(self, "_forced_warp_proxy", "") or "")
             if not self._api_relays_disabled():
-                for relay in self.API_RELAYS:
+                for relay in self.api_relays():
                     add(relay)
             add(self._get_warp_bootstrap_proxy() or "")
             return candidates
@@ -6296,6 +6339,196 @@ try:
                 pass
             self._sync_pac_state(force=True)
 
+
+    TLS_TERMINATOR_FILENAME = "nova-tls-terminator.exe"
+
+    class TlsTerminatorManager:
+        """Supervises the process that performs the relay's TLS handshakes.
+
+        Nova's own ClientHello, measured, is `t13d181100` — eighteen ciphers,
+        eleven extensions, no ALPN at all. It matches no browser on any desktop
+        and so identifies Nova and nothing else. This helper, built from
+        `nova-rs/crates/nova-tls`, performs the handshake in the shape of a
+        captured browser instead and hands back a plaintext stream on loopback.
+
+        Optional by construction. If the binary is absent — which is the case
+        for anyone who has not built the Rust workspace — nothing starts and the
+        relay keeps its previous TLS path. A bypass tool that refuses to run
+        because an optimisation is missing is worse than one that is merely
+        legible.
+        """
+
+        def __init__(self, log_func=None, port=1374, profile="yandex-windows"):
+            self.log_func = log_func or print
+            self.port = int(port)
+            self.profile = str(profile or "yandex-windows")
+            self.process = None
+            self.token = ""
+            self.f_log = None
+            self.pid_path = os.path.join(get_base_dir(), "temp", "NovaTlsTerminator.pid")
+            self.log_path = os.path.join(get_base_dir(), "temp", "tls_terminator.log")
+            self._probe_ts = 0.0
+            self._probe_ok = False
+
+        def exe_path(self):
+            return os.path.join(get_bin_dir(), TLS_TERMINATOR_FILENAME)
+
+        def is_available(self):
+            try:
+                return os.path.exists(self.exe_path())
+            except Exception:
+                return False
+
+        def _runtime_path(self):
+            return os.path.join(get_base_dir(), "temp", "tls_terminator.json")
+
+        def _publish_runtime(self):
+            """Tell the clients where to find us.
+
+            Two processes read this: the relay thread inside Nova, and the
+            separate interpreter running NovaWFP's TCP proxy. An environment
+            variable set here would never reach the second one.
+            """
+            try:
+                os.makedirs(os.path.dirname(self._runtime_path()), exist_ok=True)
+                with open(self._runtime_path(), "w", encoding="utf-8") as handle:
+                    json.dump({"port": int(self.port), "token": self.token,
+                               "profile": self.profile}, handle)
+            except Exception as e:
+                self.log_func(f"[TLS] Не удалось опубликовать параметры терминатора: {e}")
+
+        def _withdraw_runtime(self):
+            # Removed on stop so a client started later cannot dial a port that
+            # now belongs to somebody else.
+            with contextlib.suppress(Exception):
+                os.remove(self._runtime_path())
+
+        def _kill_stale(self):
+            # The default allowlist in these helpers is python.exe and friends,
+            # because every previous helper was a script. Ours is a native
+            # binary, so without naming it here a wedged terminator survives
+            # both the pid-file sweep and the port reclaim, and the next start
+            # fails to bind against our own orphan.
+            with contextlib.suppress(Exception):
+                _terminate_helper_pid(self.pid_path, allowed_image_names=(TLS_TERMINATOR_FILENAME,))
+            with contextlib.suppress(Exception):
+                _terminate_tcp_listeners_on_port(
+                    self.port, log_func=None, allowed_image_names=(TLS_TERMINATOR_FILENAME,)
+                )
+
+        def start(self):
+            if not self.is_available():
+                # Not an error. The Rust workspace is not built in every tree.
+                return False
+            try:
+                if self.process is not None and self.process.poll() is None:
+                    return True
+            except Exception:
+                pass
+
+            self._kill_stale()
+            try:
+                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            except Exception:
+                pass
+
+            # A fresh token per run. It guards a helper that will make TLS
+            # connections wearing a browser's fingerprint on request, which is
+            # a more useful thing for a local process to borrow than an
+            # ordinary open proxy.
+            self.token = os.urandom(24).hex()
+
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            try:
+                self._close_log()
+                self.f_log = open(self.log_path, "w", encoding="utf-8", errors="replace")
+                self.process = subprocess.Popen(
+                    [self.exe_path(), "--port", str(self.port),
+                     "--token", self.token, "--profile", self.profile],
+                    cwd=os.path.dirname(self.exe_path()),
+                    stdout=self.f_log,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                _write_helper_pid(self.pid_path, self.process.pid, self.exe_path())
+            except Exception as e:
+                self.process = None
+                self._close_log()
+                self.log_func(f"[TLS] Не удалось запустить терминатор: {e}")
+                return False
+
+            # Publish only once it answers. A client that reads the file and
+            # finds nobody listening would charge the failure to the network.
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if self.process.poll() is not None:
+                    break
+                if self._probe_once(timeout=0.4):
+                    self._publish_runtime()
+                    self.log_func(
+                        f"[TLS] Терминатор TLS готов на 127.0.0.1:{self.port}, профиль {self.profile}."
+                    )
+                    return True
+                time.sleep(0.15)
+
+            self.log_func(f"[TLS] Терминатор не ответил; TLS остаётся на прежнем пути. Лог: {self.log_path}")
+            self.stop()
+            return False
+
+        def _close_log(self):
+            with contextlib.suppress(Exception):
+                if self.f_log is not None:
+                    self.f_log.close()
+            self.f_log = None
+
+        def _probe_once(self, timeout=1.0):
+            """Ask the helper to identify itself.
+
+            Deliberately more than a TCP connect. A wedged process still has a
+            listening socket, and the relay's health is read off this: a bare
+            connect would keep advertising a route through a helper that has
+            stopped accepting work. Reading the greeting proves the accept loop
+            runs and a worker was spawned.
+            """
+            try:
+                with socket.create_connection(("127.0.0.1", int(self.port)), timeout=float(timeout)) as s:
+                    s.settimeout(float(timeout))
+                    greeting = s.recv(128)
+                return b"tls-terminator" in greeting
+            except Exception:
+                return False
+
+        def is_ready(self):
+            if self.process is None:
+                return False
+            try:
+                if self.process.poll() is not None:
+                    return False
+            except Exception:
+                return False
+            now = time.monotonic()
+            if (now - float(self._probe_ts or 0.0)) < 8.0:
+                return bool(self._probe_ok)
+            self._probe_ts = now
+            self._probe_ok = self._probe_once()
+            return self._probe_ok
+
+        def stop(self):
+            self._withdraw_runtime()
+            try:
+                if self.process is not None:
+                    with contextlib.suppress(Exception):
+                        self.process.terminate()
+                    with contextlib.suppress(Exception):
+                        self.process.wait(timeout=2.0)
+            finally:
+                self.process = None
+                self._close_log()
+                self._kill_stale()
+                self.token = ""
 
     class LocalTransparentRelayManager:
         """Shared lifecycle for local public TCP relay services."""
@@ -23374,9 +23607,19 @@ try:
                         safe_log(f"[Init] Не удалось запустить {label}: {e}")
                 
                 # Initialize managers
-                global warp_manager, pac_manager, opera_proxy_manager, telegram_relay_manager, public_relay_managers, novawfp_observer_manager, novadivert_observer_manager, novadivert_tcp_proxy_manager, novadivert_udp_proxy_manager, novadivert_redirect_manager, novawfp_tcp_proxy_manager, novawfp_udp_proxy_manager, routing_backend_manager
+                global warp_manager, pac_manager, opera_proxy_manager, telegram_relay_manager, public_relay_managers, novawfp_observer_manager, novadivert_observer_manager, novadivert_tcp_proxy_manager, novadivert_udp_proxy_manager, novadivert_redirect_manager, novawfp_tcp_proxy_manager, novawfp_udp_proxy_manager, routing_backend_manager, tls_terminator_manager
                 if not warp_manager: warp_manager = WarpManager(log_func=safe_log)
                 if not pac_manager: pac_manager = PacManager(log_func=safe_log)
+
+                # Before the relays, and not in a thread: the relay decides per
+                # connection whether the helper is available, so a start that
+                # lands late costs exactly the cold-start tunnels that matter
+                # most. Absent binary means it stays on the old TLS path.
+                if not tls_terminator_manager:
+                    tls_terminator_manager = TlsTerminatorManager(log_func=safe_log)
+                if tls_terminator_manager.is_available():
+                    with contextlib.suppress(Exception):
+                        tls_terminator_manager.start()
                 current_routing_settings = load_routing_settings()
                 desired_opera_country = get_routing_opera_country(current_routing_settings)
                 if not opera_proxy_manager:
@@ -24904,6 +25147,10 @@ try:
                 for _, relay_manager in _iter_public_relay_managers():
                     if relay_manager:
                         relay_manager.stop()
+                # After the relays, not before: a relay still draining a tunnel
+                # through the helper should find it there until it is done.
+                if 'tls_terminator_manager' in globals() and tls_terminator_manager:
+                    tls_terminator_manager.stop()
                 if 'novawfp_tcp_proxy_manager' in globals() and novawfp_tcp_proxy_manager:
                     novawfp_tcp_proxy_manager.stop()
                 if 'novawfp_udp_proxy_manager' in globals() and novawfp_udp_proxy_manager:
@@ -25221,6 +25468,16 @@ try:
                     temp_dir = os.path.join(get_base_dir(), "temp")
                     for pid_name in ["NovaWfpTcpProxy.pid", "NovaWfpUdpProxy.pid", "NovaDivertObserver.pid", "NovaDivertTcpProxy.pid", "NovaDivertUdpProxy.pid", "NovaDivertRedirect.pid"]:
                         _terminate_helper_pid(os.path.join(temp_dir, pid_name))
+                    # The loop above leaves the default allowlist in place, and
+                    # that allowlist is python.exe and friends because every
+                    # helper used to be a script. The TLS terminator is a native
+                    # binary, so it has to name itself or it survives cleanup.
+                    _terminate_helper_pid(
+                        os.path.join(temp_dir, "NovaTlsTerminator.pid"),
+                        allowed_image_names=(TLS_TERMINATOR_FILENAME,),
+                    )
+                    with contextlib.suppress(Exception):
+                        os.remove(os.path.join(temp_dir, "tls_terminator.json"))
                 except:
                     pass
 
@@ -25259,7 +25516,8 @@ try:
             _kill_singbox_processes_best_effort()
 
             for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "wireproxy-awg.exe", "warp-svc.exe", "warp-cli.exe",
-                              "opera-proxy.windows-amd64.exe", "opera-proxy.exe", "opera-proxy*", *_novawfp_service_image_names()]:
+                              "opera-proxy.windows-amd64.exe", "opera-proxy.exe", "opera-proxy*",
+                              TLS_TERMINATOR_FILENAME, *_novawfp_service_image_names()]:
                 try:
                     subprocess.run(["taskkill", "/F", "/IM", proc_name],
                                    creationflags=subprocess.CREATE_NO_WINDOW,
