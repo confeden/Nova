@@ -19,11 +19,22 @@
 """
 
 import argparse
+import contextlib
 import hashlib
 import os
 import sys
 import urllib.error
 import urllib.request
+
+# Сообщения здесь русские, а консоль Windows по умолчанию cp1252 — печать
+# упала бы с UnicodeEncodeError вместо того, чтобы сказать, что происходит.
+# Тот же приём, что в deploy_opera_relay.py, и по той же причине: диагностика,
+# которая ломается при попытке напечататься, хуже отсутствующей.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 REPO = os.environ.get("NOVA_TLS_TERMINATOR_REPO", "confeden/Nova")
 TAG = os.environ.get("NOVA_TLS_TERMINATOR_TAG", "tls-terminator")
@@ -113,14 +124,44 @@ def ensure(force: bool = False, log=print, timeout: float = 180.0) -> str:
         )
 
     os.makedirs(os.path.dirname(TARGET), exist_ok=True)
+    _sweep_leftovers()
     # Через временный файл: прерванная запись не должна оставить обрезанный
     # exe, который потом молча попадёт в установщик.
     temporary = TARGET + ".part"
     with open(temporary, "wb") as handle:
         handle.write(payload)
-    os.replace(temporary, TARGET)
+
+    try:
+        os.replace(temporary, TARGET)
+    except PermissionError:
+        # Терминатор запущен — обычно потому, что запущена сама Nova. Windows
+        # не даёт перезаписать работающий exe, но переименовать его позволяет:
+        # дескриптор остаётся у процесса, а имя освобождается. Так обновление
+        # проходит, не требуя закрывать приложение, а старый файл убирается
+        # следующим запуском, когда его уже никто не держит.
+        aside = TARGET + ".old"
+        try:
+            os.replace(TARGET, aside)
+            os.replace(temporary, TARGET)
+            log("[TLS] Терминатор был запущен; заменён, прежний файл удалится позже.")
+        except OSError as err:
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
+            raise FetchError(
+                f"не удалось заменить {TARGET}: {err}. Закройте Nova и повторите."
+            ) from err
+
     log(f"[TLS] Готово: {TARGET} ({len(payload)} байт)")
     return TARGET
+
+
+def _sweep_leftovers() -> None:
+    """Убрать файлы, оставшиеся от прошлого обновления при запущенной Nova."""
+    for suffix in (".old", ".part"):
+        with contextlib.suppress(OSError):
+            path = TARGET + suffix
+            if os.path.exists(path):
+                os.remove(path)
 
 
 def main() -> int:
