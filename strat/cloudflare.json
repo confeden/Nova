@@ -1,17 +1,69 @@
 {
-    "version": "1.31.2",
+    "version": "1.32",
     "strategies": [
         {
-            "name": "cloudflare_M39A",
+            "name": "cloudflare_M0B2",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-fooling=badseq",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
+                "--dpi-desync-fake-tls-mod=padencap",
+                "--dpi-desync-fooling=badseq,ts",
+                "--dpi-desync-ttl=8",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
                 "--dpi-desync-split-seqovl=2",
-                "--dpi-desync-autottl=5"
+                "--dpi-desync-autottl=2"
+            ]
+        },
+        {
+            "name": "cloudflare_MD09",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split",
+                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fooling=md5sig,ts",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
+            ]
+        },
+        {
+            "name": "cloudflare_M8FA",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fooling=badseq,md5sig",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
+            ]
+        },
+        {
+            "name": "cloudflare_MFDD",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-ttl=5",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_gosuslugi_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
+            ]
+        },
+        {
+            "name": "cloudflare_MF44",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-fooling=ts,badseq",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
             ]
         },
         {
@@ -27,150 +79,92 @@
             ]
         },
         {
-            "name": "cloudflare_MB9C",
+            "name": "cloudflare_MBB8",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-fooling=badseq,ts",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
-                "--dpi-desync-split-seqovl=2"
-            ]
-        },
-        {
-            "name": "cloudflare_M34A",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync-fake-tls-mod=rnd",
                 "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_taximaxim_ru.bin",
-                "--dpi-desync-split-seqovl=2"
-            ]
-        },
-        {
-            "name": "cloudflare_MECD",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
-                "--dpi-desync-split-seqovl=2"
-            ]
-        },
-        {
-            "name": "cloudflare_MA63",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-fooling=badseq,ts",
-                "--dpi-desync-ttl=11",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
+                "--dpi-desync-ttl=7",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
                 "--dpi-desync-split-seqovl=2",
                 "--dpi-desync-autottl=2"
             ]
         },
         {
-            "name": "cloudflare_MFF5",
+            "name": "cloudflare_M5A6",
             "args": [
                 "--filter-tcp=80,443",
-                "--dpi-desync=split2",
+                "--dpi-desync=fakedsplit",
                 "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
-                "--dpi-desync-split-seqovl=1"
-            ]
-        },
-        {
-            "name": "cloudflare_M7A1",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-fooling=badseq,ts",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
-                "--dpi-desync-split-seqovl=2",
-                "--dpi-desync-autottl=2"
-            ]
-        },
-        {
-            "name": "cloudflare_MC9B",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
-                "--dpi-desync-split-seqovl=2"
-            ]
-        },
-        {
-            "name": "cloudflare_M5B6",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multisplit",
-                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
-                "--dpi-desync-fooling=badseq,ts",
+                "--dpi-desync-fooling=md5sig,ts",
                 "--dpi-desync-ttl=6",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_ozonusercontent_com.bin",
+                "--dpi-desync-fake-tls=fake/fake_tls_8.bin",
                 "--dpi-desync-split-seqovl=2",
                 "--dpi-desync-autottl=2"
             ]
         },
         {
-            "name": "cloudflare_M552",
+            "name": "cloudflare_M01F",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
-                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fooling=datanoack",
                 "--dpi-desync-ttl=8",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
-                "--dpi-desync-split-seqovl=2"
-            ]
-        },
-        {
-            "name": "cloudflare_M9EA",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_3.bin",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
                 "--dpi-desync-split-seqovl=2",
-                "--dpi-desync-autottl=5"
+                "--dpi-desync-autottl=2"
             ]
         },
         {
-            "name": "cloudflare_M9ED",
+            "name": "cloudflare_M61D",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-fooling=badseq,md5sig",
+                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fooling=md5sig,badseq",
                 "--dpi-desync-ttl=4",
-                "--dpi-desync-fake-tls=fake/fake_tls_7.bin",
-                "--dpi-desync-split-seqovl=2"
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
             ]
         },
         {
-            "name": "cloudflare_MAF2",
+            "name": "cloudflare_M515",
             "args": [
                 "--filter-tcp=80,443",
-                "--dpi-desync=multisplit",
-                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fooling=datanoack",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
+            ]
+        },
+        {
+            "name": "cloudflare_MA0D",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fooling=ts,badseq",
+                "--dpi-desync-ttl=4",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
+                "--dpi-desync-split-seqovl=2",
+                "--dpi-desync-autottl=2"
+            ]
+        },
+        {
+            "name": "cloudflare_M0D3",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=rndsni",
                 "--dpi-desync-fooling=badseq,ts",
-                "--dpi-desync-ttl=6",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_sberbank_ru.bin",
+                "--dpi-desync-ttl=8",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_mts_ru.bin",
                 "--dpi-desync-split-seqovl=2",
                 "--dpi-desync-autottl=2"
             ]

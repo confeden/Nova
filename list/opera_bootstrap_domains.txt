@@ -1,4 +1,4 @@
-# version: 1.31.2
+# version: 1.32
 # Domains used for Opera device registration and configuration retrieval.
 # Example: device-registration.opera.com
 # Example: config-api.opera.com
