@@ -260,6 +260,19 @@ impl Learner {
             return;
         }
 
+        // The same rule, for a failure that is emphatically ours but belongs to
+        // somebody else's lever. Tunnel phases describe the relay's own TLS
+        // connection, which winws never touches — no strategy in this pool can
+        // shape a ClientHello the relay writes itself. Charging one for an
+        // ignored handshake would let a filtered fingerprint slowly retire the
+        // best browser strategy on the machine, and the strategy would never
+        // have been able to help.
+        if let Some(sig) = outcome.signature()
+            && sig.is_tunnel_phase()
+        {
+            return;
+        }
+
         let weight = if from_probe { self.config.probe_weight } else { self.config.passive_weight };
         let success = outcome.is_success();
         let is_incumbent;
@@ -567,6 +580,58 @@ mod tests {
         }
         let after = l.state.contexts[&l.context][&group].arms[&winner].mean_at(60_000);
         assert!((before - after).abs() < 1e-6, "site-down errors were charged to the strategy");
+    }
+
+    #[test]
+    fn tunnel_phases_are_not_charged_to_a_strategy_that_cannot_reach_them() {
+        // The relay shapes its own TLS before it is ever a packet, so winws has
+        // no lever on it. Letting a filtered ClientHello count against the
+        // incumbent would retire the best browser strategy on the machine over
+        // a failure it was structurally incapable of fixing.
+        let mut l = learner();
+        let group = GroupId::new("general");
+        let p = pool(16);
+        let winner = p[5].clone();
+        converge(&mut l, &group, &p, &winner);
+
+        let before = l.state.contexts[&l.context][&group].arms[&winner].mean_at(60_000);
+        for sig in BlockSignature::ALL.into_iter().filter(|s| s.is_tunnel_phase()) {
+            for _ in 0..50 {
+                l.record(&group, &winner, &ProbeOutcome::Failed { signature: sig }, false, 60_000);
+            }
+        }
+        let after = l.state.contexts[&l.context][&group].arms[&winner].mean_at(60_000);
+        assert!((before - after).abs() < 1e-6, "a tunnel phase was charged to a winws strategy");
+    }
+
+    #[test]
+    fn tunnel_phases_do_not_drive_the_egress_escalation_either() {
+        // `TunnelStalled` and `TunnelUpgradeRejected` do ask for another
+        // egress — the relay's own. Feeding that into the browser groups'
+        // escalation counter would move traffic for an unrelated subsystem.
+        let mut l = learner();
+        let group = GroupId::new("general");
+        let p = pool(16);
+        let arm = p[0].clone();
+        for _ in 0..10 {
+            l.record(
+                &group,
+                &arm,
+                &ProbeOutcome::Failed { signature: BlockSignature::TunnelStalled },
+                true,
+                10,
+            );
+        }
+        // Strongest form of the guarantee: ten tunnel failures did not even
+        // bring the group into existence, so there is nothing they could have
+        // biased. If the group does exist, its escalation counter must be cold.
+        let escalations = l
+            .state
+            .contexts
+            .get(&l.context)
+            .and_then(|groups| groups.get(&group))
+            .map_or(0, |state| state.egress_failures);
+        assert_eq!(escalations, 0);
     }
 
     #[test]

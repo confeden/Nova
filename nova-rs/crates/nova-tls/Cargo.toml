@@ -1,0 +1,56 @@
+[package]
+name = "nova-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Reading and shaping the TLS ClientHello Nova puts on the wire: JA4 measurement and browser-shaped handshakes."
+
+[features]
+# Off by default. The measurement half is pure Rust and must build anywhere;
+# emitting a shaped hello pulls in BoringSSL, which needs a C toolchain plus
+# NASM on Windows. Keeping that behind a flag means a machine that only wants
+# to read fingerprints is not asked to build a crypto library to do it.
+default = []
+shape = ["dep:boring", "dep:brotli", "dep:polling", "dep:socket2"]
+
+[dependencies]
+# `pq-experimental` is what carries X25519MLKEM768, the first group all
+# three captured browsers offer. Without it the hello is missing the very
+# key share a current browser leads with.
+boring = { version = "4", optional = true, features = ["pq-experimental"] }
+# Certificate decompression, which Chromium advertises. Reading only: the
+# server is the side that compresses, and claiming an ability we lack would
+# break every connection to a server that took us up on it.
+brotli = { version = "8", optional = true, default-features = false, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Only for SO_LINGER, which std still gates behind an unstable feature. The
+# terminator needs it to turn an aborted loopback leg into an aborted
+# upstream one rather than a polite shutdown the far end can sit on.
+# BoringSSL states plainly that an SSL object "may only be used on one
+# thread at a time", with no exception for a concurrent reader and writer.
+# So the data path is one thread driving both sockets through a poller
+# rather than two threads sharing a lock — measured: the lock version
+# livelocks, because the reader reacquires faster than the writer can.
+polling = { version = "3", optional = true }
+socket2 = { version = "0.6", optional = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+
+# The library stays free of I/O, in keeping with the workspace. The capture
+# tool is a separate binary target precisely so that stays true.
+[[bin]]
+name = "capture-hello"
+path = "src/bin/capture-hello.rs"
+
+[[bin]]
+name = "ja4"
+path = "src/bin/ja4.rs"
+
+# Needs the shaping half, and with it BoringSSL.
+[[bin]]
+name = "tls-terminator"
+path = "src/bin/tls-terminator.rs"
+required-features = ["shape"]

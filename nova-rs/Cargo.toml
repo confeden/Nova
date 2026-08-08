@@ -1,9 +1,18 @@
 [workspace]
 resolver = "3"
-members = ["crates/nova-core", "crates/nova-learn", "crates/nova-cloudflare", "crates/nova-health", "crates/nova-zapret", "crates/nova-cli"]
+members = [
+    "crates/nova-core",
+    "crates/nova-learn",
+    "crates/nova-cloudflare",
+    "crates/nova-health",
+    "crates/nova-probe",
+    "crates/nova-tls",
+    "crates/nova-zapret",
+    "crates/nova-cli",
+]
 
 [workspace.package]
-version = "1.31.0"
+version = "1.32.0"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Brent"]
@@ -19,6 +28,7 @@ nova-learn = { path = "crates/nova-learn" }
 nova-cloudflare = { path = "crates/nova-cloudflare" }
 nova-health = { path = "crates/nova-health" }
 nova-routing = { path = "crates/nova-routing" }
+nova-tls = { path = "crates/nova-tls" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

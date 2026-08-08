@@ -1,0 +1,15 @@
+[package]
+name = "nova-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Classification of connection failures into the phase that caused them, so each layer is charged only for its own faults."
+
+[dependencies]
+nova-core = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

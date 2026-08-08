@@ -46,6 +46,7 @@ pub mod governor;
 pub mod halving;
 pub mod import;
 pub mod posterior;
+pub mod tls_shape;
 
 mod context;
 mod learner;
@@ -55,3 +56,4 @@ pub use governor::{Activity, Governor, GovernorConfig};
 pub use import::{GeneEvidence, ImportReport, PythonHistory};
 pub use learner::{Decision, Learner, LearnerConfig, LearnerState};
 pub use posterior::Posterior;
+pub use tls_shape::{Charged, FALLBACK_SHAPE, ShapeLearner};
