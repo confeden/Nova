@@ -122,15 +122,33 @@ jobs:
       # 8. Публикация по запросу. Тег движущийся: это не версия продукта, а
       #    текущий собранный инструмент, и скрипту загрузки нужен постоянный
       #    адрес, который не надо править при каждом выпуске.
+      #
+      #    Публикация пересоздаёт релиз целиком, поэтому текст описания живёт
+      #    здесь, а не правится руками на сайте: иначе следующая же публикация
+      #    молча стирала бы правку. Первым абзацем идёт предупреждение для тех,
+      #    кто забредёт сюда со страницы релизов, дальше — служебное.
+      #
+      #    --prerelease, чтобы этот тег не подменял собой последний релиз Nova
+      #    в списке: он не версия продукта и пользователю не нужен.
       - name: Publish to release
         if: inputs.publish
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $notes = @"
+          Это технический файл, он нужен только для разработки. Скачивать и запускать его - не нужно, если вы не пытаетесь собирать Nova самостоятельно.
+
+          ---
+
+          Собрано из ${{ github.sha }}.
+          Скачивается скриптом ``fetch_tls_terminator.py`` в ``bin/``, сверка по ``nova-tls-terminator.exe.sha256``.
+          "@
+          $notes | Out-File -FilePath dist/notes.md -Encoding utf8
           gh release delete tls-terminator --yes --cleanup-tag 2>$null
           gh release create tls-terminator `
             dist/nova-tls-terminator.exe `
             dist/nova-tls-terminator.exe.sha256 `
             --title "TLS terminator (сборка из nova-rs)" `
-            --notes "Собрано из ${{ github.sha }}. Скачивается скриптом fetch_tls_terminator.py в bin/."
+            --prerelease `
+            --notes-file dist/notes.md
