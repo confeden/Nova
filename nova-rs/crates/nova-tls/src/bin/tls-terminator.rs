@@ -47,8 +47,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use nova_tls::{built_in_profile, shape};
@@ -261,6 +261,7 @@ fn main() {
     };
     eprintln!("tls-terminator listening on 127.0.0.1:{port}, profile {}", profile.name);
 
+    phase_watch::spawn_watchdog();
     let token = Arc::new(token);
     let shapers = Arc::new(Shapers::new(profile.name.clone()));
     // A bound on concurrency rather than an async runtime. The relay's cold
@@ -287,6 +288,149 @@ fn main() {
             live.fetch_sub(1, Ordering::Relaxed);
         });
     }
+}
+
+// Диагностика зависаний в теле итерации pump().
+//
+// Три попытки угадать место провалились: счётчик оборотов молчит, маркеры вокруг
+// poller.wait дали 208 входов и 208 выходов. Значит поток стоит между выходом из
+// ожидания и следующим входом — то есть в одном из четырёх вызовов ввода-вывода
+// или в poller.modify. Вместо очередной догадки — метка фазы и сторож, который
+// печатает фазу тех pump, у которых счётчик перестал меняться.
+mod phase_watch {
+    use super::*;
+
+    pub const MODIFY: u8 = 1;
+    pub const WAIT: u8 = 2;
+    pub const CLIENT_READ: u8 = 3;
+    pub const UPSTREAM_READ: u8 = 4;
+    pub const UPSTREAM_WRITE: u8 = 5;
+    pub const CLIENT_WRITE: u8 = 6;
+    pub const TAIL: u8 = 7;
+
+    pub fn name(phase: u8) -> &'static str {
+        match phase {
+            MODIFY => "poller.modify",
+            WAIT => "poller.wait",
+            CLIENT_READ => "client.read",
+            UPSTREAM_READ => "upstream.read (TLS)",
+            UPSTREAM_WRITE => "upstream.write (TLS)",
+            CLIENT_WRITE => "client.write",
+            TAIL => "конец итерации",
+            _ => "?",
+        }
+    }
+
+    /// Верхние биты — счётчик смен фазы, нижние восемь — сама фаза. Сторожу
+    /// достаточно сравнить два снимка целиком: не изменилось — значит стоит.
+    pub struct Slot(pub AtomicU64, pub AtomicU64);
+
+    impl Slot {
+        pub fn set(&self, phase: u8) {
+            let prev = self.0.load(Ordering::Relaxed);
+            self.0.store(((prev >> 8) + 1) << 8 | phase as u64, Ordering::Relaxed);
+        }
+
+        /// Флаги интереса на момент входа в ожидание — чтобы «застрял в wait»
+        /// сразу говорило, с какой маской он туда вошёл.
+        pub fn set_want(&self, client: polling::Event, upstream: polling::Event) {
+            let bits = (client.readable as u64)
+                | (client.writable as u64) << 1
+                | (upstream.readable as u64) << 2
+                | (upstream.writable as u64) << 3;
+            self.1.store(bits, Ordering::Relaxed);
+        }
+    }
+
+    pub fn want_text(bits: u64) -> String {
+        format!(
+            "client(r={},w={}) upstream(r={},w={})",
+            bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0
+        )
+    }
+
+    static REGISTRY: OnceLock<Mutex<Vec<(usize, Arc<Slot>)>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<Vec<(usize, Arc<Slot>)>> {
+        REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub fn register(id: usize) -> Arc<Slot> {
+        let slot = Arc::new(Slot(AtomicU64::new(0), AtomicU64::new(0)));
+        if let Ok(mut guard) = registry().lock() {
+            guard.push((id, Arc::clone(&slot)));
+        }
+        slot
+    }
+
+    pub fn unregister(id: usize) {
+        if let Ok(mut guard) = registry().lock() {
+            guard.retain(|(other, _)| *other != id);
+        }
+    }
+
+    pub fn spawn_watchdog() {
+        std::thread::spawn(|| {
+            let mut previous: Vec<(usize, u64, u64)> = Vec::new();
+            loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let now: Vec<(usize, u64, u64)> = match registry().lock() {
+                    Ok(guard) => guard.iter().map(|(id, s)| (*id, s.0.load(Ordering::Relaxed), s.1.load(Ordering::Relaxed))).collect(),
+                    Err(_) => continue,
+                };
+                for (id, value, want) in &now {
+                    if let Some((_, before, _)) = previous.iter().find(|(other, _, _)| other == id) {
+                        // Ожидание — единственная фаза, где стоять долго
+                        // нормально: туннель Telegram простаивает по многу
+                        // минут. Отчёт о ней был бы сплошным шумом. Любой
+                        // другой вызов, замерший на полминуты, — дефект.
+                        let phase = (*value & 0xff) as u8;
+                        if before == value && *value != 0 && phase != WAIT {
+                            eprintln!(
+                                "phase-stuck: id={id} фаза={} уже 30с (смен фазы={}) интерес: {}",
+                                name(phase),
+                                value >> 8,
+                                want_text(*want)
+                            );
+                        }
+                    }
+                }
+                previous = now;
+            }
+        });
+    }
+}
+
+/// Держит источник в поллере только пока к нему есть интерес.
+///
+/// `Event::none()` оставляет сокет зарегистрированным с пустой маской, и на
+/// сокете с висящим HUP это уводит windows-бэкенд `polling` в бесконечный
+/// внутренний цикл внутри `wait()`. Снятие с регистрации закрывает этот путь.
+fn reregister_source(
+    poller: &polling::Poller,
+    source: &TcpStream,
+    want: polling::Event,
+    registered: &mut bool,
+) -> bool {
+    let wanted = want.readable || want.writable;
+    if wanted {
+        let result = if *registered {
+            poller.modify(source, want)
+        } else {
+            // SAFETY: источник живёт до конца pump(), удаляется там же.
+            unsafe { poller.add(source, want) }
+        };
+        if result.is_err() {
+            return false;
+        }
+        *registered = true;
+    } else if *registered {
+        if poller.delete(source).is_err() {
+            return false;
+        }
+        *registered = false;
+    }
+    true
 }
 
 fn serve(mut client: TcpStream, token: &str, shapers: &Shapers) {
@@ -587,15 +731,66 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
         }
     }
 
+    // A readiness that never becomes a byte. BoringSSL answers WANT_READ while
+    // it waits for the rest of a record, and a peer that sent FIN mid-record is
+    // reported readable forever: the poller wakes us, the read yields nothing,
+    // the state does not change, and the loop spins at a full core. Measured in
+    // the field at ~8.5 cores across a handful of such tunnels, with CLOSE_WAIT
+    // sockets piling up next to them.
+    //
+    // Real readiness always produces either a byte or a terminal error, so a run
+    // of woken-but-empty iterations means this tunnel is dead rather than idle.
+    // Idle tunnels are not affected: they arrive here as timeouts, and timeouts
+    // do not count.
+    const STALLED_WAKEUPS: u32 = 64;
+    let mut idle_wakeups: u32 = 0;
+
     let mut to_upstream = Direction::new();
     let mut to_client = Direction::new();
     let mut events = polling::Events::new();
     let mut buffer = vec![0u8; CHUNK];
     let mut aborted = false;
 
+    // Diagnostic for a spin that survived the first fix. Counting whole
+    // iterations rather than idle ones: the previous counter reset whenever any
+    // one of the four blocks moved a byte, so a direction stuck on WANT_READ
+    // stayed invisible as long as the other direction kept trickling.
+    //
+    // The per-iteration counter alone answered nothing: four threads sat at a
+    // full core each and it never printed. Either the loop does not turn, or it
+    // never returns from the wait. Start/end markers separate the two.
+    static PUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let pump_id = PUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let phase = phase_watch::register(pump_id);
+
+    let mut client_registered = true;
+    let mut upstream_registered = true;
+    let mut iterations: u64 = 0;
+    let mut reported: u64 = 0;
+    let mut last_events: usize = 0;
+    const REPORT_EVERY: u64 = 200_000;
+
     loop {
         if to_upstream.done() && to_client.done() {
             break;
+        }
+        iterations += 1;
+        // Пороги низкие намеренно: при 200 000 нельзя было отличить «цикл
+        // крутится вхолостую» от «управление не вернулось из wait». Здоровый
+        // туннель этих чисел не достигает — самый долгий завершившийся прошёл
+        // 191 оборот.
+        // Канарейка на будущее: здоровый туннель не делает и двух сотен
+        // оборотов, так что двести тысяч — это уже раскрутка цикла.
+        let report_now = iterations - reported >= REPORT_EVERY;
+        if report_now {
+            reported = iterations;
+            eprintln!(
+                "spin-diag: id={pump_id} iters={iterations} to_upstream(fin={}, pend={}) to_client(fin={}, pend={}) idle_wakeups={idle_wakeups} last_events={last_events}",
+                to_upstream.finished,
+                to_upstream.pending.len(),
+                to_client.finished,
+                to_client.pending.len(),
+            );
         }
         // Ask only for what we can act on. Reading a side we already owe a
         // megabyte to would just move the backlog into this process.
@@ -605,19 +800,38 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
         let mut want_upstream = polling::Event::none(UPSTREAM);
         want_upstream.readable = !to_client.finished && to_client.pending.len() < HIGH_WATER;
         want_upstream.writable = !to_upstream.pending.is_empty();
-        if poller.modify(&client, want_client).is_err()
-            || poller.modify(upstream.get_ref(), want_upstream).is_err()
-        {
+        phase.set(phase_watch::MODIFY);
+        phase.set_want(want_client, want_upstream);
+        // Источник без интереса снимается с регистрации, а не переводится в
+        // Event::none(). Это и есть подозреваемый: сокет, у которого висит
+        // HUP/ERR, но ни одно из событий не запрошено, — на нём windows-бэкенд
+        // polling переоткрывает AFD-запрос по кругу внутри wait() и наружу не
+        // возвращается. Ровно это показал сторож: все зависшие стоят в
+        // poller.wait, счётчик оборотов при этом не растёт.
+        //
+        // Снятие с регистрации убирает такой сокет из опроса совсем; когда
+        // интерес появится снова, он добавляется обратно.
+        let client_ok = reregister_source(&poller, &client, want_client, &mut client_registered);
+        let upstream_ok =
+            reregister_source(&poller, upstream.get_ref(), want_upstream, &mut upstream_registered);
+        if !client_ok || !upstream_ok {
             break;
         }
 
         events.clear();
+        // Маркеры вокруг самого вызова: spin-diag молчит даже с порогом в тысячу
+        // оборотов, а поток при этом жжёт целое ядро — значит управление не
+        // возвращается. enter без парного exit докажет это адресно.
+        // Ограничено первыми оборотами и каждым сотым: здоровый туннель делает
+        // 3-18 оборотов, флуда не будет.
         // A timeout rather than an indefinite wait: TLS can want to write while
         // reading, and the wakeup lets the loop retry without tracking every
         // such case explicitly.
+        phase.set(phase_watch::WAIT);
         if poller.wait(&mut events, Some(Duration::from_secs(30))).is_err() {
             break;
         }
+        last_events = events.len();
 
         let mut client_ready = (false, false);
         let mut upstream_ready = (false, false);
@@ -634,52 +848,103 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
             upstream_ready = (true, true);
         }
 
+        // Anything that counts as the tunnel still being alive: a byte in either
+        // direction, or a side reaching a definite end.
+        let mut progressed = false;
+
         if client_ready.0 && !to_upstream.finished {
+            phase.set(phase_watch::CLIENT_READ);
             match (&client).read(&mut buffer) {
                 Ok(0) => {
                     to_upstream.finished = true;
+                    progressed = true;
                     // The relay hung up. Whatever it owed upstream is moot, and
                     // an abort must stay an abort.
                     aborted = true;
                 }
-                Ok(n) => to_upstream.pending.extend_from_slice(&buffer[..n]),
+                Ok(n) => {
+                    to_upstream.pending.extend_from_slice(&buffer[..n]);
+                    progressed = true;
+                }
                 Err(err) if would_block(&err) => {}
                 Err(_) => {
                     to_upstream.finished = true;
+                    progressed = true;
                     aborted = true;
                 }
             }
         }
 
         if upstream_ready.0 && !to_client.finished {
+            phase.set(phase_watch::UPSTREAM_READ);
             match upstream.read(&mut buffer) {
-                Ok(0) => to_client.finished = true,
-                Ok(n) => to_client.pending.extend_from_slice(&buffer[..n]),
+                Ok(0) => {
+                    to_client.finished = true;
+                    progressed = true;
+                }
+                Ok(n) => {
+                    to_client.pending.extend_from_slice(&buffer[..n]);
+                    progressed = true;
+                }
                 Err(err) if would_block(&err) => {}
-                Err(_) => to_client.finished = true,
+                Err(_) => {
+                    to_client.finished = true;
+                    progressed = true;
+                }
             }
         }
 
         if !to_upstream.pending.is_empty() && (upstream_ready.1 || events.is_empty()) {
+            phase.set(phase_watch::UPSTREAM_WRITE);
             match upstream.write(&to_upstream.pending) {
-                Ok(0) => to_upstream.finished = true,
+                Ok(0) => {
+                    to_upstream.finished = true;
+                    progressed = true;
+                }
                 Ok(n) => {
                     to_upstream.pending.drain(..n);
                     let _ = upstream.flush();
+                    progressed = true;
                 }
                 Err(err) if would_block(&err) => {}
-                Err(_) => to_upstream.finished = true,
+                Err(_) => {
+                    to_upstream.finished = true;
+                    progressed = true;
+                }
             }
         }
 
         if !to_client.pending.is_empty() && (client_ready.1 || events.is_empty()) {
+            phase.set(phase_watch::CLIENT_WRITE);
             match (&client).write(&to_client.pending) {
-                Ok(0) => to_client.finished = true,
+                Ok(0) => {
+                    to_client.finished = true;
+                    progressed = true;
+                }
                 Ok(n) => {
                     to_client.pending.drain(..n);
+                    progressed = true;
                 }
                 Err(err) if would_block(&err) => {}
-                Err(_) => to_client.finished = true,
+                Err(_) => {
+                    to_client.finished = true;
+                    progressed = true;
+                }
+            }
+        }
+
+        phase.set(phase_watch::TAIL);
+        // Only woken iterations count. A timeout is how an idle-but-healthy
+        // tunnel gets here, and it must not be mistaken for a stall.
+        if progressed || events.is_empty() {
+            idle_wakeups = 0;
+        } else {
+            idle_wakeups += 1;
+            if idle_wakeups >= STALLED_WAKEUPS {
+                // Neither side will finish on its own: reset upstream rather
+                // than leave the pair in CLOSE_WAIT for the process lifetime.
+                aborted = true;
+                break;
             }
         }
 
@@ -690,7 +955,18 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
         if to_client.done() && to_upstream.finished {
             break;
         }
+        // The relay hung up and we owe it nothing: whatever upstream might still
+        // send has no reader. Without this the loop waits on upstream forever in
+        // thirty-second steps — neither exit above ever becomes true, because
+        // `to_client.finished` only flips when upstream closes on its own.
+        // Measured: 48 such threads alive at once, each holding two sockets.
+        if to_upstream.finished && to_client.pending.is_empty() {
+            aborted = true;
+            break;
+        }
     }
+
+    phase_watch::unregister(pump_id);
 
     let raw = upstream.get_ref();
     if aborted {

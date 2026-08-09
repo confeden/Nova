@@ -541,6 +541,9 @@ def restart_nova():
             restart_nova._in_progress = True
 
             # 0. Сохраняем геометрию окна ДО остановки (on_closing не вызывается при restart)
+            # Заодно запоминаем, было ли окно лога открыто: перезапуск не должен
+            # его показывать, если пользователь его закрыл.
+            _log_was_open = False
             try:
                 _root = globals().get('root')
                 _log_window = globals().get('log_window')
@@ -553,10 +556,14 @@ def restart_nova():
                         import tkinter as _tk
                         if _log_window and _tk.Toplevel.winfo_exists(_log_window):
                             _state['log_size'] = _log_window.geometry()
+                            # withdraw() оставляет окно существующим, поэтому
+                            # winfo_exists недостаточно — спрашиваем состояние.
+                            _log_was_open = str(_log_window.state()) == "normal"
                     except: pass
                     if _state:
                         _save_ws(**_state)
             except: pass
+            restart_nova._log_was_open = bool(_log_was_open)
 
             # 1. Остановка логики
             save_visited_domains_func = globals().get('save_visited_domains')
@@ -625,7 +632,13 @@ def restart_nova():
             except:
                 base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 
-            restart_args = ["--show-log", "--restart", "--force-instance"]
+            # --show-log передавался безусловно, поэтому любой перезапуск
+            # (в том числе автоматический, по смене стратегии) заново открывал
+            # окно лога, даже если пользователь его закрыл. Передаём флаг только
+            # когда окно действительно было открыто.
+            restart_args = ["--restart", "--force-instance"]
+            if getattr(restart_nova, "_log_was_open", False):
+                restart_args.insert(0, "--show-log")
             
             # Formulate the definitive launch command
             is_nuitka = "__compiled__" in dir() or globals().get("__compiled__") is not None
@@ -4844,24 +4857,48 @@ try:
                         result.append(text)
                     return result
 
+                # Последнее звено любой цепочки, когда ни один VPN не отвечает.
+                #
+                # Раньше здесь стоял blackhole «SOCKS5 127.0.0.1:1» — закрытый порт,
+                # на котором соединение умирало. Решение владельца: соединение не
+                # убивать, а пускать напрямую, где им займётся winws-стратегия, если
+                # для домена она есть. Порядок сохраняется: DIRECT стоит последним,
+                # поэтому пока жив WARP или Opera, трафик идёт туда, а прямой путь
+                # включается только на время их недоступности.
+                #
+                # Осознанный размен: в окно, пока оба VPN лежат, трафик и реальный IP
+                # идут в обход туннеля. NOVA_PAC_KILLSWITCH=1 возвращает прежнее
+                # поведение.
+                #
+                # Присвоено до _route_for_target намеренно: та читает переменную из
+                # замыкания, и порядок «определение раньше присваивания» работал бы
+                # лишь до первого вызова из другого места.
+                last_resort = "SOCKS5 127.0.0.1:1" if _env_bool_global("NOVA_PAC_KILLSWITCH", False) else "DIRECT"
+
                 def _route_for_target(target, strict=False):
                     target = str(target or "").strip().lower()
                     if target == "direct":
                         return "DIRECT"
+                    # Хвост тот же, что у ru/eu: цепочка заканчивается прямым
+                    # путём, а не обрывается на VPN. Без него discord и whatsapp
+                    # получали одиночный «SOCKS5 …:1370» и при падении WARP
+                    # оставались без запасного варианта до перегенерации PAC.
                     if target == "warp":
                         parts = []
                         if warp_active:
                             parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
                         elif not strict and opera_active:
                             parts.append("PROXY 127.0.0.1:1371")
-                        return "; ".join(_dedupe_route_parts(parts)) if parts else "DIRECT"
+                        parts.append(last_resort)
+                        return "; ".join(_dedupe_route_parts(parts))
                     if target == "opera":
                         parts = []
                         if opera_active:
                             parts.append("PROXY 127.0.0.1:1371")
                         elif not strict and warp_active:
                             parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
-                        return "; ".join(_dedupe_route_parts(parts)) if parts else "DIRECT"
+                        parts.append(last_resort)
+                        return "; ".join(_dedupe_route_parts(parts))
                     return "DIRECT"
 
                 def _route_for_app_mode(mode, default_route):
@@ -4895,10 +4932,9 @@ try:
                 # EU domains are Opera-only. Do not fall back to WARP here:
                 # otherwise EU-listed browser traffic can silently use RU/WARP egress.
                 if opera_active:
-                    eu_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1"
+                    eu_route = f"PROXY 127.0.0.1:1371; {last_resort}"
                 else:
-                    # Kill-switch for EU domains if Opera is down.
-                    eu_route = "SOCKS5 127.0.0.1:1"
+                    eu_route = last_resort
 
                 # Routing strings for RU domains: browser PAC should not enter a stale
                 # app-relay path first. Otherwise browsers can wait inside a degraded
@@ -4908,12 +4944,10 @@ try:
                     ru_route_parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}") # Direct WARP SOCKS fallback
                     if opera_active:
                         ru_route_parts.append("PROXY 127.0.0.1:1371")
-                    # NO DIRECT fallback for RU to prevent IP leak. Use a blackhole proxy.
-                    ru_route_parts.append("SOCKS5 127.0.0.1:1") 
-                    ru_route = "; ".join(ru_route_parts) if ru_route_parts else "SOCKS5 127.0.0.1:1"
+                    ru_route_parts.append(last_resort)
+                    ru_route = "; ".join(ru_route_parts) if ru_route_parts else last_resort
                 else:
-                    # Warp down: use Opera if available, otherwise Blackhole (No direct leak)
-                    ru_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
+                    ru_route = f"PROXY 127.0.0.1:1371; {last_resort}" if opera_active else last_resort
 
                 # Browser Discord traffic also uses plain PAC fallbacks.
                 # App Discord traffic is routed separately from browser PAC.
@@ -4922,10 +4956,10 @@ try:
                     discord_route_parts.append(f"SOCKS5 127.0.0.1:{self.warp_port}")
                     if opera_active:
                         discord_route_parts.append("PROXY 127.0.0.1:1371")
-                    discord_route_parts.append("SOCKS5 127.0.0.1:1")
-                    discord_route = "; ".join(discord_route_parts) if discord_route_parts else "SOCKS5 127.0.0.1:1"
+                    discord_route_parts.append(last_resort)
+                    discord_route = "; ".join(discord_route_parts) if discord_route_parts else last_resort
                 else:
-                    discord_route = "PROXY 127.0.0.1:1371; SOCKS5 127.0.0.1:1" if opera_active else "SOCKS5 127.0.0.1:1"
+                    discord_route = f"PROXY 127.0.0.1:1371; {last_resort}" if opera_active else last_resort
 
                 telegram_route = _route_for_app_mode(get_routing_app_mode("telegram", routing_settings), ru_route)
                 tgrelay_port = 1372
@@ -4957,7 +4991,29 @@ try:
                 telegram_ips_js = json.dumps(telegram_ips)
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in whatsapp_domains) + "}"
                 ide_js = "{" + ",".join(f'"{d}":1' for d in ide_domains) + "}"
-                
+
+                # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
+                # kill-switch: DNS для них уже развязан правилами, а blackhole
+                # 127.0.0.1:1 роняет Claude/ChatGPT, когда Opera недоступна.
+                # matchDomain проверяет и родительские суффиксы, поэтому
+                # "anthropic.com" покрывает "api.anthropic.com".
+                ai_unlock_domains = sorted({
+                    str(ns).lstrip(".").strip().lower()
+                    for ns in (
+                        tuple(globals().get("NOVA_NRPT_NAMESPACES") or ())
+                        + tuple(globals().get("NOVA_AI_KILLSWITCH_EXEMPT_EXTRA") or ())
+                    )
+                    if str(ns).strip()
+                })
+                ai_unlock_js = "{" + ",".join(f'"{d}":1' for d in ai_unlock_domains) + "}"
+                # Обход включается только пока Opera лежит. Пока она жива, маршрут
+                # для этих доменов не меняется — они идут через EU как раньше.
+                ai_unlock_guard = (
+                    ""
+                    if opera_active
+                    else '    if (matchDomain(ai_unlock, host) && matchDomain(eu, host)) return "DIRECT";\n'
+                )
+
                 pac_content = f"""
     function FindProxyForURL(url, host) {{
     host = (host || "").toLowerCase();
@@ -4980,6 +5036,7 @@ try:
     var exclude = {exclude_js};
     var ru = {ru_js};
     var eu = {eu_js};
+    var ai_unlock = {ai_unlock_js};
     var discord = {discord_js};
     var telegram = {telegram_js};
     var telegram_ips = {telegram_ips_js};
@@ -5131,7 +5188,7 @@ try:
     if (matchDomain(user_ru, host)) return "{ru_route}";
     if (matchDomain(user_eu, host)) return "{eu_route}";
     if (matchDomain(exclude, host)) return "DIRECT";
-    if (matchDomain(eu, host)) return "{eu_route}";
+{ai_unlock_guard}    if (matchDomain(eu, host)) return "{eu_route}";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
     if (matchDomain(telegram, host)) return "{telegram_route}";
@@ -5176,7 +5233,7 @@ try:
                     if opera_active:
                         self.log_func("[PAC] EU маршрут: PROXY 127.0.0.1:1371 (Opera VPN ONLY)")
                     else:
-                        self.log_func("[PAC] EU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Opera недоступна)")
+                        self.log_func(f"[PAC] EU маршрут: {last_resort} (Opera недоступна)")
 
                 # Define RU route state for logging (includes RU + Discord)
                 ru_route_state = ("warp+opera" if warp_active and opera_active else
@@ -5190,7 +5247,7 @@ try:
                     elif ru_route_state == "opera":
                         self.log_func("[PAC] RU маршрут: PROXY 127.0.0.1:1371 (Opera VPN fallback)")
                     else:
-                        self.log_func("[PAC] RU маршрут: SOCKS5 127.0.0.1:1 (Kill-switch: Warp/Opera недоступны)")
+                        self.log_func(f"[PAC] RU маршрут: {last_resort} (Warp/Opera недоступны)")
 
                 # Trigger refresh if statuses changed
                 status_signature = (bool(warp_active), bool(opera_active))
@@ -5657,7 +5714,26 @@ try:
             self._forced_warp_proxy = ""
             self._forced_full_proxy = ""
             self._direct_restart_attempted = False
+            # Взводится, когда opera-proxy умер на выборе эндпоинта (код 12). Пока
+            # взведён, замер скорости пропускаем и берём первый выданный эндпоинт.
+            self._selection_timeout_seen = False
             self.failover = OperaFailoverController(self.country)
+
+        # opera-proxy: таймаут функции выбора сервера истёк, результат не получен.
+        OPERA_SELECTION_TIMEOUT_RC = 12
+
+        def note_exit_code(self, rc):
+            """Учитывает код выхода opera-proxy для следующей попытки запуска."""
+            try:
+                if int(rc) == self.OPERA_SELECTION_TIMEOUT_RC:
+                    if not self._selection_timeout_seen:
+                        self.log_func(
+                            "[EU] Замер скорости эндпоинтов не уложился в таймаут. "
+                            "Дальше берём первый выданный эндпоинт без замера."
+                        )
+                    self._selection_timeout_seen = True
+            except:
+                pass
 
         def configure_country(self, country):
             try:
@@ -6178,13 +6254,27 @@ try:
                 attempts.append(("discover", None, 6.5, None))
 
                 for attempt_mode, override_endpoint, ready_timeout, base_proxy in attempts:
+                    # "fastest" реально качает данные через каждый выданный эндпоинт и
+                    # умирает с кодом 12, если не уложится в свой таймаут. Он больше
+                    # окна ожидания ниже (2.5-6.5с), поэтому процесс успевает уйти в
+                    # фон и падает уже после возврата — watchdog видит только код 12.
+                    # Меряем скорость лишь когда это осмысленно и ещё не подводило.
+                    # Сам бенчмарк качает https://ajax.googleapis.com/... — домен, который
+                    # у части провайдеров режется, отчего замер и не укладывается.
+                    measuring = not override_endpoint and not self._selection_timeout_seen
+                    if measuring:
+                        selection_args = [
+                            "-server-selection", "fastest",
+                            "-server-selection-timeout", "10s",
+                        ]
+                    else:
+                        # Эндпоинт задан явно либо замер уже подводил — берём первый.
+                        selection_args = ["-server-selection", "first"]
                     cmd = [
                         self.exe_path,
                         "-bind-address", f"127.0.0.1:{self.port}",
                         "-country", self.country,
-                        "-server-selection", "fastest",
-                        "-server-selection-timeout", "10s",
-                    ]
+                    ] + selection_args
                     cmd.extend(build_full_dial_proxy_args(full_dial_proxy))
                     if base_proxy:
                         # API-only bootstrap: init/discover via proxy, Opera tunnel direct.
@@ -6241,12 +6331,16 @@ try:
                         self.log_func(f"[EU] {self.port} готов")
                         self.owns_process = True
                         self.using_external = False
+                        if measuring:
+                            # Замер отработал — не считаем его проблемным.
+                            self._selection_timeout_seen = False
                         self._startup_grace_deadline = 0.0
                         self._sync_pac_state(force=True)
                         return
 
                     if self.process and self.process.poll() is not None:
                         rc = self.process.returncode
+                        self.note_exit_code(rc)
                         if IS_DEBUG_MODE:
                             self.log_func(f"[EU] Процесс завершился сразу после запуска (код: {rc}).")
                         elif base_proxy:
@@ -6409,11 +6503,21 @@ try:
             # binary, so without naming it here a wedged terminator survives
             # both the pid-file sweep and the port reclaim, and the next start
             # fails to bind against our own orphan.
+            #
+            # The `.old` name is not paranoia. Updating the helper while it runs
+            # goes through a rename (fetch_tls_terminator.py), and Windows
+            # reports the *current* file name for a running image — so after an
+            # update the live process answers as `...exe.old`. Without it in the
+            # allowlist the sweep politely refuses to kill it, the fresh binary
+            # cannot bind 1374, and the update silently never takes effect.
+            # Observed exactly that: a rebuilt terminator sat unused while the
+            # old code kept serving.
+            names = (TLS_TERMINATOR_FILENAME, TLS_TERMINATOR_FILENAME + ".old")
             with contextlib.suppress(Exception):
-                _terminate_helper_pid(self.pid_path, allowed_image_names=(TLS_TERMINATOR_FILENAME,))
+                _terminate_helper_pid(self.pid_path, allowed_image_names=names)
             with contextlib.suppress(Exception):
                 _terminate_tcp_listeners_on_port(
-                    self.port, log_func=None, allowed_image_names=(TLS_TERMINATOR_FILENAME,)
+                    self.port, log_func=None, allowed_image_names=names
                 )
 
         def start(self):
@@ -6462,11 +6566,27 @@ try:
 
             # Publish only once it answers. A client that reads the file and
             # finds nobody listening would charge the failure to the network.
+            #
+            # The greeting alone is not proof it is ours: a surviving orphan
+            # holds the port and answers exactly the same way, while the process
+            # we just spawned dies on bind. That is how a stale helper got
+            # reported as ready — and how a rebuilt binary went unused without a
+            # single line of complaint. Match the listener against our own pid.
             deadline = time.time() + 3.0
             while time.time() < deadline:
                 if self.process.poll() is not None:
                     break
                 if self._probe_once(timeout=0.4):
+                    owner = None
+                    with contextlib.suppress(Exception):
+                        owner = _tcp_listen_pids_for_port(self.port)
+                    if owner and self.process.pid not in owner:
+                        self.log_func(
+                            f"[TLS] Порт {self.port} занят чужим процессом (pid {sorted(owner)}); "
+                            f"терминатор не наш, TLS остаётся на прежнем пути."
+                        )
+                        self.stop()
+                        return False
                     self._publish_runtime()
                     self.log_func(
                         f"[TLS] Терминатор TLS готов на 127.0.0.1:{self.port}, профиль {self.profile}."
@@ -10497,149 +10617,6 @@ try:
         except: pass
 
 
-    # ================= МОДУЛЬ: NRPT DNS UNBLOCK =================
-    # Selective DNS routing for Google/AI domains via xbox-dns.ru NRPT rules.
-    # This allows Gemini and other region-locked Google AI services to resolve
-    # to non-blocked IPs without proxying all traffic.
-
-    NOVA_NRPT_TAG = "NOVA_DNS_UNBLOCK"
-    NOVA_NRPT_NAMESPACES = (
-        ".googleapis.com",
-        ".googleusercontent.com",
-        "lh3.googleusercontent.com",
-        "accounts.google.com",
-        ".google.com",
-        ".googletagmanager.com",
-        ".gstatic.com",
-        "gemini.google.com",
-        ".gemini.google.com",
-        "gemini.google",
-        ".gemini.google",
-        "aistudio.google.com",
-        ".aistudio.google.com",
-        "ai.google.dev",
-        ".ai.google.dev",
-        "generativelanguage.googleapis.com",
-        ".clients6.google.com",
-        "gemini.gstatic.com",
-        "play.google.com",
-        # OpenAI / ChatGPT
-        "openai.com",
-        ".openai.com",
-        "chatgpt.com",
-        ".chatgpt.com",
-        # Anthropic / Claude
-        "claude.ai",
-        ".claude.ai",
-        "claude.com",
-        ".claude.com",
-        "anthropic.com",
-        ".anthropic.com",
-        # Microsoft Copilot
-        "copilot.microsoft.com",
-        ".copilot.microsoft.com",
-    )
-    # xbox-dns.ru servers (v4 + v6)
-    NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
-
-    def _check_nrpt_rules_applied(log_func=None):
-        """Check if all required NRPT rules with NOVA_DNS_UNBLOCK tag are already applied."""
-        try:
-            cmd = (
-                f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
-                f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
-                f"| Select-Object -ExpandProperty Namespace"
-            )
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            )
-            if result.returncode != 0:
-                return False
-            existing = set()
-            for line in result.stdout.strip().splitlines():
-                ns = line.strip()
-                if ns:
-                    existing.add(ns)
-            required = set(NOVA_NRPT_NAMESPACES)
-            if required.issubset(existing):
-                if log_func:
-                    log_func(f"[NRPT] DNS-правила уже применены ({len(existing)} правил).")
-                return True
-            if log_func:
-                missing = required - existing
-                log_func(f"[NRPT] Отсутствуют правила: {', '.join(sorted(missing))}")
-            return False
-        except Exception as e:
-            if log_func:
-                log_func(f"[NRPT] Ошибка проверки правил: {e}")
-            return False
-
-    def setup_nrpt_dns_unblock(log_func=None):
-        """Setup NRPT rules for Google/AI DNS unblocking. Idempotent: skips if already applied."""
-        try:
-            if _check_nrpt_rules_applied(log_func=log_func):
-                return True
-            # Remove any stale rules with our tag first
-            remove_nrpt_dns_unblock(log_func=log_func, silent=True)
-            errors = []
-            for namespace in NOVA_NRPT_NAMESPACES:
-                cmd = (
-                    f"Add-DnsClientNrptRule -Namespace '{namespace}' "
-                    f"-NameServers @({NOVA_NRPT_NAMESERVERS}) "
-                    f"-Comment '{NOVA_NRPT_TAG}' "
-                    f"-DisplayName 'Nova DNS Unblock' "
-                    f"-ErrorAction Stop"
-                )
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                    capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-                )
-                if result.returncode != 0:
-                    stderr = result.stderr.strip()
-                    if "denied" in stderr.lower() or "elevation" in stderr.lower():
-                        if log_func:
-                            log_func("[NRPT] Требуются права администратора для DNS-правил.")
-                        return False
-                    errors.append(f"{namespace}: {stderr[:80]}")
-            # Flush DNS cache
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 "Clear-DnsClientCache -ErrorAction SilentlyContinue"],
-                capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            )
-            if errors:
-                if log_func:
-                    log_func(f"[NRPT] Частичные ошибки: {'; '.join(errors[:3])}")
-                return False
-            if log_func:
-                log_func(f"[NRPT] DNS-правила для Gemini/Google AI применены ({len(NOVA_NRPT_NAMESPACES)} правил).")
-            return True
-        except Exception as e:
-            if log_func:
-                log_func(f"[NRPT] Ошибка настройки DNS: {e}")
-            return False
-
-    def remove_nrpt_dns_unblock(log_func=None, silent=False):
-        """Remove all NRPT rules tagged with NOVA_DNS_UNBLOCK."""
-        try:
-            cmd = (
-                f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
-                f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
-                f"| Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; "
-                f"Clear-DnsClientCache -ErrorAction SilentlyContinue"
-            )
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            )
-            if log_func and not silent:
-                log_func("[NRPT] DNS-правила удалены.")
-        except Exception as e:
-            if log_func and not silent:
-                log_func(f"[NRPT] Ошибка удаления DNS-правил: {e}")
-
-
     def is_ip_address(s):
         return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", s.strip()))
 
@@ -10841,6 +10818,33 @@ try:
     # xbox-dns.ru servers (v4 + v6)
     NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
 
+    # Домены, которым нужен только обход EU kill-switch, без подмены DNS.
+    # Список NRPT выше развязывает DNS через xbox-dns.ru — для Google/OpenAI/Anthropic
+    # это оправдано, а гнать туда же Microsoft и GitHub незачем: им достаточно не
+    # попадать в blackhole 127.0.0.1:1, когда Opera недоступна.
+    # Оба домена лежат в list/eu.txt, поэтому без этого списка их убивал kill-switch.
+    NOVA_AI_KILLSWITCH_EXEMPT_EXTRA = (
+        "copilot.microsoft.com",
+        "githubcopilot.com",
+    )
+
+    # Правила ставятся из нескольких мест старта; без защёлки они уходили в две
+    # параллельные гонки и каждая плодила свой пакет процессов PowerShell.
+    _nrpt_setup_lock = threading.Lock()
+
+    def _nrpt_ps_literal(value):
+        """Оборачивает значение в одинарные кавычки PowerShell, экранируя свои."""
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _nrpt_clean_on_exit_enabled():
+        """Сносить ли правила при остановке/выходе.
+
+        По умолчанию правила остаются: они помечены тегом и сверяются при старте,
+        а пересоздание стоит полного круга PowerShell на каждом запуске.
+        NOVA_NRPT_CLEAN_ON_EXIT=1 возвращает прежнее поведение.
+        """
+        return _env_bool_global("NOVA_NRPT_CLEAN_ON_EXIT", False)
+
     def _check_nrpt_rules_applied(log_func=None):
         """Check if all required NRPT rules with NOVA_DNS_UNBLOCK tag are already applied."""
         try:
@@ -10875,49 +10879,75 @@ try:
             return False
 
     def setup_nrpt_dns_unblock(log_func=None):
-        """Setup NRPT rules for Google/AI DNS unblocking. Idempotent: skips if already applied."""
-        try:
-            if _check_nrpt_rules_applied(log_func=log_func):
-                return True
-            # Remove any stale rules with our tag first
-            remove_nrpt_dns_unblock(log_func=log_func, silent=True)
-            errors = []
-            for namespace in NOVA_NRPT_NAMESPACES:
+        """Setup NRPT rules for Google/AI DNS unblocking. Idempotent: skips if already applied.
+
+        Снос старых правил, создание всех новых и сброс кэша выполняются одним
+        процессом PowerShell. Отдельный powershell.exe на каждое правило стоил
+        ~0.5 с на быстрой машине и 1-2 с на слабой, что добавляло к старту ~40 с.
+        """
+        with _nrpt_setup_lock:
+            try:
+                if _check_nrpt_rules_applied(log_func=log_func):
+                    return True
+
+                namespaces = ", ".join(_nrpt_ps_literal(ns) for ns in NOVA_NRPT_NAMESPACES)
+                # Сбои по конкретным namespace помечаем маркером, чтобы разобрать их
+                # построчно: код возврата один на весь пакет и деталей не несёт.
                 cmd = (
-                    f"Add-DnsClientNrptRule -Namespace '{namespace}' "
-                    f"-NameServers @({NOVA_NRPT_NAMESERVERS}) "
-                    f"-Comment '{NOVA_NRPT_TAG}' "
-                    f"-DisplayName 'Nova DNS Unblock' "
-                    f"-ErrorAction Stop"
+                    f"$namespaces = @({namespaces}); "
+                    f"$servers = @({NOVA_NRPT_NAMESERVERS}); "
+                    f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
+                    f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
+                    f"| Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; "
+                    f"foreach ($ns in $namespaces) {{ "
+                    f"try {{ Add-DnsClientNrptRule -Namespace $ns -NameServers $servers "
+                    f"-Comment '{NOVA_NRPT_TAG}' -DisplayName 'Nova DNS Unblock' -ErrorAction Stop }} "
+                    f"catch {{ Write-Output ('NRPTFAIL' + [char]9 + $ns + [char]9 + $_.Exception.Message) }} "
+                    f"}}; "
+                    f"Clear-DnsClientCache -ErrorAction SilentlyContinue"
                 )
                 result = subprocess.run(
                     ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-                    capture_output=True, text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                    capture_output=True, text=True, timeout=90, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
                 )
-                if result.returncode != 0:
-                    stderr = result.stderr.strip()
-                    if "denied" in stderr.lower() or "elevation" in stderr.lower():
+
+                def _is_elevation_error(text):
+                    low = str(text or "").lower()
+                    return "denied" in low or "elevation" in low
+
+                errors = []
+                for line in str(result.stdout or "").splitlines():
+                    if not line.startswith("NRPTFAIL"):
+                        continue
+                    parts = line.split("\t")
+                    namespace = parts[1] if len(parts) > 1 else "?"
+                    message = parts[2] if len(parts) > 2 else ""
+                    if _is_elevation_error(message):
                         if log_func:
                             log_func("[NRPT] Требуются права администратора для DNS-правил.")
                         return False
-                    errors.append(f"{namespace}: {stderr[:80]}")
-            # Flush DNS cache
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 "Clear-DnsClientCache -ErrorAction SilentlyContinue"],
-                capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            )
-            if errors:
+                    errors.append(f"{namespace}: {message[:80]}")
+
+                if result.returncode != 0 and not errors:
+                    stderr = str(result.stderr or "").strip()
+                    if _is_elevation_error(stderr):
+                        if log_func:
+                            log_func("[NRPT] Требуются права администратора для DNS-правил.")
+                        return False
+                    if stderr:
+                        errors.append(stderr[:80])
+
+                if errors:
+                    if log_func:
+                        log_func(f"[NRPT] Частичные ошибки: {'; '.join(errors[:3])}")
+                    return False
                 if log_func:
-                    log_func(f"[NRPT] Частичные ошибки: {'; '.join(errors[:3])}")
+                    log_func(f"[NRPT] DNS-правила для Gemini/Google AI применены ({len(NOVA_NRPT_NAMESPACES)} правил).")
+                return True
+            except Exception as e:
+                if log_func:
+                    log_func(f"[NRPT] Ошибка настройки DNS: {e}")
                 return False
-            if log_func:
-                log_func(f"[NRPT] DNS-правила для Gemini/Google AI применены ({len(NOVA_NRPT_NAMESPACES)} правил).")
-            return True
-        except Exception as e:
-            if log_func:
-                log_func(f"[NRPT] Ошибка настройки DNS: {e}")
-            return False
 
     def remove_nrpt_dns_unblock(log_func=None, silent=False):
         """Remove all NRPT rules tagged with NOVA_DNS_UNBLOCK."""
@@ -10937,6 +10967,17 @@ try:
         except Exception as e:
             if log_func and not silent:
                 log_func(f"[NRPT] Ошибка удаления DNS-правил: {e}")
+
+    def remove_nrpt_dns_unblock_on_exit(log_func=None, silent=True):
+        """Путь остановки/выхода: по умолчанию правила остаются на месте.
+
+        Правила помечены тегом NOVA_DNS_UNBLOCK и сверяются при старте, поэтому
+        сохранённый набор даёт быстрый путь (одна проверка вместо пересоздания).
+        Отключение ai_unlock пользователем по-прежнему сносит их сразу.
+        """
+        if not _nrpt_clean_on_exit_enabled():
+            return
+        remove_nrpt_dns_unblock(log_func=log_func, silent=silent)
 
     # ================= МОДУЛЬ: NOVA_LOGIC =================
 
@@ -13534,17 +13575,41 @@ try:
                     is_vpn_active = True
                     was_service_active_before_vpn = is_service_active
                     
-                    if is_service_active: 
+                    if is_service_active:
                         # silent=True, чтобы не спамить в лог об остановке, так как мы выше уже написали причину
                         stop_nova_service(silent=True)
-                    
-                    if root: 
+
+                    # Строго ПОСЛЕ stop_nova_service: та в ветке `if not restart_mode`
+                    # зовёт clear_hotswap_checker_pause, и пауза, поставленная раньше,
+                    # была бы стёрта через миллисекунды. Ставим безусловно — в том
+                    # числе когда сервис уже был остановлен и stop_nova_service не
+                    # вызывалась.
+                    #
+                    # Верхний гейт чекера (`if is_vpn_active: continue`) срабатывает
+                    # только на границе внешнего цикла, а скан идёт минутами: без
+                    # этой паузы он продолжает мерить сеть через чужой VPN и
+                    # записывает результат как «прямую» проверку.
+                    try:
+                        pause_checker_for_hotswap("Активен сторонний VPN")
+                    except Exception:
+                        pass
+
+                    if root:
                         root.after(0, lambda: (status_label.config(text="ПАУЗА (VPN)", fg=COLOR_TEXT_ERROR), btn_toggle.config(state=tk.DISABLED)))
-                        
+
                 elif not vpn_is_currently_active and is_vpn_active:
                     log_func("[VPN Detector] VPN отключен. Возобновление работы...")
                     is_vpn_active = False
-                    
+
+                    # До restore_ui и до start_nova_service: при
+                    # was_service_active_before_vpn == False автозапуска не будет,
+                    # и снять паузу больше некому — чекер остался бы замороженным
+                    # до перезапуска Nova.
+                    try:
+                        clear_hotswap_checker_pause(log_resume=False)
+                    except Exception:
+                        pass
+
                     def restore_ui():
                         btn_toggle.config(state=tk.NORMAL)
                         if not was_service_active_before_vpn:
@@ -13831,6 +13896,59 @@ try:
     _core_backend_reason = [""]
     _degraded_core_recovery_scheduled = [False]
     _degraded_core_recovery_attempts = [0]
+    # Отложенный hot-restart ядра. Пока поднят собственный VPN-транспорт (WARP 1370 /
+    # Opera 1371), горячий рестарт рвёт их сессии: opera-proxy при этом умирает с
+    # кодом 12 на этапе выбора эндпоинта, а PAC успевает уйти в kill-switch.
+    # Стратегия к этому моменту уже сохранена в strategies.json, поэтому применяем её,
+    # когда транспорт снимут, либо она подхватится сама при следующем запуске Nova.
+    _deferred_hotswap_pending = [False]
+    _deferred_hotswap_reason = [""]
+
+    def is_vpn_transport_active():
+        """Поднят ли собственный VPN-транспорт Nova (WARP 1370 / Opera 1371)."""
+        for port in (1370, 1371):
+            try:
+                if is_local_port_open_quick(port, timeout=0.25):
+                    return True
+            except:
+                pass
+        return False
+
+    def should_defer_hotswap():
+        """Причина отложить hot-restart «применения правил», либо False.
+
+        Касается только перезапусков ради новых стратегий и списков: они могут
+        подождать. Аварийные пути (падение ядра, degraded-recovery, повтор
+        зависшего рестарта) этот чек намеренно не используют — там ядро уже
+        нерабочее и ждать нечего.
+        """
+        try:
+            if is_closing:
+                return False
+        except:
+            pass
+        for manager_name in ("novadivert_redirect_manager", "telegram_relay_manager"):
+            try:
+                manager = globals().get(manager_name)
+                if manager and bool(getattr(manager, "is_ready", lambda: False)()):
+                    return "активен Telegram transparent path"
+            except:
+                pass
+        try:
+            if is_vpn_transport_active():
+                return "поднят VPN-транспорт (WARP/Opera)"
+        except:
+            pass
+        return False
+
+    def mark_hotswap_deferred(reason):
+        """Ставит флаг отложенного рестарта; watchdog применит его при снятии транспорта."""
+        try:
+            _deferred_hotswap_pending[0] = True
+            _deferred_hotswap_reason[0] = str(reason)
+        except:
+            pass
+
     _safe_filter_mode_notice_shown = [False]
     _safe_filter_mode_block_notice_shown = [False]
     _safe_filter_mode_explicit_opt_in = _env_bool_global("NOVA_DEV_EXPERIMENTAL_SAFE_FILTER_MODE", False)
@@ -14256,12 +14374,16 @@ try:
                 # Блокирующее получение задачи из очереди с таймаутом
                 domain = check_queue.get(timeout=1)
     
-                # Если сервис выключен, возвращаем задачу и ждем, чтобы не потерять ее
-                if not is_service_active:
+                # Если сервис выключен, возвращаем задачу и ждем, чтобы не потерять ее.
+                # is_vpn_active — по образцу periodic_exclude_checker_worker и
+                # hard_strategy_matcher_worker: это был единственный воркер без
+                # VPN-гейта, и через чужой туннель он записывал результат в
+                # check_cache на сутки как «прямую» проверку.
+                if not is_service_active or is_vpn_active:
                     check_queue.put(domain)
                     time.sleep(2)
                     continue
-                
+
                 # Пропускаем домены, которые уже в исключениях или являются мусором
                 if is_domain_excluded(domain) or is_garbage_domain(domain):
                     continue
@@ -17122,21 +17244,6 @@ try:
 
                 
                 # HELPER: Update Active Config Immediate
-                def _should_defer_general_hotswap():
-                    try:
-                        if is_closing:
-                            return False
-                    except:
-                        pass
-                    for manager_name in ("novadivert_redirect_manager", "telegram_relay_manager"):
-                        try:
-                            manager = globals().get(manager_name)
-                            if manager and bool(getattr(manager, "is_ready", lambda: False)()):
-                                return True
-                        except:
-                            pass
-                    return False
-
                 def update_active_config_immediate(succ_svc, succ_args, reason_msg):
                     try:
                         s_path = os.path.join(base_dir, "strat", "strategies.json")
@@ -17154,8 +17261,17 @@ try:
                         
                         if updated:
                             save_json_safe(s_path, c_data)
-                            if succ_svc == "general" and _should_defer_general_hotswap():
-                                defer_msg = f"{reason_msg}. Hot-restart отложен: активен Telegram transparent path; стратегия вступит в силу после следующего ручного перезапуска Nova."
+                            # Откладываем для любого сервиса, не только general: рестарт ради
+                            # youtube/discord рвёт транспорт ровно так же.
+                            defer_reason = should_defer_hotswap()
+                            if defer_reason:
+                                # Стратегия уже в strategies.json. Флаг снимет watchdog, как
+                                # только транспорт опустится, иначе применится при старте Nova.
+                                mark_hotswap_deferred(defer_reason)
+                                defer_msg = (
+                                    f"{reason_msg}. Hot-restart отложен: {defer_reason}; "
+                                    f"стратегия вступит в силу после отключения VPN или перезапуска Nova."
+                                )
                                 if root:
                                     root.after(0, lambda m=defer_msg: log_print(m))
                                 else:
@@ -22771,8 +22887,18 @@ try:
                     restart_reasons.append(f"exclude +{exclude_new_unique_count}")
 
                 if restart_reasons:
-                    log_func(f"[Auto] Добавлены новые записи ({', '.join(restart_reasons)}) -> Ядро перезапущено")
-                    perform_hot_restart_backend()
+                    # Тот же принцип, что и у чекера: новые записи подождут снятия
+                    # транспорта, иначе рестарт рвёт сессии WARP/Opera на ровном месте.
+                    defer_reason = should_defer_hotswap()
+                    if defer_reason:
+                        mark_hotswap_deferred(defer_reason)
+                        log_func(
+                            f"[Auto] Добавлены новые записи ({', '.join(restart_reasons)}). "
+                            f"Перезапуск отложен: {defer_reason}."
+                        )
+                    else:
+                        log_func(f"[Auto] Добавлены новые записи ({', '.join(restart_reasons)}) -> Ядро перезапущено")
+                        perform_hot_restart_backend()
                 else:
                     if exclude_changed and IS_DEBUG_MODE:
                         log_func("[Auto] Изменен exclude.txt без новых записей (без автоперезапуска).")
@@ -22828,9 +22954,29 @@ try:
         except:
             pass
 
-        # Wait a bit for network to stabilize
-        time.sleep(8)
-        
+        # Ждём не «восемь секунд», а состояние, ради которого эти секунды стояли:
+        # поднятый интернет и маршрут, определённый через PowerShell, а не через
+        # UDP-фолбэк. Фолбэк отдаёт адрес ВНУТРИ туннеля, если TUN уже встал, и
+        # именно он делает измерение ложным.
+        #
+        # Цена ошибки тут не косметическая: несовпадение с ip_last.txt ниже
+        # чистит check_cache целиком, а это суточный кэш проверок доменов.
+        # Поэтому ожидание дополнено флагом доверия: не сошлось за отведённое
+        # время — измерение считаем ненадёжным и разрушительную часть пропускаем.
+        route_trusted = False
+        _wait_deadline = time.monotonic() + 8.0
+        while not is_closing and time.monotonic() < _wait_deadline:
+            try:
+                if check_internet_connectivity():
+                    _info = get_direct_route_info() or {}
+                    # Непустой gateway = ветка PowerShell, а не UDP-фолбэк.
+                    if str(_info.get("gateway") or "").strip():
+                        route_trusted = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
         try:
             ip_cache_file = os.path.join(get_base_dir(), "temp", "ip_last.txt")
             last_ip = ""
@@ -22861,6 +23007,17 @@ try:
             if route_identity_equal(current_ip, last_ip):
                 pass # Silent success (User request: reduce log spam)
 
+            elif not route_trusted:
+                # Сеть так и не устоялась за отведённое время. Отличить смену
+                # провайдера от адреса внутри поднявшегося туннеля сейчас нельзя,
+                # а ошибка стоит суточного кэша проверок — поэтому только запись
+                # в лог. Настоящая смена маршрута будет замечена при следующем
+                # запуске, когда измерение окажется надёжным.
+                safe_trace(
+                    f"[IP Worker] Маршрут не устоялся ({format_route_identity(last_ip)} -> "
+                    f"{format_route_identity(current_ip)}); кэш проверок сохранён."
+                )
+
             else:
                 log_func(f"[Init] Прямой маршрут изменился ({format_route_identity(last_ip)} -> {format_route_identity(current_ip)}). Сброс кэша проверок.")
                 try:
@@ -22868,7 +23025,7 @@ try:
                         check_cache.clear()
                         save_json_safe(CHECK_CACHE_FILE, check_cache)
                 except: pass
-                
+
                 try:
                     with open(ip_cache_file, "w") as f:
                         f.write(current_ip)
@@ -22936,6 +23093,23 @@ try:
                     warp_last_good_ts = 0.0
                     warp_next_recovery_ts = 0.0
                     continue
+
+                # Транспорт опустился — применяем стратегию, отложенную чекером.
+                if _deferred_hotswap_pending[0]:
+                    try:
+                        if not is_vpn_transport_active():
+                            _deferred_hotswap_pending[0] = False
+                            held_by = _deferred_hotswap_reason[0] or "VPN-транспорт"
+                            _deferred_hotswap_reason[0] = ""
+                            log_func(
+                                f"[HotSwap] Транспорт снят ({held_by}). Применяем отложенную стратегию."
+                            )
+                            if root:
+                                root.after(0, perform_hot_restart_backend)
+                            else:
+                                perform_hot_restart_backend()
+                    except Exception as e:
+                        safe_trace(f"[HotSwap] Ошибка применения отложенной стратегии: {e}")
 
                 now = time.time()
                 warp_usable = False
@@ -23077,6 +23251,12 @@ try:
                         need_restart = False
                     elif opera_proc_dead:
                         exit_code = opera_proc.returncode
+                        # Код 12 = замер скорости эндпоинтов не уложился в таймаут.
+                        # Помечаем, чтобы следующий запуск обошёлся без замера.
+                        try:
+                            opera_proxy_manager.note_exit_code(exit_code)
+                        except:
+                            pass
                         if last_opera_issue_state != "proc_dead":
                             log_func(f"[EU] Процесс завершился (код: {exit_code}). Перезапуск...")
                         last_opera_issue_state = "proc_dead"
@@ -23966,21 +24146,11 @@ try:
                 if IS_DEBUG_MODE and not silent:
                     logger(f"[Init] Ошибка раннего запуска WARP: {_e}")
 
-        # Apply NRPT DNS rules for Gemini/Google AI unblocking
-        def _setup_nrpt_async():
-            try:
-                settings = load_routing_settings()
-                sys_settings = settings.get("system") or {}
-                ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
-                if ai_unlock_enabled:
-                    setup_nrpt_dns_unblock(log_func=logger if not silent else None)
-                else:
-                    remove_nrpt_dns_unblock(log_func=logger if not silent else None, silent=True)
-            except Exception as e:
-                if not silent:
-                    logger(f"[Init] NRPT setup error: {e}")
-        threading.Thread(target=_setup_nrpt_async, daemon=True, name="NovaNrptSetup").start()
-        
+        # NRPT-правила ставит start_bg_services() на холодном старте. Дубль этого
+        # блока здесь давал две параллельные гонки: обе не находили правил и обе
+        # пересоздавали весь набор. При горячем рестарте правила не сносятся
+        # (remove идёт под `if not restart_mode`), поэтому повтор тут не нужен.
+
         # AUTO-RECOVERY: If windivert driver is stuck (commands timed out),
         # force config update instead of deleting (since we lack admin rights to recreate).
         if _windivert_stuck:
@@ -25135,7 +25305,7 @@ try:
         # Иначе браузер не сможет подключиться к сайтам после остановки Nova
         if not restart_mode:
             try:
-                remove_nrpt_dns_unblock(silent=True)
+                remove_nrpt_dns_unblock_on_exit(silent=True)
             except: pass
             try:
                 if pac_manager:
@@ -25391,9 +25561,9 @@ try:
             except: pass
 
             try:
-                remove_nrpt_dns_unblock(silent=True)
+                remove_nrpt_dns_unblock_on_exit(silent=True)
             except: pass
-            
+
             try:
                 if warp_manager:
                     warp_manager.stop_service()
@@ -25448,7 +25618,7 @@ try:
             except: pass
 
             try:
-                remove_nrpt_dns_unblock()
+                remove_nrpt_dns_unblock_on_exit(silent=False)
             except: pass
             
             try:

@@ -1,9 +1,7 @@
-# version: 1.32
+# version: 1.33
 4pda.to
 4pda.ws
 analog.com
-anthropic.com
-apihub.googleapis.com
 autodesk.com
 autodesk360.com
 b-cdn.net
@@ -13,13 +11,9 @@ cdn.cookielaw.org
 cdnbunny.org
 cerebras.ai
 chatgpt.com
-cloudcode-pa.googleapis.com
-cloudcode.googleapis.com
-cloudresourcemanager.googleapis.com
 codegpt.co
 collaborator.pro
 copilot.microsoft.com
-daily-cloudcode-pa.googleapis.com
 digikey.com
 digikeyassets.com
 digiseller.mycdn.ink
@@ -32,7 +26,6 @@ fitgirl-repacks.site
 flibusta.is
 g2a.com
 gamsgo.com
-generativelanguage.googleapis.com
 geolocation.onetrust.com
 githubcopilot.com
 gog.com
@@ -63,7 +56,6 @@ ntc.party
 nxp.com
 oaistatic.com
 oaiusercontent.com
-oauth2.googleapis.com
 onlinesim.io
 openai.com
 openrouter.ai
@@ -73,7 +65,6 @@ paddle.com
 parklogic.com
 patreon.com
 patreonusercontent.com
-people.googleapis.com
 performance.radar.cloudflare.com
 pixabay.com
 plati.io

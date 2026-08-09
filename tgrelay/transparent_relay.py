@@ -347,6 +347,29 @@ def _ws_domains(dc: int, is_media: bool) -> List[str]:
     return [f"kws{dc}.web.telegram.org"]
 
 
+# Two different things travel over WSS: our own Worker and Telegram Web itself.
+# They fail for unrelated reasons, so the first-byte circuit keeps a counter per
+# kind. Before this split the key was (dc, is_media) alone, and two empty replies
+# from the weaker route tripped the breaker for the healthy one on the same DC —
+# visible in the log as a web.telegram.org pair at down=0 followed immediately by
+# nova-app.eu being paused.
+WSS_ROUTE_KINDS = ("cf", "web")
+
+
+def _wss_route_kind(route_label) -> str:
+    """"web" for kwsN[-1].web.telegram.org, "cf" for our Worker zones.
+
+    Labels look like ``domain via egress`` or ``domain@ip via egress``; an
+    unparsable one counts as "cf", which is the path that carries most traffic
+    and the behaviour these counters had before the split.
+    """
+    try:
+        domain = str(route_label or "").split(" via ", 1)[0].split("@", 1)[0].strip().lower()
+    except Exception:
+        return "cf"
+    return "web" if domain.endswith("web.telegram.org") else "cf"
+
+
 def _cf_ws_domains_for_bases(dc: int, bases: List[str], is_media: bool = False) -> List[str]:
     if int(dc or 0) == 203:
         dc = 2
@@ -358,10 +381,20 @@ def _cf_ws_domains_for_bases(dc: int, bases: List[str], is_media: bool = False) 
         # Allow kwsN-1 for media on custom CF domains as well
         if is_media:
             domains.append(f"kws{int(dc)}-1.{domain_base}")
-        # The owned Worker selects Telegram's media upstream from the ``-1``
-        # hostname. Trying its regular sibling for a media session sends the
-        # connection to the non-media upstream and creates an empty retry.
-        if not (is_media and domain_base == "nova-app.eu"):
+        # The Worker picks Telegram's media upstream from the ``-1`` hostname, so
+        # the regular sibling sends a media session to the non-media upstream:
+        # the handshake succeeds, then nothing ever arrives.
+        #
+        # This used to exclude the sibling for nova-app.eu only, which made the
+        # other zones actively harmful. Their ``-1`` names have no DNS record, so
+        # a media race offered exactly one resolvable candidate per zone — the
+        # broken sibling — and it won the race by answering first, every time.
+        # Measured: kws2.pclead.co.uk answers 101 in ~350 ms and then delivers
+        # down=0, while kws2-1.pclead.co.uk does not resolve at all.
+        #
+        # Dropping it costs zone diversity for media until those zones get their
+        # ``-1`` records; carrying it cost media entirely.
+        if not is_media:
             domains.append(f"kws{int(dc)}.{domain_base}")
     seen = set()
     return [item for item in domains if not (item in seen or seen.add(item))]
@@ -1420,6 +1453,9 @@ class TelegramTransparentRelayServer:
         self.stop_event = None
         self.started_event = threading.Event()
         self.running = False
+        # Set by stop() so the supervisor in _thread_main can tell an ordered
+        # shutdown from a crash and not fight it by restarting.
+        self._stopping = False
         self._cf_started = False
         self._no_probe_until: Dict[Tuple[str, int], float] = {}
         self._http_transport_until: Dict[Tuple[str, int], float] = {}
@@ -1441,8 +1477,9 @@ class TelegramTransparentRelayServer:
         self._cf_refilling = set()
         self._last_skip_log: Dict[Tuple[str, str, int, int, bool], float] = {}
         self._route_scoring: Dict[Tuple[int, str], float] = {}  # (dc, route_label_type): score
-        self._wss_first_byte_fail: Dict[Tuple[int, bool], Tuple[int, float]] = {}
-        self._wss_first_byte_disabled_until: Dict[Tuple[int, bool], float] = {}
+        # Ключ (dc, is_media, route_kind) — см. _wss_route_kind.
+        self._wss_first_byte_fail: Dict[Tuple[int, bool, str], Tuple[int, float]] = {}
+        self._wss_first_byte_disabled_until: Dict[Tuple[int, bool, str], float] = {}
         self._active_clients = {}
         self._last_client_mode_seen = {"socks": 0.0, "divert": 0.0}
         self._last_mode_switch_close = 0.0
@@ -1708,6 +1745,7 @@ class TelegramTransparentRelayServer:
     def start(self, timeout: float = 8.0) -> bool:
         if self.thread and self.thread.is_alive():
             return True
+        self._stopping = False
         self.started_event.clear()
         self.thread = threading.Thread(target=self._thread_main, daemon=True, name="NovaTelegramRelay")
         self.thread.start()
@@ -1715,6 +1753,7 @@ class TelegramTransparentRelayServer:
         return bool(self.running)
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._stopping = True
         if self.loop and self.stop_event:
             try:
                 self.loop.call_soon_threadsafe(self.stop_event.set)
@@ -1761,7 +1800,54 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
 
+    # Supervision. A single unhandled exception out of _run() used to end the
+    # relay for the rest of the session: the thread returned, nothing watched
+    # `running`, and Telegram simply had no local SOCKS5 until Nova restarted.
+    # Observed in the field as one line — «Ошибка запуска: invalid state» — and
+    # then eighteen minutes of silence.
+    #
+    # A crash mid-session is not the same failure as a bad start, so the backoff
+    # resets after a run that stayed up: a relay that served for a minute and
+    # then hit a race should come back at once, while a port that is genuinely
+    # taken should not spin.
+    _SUPERVISOR_BACKOFF_MAX = 15.0
+    _SUPERVISOR_HEALTHY_RUN = 30.0
+
     def _thread_main(self) -> None:
+        backoff = 1.0
+        attempt = 0
+        while not self._stopping:
+            attempt += 1
+            started = time.monotonic()
+            crashed = self._run_once()
+            uptime = time.monotonic() - started
+
+            if self._stopping:
+                break
+            if not crashed:
+                # Ordered exit of the event loop without an exception.
+                break
+
+            if uptime >= self._SUPERVISOR_HEALTHY_RUN:
+                backoff = 1.0
+                attempt = 1
+            # First failure and then every fifth: enough to see it in the log
+            # without burying everything else when a port stays occupied.
+            if attempt == 1 or attempt % 5 == 0:
+                self.log_func(
+                    f"[TgRelay] Релей упал после {uptime:.0f}с (попытка {attempt}); "
+                    f"перезапуск через {backoff:.0f}с."
+                )
+            slept = 0.0
+            while slept < backoff and not self._stopping:
+                step = min(0.25, backoff - slept)
+                time.sleep(step)
+                slept += step
+            backoff = min(self._SUPERVISOR_BACKOFF_MAX, backoff * 2.0)
+
+    def _run_once(self) -> bool:
+        """One life of the relay. True when it ended on an exception."""
+        crashed = False
         loop = asyncio.new_event_loop()
         self.loop = loop
         asyncio.set_event_loop(loop)
@@ -1779,6 +1865,7 @@ class TelegramTransparentRelayServer:
         try:
             loop.run_until_complete(self._run())
         except Exception as exc:
+            crashed = True
             self.log_func(f"[TgRelay] Ошибка запуска: {exc}")
         finally:
             self.running = False
@@ -1790,6 +1877,11 @@ class TelegramTransparentRelayServer:
                 if pending:
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+            # The loop these belong to is gone; leaving them set would let
+            # stop() and notify_route_usable() call into a closed loop.
+            self.loop = None
+            self.stop_event = None
+        return crashed
 
     def _loop_exception_handler(self, loop, context):
         exc = (context or {}).get("exception")
@@ -1905,15 +1997,28 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
 
-    def _wss_first_byte_disabled(self, dc_hint: int, is_media: bool) -> bool:
+    def _wss_first_byte_disabled(self, dc_hint: int, is_media: bool, route_kind=None) -> bool:
+        """Is the first-byte circuit open?
+
+        With ``route_kind`` — for that kind alone. Without it the question is
+        «is WSS worth attempting at all», and the answer is yes while any kind
+        still has a closed circuit: one dead route must not speak for the other.
+        """
         try:
-            until = float(self._wss_first_byte_disabled_until.get((int(dc_hint or 0), bool(is_media)), 0.0) or 0.0)
-            return until > time.monotonic()
+            now = time.monotonic()
+            kinds = (str(route_kind),) if route_kind else WSS_ROUTE_KINDS
+            for kind in kinds:
+                key = (int(dc_hint or 0), bool(is_media), kind)
+                until = float(self._wss_first_byte_disabled_until.get(key, 0.0) or 0.0)
+                if until <= now:
+                    return False
+            return True
         except Exception:
             return False
 
-    def _note_wss_first_byte_result(self, dc_hint: int, is_media: bool, down: int) -> None:
-        key = (int(dc_hint or 0), bool(is_media))
+    def _note_wss_first_byte_result(self, dc_hint: int, is_media: bool, down: int, route_label="") -> None:
+        kind = _wss_route_kind(route_label)
+        key = (int(dc_hint or 0), bool(is_media), kind)
         if key[0] <= 0:
             return
         now = time.monotonic()
@@ -1941,7 +2046,7 @@ class TelegramTransparentRelayServer:
                     else "using TCP fallback via WARP"
                 )
                 self.log_func(
-                    f"[TgRelay] WSS first-byte circuit: dc={key[0]} media={bool(is_media)} "
+                    f"[TgRelay] WSS first-byte circuit: dc={key[0]} media={bool(is_media)} route={kind} "
                     f"disabled_for={int(ttl)}s; {action}."
                 )
         except Exception:
@@ -2233,7 +2338,7 @@ class TelegramTransparentRelayServer:
                     await ws.close()
                 if _has_custom_cfproxy_domain():
                     self._cf_note_bad_route_label(route_label, is_media, ttl=CF_MEDIA_BAD_TTL)
-                    self._note_wss_first_byte_result(dc_hint, is_media, 0)
+                    self._note_wss_first_byte_result(dc_hint, is_media, 0, route_label)
                     return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=True)
                 return
@@ -2275,14 +2380,14 @@ class TelegramTransparentRelayServer:
                 )
                 if media_stalled:
                     self._cf_note_bad_route_label(route_label, True, ttl=CF_MEDIA_BAD_TTL)
-                    self._note_wss_first_byte_result(dc_hint, True, 0)
+                    self._note_wss_first_byte_result(dc_hint, True, 0, route_label)
                     self.log_func(
                         f"[TgRelay] WSS media progress stalled: dc={dc_hint or '?'} "
                         f"route={route_label} down={down} duration_ms={duration_ms}; reconnecting."
                     )
                     return
                 self._cf_note_good_route_label(route_label, dc_hint, is_media, down)
-                self._note_wss_first_byte_result(dc_hint, is_media, down)
+                self._note_wss_first_byte_result(dc_hint, is_media, down, route_label)
                 return
             if int(down or 0) <= 0:
                 pending_replay = bytes(_replay or b"")
@@ -2316,7 +2421,7 @@ class TelegramTransparentRelayServer:
                     if retried:
                         return
                     replay_initial = retry_replay
-                self._note_wss_first_byte_result(dc_hint, is_media, 0)
+                self._note_wss_first_byte_result(dc_hint, is_media, 0, route_label)
                 # Skip TCP fallback when CF domains are available — ISP throttles
                 # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
                 if _has_custom_cfproxy_domain():
@@ -2394,7 +2499,9 @@ class TelegramTransparentRelayServer:
             return False
         if not CF_FALLBACK_ENABLED or not _has_custom_cfproxy_domain():
             return False
-        if self._wss_first_byte_disabled(dc_hint, False):
+        # Только CF: этот путь ведёт исключительно на свой Worker, и молчание
+        # web.telegram.org не повод его пропускать.
+        if self._wss_first_byte_disabled(dc_hint, False, route_kind="cf"):
             return False
         # Treat all Telegram connections as CF/WSS bootstrap candidates when a custom domain is configured.
         try:
@@ -2460,7 +2567,7 @@ class TelegramTransparentRelayServer:
         )
         if int(down or 0) > 0:
             self._cf_note_good_route_label(route_label, dc_hint, False, down)
-            self._note_wss_first_byte_result(dc_hint, False, down)
+            self._note_wss_first_byte_result(dc_hint, False, down, route_label)
             return True
         if int(down or 0) <= 0:
             pending_replay = bytes(replay or b"")
@@ -2493,7 +2600,7 @@ class TelegramTransparentRelayServer:
                 if retried:
                     return True
                 replay_initial = retry_replay
-            self._note_wss_first_byte_result(dc_hint, False, 0)
+            self._note_wss_first_byte_result(dc_hint, False, 0, route_label)
             if int(target_port or 0) == 80 and self._cf_has_recent_good(dc_hint, False, max_age=180.0):
                 self.log_func(
                     f"[TgRelay] WSS recent-good dc={dc_hint}; closing empty bootstrap target={target_ip}:{target_port} "
@@ -3028,7 +3135,7 @@ class TelegramTransparentRelayServer:
             and 0 < int(down or 0) < MEDIA_WSS_MIN_PROGRESS
             and int(duration_ms or 0) >= 1800
         )
-        self._note_wss_first_byte_result(dc_hint, is_media, 0 if media_stalled else down)
+        self._note_wss_first_byte_result(dc_hint, is_media, 0 if media_stalled else down, route_label)
         if media_stalled:
             self._cf_note_bad_route_label(route_label, True, ttl=CF_MEDIA_BAD_TTL)
             self.log_func(
@@ -3061,14 +3168,29 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
 
-        custom_cf_first = bool(allow_cf and CF_FALLBACK_ENABLED and _has_custom_cfproxy_domain())
+        # Порядок маршрутов. Ниже уже написана полная развилка: сначала один из
+        # двух путей, затем второй (второй CF-заход прикрыт tried_cf_route), так
+        # что web-first — это рабочий режим, а не заготовка.
+        #
+        # Недостижим он был из-за одной строки: `_has_custom_cfproxy_domain()`
+        # константно True (config.py всегда добавляет nova-app.eu в список), а
+        # значит `custom_cf_first` истинно всегда и ветка выбора по DC никогда не
+        # исполнялась. Обе ветки при этом имели одинаковое тело, поэтому само по
+        # себе их «оживление» ничего бы не изменило — менять надо было условие.
+        #
+        # Списки решают, только если оператор задал их явно. Иначе остаётся
+        # сегодняшнее поведение: CF первым для всех DC. Без этой оговорки дефолт
+        # CF_FIRST_MEDIA_DCS увёл бы медиа DC1 и DC3 на web-first молча.
+        cf_order_configured = bool(
+            str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "") or "").strip()
+            or str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_MEDIA_DCS", "") or "").strip()
+        )
+        cf_first = self._cf_first(dc_hint, is_media) if cf_order_configured else True
+        custom_cf_first = bool(
+            allow_cf and CF_FALLBACK_ENABLED and _has_custom_cfproxy_domain() and cf_first
+        )
         tried_cf_route = False
-        if allow_cf and CF_FALLBACK_ENABLED and custom_cf_first:
-            tried_cf_route = True
-            ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=False)
-            if ws is not None:
-                return ws, route_label
-        elif allow_cf and CF_FALLBACK_ENABLED and self._cf_first(dc_hint, is_media):
+        if allow_cf and CF_FALLBACK_ENABLED and (custom_cf_first or cf_first):
             tried_cf_route = True
             ws, route_label = await self._connect_cf_ws_route(dc_hint, is_media, primary_only=False)
             if ws is not None:

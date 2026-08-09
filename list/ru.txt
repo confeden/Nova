@@ -1,4 +1,4 @@
-# version: 1.32
+# version: 1.33
 1337x.to
 1e100cdn.net
 7tv.app
@@ -114,6 +114,7 @@ ip-tracker.org
 iplogger.org
 island-of-pleasure.site
 jabber.fr
+jnn-pa.googleapis.com
 killedbygoogle.com
 kinobox.tv
 kinohub.vip
@@ -241,7 +242,6 @@ twitch.tv
 twitchcdn.net
 twitter.com
 unpkg.com
-upload.youtube.com
 userscript.zone
 vecpea.com
 vector.im
@@ -255,6 +255,7 @@ websiteplanet.com
 whatsapp.com
 whatsapp.net
 whois.com
+wide-youtube.l.google.com
 windscribe.com
 windscribe.net
 workos.com
@@ -263,10 +264,17 @@ x.com
 xv-ru.com
 xvideos-cdn.com
 xvideos.com
+youtu.be
 youtube-nocookie.com
+youtube-ui.l.google.com
 youtube.com
+youtubeembeddedplayer.googleapis.com
+youtubei.googleapis.com
+youtubekids.com
+yt-video-upload.l.google.com
 yt3.googleusercontent.com
 ytimg.com
+ytimg.l.google.com
 z-lib.sk
 z-library.sk
 zendesk.com

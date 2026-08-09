@@ -1,4 +1,4 @@
-# version: 1.32
+# version: 1.33
 # Nova PC - Games routing domains (TCP patch/update endpoints)
 #
 # Domains for Path of Exile update/patch/news traffic. The PoE launcher
