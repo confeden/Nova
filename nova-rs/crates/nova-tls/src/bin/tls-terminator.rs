@@ -36,10 +36,16 @@
 //!       {"ok":false,"reached":1,"ended":3,"error":"connection refused"}
 //! ```
 //!
+//! The request line must be the last thing the client writes before the reply
+//! arrives. It is read through a `BufReader` that is discarded straight after,
+//! so anything pipelined behind it is dropped without a trace.
+//!
 //! Then the connection carries plaintext in both directions until either side
 //! closes. A loopback close is translated into an abrupt upstream teardown, so
 //! that the relay's `transport.abort()` — which it uses deliberately to punish
-//! a stalled route — still means what it meant.
+//! a stalled route — still means what it meant. The reverse is not symmetric:
+//! when the *upstream* closes, the loopback gets a plain shutdown, because that
+//! EOF is the only way the relay ever learns the far side is gone.
 //!
 //! ```text
 //! tls-terminator --port 1374 --token <secret>
@@ -49,7 +55,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nova_tls::{built_in_profile, shape};
 use serde::Deserialize;
@@ -271,22 +277,66 @@ fn main() {
     let live = Arc::new(AtomicUsize::new(0));
     const MAX_LIVE: usize = 128;
 
+    let mut refused: u64 = 0;
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                // Исчерпание дескрипторов возвращает ошибку на каждом accept, и
+                // без паузы это горячий цикл на целом ядре — который сам же и не
+                // даёт освободиться тем дескрипторам, которых не хватает.
+                eprintln!("accept не удался: {err}");
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
         if live.load(Ordering::Relaxed) >= MAX_LIVE {
             // Refusing is better than queueing: the caller has a deadline and a
             // fallback, and a refused connection reaches it immediately.
+            //
+            // Но молча отказывать нельзя: со стороны релея это неотличимо от
+            // упавшего помощника (terminator.py говорит «TLS helper closed
+            // without a greeting»), а упёршийся потолок — единственный видимый
+            // снаружи признак утечки соединений. Степени двойки, чтобы шквал
+            // отказов не залил лог.
+            refused += 1;
+            if refused.is_power_of_two() {
+                eprintln!("отказ: занято {MAX_LIVE} соединений, отказов всего {refused}");
+            }
             drop(stream);
             continue;
         }
         let token = Arc::clone(&token);
         let shapers = Arc::clone(&shapers);
-        let live = Arc::clone(&live);
         live.fetch_add(1, Ordering::Relaxed);
-        std::thread::spawn(move || {
-            serve(stream, &token, &shapers);
-            live.fetch_sub(1, Ordering::Relaxed);
-        });
+        let slot = LiveSlot(Arc::clone(&live));
+        // Builder, а не thread::spawn: последний паникует, когда поток создать
+        // не удалось, и уносит с собой цикл accept — то есть весь терминатор.
+        let spawned = std::thread::Builder::new()
+            .name(format!("tunnel-{}", live.load(Ordering::Relaxed)))
+            .spawn(move || {
+                let _slot = slot;
+                serve(stream, &token, &shapers);
+            });
+        if let Err(err) = spawned {
+            // Замыкание уничтожено вместе с `slot`, счётчик уже вернулся.
+            eprintln!("не удалось создать поток соединения: {err}");
+        }
+    }
+}
+
+/// Возвращает слот в счётчик живых соединений, в том числе при панике.
+///
+/// Уменьшение счётчика последней строкой замыкания разматывающаяся паника
+/// просто перепрыгивает — а профиль release собран с `panic = "unwind"`
+/// намеренно. Один аварийный поток навсегда съедал единицу из `MAX_LIVE`, а
+/// сотня таких превращала терминатор в процесс, который жив, слушает порт и
+/// отказывает всем.
+struct LiveSlot(Arc<AtomicUsize>);
+
+impl Drop for LiveSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -307,6 +357,9 @@ mod phase_watch {
     pub const UPSTREAM_WRITE: u8 = 5;
     pub const CLIENT_WRITE: u8 = 6;
     pub const TAIL: u8 = 7;
+
+    /// Пятый бит маски — не интерес, а состояние: одна из сторон уже отвалилась.
+    pub const HALF_CLOSED: u64 = 16;
 
     pub fn name(phase: u8) -> &'static str {
         match phase {
@@ -333,19 +386,24 @@ mod phase_watch {
 
         /// Флаги интереса на момент входа в ожидание — чтобы «застрял в wait»
         /// сразу говорило, с какой маской он туда вошёл.
-        pub fn set_want(&self, client: polling::Event, upstream: polling::Event) {
+        pub fn set_want(&self, client: polling::Event, upstream: polling::Event, half_closed: bool) {
             let bits = (client.readable as u64)
                 | (client.writable as u64) << 1
                 | (upstream.readable as u64) << 2
-                | (upstream.writable as u64) << 3;
+                | (upstream.writable as u64) << 3
+                | (half_closed as u64) << 4;
             self.1.store(bits, Ordering::Relaxed);
         }
     }
 
     pub fn want_text(bits: u64) -> String {
         format!(
-            "client(r={},w={}) upstream(r={},w={})",
-            bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0
+            "client(r={},w={}) upstream(r={},w={}) полузакрыт={}",
+            bits & 1 != 0,
+            bits & 2 != 0,
+            bits & 4 != 0,
+            bits & 8 != 0,
+            bits & HALF_CLOSED != 0
         )
     }
 
@@ -355,18 +413,32 @@ mod phase_watch {
         REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    pub fn register(id: usize) -> Arc<Slot> {
+    /// Запись в реестре сторожа, снимающая себя сама.
+    ///
+    /// Снятие стояло отдельной строкой перед выходом из `pump()`, и паника её
+    /// перепрыгивала: в реестре оставался слот мёртвого потока, `Vec` рос, а
+    /// сторож либо печатал его вечно, либо (если фаза замерла на ожидании)
+    /// молча носил вечно. Владение закрывает оба исхода без единой строки на
+    /// стороне вызова.
+    pub struct Registration {
+        id: usize,
+        pub slot: Arc<Slot>,
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = registry().lock() {
+                guard.retain(|(other, _)| *other != self.id);
+            }
+        }
+    }
+
+    pub fn register(id: usize) -> Registration {
         let slot = Arc::new(Slot(AtomicU64::new(0), AtomicU64::new(0)));
         if let Ok(mut guard) = registry().lock() {
             guard.push((id, Arc::clone(&slot)));
         }
-        slot
-    }
-
-    pub fn unregister(id: usize) {
-        if let Ok(mut guard) = registry().lock() {
-            guard.retain(|(other, _)| *other != id);
-        }
+        Registration { id, slot }
     }
 
     pub fn spawn_watchdog() {
@@ -379,13 +451,29 @@ mod phase_watch {
                     Err(_) => continue,
                 };
                 for (id, value, want) in &now {
-                    if let Some((_, before, _)) = previous.iter().find(|(other, _, _)| other == id) {
+                    if let Some((_, before, before_want)) =
+                        previous.iter().find(|(other, _, _)| other == id)
+                    {
                         // Ожидание — единственная фаза, где стоять долго
                         // нормально: туннель Telegram простаивает по многу
                         // минут. Отчёт о ней был бы сплошным шумом. Любой
                         // другой вызов, замерший на полминуты, — дефект.
                         let phase = (*value & 0xff) as u8;
-                        if before == value && *value != 0 && phase != WAIT {
+                        let frozen = before == value && *value != 0;
+
+                        // Полузакрытая пара — второй случай, и его нельзя
+                        // ловить неподвижностью счётчика: такой поток не
+                        // замирает, он просыпается по таймауту и честно крутит
+                        // оборот, меняя фазу по четыре раза за круг. Признак
+                        // здесь — само состояние, увиденное дважды подряд.
+                        // Отсрочка рвёт такую пару за полминуты, поэтому два
+                        // попадания через тридцать секунд означают, что рвать
+                        // перестало работать. Ровно этого сторож и не видел,
+                        // пока копился CLOSE_WAIT.
+                        let stuck_half_closed =
+                            (*want & HALF_CLOSED != 0) && (*before_want & HALF_CLOSED != 0);
+
+                        if (frozen && phase != WAIT) || stuck_half_closed {
                             eprintln!(
                                 "phase-stuck: id={id} фаза={} уже 30с (смен фазы={}) интерес: {}",
                                 name(phase),
@@ -464,6 +552,14 @@ fn serve(mut client: TcpStream, token: &str, shapers: &Shapers) {
                 serde_json::to_string(&alpn).unwrap_or_else(|_| "null".into()),
             );
             if client.write_all(payload.as_bytes()).is_err() {
+                // Клиент исчез между рукопожатием и подтверждением. По правилу
+                // модуля уход петли — это обрыв, а не вежливое закрытие: иначе
+                // далёкая сторона может сидеть на нашем FIN сколько захочет.
+                // Окно узкое — `transport.abort()` шлёт FIN, а запись шести
+                // десятков байт в такой сокет проходит, — так что сюда попадает
+                // только настоящий RST.
+                let _ = socket2::SockRef::from(upstream.get_ref())
+                    .set_linger(Some(Duration::ZERO));
                 return;
             }
             pump(client, upstream);
@@ -687,6 +783,44 @@ impl Direction {
     }
 }
 
+/// Условия выхода из `pump()`, собранные в одно место.
+///
+/// `Some(true)` — рвать upstream: релей ушёл, а вежливое закрытие превратило бы
+/// его `transport.abort()` в shutdown, на котором далёкая сторона может сидеть.
+/// `Some(false)` — закрыть вежливо: upstream кончился сам.
+///
+/// Собраны они здесь потому, что россыпь отдельных `if` в хвосте цикла спрятала
+/// пропуск ровно одного из них. Из двух зеркальных условий было написано одно —
+/// «релей ушёл, отдавать ему нечего». Обратное — «upstream закрылся, всё его
+/// уже у релея» — не выполнялось ни одной из веток: `to_upstream.finished`
+/// остаётся ложным, потому что клиент жив и просто молчит. Поток парковался в
+/// тридцатисекундном ожидании навсегда, держа сокет upstream в CLOSE_WAIT.
+/// Замерено: 48 таких потоков одновременно, у каждого два сокета, 243 сокета на
+/// 116 потоков при десятке настоящих туннелей.
+fn stop_reason(to_upstream: &Direction, to_client: &Direction) -> Option<bool> {
+    // Обе стороны сказали последнее слово, и наверх отдавать больше нечего.
+    if to_upstream.done() && to_client.finished {
+        return Some(false);
+    }
+    // То же с другого конца: релею отдано всё, а он сам ещё пишет наверх.
+    if to_client.done() && to_upstream.finished {
+        return Some(false);
+    }
+    // Зеркало нижнего условия, и именно его не было. Upstream закрылся, всё,
+    // что он прислал, уже у релея, и наверх ничего не осталось. Держать нечего:
+    // писать в закрывшуюся сторону некуда, а сам релей про её уход не узнает,
+    // пока мы не закроем петлю — полузакрытия в протоколе нет.
+    if to_client.done() && to_upstream.pending.is_empty() {
+        return Some(false);
+    }
+    // Релей отвалился, и отдавать ему нечего. Единственное условие пары,
+    // которое было написано.
+    if to_upstream.finished && to_client.pending.is_empty() {
+        return Some(true);
+    }
+    None
+}
+
 /// A read that only says "not yet".
 fn would_block(err: &std::io::Error) -> bool {
     matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
@@ -745,6 +879,21 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
     const STALLED_WAKEUPS: u32 = 64;
     let mut idle_wakeups: u32 = 0;
 
+    // Крайний срок появляется только после того, как одна из сторон отвалилась,
+    // и ни секундой раньше. Общего таймаута простоя тут быть не может: туннель
+    // Telegram молчит по многу минут, и это законно. Но простаивающий живой
+    // туннель — это два открытых сокета, а полузакрытая пара — уже нет:
+    // взведённый `finished` означает, что сокет висит в CLOSE_WAIT (или что
+    // запись в него провалилась), и ждать на нём можно только того, чего никто
+    // не пришлёт. Вот по этому признаку мёртвое отличимо от простаивающего, не
+    // трогая второе.
+    //
+    // Сеть безопасности, а не основная правка: с `stop_reason` ниже такая пара
+    // выходит на том же обороте. Срок остаётся на случай, когда `pending`
+    // некуда девать.
+    const HALF_CLOSED_GRACE: Duration = Duration::from_secs(30);
+    let mut half_closed_at: Option<Instant> = None;
+
     let mut to_upstream = Direction::new();
     let mut to_client = Direction::new();
     let mut events = polling::Events::new();
@@ -761,7 +910,8 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
     // never returns from the wait. Start/end markers separate the two.
     static PUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
     let pump_id = PUMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let phase = phase_watch::register(pump_id);
+    let registration = phase_watch::register(pump_id);
+    let phase = &registration.slot;
 
     let mut client_registered = true;
     let mut upstream_registered = true;
@@ -771,7 +921,8 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
     const REPORT_EVERY: u64 = 200_000;
 
     loop {
-        if to_upstream.done() && to_client.done() {
+        if let Some(reset) = stop_reason(&to_upstream, &to_client) {
+            aborted |= reset;
             break;
         }
         iterations += 1;
@@ -801,7 +952,7 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
         want_upstream.readable = !to_client.finished && to_client.pending.len() < HIGH_WATER;
         want_upstream.writable = !to_upstream.pending.is_empty();
         phase.set(phase_watch::MODIFY);
-        phase.set_want(want_client, want_upstream);
+        phase.set_want(want_client, want_upstream, half_closed_at.is_some());
         // Источник без интереса снимается с регистрации, а не переводится в
         // Event::none(). Это и есть подозреваемый: сокет, у которого висит
         // HUP/ERR, но ни одно из событий не запрошено, — на нём windows-бэкенд
@@ -827,8 +978,18 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
         // A timeout rather than an indefinite wait: TLS can want to write while
         // reading, and the wakeup lets the loop retry without tracking every
         // such case explicitly.
+        // Пока обе стороны живы — тридцать секунд: будить простаивающий туннель
+        // незачем. Как только одна отвалилась, шаг ожидания сжимается до
+        // остатка отсрочки, иначе полузакрытая пара пережила бы свой срок ещё
+        // на целый шаг.
+        let wait_step = match half_closed_at {
+            Some(since) => HALF_CLOSED_GRACE
+                .saturating_sub(since.elapsed())
+                .max(Duration::from_millis(200)),
+            None => Duration::from_secs(30),
+        };
         phase.set(phase_watch::WAIT);
-        if poller.wait(&mut events, Some(Duration::from_secs(30))).is_err() {
+        if poller.wait(&mut events, Some(wait_step)).is_err() {
             break;
         }
         last_events = events.len();
@@ -948,25 +1109,28 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
             }
         }
 
-        // Once one side is finished and drained, the other has nowhere to go.
-        if to_upstream.done() && to_client.finished {
-            break;
+        // Отсчёт от того оборота, где взвёлся первый `finished`, а не от начала
+        // соединения.
+        if to_upstream.finished || to_client.finished {
+            let since = *half_closed_at.get_or_insert_with(Instant::now);
+            if since.elapsed() >= HALF_CLOSED_GRACE {
+                // Полузакрытая пара, не сошедшаяся за отсрочку: рвать, это уже
+                // не туннель, а два повисших дескриптора. Если строка вообще
+                // появилась в логе — значит `stop_reason` её не поймал, и
+                // смотреть надо туда, а не на отсрочку.
+                eprintln!("half-closed: id={pump_id} не сошлась за {HALF_CLOSED_GRACE:?}, рву");
+                aborted = true;
+                break;
+            }
         }
-        if to_client.done() && to_upstream.finished {
-            break;
-        }
-        // The relay hung up and we owe it nothing: whatever upstream might still
-        // send has no reader. Without this the loop waits on upstream forever in
-        // thirty-second steps — neither exit above ever becomes true, because
-        // `to_client.finished` only flips when upstream closes on its own.
-        // Measured: 48 such threads alive at once, each holding two sockets.
-        if to_upstream.finished && to_client.pending.is_empty() {
-            aborted = true;
+
+        if let Some(reset) = stop_reason(&to_upstream, &to_client) {
+            aborted |= reset;
             break;
         }
     }
 
-    phase_watch::unregister(pump_id);
+    drop(registration);
 
     let raw = upstream.get_ref();
     if aborted {
@@ -976,4 +1140,50 @@ fn pump(client: TcpStream, mut upstream: boring::ssl::SslStream<TcpStream>) {
     let _ = client.shutdown(Shutdown::Both);
     let _ = poller.delete(&client);
     let _ = poller.delete(raw);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(finished: bool, pending: usize) -> Direction {
+        Direction { pending: vec![0u8; pending], finished }
+    }
+
+    #[test]
+    fn a_live_tunnel_is_never_stopped() {
+        assert_eq!(stop_reason(&dir(false, 0), &dir(false, 0)), None);
+        assert_eq!(stop_reason(&dir(false, 10), &dir(false, 10)), None);
+    }
+
+    #[test]
+    fn client_gone_is_an_abort() {
+        assert_eq!(stop_reason(&dir(true, 0), &dir(false, 0)), Some(true));
+    }
+
+    /// Зеркало предыдущего. Именно его отсутствие копило CLOSE_WAIT: поток
+    /// парковался в ожидании клиента, который уже ничего не пришлёт, и держал
+    /// оба сокета до конца жизни процесса.
+    #[test]
+    fn upstream_gone_is_a_polite_close() {
+        assert_eq!(stop_reason(&dir(false, 0), &dir(true, 0)), Some(false));
+    }
+
+    /// Долг перед релеем важнее скорости выхода: пока есть что отдать, пара
+    /// живёт. Без этого правка выбрасывала бы последний ответ upstream.
+    #[test]
+    fn bytes_owed_to_the_relay_are_delivered_before_stopping() {
+        assert_eq!(stop_reason(&dir(false, 0), &dir(true, 4)), None);
+    }
+
+    /// И симметрично — то, что релей уже прислал, дописывается наверх.
+    #[test]
+    fn bytes_owed_upstream_are_delivered_before_stopping() {
+        assert_eq!(stop_reason(&dir(false, 4), &dir(true, 0)), None);
+    }
+
+    #[test]
+    fn both_sides_finished_and_drained_is_a_polite_close() {
+        assert_eq!(stop_reason(&dir(true, 0), &dir(true, 0)), Some(false));
+    }
 }

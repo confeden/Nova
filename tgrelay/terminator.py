@@ -18,8 +18,12 @@ So the helper reports `reached` and `ended` as numbers, this module copies them
 onto the exception, and `phase.ended_from_exception` prefers them over anything
 it could infer. Nothing downstream changes.
 
-Disabled unless `NOVA_TLS_TERMINATOR_PORT` is set, and the relay keeps its old
-path in that case — this is a lever, not a migration.
+On by default, because the port and token are read from the runtime file the
+supervisor writes on every start (`temp/tls_terminator.json`) as readily as from
+the environment. `NOVA_TLS_TERMINATOR_PORT` overrides that file; it does not
+gate it. The way off is to stop the helper, and then `transport.open_tls_stream`
+falls back to CPython's own hello — and says so once, because a silent downgrade
+to `t13d181100` is the one failure this whole module exists to prevent.
 """
 
 import asyncio

@@ -1,13 +1,9 @@
 import os
-import ssl
-import base64
 import struct
 import asyncio
 import socket as _socket
 
-from typing import Dict, List, Optional, Set, Tuple
-from . import persona
-from .config import cf_ws_subprotocol_header, proxy_config
+from typing import List, Optional, Set, Tuple
 
 # Endpoints that took us up on the compression offer. Nothing here can decode a
 # deflated frame, so the offer is withdrawn for that endpoint and the next
@@ -34,9 +30,18 @@ _st_BBQ4s = struct.Struct('>BBQ4s')
 _st_H = struct.Struct('>H')
 _st_Q = struct.Struct('>Q')
 
-_ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+# Framing only — there is deliberately no `connect` here any more.
+#
+# This module used to own a second entry point: a `connect` staticmethod with
+# its own module-level `ssl.create_default_context()`, bypassing the shaping
+# helper entirely. Its only caller was `bridge.py`, which nothing imported, so
+# it never fired — but a handshake site that answers to no gate is a loaded
+# gun, and the fingerprint it would have emitted is `t13d181100`, which
+# identifies Nova and nothing else.
+#
+# The handshake that produces one of these now lives in exactly one place,
+# `transparent_relay._connect_websocket_once`, and it goes out through
+# `transport.open_tls_stream` — and therefore through the terminator.
 
 
 class WsHandshakeError(Exception):
@@ -92,62 +97,6 @@ class RawWebSocket:
         self.reader = reader
         self.writer = writer
         self._closed = False
-
-    @staticmethod
-    async def connect(host: str, domain: str, timeout: float = 10.0) -> 'RawWebSocket':
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, 443, ssl=_ssl_ctx,
-                                    server_hostname=domain),
-            timeout=min(timeout, 10))
-        
-        set_sock_opts(writer.transport, proxy_config.buffer_size)
-
-        ws_key = base64.b64encode(os.urandom(16)).decode()
-
-        writer.write(persona.upgrade_request(
-            "/apiws",
-            domain,
-            ws_key,
-            cf_ws_subprotocol_header(domain),
-            offer_deflate=offers_deflate(domain),
-        ))
-        await writer.drain()
-
-        response_lines: list[str] = []
-        try:
-            while True:
-                line = await asyncio.wait_for(reader.readline(),
-                                              timeout=timeout)
-                if line in (b'\r\n', b'\n', b''):
-                    break
-                response_lines.append(
-                    line.decode('utf-8', errors='replace').strip())
-        except asyncio.TimeoutError:
-            writer.close()
-            raise
-
-        if not response_lines:
-            writer.close()
-            raise WsHandshakeError(0, 'empty response')
-
-        status_code, first_line = persona.status_of(response_lines)
-        headers = persona.parse_headers(response_lines[1:])
-
-        if status_code == 101:
-            # A 101 is not enough on its own: a server that accepted the
-            # compression offer would send deflated frames from here on, and
-            # nothing downstream can inflate them. Withdraw the offer and let
-            # the caller retry rather than hand on bytes we cannot read.
-            refusal = persona.rejects_us(headers)
-            if refusal:
-                note_deflate_unusable(domain)
-                writer.close()
-                raise WsHandshakeError(0, refusal, headers)
-            return RawWebSocket(reader, writer)
-
-        writer.close()
-        raise WsHandshakeError(status_code, first_line, headers,
-                                location=headers.get('location'))
 
     async def send(self, data: bytes):
         if self._closed:

@@ -1,5 +1,6 @@
 import asyncio
 import ipaddress
+import logging
 import socket
 import ssl
 from typing import Callable, Dict, List, Optional, Tuple
@@ -31,6 +32,28 @@ def _tag(exc: BaseException, reached: int) -> BaseException:
     return exc
 
 _upstream_provider = None
+
+_warned_bare_hello = False
+
+
+def _warn_bare_hello_once() -> None:
+    """Say once per process that the handshakes stopped being shaped.
+
+    Once, not per connection: the relay opens dozens of tunnels a minute and a
+    line on each would bury the log. Once is enough — the condition is
+    process-wide and does not come back on its own.
+    """
+    global _warned_bare_hello
+    if _warned_bare_hello:
+        return
+    _warned_bare_hello = True
+    try:
+        logging.getLogger("tg-mtproto-proxy").warning(
+            "[TgRelay] Терминатор недоступен — рукопожатия идут своим стеком CPython "
+            "(отпечаток t13d181100). Релей работает, маскировка выключена."
+        )
+    except Exception:
+        pass
 
 
 def set_upstream_provider(provider: Optional[Callable[[], List[Dict[str, object]]]]) -> None:
@@ -243,6 +266,13 @@ async def open_tls_stream(
             timeout=float(timeout),
             attempts=chosen_attempts,
         )
+
+    # Reaching this line is not the same as never having configured the helper.
+    # `is_enabled()` re-reads `temp/tls_terminator.json` on every call, so a
+    # helper that died mid-session drops the whole relay back to CPython's hello
+    # here — and it used to do that without saying a word. The relay keeps
+    # working; what it loses is the only thing this indirection exists for.
+    _warn_bare_hello_once()
 
     sock, label = await asyncio.to_thread(
         _open_tunnel_socket_sync,

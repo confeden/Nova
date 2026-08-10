@@ -10,6 +10,7 @@ import socket
 import struct
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -858,14 +859,28 @@ def _order_native_attempts(attempts, dc: int):
 # label, and the value the handshake signature is bound to, so no state
 # migrates and the Worker needs no change at all.
 NEUTRAL_SNI_ENABLED = _env_bool("NOVA_TG_RELAY_NEUTRAL_SNI", True)
-# Only names that actually exist. Cloudflare's edge accepted `cdn.`, `static.`,
-# `assets.` and `img.` too — the zone answers on a wildcard — but a name with no
-# record of its own stops working the moment that wildcard is tightened, and
-# the failure would look like DPI rather than like a DNS change. The apex and
-# `www.` both resolve today and are both inside the universal certificate, so
-# verification can be switched back on later without revisiting this.
+# One candidate, and it is `www.` — not a shortlist to pick from.
+#
+# The list used to be `[base, f"www.{base}"]` and `random.choice` took the apex
+# about half the time. Re-measured against the live Worker with the route in the
+# `Host` header:
+#
+#     SNI kws5-1.nova-app.eu -> 429     (edge matched the route)
+#     SNI www.nova-app.eu    -> 429     (edge matched the route)
+#     SNI nova-app.eu        -> 403     (edge refused)
+#
+# 429 is the Worker's exhausted daily quota, i.e. the request got as far as our
+# route; 403 is the edge declining before that. So the apex does not work here,
+# and every second start was retiring the zone's substituted name for fifteen
+# minutes — which read in the logs like a working automatic rollback rather than
+# like a defect.
+#
+# There is also no wildcard to fall back on: `cdn.`, `static.` and `assets.` do
+# not resolve at all. `www.` has its own record and sits inside the universal
+# certificate, so verification can still be switched on later without revisiting
+# this. ADR 0004 said otherwise on both counts and has been corrected.
 def _cf_neutral_candidates(base: str) -> List[str]:
-    return [base, f"www.{base}"]
+    return [f"www.{base}"]
 # One name per zone for the life of the process, rather than a fresh one per
 # connection. A client that talks to a single content host looks like every
 # other client; one that sprays five names per minute is its own signature.
@@ -1437,6 +1452,46 @@ async def _bridge_ws(
     return counters["up"], counters["down"], int((time.monotonic() - started) * 1000), replay
 
 
+async def serve_until_stopped(server: asyncio.AbstractServer, stop_event: asyncio.Event) -> None:
+    """Отдать сервер в работу и остановить его так, чтобы остановка кончалась.
+
+    Отдельная функция, а не пять строк внутри `_run()`, потому что здесь важен
+    порядок, и порядок этот неочевиден настолько, что первый вариант его
+    нарушал и вешал релей навсегда.
+
+    `serve_forever()` отвечает на отмену собственными `close()` и
+    `wait_closed()`, а `wait_closed()` начиная с 3.12.1 ждёт ещё и отцепления
+    каждого клиентского транспорта. Telegram держит свои SOCKS5-сокеты часами.
+    Поэтому «отменить задачу и дождаться её» до того, как клиенты отпущены, —
+    это ожидание длиной в сессию: корутина не возвращается, `stop()` уходит по
+    таймауту join и обнуляет `self.server` под работающей корутиной, а та потом
+    падает на `None.close()` и приходит в супервизор как «Ошибка запуска».
+    Внешний `wait_for` от этого не спасает: отмену съедает `suppress` внутри.
+
+    Отсюда правило: сначала закрыть сервер и сбросить клиентов, и только потом
+    ждать отменённые задачи. Проверено воспроизведением с живым клиентом —
+    прежний порядок не возвращается за 15 с, этот выходит сразу.
+    """
+    serve_task = asyncio.create_task(server.serve_forever())
+    stop_task = asyncio.create_task(stop_event.wait())
+    try:
+        await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        server.close()
+        # Появился в 3.13; на более раннем интерпретаторе просто нечего звать.
+        with contextlib.suppress(Exception):
+            server.close_clients()
+        for task in (serve_task, stop_task):
+            task.cancel()
+        for task in (serve_task, stop_task):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        # Ограничен намеренно: к этому моменту закрывать уже нечего, и повод
+        # ждать здесь дольше означал бы, что сброс клиентов не сработал.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server.wait_closed(), timeout=3.0)
+
+
 class TelegramTransparentRelayServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 1372, log_func=None, upstream_provider=None, warp_bootstrap_waiter=None):
         self.host = host
@@ -1866,7 +1921,14 @@ class TelegramTransparentRelayServer:
             loop.run_until_complete(self._run())
         except Exception as exc:
             crashed = True
-            self.log_func(f"[TgRelay] Ошибка запуска: {exc}")
+            # Тип и трассировка, а не только str(exc). Разбор аварии 2026-08-09
+            # встал именно на этом: в логе была одна строка «Ошибка запуска:
+            # invalid state» — текст `asyncio.InvalidStateError` без единого
+            # намёка, где он возник, и восстановить место по нему не удалось.
+            self.log_func(f"[TgRelay] Ошибка запуска: {type(exc).__name__}: {exc}")
+            with contextlib.suppress(Exception):
+                for line in "".join(traceback.format_exception(exc)).rstrip().splitlines():
+                    self.log_func(f"[TgRelay]   {line}")
         finally:
             self.running = False
             self.started_event.set()
@@ -1889,7 +1951,16 @@ class TelegramTransparentRelayServer:
             return
         try:
             msg = (context or {}).get("message") or str(exc or "unknown")
+            if exc is not None:
+                msg = f"{type(exc).__name__}: {exc} ({msg})"
             self.log_func(f"[TgRelay] asyncio warning: {msg}")
+            # Всё, что сюда попадает, уже потеряло свой стек в глазах вызывающего:
+            # это не исключение, а отчёт о нём. Без трассировки такая строка
+            # называет симптом и молчит о месте.
+            if exc is not None:
+                with contextlib.suppress(Exception):
+                    for line in "".join(traceback.format_exception(exc)).rstrip().splitlines():
+                        self.log_func(f"[TgRelay]   {line}")
         except Exception:
             pass
 
@@ -1953,30 +2024,22 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
 
-        self.server = await asyncio.start_server(
+        server = await asyncio.start_server(
             self._handle_client,
             self.host,
             self.port,
             backlog=512,
             limit=max(256 * 1024, int(getattr(proxy_config, "buffer_size", 256 * 1024))),
         )
+        # Локальная привязка нарочно: `stop()` обнуляет `self.server`, не
+        # дожидаясь конца этой корутины, и чтение атрибута ниже уронило бы
+        # `AttributeError: 'NoneType' object has no attribute 'close'` в
+        # супервизор под видом «Ошибка запуска».
+        self.server = server
         self.running = True
         self.started_event.set()
         self.log_func(f"[TgRelay] Локальный SOCKS5 relay активен на {self.host}:{self.port}.")
-        async with self.server:
-            serve_task = asyncio.create_task(self.server.serve_forever())
-            stop_task = asyncio.create_task(self.stop_event.wait())
-            done, pending = await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            if stop_task in done:
-                self.server.close()
-                await self.server.wait_closed()
-            if serve_task in done:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await serve_task
+        await serve_until_stopped(server, self.stop_event)
 
     async def _schedule_cf_bootstrap_prewarm_wave(self, delay: float = 0.0) -> None:
         try:
