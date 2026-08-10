@@ -128,6 +128,11 @@ jobs:
       #    молча стирала бы правку. Первым абзацем идёт предупреждение для тех,
       #    кто забредёт сюда со страницы релизов, дальше — служебное.
       #
+      #    Кнопка SourceForge внизу — из той же серии: её однажды дописали руками
+      #    на сайте, и публикация 1.34 стёрла бы её вместе со всем остальным
+      #    описанием. Всё, что должно пережить следующую сборку, обязано лежать
+      #    в этом файле.
+      #
       #    --prerelease, чтобы этот тег не подменял собой последний релиз Nova
       #    в списке: он не версия продукта и пользователю не нужен.
       - name: Publish to release
@@ -143,6 +148,8 @@ jobs:
 
           Собрано из ${{ github.sha }}.
           Скачивается скриптом ``fetch_tls_terminator.py`` в ``bin/``, сверка по ``nova-tls-terminator.exe.sha256``.
+
+          [![Download Nova](https://a.fsdn.com/con/app/sf-download-button)](https://sourceforge.net/projects/nova-pc/files/tls-terminator/)
           "@
           $notes | Out-File -FilePath dist/notes.md -Encoding utf8
           gh release delete tls-terminator --yes --cleanup-tag 2>$null
