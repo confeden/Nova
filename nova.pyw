@@ -22376,6 +22376,12 @@ try:
         safe_trace("[Services] Priority threads launching; heavy workers deferred.")
 
         def _start_worker(name, target, args=(), delay=0.0, track=True):
+            # Момент планирования, а не момент старта процесса. Задержка ниже
+            # отсчитывается отсюда, и только относительно этой точки «проснулся
+            # на +16 с» что-то значит: сама start_services_threads запускается
+            # примерно через пять секунд после старта Nova.
+            scheduled_at = boot_timeline.elapsed_ms()
+
             def _runner():
                 delay_left = max(0.0, float(delay or 0.0))
                 while delay_left > 0 and not is_closing:
@@ -22396,7 +22402,7 @@ try:
                 # же прогоне это дало параллельность 0.8x - величину, которой не
                 # бывает.
                 if track:
-                    boot_timeline.worker_started(name, delay)
+                    boot_timeline.worker_started(name, delay, scheduled_at)
                 try:
                     target(*args)
                 except Exception as e:
