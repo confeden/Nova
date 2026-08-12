@@ -1659,8 +1659,6 @@ try:
     EXCLUDE_AUTO_CHECKED_FILE = "temp/exclude_auto_checked.json"
     background_connection_semaphore = threading.Semaphore(32) # Лимит фоновых подключений
     
-    # Конфигурация
-    CONFIG_FILENAME = "window_config.json"
     STRATEGIES_FILENAME = "strategies.json"
     WARP_STRATEGIES_FILENAME = "warp.json"
     AWG_PROFILES_DIRNAME = "awg"
@@ -1671,7 +1669,6 @@ try:
     VISITED_DOMAINS_FILE = "temp/visited_domains_stats.json"
     STRATEGIES_EVOLUTION_FILE = "temp/strategies_evolution.json"
     IP_HISTORY_FILE = "temp/ip_history.json"
-    LEARNING_DATA_FILE = os.path.join(get_base_dir(), "temp", "learning_data.json")
 
     # === NEW: Service Run ID for zombie thread suppression ===
     SERVICE_RUN_ID = 0
@@ -1687,15 +1684,6 @@ try:
     routing_backend_manager = None
 
 
-    # ================= WARP & PROXY MANAGER =================
-    # Alternative Cloudflare WARP ports
-    # Port 443 FIRST: works with QUIC bypass (user confirmed official WARP client works on 443)
-    # Port 2408 is default but often blocked
-    WARP_PORTS = [443, 500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 
-                  908, 928, 934, 939, 942, 943, 945, 946, 955, 968, 
-                  987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180, 
-                  1387, 1843, 2371, 2506, 3138, 3476, 3581, 3854, 4177, 
-                  4198, 4233, 5279, 5956]
     
     CLOUDFLARE_CIDRS = [
         "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
@@ -9397,7 +9385,6 @@ try:
     # Public-hybrid is the first migration mode for the no-custom-driver
     # release path. In the default "current" backend we keep relay disabled.
     PUBLIC_RELAY_SPECS = get_public_relay_specs(ROUTING_BACKEND_MODE)
-    ENABLE_TELEGRAM_RELAY = bool(getattr(PUBLIC_RELAY_SPECS.get("telegram"), "enabled", False))
     ENABLE_NOVAWFP_OBSERVER = True
     ENABLE_NOVAWFP_TCP_PROXY = True
     ENABLE_NOVAWFP_UDP_PROXY = True
@@ -9890,10 +9877,6 @@ try:
         
         return res
 
-    def ensure_warp_control_exclusions(log_func=None):
-        """Deprecated: no longer auto-modifies general/exclude lists."""
-        return
-
     def load_strategies_from_file(filepath):
         if not os.path.exists(filepath): return {}
         try:
@@ -10366,13 +10349,6 @@ try:
                 _learning_data_cache["last_updated"] = time.time()
                 save_json_safe(LEARNING_DATA_PATH, _learning_data_cache)
 
-    def save_learning_data(data):
-        """Сохраняет данные обучения (обновляет кэш и сбрасывает на диск)"""
-        global _learning_data_cache
-        with _learning_data_lock:
-            _learning_data_cache = data
-        flush_learning_data()
-    
     def update_learning_stats(args, score, max_score, service="general", bin_files_used=None, logger=None):
         """Обновляет статистику обучения после проверки стратегии"""
         # CRITICAL FIX: Use Lock for END-TO-END Read-Modify-Write cycle to prevent race conditions
@@ -10439,30 +10415,6 @@ try:
         if uses == 0: return 0.5  # Неизвестный - средний приоритет
         return stats.get("total_score", 0) / uses
     
-    def can_recheck_strategy(args_hash, days_threshold=7):
-        """Проверяет можно ли перепроверить стратегию (прошло ли 7 дней)"""
-        data = load_learning_data()
-        checked = data.get("checked_hashes", {}).get(args_hash, {})
-        if not checked: return True
-        last_check = checked.get("timestamp", 0)
-        return (time.time() - last_check) > (days_threshold * 24 * 3600)
-    
-    def mark_strategy_checked(args_hash, score):
-        """Помечает стратегию как проверенную"""
-        try:
-            data = load_learning_data()
-            if "checked_hashes" not in data:
-                data["checked_hashes"] = {}
-            data["checked_hashes"][args_hash] = {"timestamp": time.time(), "score": score}
-            # Ограничиваем размер кэша (хранить последние 500)
-            if len(data["checked_hashes"]) > 500:
-                sorted_hashes = sorted(data["checked_hashes"].items(), 
-                                      key=lambda x: x[1].get("timestamp", 0))
-                data["checked_hashes"] = dict(sorted_hashes[-500:])
-            save_learning_data(data)
-        except: pass
-
-
     def is_ip_address(s):
         return bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", s.strip()))
 
@@ -10502,47 +10454,6 @@ try:
         except:
             return False
         return False
-
-    def load_config():
-        default_conf = {"main_geometry": None, "log_size": None, "last_exclude_check_time": 0, "last_exclude_mtime": 0}
-        acquired = config_lock.acquire(timeout=2)
-        if not acquired: return default_conf
-        try:
-            config_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
-            loaded_conf = load_json_robust(config_path, {})
-            return {**default_conf, **loaded_conf}
-        except: 
-            return default_conf
-        finally: 
-            config_lock.release()
-
-    def save_config(geometry=None, log_size=None, exclude_check_info=None):
-        blocking_mode = not is_closing
-        if not config_lock.acquire(blocking=blocking_mode): return 
-        try:
-            config_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
-            current_conf = {"main_geometry": None, "log_size": None, "last_exclude_check_time": 0, "last_exclude_mtime": 0}
-            if os.path.exists(config_path):
-                try: 
-                    with open(config_path, "r") as f: 
-                        current_conf.update(json.load(f))
-                except: pass
-            
-            if geometry: current_conf["main_geometry"] = geometry
-            if log_size: 
-                match = re.match(r"(\d+)x(\d+)", log_size)
-                if match:
-                    current_conf["log_size"] = f"{match.group(1)}x{match.group(2)}"
-            if exclude_check_info:
-                current_conf["last_exclude_check_time"] = exclude_check_info["time"]
-                current_conf["last_exclude_mtime"] = exclude_check_info["mtime"]
-            
-            with open(config_path, "w") as f:
-                json.dump(current_conf, f)
-                f.flush()
-                os.fsync(f.fileno())
-        except: pass
-        finally: config_lock.release()
 
     def check_single_instance():
         kernel32 = ctypes.windll.kernel32
@@ -10611,22 +10522,6 @@ try:
     class POINT(ctypes.Structure): _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
     def is_monitor_available(x, y):
         return ctypes.windll.user32.MonitorFromPoint(POINT(int(x), int(y)), 0) != 0
-
-    def check_internet_connection():
-        # Проверяем интернет через разрешение известных доменов и подключение к ним
-        known_hosts = ["www.google.com", "www.cloudflare.com", "www.microsoft.com"]
-        for host in known_hosts:
-            # check_cache=False, чтобы это была реальная проверка сети, а не кэша
-            ip, _ = dns_manager.resolve(host, dns_manager.burst_limiter, check_cache=False)
-            if ip:
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.settimeout(3)
-                        s.connect((ip, 80))
-                    return True
-                except:
-                    continue
-        return False
 
     # ================= МОДУЛЬ: NRPT DNS UNBLOCK =================
     # Selective DNS routing for Google/AI domains via xbox-dns.ru NRPT rules.
@@ -11063,41 +10958,6 @@ try:
         except:
             return False
 
-    def add_to_hard_list(domain):
-        filepath = os.path.join(get_base_dir(), "temp", HARD_LIST_FILENAME)
-        try:
-            with open(filepath, "a", encoding="utf-8") as f:
-                ts = time.strftime('%d.%m.%Y в %H:%M')
-                f.write(f"{domain} # Не удалось разблокировать (Auto-Detect {ts})\n")
-            
-            print(f"[HardList] Домен {domain} добавлен в hard.txt.")
-            return True
-        except: return False
-
-    def check_unblock_success(domain):
-        url = f"https://{domain}"
-        import requests
-        import urllib3
-        # Отключаем предупреждения SSL
-        try: urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        except: pass
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36", "Connection": "keep-alive"}
-        try:
-            # Используем DNSManager для проверки существования домена
-            ip, _ = dns_manager.resolve(domain, dns_manager.burst_limiter, check_cache=False)
-            if not ip:
-                return False
-            
-            session = requests.Session()
-            session.trust_env = False
-            with session.get(url, headers=headers, timeout=(10, 10), stream=True, allow_redirects=True, verify=False) as response:
-                if response.status_code < 400:
-                    return True
-                else:
-                    return False
-        except:
-            return False
-
     def explain_winws_exit_code(exit_code, stderr_text=""):
         """
         Best-effort explanation for common WinWS/WinDivert exit codes.
@@ -11185,7 +11045,6 @@ try:
     COLOR_TEXT_NORMAL = MAIN_COLOR_TEXT_NORMAL
     COLOR_TEXT_WARNING = MAIN_COLOR_TEXT_WARNING
     COLOR_TEXT_ERROR = MAIN_COLOR_TEXT_ERROR
-    COLOR_TEXT_INFO = MAIN_COLOR_TEXT_INFO
     COLOR_TEXT_FAIL = MAIN_COLOR_TEXT_FAIL
     if SYSTEM_THEME == "dark":
         LOG_THEME = {
@@ -18338,46 +18197,6 @@ try:
             if log_func:
                 log_func(f"[HardList] Ошибка при сохранении {hard_file}: {e}")
 
-    def load_all_hard_domains():
-        """Домены, назначенные персональным профилям, по имени профиля."""
-        all_domains = {}
-        for slot_name in get_per_domain_slot_names():
-            domains = load_hard_strategy_domains(slot_name)
-            if domains:
-                all_domains[slot_name] = domains
-        return all_domains
-
-    def migrate_hard_domains(old_hard_name, new_hard_name, log_func=None):
-        """Переносит назначенные домены с одной ступени лестницы на другую.
-
-        Нужно, когда состав лестницы пересобирается и профиль меняет номер слота:
-        домены должны следовать за стратегией, а не за номером."""
-        base_dir = get_base_dir()
-        
-        # Загружаем домены старой стратегии
-        domains = load_hard_strategy_domains(old_hard_name)
-        
-        if not domains:
-            return
-        
-        # Загружаем существующие домены новой стратегии (если есть)
-        new_domains = load_hard_strategy_domains(new_hard_name)
-        new_domains.update(domains)
-        
-        # Сохраняем в новое место
-        save_hard_strategy_domains(new_hard_name, new_domains, log_func)
-        
-        # Удаляем старый файл
-        old_file = os.path.join(base_dir, "list", f"{old_hard_name}.txt")
-        try:
-            if os.path.exists(old_file):
-                os.remove(old_file)
-                if log_func:
-                    log_func(f"[HardList] Домены из {old_hard_name} перемещены в {new_hard_name}.")
-        except Exception as e:
-            if log_func:
-                log_func(f"[HardList] Ошибка при удалении {old_file}: {e}")
-
     def cleanup_hard_lists(log_func=None):
         """Удаляет пустые hard_X.txt файлы."""
         base_dir = get_base_dir()
@@ -18445,30 +18264,6 @@ try:
                 throttled_domains_registry[domain]["timestamp"] = time.time()
                 save_throttled_registry()
 
-    def get_boost_strategy_for_domain(domain):
-        """Получает сохраненную boost стратегию для замедленного домена."""
-        domain = domain.lower()
-        with throttled_registry_lock:
-            if domain in throttled_domains_registry:
-                return throttled_domains_registry[domain].get("boost_strategy")
-        return None
-
-    def get_throttle_type_for_domain(domain):
-        """Получает тип замедления для домена из реестра."""
-        domain = domain.lower()
-        with throttled_registry_lock:
-            if domain in throttled_domains_registry:
-                return throttled_domains_registry[domain].get("throttle_type", "unknown")
-        return None
-
-    def is_domain_in_throttled_registry(domain):
-        """Проверяет, есть ли домен в реестре замедленных."""
-        domain = domain.lower()
-        with throttled_registry_lock:
-            return domain in throttled_domains_registry
-
-
-
     def add_domain_to_hard_strategy(domain, hard_name, log_func=None):
         """Добавляет домен в определенную hard_X стратегию."""
         domain = domain.lower()
@@ -18479,25 +18274,6 @@ try:
             save_hard_strategy_domains(hard_name, domains, log_func)
             return True
         return False
-
-    def remove_domain_from_hard_strategy(domain, hard_name, log_func=None):
-        """Удаляет домен из hard_X стратегии."""
-        domain = domain.lower()
-        domains = load_hard_strategy_domains(hard_name)
-        
-        if domain in domains:
-            domains.discard(domain)
-            save_hard_strategy_domains(hard_name, domains, log_func)
-            return True
-        return False
-
-    def find_hard_strategy_for_domain(domain):
-        """Имя профиля, которому назначен домен, или None."""
-        domain = domain.lower()
-        for slot_name in get_per_domain_slot_names():
-            if domain in load_hard_strategy_domains(slot_name):
-                return slot_name
-        return None
 
     def add_to_auto_exclude(domain):
         domain = domain.lower()
@@ -18549,8 +18325,6 @@ try:
     # Состояние для отслеживания замедленных доменов
     throttled_domains = {}  # domain -> {"first_check": timestamp, "count": int}
     throttled_domains_lock = threading.Lock()
-    THROTTLE_DETECTION_THRESHOLD = 3  # Количество проверок для подтверждения замедления
-    THROTTLE_RECOVERY_TIME = 3600  # 1 час, после которого забываем о замедлении
     
     # === НОВОЕ: Реестр замедленных доменов для boost стратегий ===
     throttled_domains_registry = {}  # domain -> {"boost_strategy": name, "throttle_type": type, "timestamp": time}
@@ -18780,20 +18554,6 @@ try:
         except Exception as e:
             error_type = type(e).__name__
             return "error", f"error_{error_type}"
-
-    def is_domain_throttled(domain):
-        """Проверяет, был ли домен помечен как замедленный."""
-        with throttled_domains_lock:
-            if domain not in throttled_domains:
-                return False
-            
-            entry = throttled_domains[domain]
-            # Проверяем, не прошло ли время восстановления
-            if time.time() - entry["first_check"] > THROTTLE_RECOVERY_TIME:
-                del throttled_domains[domain]
-                return False
-            
-            return entry["count"] >= THROTTLE_DETECTION_THRESHOLD
 
     def classify_throttle_type(diag_info):
         """Классифицирует тип замедления на основе диагностики и возвращает тип для boost стратегии."""
@@ -19233,53 +18993,6 @@ try:
         except Exception as e:
             print(f"[AdaptiveSystem] Ошибка загрузки strategies_evolution: {e}")
         return 0
-
-    def save_strategies_evolution():
-        """Сохраняет историю эволюции стратегий."""
-        global strategies_evolution
-        try:
-            base_dir = get_base_dir()
-            path = os.path.join(base_dir, STRATEGIES_EVOLUTION_FILE)
-            with strategies_evolution_lock:
-                # FIX: Save current version to protect against future wipes
-                strategies_evolution["_version"] = CURRENT_VERSION
-                save_json_safe(path, strategies_evolution)
-        except Exception as e:
-            print(f"[AdaptiveSystem] Ошибка сохранения strategies_evolution: {e}")
-
-    def update_strategy_success_rate(strategy_name, success_rate, log_func=None):
-        """Обновляет метрику успеха для стратегии и отслеживает деградацию."""
-        global strategies_evolution
-        with strategies_evolution_lock:
-            if strategy_name not in strategies_evolution:
-                strategies_evolution[strategy_name] = {
-                    "original_params": None,
-                    "current_success_rate": success_rate,
-                    "previous_success_rate": success_rate,
-                    "modifications_tried": 0,
-                    "last_checked": time.time(),
-                    "status": "active"  # active, degraded, pending_review
-                }
-            else:
-                evo = strategies_evolution[strategy_name]
-                evo["previous_success_rate"] = evo.get("current_success_rate", success_rate)
-                evo["current_success_rate"] = success_rate
-                evo["last_checked"] = time.time()
-                
-                # Если деградация > 20%
-                if evo["previous_success_rate"] > 0:
-                    degradation = ((evo["previous_success_rate"] - success_rate) / evo["previous_success_rate"]) * 100
-                    if degradation > 20:
-                        # Если статус уже был degraded, не спамим логами, но обновляем данные
-                        if evo["status"] != "degraded" and log_func:
-                            log_func(f"[AdaptiveSystem] {strategy_name} деградировала на {degradation:.1f}% (было {evo['previous_success_rate']:.0f}%, стало {success_rate:.0f}%)")
-                        evo["status"] = "degraded"
-                    else:
-                        evo["status"] = "active"
-                    return degradation > 20
-        
-        save_strategies_evolution()
-        return False
 
     def load_ip_history():
         """Загружает историю IP адресов."""
@@ -19860,147 +19573,6 @@ try:
                     f.write(f"{ip}\n")
             return True
         except: return False
-
-    # ================= МОДУЛЬ: AI LEARNING SYSTEM =================
-    class StrategyLearner:
-        def __init__(self):
-            self.filepath = LEARNING_DATA_FILE
-            self.data = {
-                "weights": {},  # {feature: score}
-                "bins": {},     # {bin_name: score}
-                "services": {}  # {service_name: {feature: score}}
-            }
-            self.lock = threading.Lock()
-            self.load()
-
-        def load(self):
-            if os.path.exists(self.filepath):
-                loaded = load_json_robust(self.filepath)
-                if isinstance(loaded, dict) and loaded:
-                    # FIX: Versioned Migration for Learning Data
-                    ver = loaded.get("_version", "0.0")
-                    if ver < "0.997":
-                        self.data = {}
-                    else:
-                        self.data = loaded
-            
-            # Ensure structure integrity
-            if "weights" not in self.data: self.data["weights"] = {}
-            if "bins" not in self.data: self.data["bins"] = {}
-            if "services" not in self.data: self.data["services"] = {}
-
-        def save(self):
-            try:
-                with self.lock:
-                    self.data["_version"] = CURRENT_VERSION
-                    save_json_safe(self.filepath, self.data)
-            except: pass
-
-        def _extract_features(self, args):
-            features = []
-            for arg in args:
-                if "=" in arg:
-                    key, val = arg.split("=", 1)
-                    if key in ["--dpi-desync", "--dpi-desync-fooling", "--dpi-desync-mode"]:
-                        features.extend([f"{key}={v}" for v in val.split(",")])
-                    elif key in ["--dpi-desync-ttl", "--dpi-desync-repeats", "--dpi-desync-split-pos"]:
-                        features.append(arg) # Keep value for these
-                    elif "fake" in key and ".bin" in val:
-                        pass # Bins handled separately
-                    else:
-                        features.append(key) # Just existence of flag
-                else:
-                    features.append(arg)
-            return features
-
-        def _extract_bin(self, args):
-            for arg in args:
-                if ".bin" in arg and "=" in arg:
-                    return os.path.basename(arg.split("=", 1)[1])
-            return None
-
-        def train(self, service, args, success_rate):
-            """Обновляет веса на основе успеха стратегии (0-100)."""
-            with self.lock:
-                # Нормализация: >50 - успех, <50 - неудача
-                delta = (success_rate - 50) / 10.0 
-                
-                features = self._extract_features(args)
-                bin_file = self._extract_bin(args)
-
-                # Обновляем глобальные веса
-                for f in features:
-                    self.data["weights"][f] = self.data["weights"].get(f, 0) + delta
-                
-                if bin_file:
-                    self.data["bins"][bin_file] = self.data["bins"].get(bin_file, 0) + delta
-
-                # Обновляем веса сервиса
-                if service not in self.data["services"]:
-                    self.data["services"][service] = {}
-                
-                for f in features:
-                    self.data["services"][service][f] = self.data["services"][service].get(f, 0) + delta * 1.5 # Сервис-специфичные веса важнее
-
-        def generate_strategy(self, service, base_args=None):
-            """Генерирует стратегию на основе обученных весов."""
-            with self.lock:
-                # Базовые компоненты
-                core_modes = ["--dpi-desync=fake", "--dpi-desync=split2", "--dpi-desync=disorder2", "--dpi-desync=multisplit"]
-                fooling_modes = ["badseq", "badsum", "md5sig", "ts"]
-                
-                # Выбор режима на основе весов
-                mode = self._weighted_choice(core_modes, service)
-                
-                new_args = [mode]
-                
-                # Добавляем fooling
-                if random.random() > 0.3:
-                    f = self._weighted_choice([f"--dpi-desync-fooling={x}" for x in fooling_modes], service)
-                    new_args.append(f)
-                
-                # Добавляем TTL (min=4, max=11)
-                ttl = random.randint(4, 11)
-                new_args.append(f"--dpi-desync-ttl={ttl}")
-                
-                # Добавляем Bin (если fake)
-                if "fake" in mode:
-                    best_bins = sorted(self.data["bins"].items(), key=lambda x: x[1], reverse=True)
-                    if best_bins and random.random() > 0.2:
-                        bin_name = best_bins[0][0] # Top bin
-                    else:
-                        # Fallback or exploration
-                        bin_name = "tls_clienthello_www_google_com.bin" 
-                    
-                    # Определяем тип fake
-                    if "quic" in bin_name:
-                        new_args.append(f"--dpi-desync-fake-quic=fake/{bin_name}")
-                    else:
-                        new_args.append(f"--dpi-desync-fake-tls=fake/{bin_name}")
-
-                return new_args
-
-        def _weighted_choice(self, options, service):
-            # Простой эпсилон-жадный выбор
-            if random.random() < 0.2: # 20% exploration
-                return random.choice(options)
-            
-            # Exploitation
-            srv_weights = self.data["services"].get(service, {})
-            glob_weights = self.data["weights"]
-            
-            scored = []
-            for opt in options:
-                # Извлекаем ключевую часть для поиска веса
-                key = opt.split("=")[1] if "=" in opt else opt
-                # Ищем точное совпадение ключа или частичное
-                w = srv_weights.get(opt, 0) * 2 + glob_weights.get(opt, 0)
-                scored.append((w, opt))
-            
-            scored.sort(key=lambda x: x[0], reverse=True)
-            return scored[0][1]
-
-
 
     def record_ip_change(new_ip, log_func=None):
         """Записывает смену IP адреса (кроме VPN) и возвращает True если переверификация нужна."""
@@ -20611,49 +20183,6 @@ try:
 
     # ================= УПРАВЛЕНИЕ ПРОЦЕССОМ =================
     
-    def parse_ports_from_args(arg_list):
-        tcp_ports = set()
-        udp_ports = set()
-        
-        # FIX: Ensure we have a list to iterate
-        if isinstance(arg_list, dict):
-            arg_list = arg_list.get("args", [])
-        if not isinstance(arg_list, list):
-            return tcp_ports, udp_ports
-
-        for arg in arg_list:
-            if not isinstance(arg, str): continue
-            arg_clean = arg.strip()
-            
-            if "=" not in arg_clean: continue
-            
-            if arg_clean.startswith("--wf-tcp=") or arg_clean.startswith("--filter-tcp="):
-                ports = arg_clean.split("=", 1)[1]
-                for part in ports.split(","):
-                    part = part.strip()
-                    if not part: continue
-                    if "-" in part:
-                         try:
-                             start, end = part.split('-')
-                             tcp_ports.add(f"(tcp.DstPort >= {start} and tcp.DstPort <= {end})")
-                         except: pass
-                    else:
-                         tcp_ports.add(f"tcp.DstPort == {part}")
-            
-            if arg_clean.startswith("--wf-udp=") or arg_clean.startswith("--filter-udp="):
-                ports = arg_clean.split("=", 1)[1]
-                for part in ports.split(","):
-                    part = part.strip()
-                    if not part: continue
-                    if "-" in part:
-                         try:
-                             start, end = part.split('-')
-                             udp_ports.add(f"(udp.DstPort >= {start} and udp.DstPort <= {end})")
-                         except: pass
-                    else:
-                         udp_ports.add(f"udp.DstPort == {part}")
-        return tcp_ports, udp_ports
-
     _repair_lock = threading.Lock()
     _repair_in_progress = False
     _windivert_broken = False  # Global flag: driver confirmed broken, checkers should skip
@@ -21512,75 +21041,6 @@ try:
         except Exception as e:
             if log_func:
                 log_func(f"[HardSync] Ошибка: {e}")
-
-    def check_hard_list_on_startup(log_func=None):
-        """Проверяет домены из temp/hard.txt при запуске. Если стратегии не подобраны и new hard_X списки не сформированы, оставляет домены в hard.txt."""
-        try:
-            base_dir = get_base_dir()
-            hard_path = os.path.join(base_dir, "temp", "hard.txt")
-            
-            if not os.path.exists(hard_path):
-                return
-            
-            # Читаем домены из hard.txt
-            with open(hard_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            
-            domains = [l.split('#')[0].strip().lower() for l in lines if l.strip() and not l.startswith("#")]
-            
-            if not domains:
-                return
-            
-            if log_func:
-                log_func(f"[HardCheck] При запуске найдено {len(domains)} доменов в temp/hard.txt, проверяем стратегии...")
-            
-            # Загружаем текущие hard_X стратегии
-            strat_path = os.path.join(base_dir, "strat", "strategies.json")
-            strategies = {}
-            try:
-                with open(strat_path, "r", encoding="utf-8") as f:
-                    strategies = json.load(f)
-            except: pass
-            
-            current_hard_strats = {k: v for k, v in strategies.items() if k.startswith(ALT_SLOT_PREFIX)}
-            
-            # Для каждого домена - проверяем был ли он уже подобран ранее
-            domains_found = []
-            domains_not_found = []
-            
-            for domain in domains:
-                found = False
-                for hard_name in current_hard_strats.keys():
-                    hard_domains = load_hard_strategy_domains(hard_name)
-                    if domain in hard_domains:
-                        domains_found.append(domain)
-                        found = True
-                        break
-                
-                if not found:
-                    domains_not_found.append(domain)
-            
-            # Если нашли - убираем из hard.txt
-            if domains_found:
-                if log_func:
-                    log_func(f"[HardCheck] {len(domains_found)} доменов уже имеют стратегии. Удаляем из hard.txt")
-                
-                with open(hard_path, "w", encoding="utf-8") as f:
-                    for domain in domains_not_found:
-                        f.write(f"{domain}\n")
-                
-                domains = domains_not_found
-            
-            # Если остались домены без стратегий - ждем пока сформируются новые hard_X списки
-            if domains:
-                if log_func:
-                    log_func(f"[HardCheck] {len(domains)} доменов ждут подбора стратегии. Оставляем в hard.txt для background worker.")
-                if log_func:
-                    log_func(f"[HardCheck] Background worker проверит их когда будут сформированы новые hard_X стратегии.")
-                    
-        except Exception as e:
-            if log_func:
-                log_func(f"[HardCheck] Ошибка: {e}")
 
     # ================= МОДУЛЬ: AUTO-UPDATE =================
     def compare_versions(v1, v2):
@@ -25850,73 +25310,6 @@ try:
                 self.bg_color = kwargs["bg"]
                 self._draw_bg()
         def place(self, **kwargs): pass
-
-    # === CRITICAL MIGRATION LOGIC ===
-    def perform_critical_migrations(log_func=None):
-        try:
-            base = get_base_dir()
-            u_strat = os.path.join(base, "strat", "strategies.json")
-            u_discord = os.path.join(base, "strat", "discord.json")
-            
-            # 1. Check strategies.json
-            if os.path.exists(u_strat):
-                try:
-                    curr = load_json_robust(u_strat)
-                    if curr:
-                        mod = False
-                        
-                        d_args = curr.get("discord", [])
-                        bad_d = any("--filter-tcp=" in x and "443" in x for x in d_args)
-                        
-                        if bad_d:
-                            ref = {}
-                            if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-                                i_strat = os.path.join(sys._MEIPASS, "strat", "strategies.json")
-                                if os.path.exists(i_strat):
-                                    ref = load_json_robust(i_strat)
-                            
-                            if ref:
-                                if bad_d and "discord" in ref:
-                                    curr["discord"] = ref["discord"]
-                                    mod = True
-                                    if log_func: log_func("[Init] Discord стратегия обновлена из пакета (v1.12).")
-                            
-                            if mod:
-                                 curr["version"] = CURRENT_VERSION
-                                 save_json_safe(u_strat, curr)
-                except: pass
-
-            # 2. Check discord.json
-            if os.path.exists(u_discord):
-                 try:
-                     with open(u_discord, "r", encoding="utf-8", errors="ignore") as f:
-                         raw = f.read()
-                     if '"--filter-tcp=443,' in raw:
-                         if log_func: log_func("[Init] Удален устаревший discord.json для обновления.")
-                         f.close()
-                         os.remove(u_discord)
-                         # Restore immediately to get the new version
-                         restore_missing_strategies()
-                 except: pass
-
-            # 3. Check list/discord.txt
-            u_discord_txt = os.path.join(base, "list", "discord.txt")
-            if os.path.exists(u_discord_txt):
-                try:
-                    with open(u_discord_txt, "r", encoding="utf-8", errors="ignore") as f:
-                        raw_txt = f.read()
-                    discord_lines = [line.split("#")[0].strip().lower() for line in raw_txt.splitlines() if line.split("#")[0].strip()]
-                    discord_set = set(discord_lines)
-                    if "discord.media" not in discord_set:
-                        if log_func: log_func("[Init] Удален устаревший discord.txt для обновления списка доменов.")
-                        f.close()
-                        os.remove(u_discord_txt)
-                        # Восстанавливаем из ресурсов (чтобы сразу появился правильный список)
-                        restore_missing_strategies()
-                except: pass
-        except: pass
-
-
 
     # ================= STARTUP =================
     if __name__ == "__main__":

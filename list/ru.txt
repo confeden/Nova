@@ -201,6 +201,7 @@ sfunpay.com
 shopify.com
 simgbb.com
 sitechecker.pro
+skills.md
 sms-act.net
 smspool.net
 smtp2go.com
