@@ -22,6 +22,8 @@
 диагностика, которой не будет в тот единственный раз, когда она нужна.
 """
 
+import json
+import os
 import threading
 import time
 
@@ -118,8 +120,14 @@ def records():
         return list(_RECORDS)
 
 
-def render(top=12):
-    """Компактный отчёт. Пусто, если мерить нечего."""
+def render(top=12, history=None):
+    """Компактный отчёт. Пусто, если мерить нечего.
+
+    `history` — записи прошлых запусков из `append_history`. С ними отчёт может
+    сказать не только «фаза заняла N мс», но и «это втрое больше обычного», а
+    без них цифра сама по себе ни о чём не говорит: разброс между запусками
+    здесь двух-трёхкратный и нормален.
+    """
     rows = records()
     if not rows:
         return []
@@ -168,7 +176,99 @@ def render(top=12):
             f"[Boot] Суммарно в фазах {total:.0f} мс, промежуток работы {span:.0f} мс "
             f"(параллельность {total / span:.1f}x)"
         )
+
+    # Главное, ради чего копится история: отличить «долго» от «дольше обычного».
+    for name, now, med in compare_with_history(history or []):
+        lines.append(
+            f"[Boot] ОТКЛОНЕНИЕ: {name} — {now:.0f} мс против обычных {med:.0f} "
+            f"({now / med:.1f}x)"
+        )
     return lines
+
+
+# Сколько запусков помнить. Двадцати хватает, чтобы медиана перестала прыгать,
+# и файл остаётся в несколько килобайт.
+HISTORY_LIMIT = 20
+
+# Во сколько раз фаза должна превысить свою же медиану, чтобы это назвали
+# отклонением. Порог грубый намеренно: разброс между запусками здесь
+# двух-трёхкратный и сам по себе нормален — 10707 мс против 3853 у одной и той
+# же фазы на соседних прогонах. Кричать надо только про то, что вышло за эти
+# рамки.
+OUTLIER_FACTOR = 3.0
+
+
+def append_history(path, stamp=""):
+    """Дописать итоги запуска в JSONL и вернуть прежние записи.
+
+    Ради этого файла всё и затевалось. Один отчёт в логе отвечает «сколько
+    заняла фаза сегодня», но не отвечает «это много или обычно» — а
+    единственный способ узнать второе состоял в том, чтобы поднять логи прошлых
+    запусков и сравнить глазами. Ровно та ручная работа, которую хронология
+    должна была убрать.
+    """
+    rows = [r for r in records() if r[0] == "phase" and r[3] is not None]
+    if not rows:
+        return []
+    previous = read_history(path)
+    entry = {
+        "stamp": str(stamp or ""),
+        "phases": {name: round(dur, 1) for _k, name, _o, dur, _d in rows},
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        kept = (previous + [entry])[-HISTORY_LIMIT:]
+        with open(path, "w", encoding="utf-8") as handle:
+            for item in kept:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return previous
+
+
+def read_history(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+    except Exception:
+        return []
+    return out
+
+
+def _median(values):
+    values = sorted(values)
+    if not values:
+        return 0.0
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
+def compare_with_history(previous, minimum_samples=3):
+    """Фазы, вышедшие за OUTLIER_FACTOR от своей медианы: [(имя, сейчас, медиана)]."""
+    if not previous:
+        return []
+    history = {}
+    for entry in previous:
+        for name, value in (entry.get("phases") or {}).items():
+            history.setdefault(name, []).append(float(value))
+    out = []
+    for _k, name, _o, dur, _d in records():
+        if _k != "phase" or dur is None:
+            continue
+        samples = history.get(name) or []
+        if len(samples) < minimum_samples:
+            continue
+        med = _median(samples)
+        if med > 0 and dur > med * OUTLIER_FACTOR:
+            out.append((name, dur, med))
+    out.sort(key=lambda item: item[1] / item[2], reverse=True)
+    return out
 
 
 def reset():

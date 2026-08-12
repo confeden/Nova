@@ -22440,7 +22440,12 @@ try:
         # само по себе то, что мы хотим увидеть.
         def _report_boot_timeline():
             try:
-                for line in boot_timeline.render():
+                # История пишется до отчёта и возвращает прежние записи, чтобы
+                # сегодняшний запуск сравнивался с прошлыми, а не с самим собой.
+                history_path = os.path.join(get_base_dir(), "temp", "boot_timeline.jsonl")
+                previous = boot_timeline.append_history(
+                    history_path, stamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+                for line in boot_timeline.render(history=previous):
                     log_func(line)
             except Exception as e:
                 safe_trace(f"[Boot] Не удалось построить хронологию: {e}")
