@@ -86,6 +86,7 @@ fbcdn.net
 fbsbx.com
 filterblade.xyz
 flagcdn.com
+flixster.com
 fontawesome.com
 frankerfacez.com
 fsdn.com
@@ -187,6 +188,7 @@ redgifs.com
 release-assets.githubusercontent.com
 rezka.ag
 romexsoftware.com
+rottentomatoes.com
 roundproxies.com
 rtrvr.ai
 rustdesk.com
