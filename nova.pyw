@@ -253,6 +253,7 @@ from nova_routing_profiles import get_default_app_routing_profiles, match_app_by
 from nova_strategy_niche import classify_strategy_niche
 from nova_relay_env import relay_env_from_settings
 import nova_boot_timeline as boot_timeline
+import nova_win_routes
 from nova_routing_backends import (
     build_app_transport_decisions,
     get_selected_routing_backend_info,
@@ -19185,6 +19186,15 @@ try:
                 "}; "
                 "if ($ip) { Write-Output $ip }"
             )
+            # Тот же отбор, что ниже делал PowerShell, но через Windows API:
+            # 3 мс вместо 1400. Скрипт оставлен запасным — он дословно тот же,
+            # что в get_direct_route_info, и снимать обе страховки разом,
+            # не накопив наработки на нативном пути, незачем.
+            info = nova_win_routes.direct_route_info()
+            if info:
+                src_ip = str(info.get("ip") or "").strip()
+                if src_ip and not src_ip.startswith("127.") and "." in src_ip:
+                    return src_ip
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
                 capture_output=True,
@@ -19222,7 +19232,28 @@ try:
         return None
 
     def get_direct_route_info():
-        """Return best-effort physical egress route info: alias, local IPv4, gateway IPv4."""
+        """Return best-effort physical egress route info: alias, local IPv4, gateway IPv4.
+
+        Сначала Windows API, потом PowerShell как запасной путь.
+
+        Замерено на этой машине: прежний `Get-NetIPConfiguration` отвечал за
+        1400-3900 мс, тот же ответ через GetAdaptersAddresses — за 3 мс, и
+        совпадает поле в поле. Разница здесь не про красоту: вызов стоит в цикле
+        ожидания IP-воркера с шагом 0.5 с и лимитом 8 с, то есть цикл, писанный
+        на шестнадцать попыток, получал четыре.
+
+        PowerShell оставлен запасным намеренно. Пустой `gateway` для вызывающего
+        означает «измерению не доверять», и он на этом основании пропускает
+        ветку, которая чистит суточный кэш проверок доменов. Пока нативный путь
+        не набрал наработки на всех раскладках адаптеров, дешевле один раз
+        заплатить секундой, чем отдать наверх «не знаю».
+        """
+        try:
+            info = nova_win_routes.direct_route_info()
+            if info and str(info.get("ip") or ""):
+                return info
+        except Exception:
+            pass
         try:
             ps_cmd = (
                 "$adapters = Get-NetIPConfiguration | Where-Object { "
