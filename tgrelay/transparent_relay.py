@@ -1449,7 +1449,13 @@ async def _bridge_ws(
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
     replay = bytes(replay_buf) if replay_enabled and replay_complete and (counters["down"] <= 0 or first_down_timed_out) else b""
-    return counters["up"], counters["down"], int((time.monotonic() - started) * 1000), replay
+    # `first_down_timed_out` возвращается наружу, а не остаётся внутренним:
+    # вызывающий отличает по нему «ждали первый байт и не дождались» от
+    # «собеседник закрыл соединение сразу же, ничего не прислав». Это разные
+    # диагнозы — первое означает медленный или чёрнодырный маршрут, второе отказ,
+    # — а без флага оба сваливались в одну строку про таймаут.
+    return (counters["up"], counters["down"],
+            int((time.monotonic() - started) * 1000), replay, first_down_timed_out)
 
 
 async def serve_until_stopped(server: asyncio.AbstractServer, stop_event: asyncio.Event) -> None:
@@ -2413,7 +2419,7 @@ class TelegramTransparentRelayServer:
                 f"path=wss proto={_proto_label(init_info.proto)} dc={dc_hint or '?'} "
                 f"media={is_media} route={route_label} target={target_ip}:{target_port}"
             )
-            up, down, duration_ms, _replay = await _bridge_ws(
+            up, down, duration_ms, _replay, first_byte_timed_out = await _bridge_ws(
                 reader,
                 writer,
                 ws,
@@ -2485,19 +2491,26 @@ class TelegramTransparentRelayServer:
                         return
                     replay_initial = retry_replay
                 self._note_wss_first_byte_result(dc_hint, is_media, 0, route_label)
+                # «Не дождались первого байта» и «собеседник закрылся сразу,
+                # ничего не прислав» — разные отказы, и лечатся они по-разному:
+                # первый это медленный или чёрнодырный маршрут, второй — отказ на
+                # той стороне. Раньше обе ветки печатали «timeout», и в логе
+                # получалось «timeout ... duration_ms=0» — таймаут, уложившийся в
+                # ноль миллисекунд.
+                verdict = "first-byte timeout" if first_byte_timed_out else "empty close (peer sent nothing)"
                 # Skip TCP fallback when CF domains are available — ISP throttles
                 # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
                 if _has_custom_cfproxy_domain():
                     self.log_func(
-                        f"[TgRelay] WSS first-byte timeout; skipping TCP fallback (ISP throttled): proto={_proto_label(init_info.proto)} "
+                        f"[TgRelay] WSS {verdict}; skipping TCP fallback (ISP throttled): proto={_proto_label(init_info.proto)} "
                         f"dc={dc_hint or '?'} media={is_media} target={target_ip}:{target_port} "
-                        f"replay={len(replay_initial)} duration_ms={duration_ms}"
+                        f"route={route_label} replay={len(replay_initial)} duration_ms={duration_ms}"
                     )
                     return
                 self.log_func(
-                    f"[TgRelay] WSS first-byte timeout; TCP fallback: proto={_proto_label(init_info.proto)} "
+                    f"[TgRelay] WSS {verdict}; TCP fallback: proto={_proto_label(init_info.proto)} "
                     f"dc={dc_hint or '?'} media={is_media} target={target_ip}:{target_port} "
-                    f"replay={len(replay_initial)} duration_ms={duration_ms}"
+                    f"route={route_label} replay={len(replay_initial)} duration_ms={duration_ms}"
                 )
                 await self._handle_plain_tunnel(
                     reader,
@@ -2607,7 +2620,7 @@ class TelegramTransparentRelayServer:
         self.log_func(
             f"[TgRelay] Подключено: proto={proto_label} dc={dc_hint} media=False route={route_label} target={target_ip}:{target_port}"
         )
-        up, down, duration_ms, replay = await _bridge_ws(
+        up, down, duration_ms, replay, first_byte_timed_out = await _bridge_ws(
             reader,
             writer,
             ws,
@@ -3170,7 +3183,7 @@ class TelegramTransparentRelayServer:
             f"path=wss-retry proto={proto_label} dc={dc_hint or '?'} media={bool(is_media)} "
             f"route={route_label} target={target_ip}:{target_port}"
         )
-        up, down, duration_ms, replay = await _bridge_ws(
+        up, down, duration_ms, replay, first_byte_timed_out = await _bridge_ws(
             reader,
             writer,
             ws,
