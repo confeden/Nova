@@ -22344,7 +22344,7 @@ try:
 
         safe_trace("[Services] Priority threads launching; heavy workers deferred.")
 
-        def _start_worker(name, target, args=(), delay=0.0):
+        def _start_worker(name, target, args=(), delay=0.0, track=True):
             def _runner():
                 delay_left = max(0.0, float(delay or 0.0))
                 while delay_left > 0 and not is_closing:
@@ -22357,7 +22357,15 @@ try:
                 # бесконечный цикл. Важно, когда он реально проснулся: отставание
                 # от запрошенной задержки означает, что потоку не досталось
                 # процессора, и это отдельный диагноз, а не медленная фаза.
-                boot_timeline.worker_started(name, delay)
+                #
+                # track=False - для наблюдателя, который сам ничего не запускает.
+                # Он просыпается последним по построению, и если считать его
+                # воркером, то «последний воркер» превращается в его же задержку,
+                # а промежуток растягивается до момента печати отчёта. На первом
+                # же прогоне это дало параллельность 0.8x - величину, которой не
+                # бывает.
+                if track:
+                    boot_timeline.worker_started(name, delay)
                 try:
                     target(*args)
                 except Exception as e:
@@ -22400,7 +22408,7 @@ try:
             except Exception as e:
                 safe_trace(f"[Boot] Не удалось построить хронологию: {e}")
 
-        _start_worker("NovaBootTimeline", _report_boot_timeline, delay=16.0)
+        _start_worker("NovaBootTimeline", _report_boot_timeline, delay=16.0, track=False)
         
 
 
