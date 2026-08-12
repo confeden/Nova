@@ -1,0 +1,272 @@
+{
+  "cases": [
+    {
+      "args": [],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "other",
+      "why": "no desync at all falls back to other/unbounded/ttl"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "inject"
+    },
+    {
+      "args": [
+        "--dpi-desync=rstack"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "inject via rst"
+    },
+    {
+      "args": [
+        "--dpi-desync=ipfrag2"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "fragment",
+      "why": "fragment"
+    },
+    {
+      "args": [
+        "--dpi-desync=multisplit"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "segment",
+      "why": "segment"
+    },
+    {
+      "args": [
+        "--dpi-desync=fakedsplit"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "decoy-segment",
+      "why": "decoy-segment"
+    },
+    {
+      "args": [
+        "--dpi-desync=syndata"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "relocate",
+      "why": "relocate"
+    },
+    {
+      "args": [
+        "--dpi-desync=hostfakesplit"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "relocate",
+      "why": "relocate via hostfakesplit"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake,multisplit"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "segment",
+      "why": "most disruptive mode wins"
+    },
+    {
+      "args": [
+        "--dpi-desync=multisplit,fake"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "segment",
+      "why": "most disruptive mode wins, reversed"
+    },
+    {
+      "args": [
+        "--dpi-desync=multisplit,syndata"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "relocate",
+      "why": "relocate outranks segment"
+    },
+    {
+      "args": [
+        "--dpi-desync=split"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "segment",
+      "why": "deprecated split is multisplit"
+    },
+    {
+      "args": [
+        "--dpi-desync=split2"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "segment",
+      "why": "deprecated split2 is multisplit"
+    },
+    {
+      "args": [
+        "--dpi-desync=disorder"
+      ],
+      "deniability": "ttl",
+      "reach": "unbounded",
+      "technique": "segment",
+      "why": "deprecated disorder is multidisorder"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=1"
+      ],
+      "deniability": "ttl",
+      "reach": "short",
+      "technique": "inject",
+      "why": "ttl 1 is short"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=4"
+      ],
+      "deniability": "ttl",
+      "reach": "short",
+      "technique": "inject",
+      "why": "ttl 4 is still short"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=5"
+      ],
+      "deniability": "ttl",
+      "reach": "medium",
+      "technique": "inject",
+      "why": "ttl 5 is medium"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=8"
+      ],
+      "deniability": "ttl",
+      "reach": "medium",
+      "technique": "inject",
+      "why": "ttl 8 is still medium"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=9"
+      ],
+      "deniability": "ttl",
+      "reach": "long",
+      "technique": "inject",
+      "why": "ttl 9 is long"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-autottl=2"
+      ],
+      "deniability": "ttl",
+      "reach": "adaptive",
+      "technique": "inject",
+      "why": "autottl alone is adaptive"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=3",
+        "--dpi-desync-autottl=2"
+      ],
+      "deniability": "ttl",
+      "reach": "adaptive",
+      "technique": "inject",
+      "why": "autottl overrides a fixed ttl"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-fooling=badsum"
+      ],
+      "deniability": "malformed",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "badsum is malformed"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-fooling=md5sig"
+      ],
+      "deniability": "malformed",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "md5sig is malformed"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-fooling=badseq"
+      ],
+      "deniability": "out-of-order",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "badseq is out-of-order"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-fooling=datanoack"
+      ],
+      "deniability": "out-of-order",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "datanoack is out-of-order"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-fooling=badsum,badseq"
+      ],
+      "deniability": "mixed",
+      "reach": "unbounded",
+      "technique": "inject",
+      "why": "both classes is mixed"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake",
+        "--dpi-desync-ttl=6"
+      ],
+      "deniability": "ttl",
+      "reach": "medium",
+      "technique": "inject",
+      "why": "no fooling is ttl"
+    },
+    {
+      "args": [
+        "--dpi-desync=fake,fakedsplit",
+        "--dpi-desync-ttl=6",
+        "--dpi-desync-fooling=badsum,md5sig",
+        "--dpi-desync-repeats=4"
+      ],
+      "deniability": "malformed",
+      "reach": "medium",
+      "technique": "decoy-segment",
+      "why": "a realistic combination"
+    }
+  ],
+  "note": "Generated by nova-zapret/tests/niche_table.rs. Do not edit by hand — regenerate with NOVA_UPDATE_NICHE_TABLE=1 cargo test -p nova-zapret --test niche_table"
+}

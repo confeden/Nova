@@ -18,17 +18,45 @@ pub struct Pool {
 
 pub struct Corpus {
     pub root: PathBuf,
+    /// Where `winws.exe` lives. Not `root/bin` — see [`Corpus::bin_dir`].
+    pub bin: PathBuf,
     pub pools: Vec<Pool>,
     pub palette: Palette,
 }
 
 impl Corpus {
-    /// Walk up from the executable or the current directory looking for a Nova
-    /// checkout, identified by the two directories the engine cannot work
-    /// without.
+    /// Where the binaries live, which is not the same place in the two layouts
+    /// this has to work in.
+    ///
+    /// A checkout keeps everything as siblings: `strat/`, `fake/`, `bin/`. An
+    /// installed tree does not — `Inno.py` stages `strat`, `fake`, `ip` and
+    /// `list` at `{app}` but copies `bin` to `{app}\resources\bin`
+    /// (`TOP_LEVEL_DIRS` vs `RESOURCE_DIRS`), and the app itself agrees
+    /// (`nova.pyw:get_bin_dir`). So `bin` is the one directory whose position
+    /// depends on how Nova got onto the machine.
+    pub fn bin_dir(root: &Path) -> PathBuf {
+        let sibling = root.join("bin");
+        if sibling.is_dir() {
+            sibling
+        } else {
+            root.join("resources").join("bin")
+        }
+    }
+
+    /// Walk up from the current directory looking for a Nova tree.
+    ///
+    /// The anchor is `strat/`, plus a `bin` in either of its two possible
+    /// positions. Requiring `bin` to be a *sibling* of `strat` — as this did —
+    /// recognises a checkout and nothing else: on an installed tree the search
+    /// walked to the filesystem root, returned `None`, and the binary exited 2
+    /// before doing anything. Nothing caught it because nova-cli ships nowhere
+    /// yet, and it would have failed on the first machine it reached.
     pub fn find_root() -> Option<PathBuf> {
         let start = std::env::current_dir().ok()?;
-        start.ancestors().find(|dir| dir.join("strat").is_dir() && dir.join("bin").is_dir()).map(Path::to_path_buf)
+        start
+            .ancestors()
+            .find(|dir| dir.join("strat").is_dir() && Self::bin_dir(dir).is_dir())
+            .map(Path::to_path_buf)
     }
 
     pub fn load(root: &Path) -> Result<Self, String> {
@@ -75,7 +103,12 @@ impl Corpus {
             .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>())
             .unwrap_or_default();
 
-        Ok(Corpus { root: root.to_path_buf(), pools, palette: Palette::from_fake_dir(fake_names) })
+        Ok(Corpus {
+            root: root.to_path_buf(),
+            bin: Self::bin_dir(root),
+            pools,
+            palette: Palette::from_fake_dir(fake_names),
+        })
     }
 
     pub fn total_strategies(&self) -> usize {
@@ -87,6 +120,6 @@ impl Corpus {
     }
 
     pub fn winws_path(&self) -> PathBuf {
-        self.root.join("bin").join("winws.exe")
+        self.bin.join("winws.exe")
     }
 }

@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "nova-cli"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "nova-cloudflare",
  "nova-core",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "nova-cloudflare"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "nova-core",
  "serde",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "nova-core"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "nova-health"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "nova-core",
  "serde",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "nova-learn"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "nova-core",
  "rand",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "nova-probe"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "nova-core",
  "serde",
@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "nova-tls"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "boring",
  "brotli",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "nova-zapret"
-version = "1.34.0"
+version = "1.35.0"
 dependencies = [
  "nova-core",
  "rand",

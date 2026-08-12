@@ -7,8 +7,14 @@ authors.workspace = true
 license.workspace = true
 description = "Headless driver for the Nova engine: run and observe the learner, the evolver and the strategy emitter without the GUI."
 
+# `nova-engine`, not `nova`. NovaInstaller.iss:148 does
+# `Get-Process -Name Nova` and :157 `taskkill /F /IM Nova.exe` to clear install
+# blockers, and both match on image name, case-insensitively. A helper called
+# `nova.exe` would therefore be killed on every install and uninstall — and,
+# worse, would convince the installer that Nova itself is running, which fires
+# the WinDivert and CloudflareWARP service stops even when the app is closed.
 [[bin]]
-name = "nova"
+name = "nova-engine"
 path = "src/main.rs"
 
 [dependencies]

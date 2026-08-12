@@ -9,70 +9,6 @@
 # permission of the copyright holder.
 # -----------------------------------------------------------------------------
 # -*- coding: utf-8 -*-
-# ------------------------------------------------------------
-# Auto‑install required third‑party packages if they are missing.
-# This runs before any other imports, so the script can recover
-# from a fresh Windows installation where the environment is empty.
-import subprocess, sys, importlib, logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-_REQUIRED = [
-    ("requests", "requests"),
-    ("urllib3", "urllib3"),
-    ("PIL", "Pillow"),
-    ("pystray", "pystray"),
-    ("cryptography", "cryptography"),
-]
-
-def _install(pkg_name: str) -> bool:
-    """Install *pkg_name* using the same interpreter that runs this script.
-    Returns ``True`` on success, ``False`` otherwise."""
-    try:
-        logging.info("Installing %s…", pkg_name)
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg_name, "--quiet"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        if result.returncode != 0:
-            logging.error("pip failed (code %s): %s", result.returncode, result.stdout)
-            return False
-        logging.info("%s installed successfully.", pkg_name)
-        return True
-    except Exception as exc:  # pragma: no cover
-        logging.exception("Unexpected error while installing %s", pkg_name)
-        return False
-
-def _ensure_dependencies() -> None:
-    missing = []
-    for import_name, package_name in _REQUIRED:
-        try:
-            importlib.import_module(import_name)
-        except Exception:
-            missing.append((import_name, package_name))
-    if not missing:
-        return
-    logging.warning("Missing dependencies: %s", ", ".join(p for _, p in missing))
-    for import_name, package_name in missing:
-        if _install(package_name):
-            try:
-                importlib.import_module(import_name)
-            except Exception as exc:
-                logging.error("%s installed but cannot be imported: %s", package_name, exc)
-        else:
-            logging.error("Failed to install %s", package_name)
-    # Final check – abort if something is still unavailable.
-    for import_name, _ in missing:
-        try:
-            importlib.import_module(import_name)
-        except Exception:
-            sys.exit(f"Critical: required module '{import_name}' is still missing. Install it manually and restart.")
-
-if False:
-    _ensure_dependencies()
-
-# ------------------------------------------------------------
-# Original imports continue below
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Auto‑install required third‑party packages if they are missing.
@@ -314,6 +250,8 @@ if getattr(sys, 'frozen', False):
         pass
 from nova_platform import is_windows_admin
 from nova_routing_profiles import get_default_app_routing_profiles, match_app_by_process_path
+from nova_strategy_niche import classify_strategy_niche
+from nova_relay_env import relay_env_from_settings
 from nova_routing_backends import (
     build_app_transport_decisions,
     get_selected_routing_backend_info,
@@ -404,15 +342,6 @@ try:
 except:
     pass
 
-
-def _env_bool_global(name, default=False):
-    try:
-        raw = os.environ.get(str(name), None)
-        if raw is None:
-            return bool(default)
-        return str(raw).strip().lower() in ("1", "true", "yes", "on")
-    except:
-        return bool(default)
 
 # === AUTO-INSTALL REQUIREMENTS ===
 def install_requirements_visually():
@@ -885,12 +814,6 @@ try:
     def is_compiled_build():
         return bool(getattr(sys, 'frozen', False) or "__compiled__" in globals())
 
-    def get_base_dir():
-        """Returns the absolute path to the application directory."""
-        if getattr(sys, 'frozen', False):
-            return os.path.dirname(os.path.abspath(sys.executable))
-        return os.path.dirname(os.path.abspath(sys.argv[0]))
-
     def get_resources_dir():
         base_dir = get_base_dir()
         candidates = []
@@ -968,37 +891,6 @@ try:
             return value
         except:
             return str(ip_str or "")
-
-    # === WINDOW STATE MANAGEMENT (Global Helper) ===
-    def load_window_state():
-        try:
-            path = os.path.join(get_base_dir(), "temp", "window_state.json")
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except: pass
-        return {}
-
-    def save_window_state(**kwargs):
-        try:
-            path = os.path.join(get_base_dir(), "temp", "window_state.json")
-            target_dir = os.path.dirname(path)
-            if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
-            
-            data = {}
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                except: pass
-            
-            data.update(kwargs)
-            
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-                
-        except Exception:
-            pass
 
     def mask_ips_in_text(text):
         """Preserve full IPs in logs."""
@@ -1359,17 +1251,6 @@ try:
                 pass
         return []
 
-    def calculate_file_hash(filepath, algorithm="sha256"):
-        """Вычисляет хэш файла."""
-        import hashlib
-        hash_func = hashlib.new(algorithm)
-        try:
-            with open(filepath, "rb") as f:
-                while chunk := f.read(8192):
-                    hash_func.update(chunk)
-            return hash_func.hexdigest()
-        except: return None
-
     # Компоненты прежних поставок, которые больше не нужны. Список явный, а не
     # "удалить всё, чего нет в бандле": вслепую подчищать bin опасно, туда могут
     # попадать файлы, которых сборка не знает.
@@ -1716,12 +1597,6 @@ try:
                 except Exception as e:
                     pass
 
-        # FIX: Проверка успешности развертывания критических файлов (DISABLED: Downloaded later)
-        if False and not os.path.exists(winws_path):
-            debug_info = f"Target: {winws_path}\nInternal Source: {get_internal_path('bin')}\nBase Dir: {base_dir}\nArgv[0]: {sys.argv[0]}"
-            try: ctypes.windll.user32.MessageBoxW(0, f"Critical Error: winws.exe not found after setup.\n\n{debug_info}", "Nova Setup Failed", 0x10)
-            except: pass
-            
         # FIX: Create winws_test.exe for background checks (Process Isolation)
         try:
              winws_test_path = os.path.join(get_bin_dir(), "winws_test.exe")
@@ -7388,10 +7263,6 @@ try:
         return {"status": "Unknown", "subject": "", "issuer": ""}
 
 
-    def _driver_authenticode_status(path):
-        return str(_driver_authenticode_info(path).get("status") or "Unknown")
-
-
     def _driver_kernel_signature_release_safe(info):
         if str((info or {}).get("status") or "") != "Valid":
             return False
@@ -7567,70 +7438,6 @@ try:
                 pass
 
 
-    def _manager_is_ready(manager):
-        try:
-            return bool(manager and getattr(manager, "is_ready", lambda: False)())
-        except:
-            return False
-
-
-    def _light_app_fallback_ready():
-        novawfp_ready = (
-            bool(globals().get("ENABLE_LIGHT_APP_FALLBACK", True))
-            and _manager_is_ready(globals().get("novawfp_tcp_proxy_manager"))
-            and _manager_is_ready(globals().get("novawfp_udp_proxy_manager"))
-        )
-        novadivert_ready = (
-            bool(globals().get("ENABLE_LIGHT_APP_FALLBACK", True))
-            and _manager_is_ready(globals().get("novadivert_tcp_proxy_manager"))
-            and _manager_is_ready(globals().get("novadivert_redirect_manager"))
-        )
-        return bool(novawfp_ready or novadivert_ready)
-
-
-    def _telegram_signed_udp_redirect_ready():
-        novawfp_ready = (
-            bool(globals().get("ENABLE_LIGHT_APP_FALLBACK", True))
-            and _manager_is_ready(globals().get("novawfp_tcp_proxy_manager"))
-            and _manager_is_ready(globals().get("novawfp_udp_proxy_manager"))
-        )
-        novadivert_ready = (
-            bool(globals().get("ENABLE_LIGHT_APP_FALLBACK", True))
-            and _manager_is_ready(globals().get("novadivert_tcp_proxy_manager"))
-            and _manager_is_ready(globals().get("novadivert_udp_proxy_manager"))
-            and _manager_is_ready(globals().get("novadivert_redirect_manager"))
-        )
-        return bool(novawfp_ready or novadivert_ready)
-
-
-    def _wait_light_app_fallback_ready(timeout=0.0):
-        deadline = time.time() + max(0.0, float(timeout or 0.0))
-        while True:
-            if _light_app_fallback_ready():
-                return True
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.2)
-
-
-    _SINGBOX_DISABLED_CLEANUP_DONE = False
-
-    def _read_routing_state_apps():
-        try:
-            path = os.path.join(get_base_dir(), "temp", "nova-routing-state.json")
-            if not os.path.exists(path):
-                return {}
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            apps = payload.get("apps") if isinstance(payload, dict) else {}
-            return apps if isinstance(apps, dict) else {}
-        except:
-            return {}
-
-    def _telegram_udp_requires_voice_fallback():
-        return False
-
-
     def _kill_singbox_processes_best_effort(log_func=None):
         """Remove stale legacy helper processes from older Nova installs."""
         killed = False
@@ -7656,21 +7463,6 @@ try:
             with contextlib.suppress(Exception):
                 log_func("[Cleanup] Удалены stale legacy helper-процессы.")
         return killed
-
-
-    def _env_bool_runtime(name, default=False):
-        raw = os.environ.get(str(name), None)
-        if raw is None:
-            return bool(default)
-        return str(raw).strip().lower() in ("1", "true", "yes", "on")
-
-
-    def _should_run_singbox_app_fallback(warp_usable=False, opera_usable=False, log_func=None, wait_timeout=0.0):
-        global _SINGBOX_DISABLED_CLEANUP_DONE
-        if not _SINGBOX_DISABLED_CLEANUP_DONE:
-            _SINGBOX_DISABLED_CLEANUP_DONE = True
-            _kill_singbox_processes_best_effort(log_func=log_func)
-        return False
 
 
     def _stop_singbox_if_light_fallback_ready(log_func=None, warp_usable=None):
@@ -9605,7 +9397,6 @@ try:
     # release path. In the default "current" backend we keep relay disabled.
     PUBLIC_RELAY_SPECS = get_public_relay_specs(ROUTING_BACKEND_MODE)
     ENABLE_TELEGRAM_RELAY = bool(getattr(PUBLIC_RELAY_SPECS.get("telegram"), "enabled", False))
-    ENABLE_LIGHT_APP_FALLBACK = _env_bool_global("NOVA_LIGHT_APP_FALLBACK", True)
     ENABLE_NOVAWFP_OBSERVER = True
     ENABLE_NOVAWFP_TCP_PROXY = True
     ENABLE_NOVAWFP_UDP_PROXY = True
@@ -10246,6 +10037,10 @@ try:
         normalized = _normalize_opera_region(region, "EU")
         return "AM" if normalized == "US" else "EU"
 
+    # Ключи верхнего уровня, за которые эта функция отвечает. Всё остальное она
+    # обязана пронести через себя нетронутым — см. ниже.
+    _OWNED_ROUTING_KEYS = ("version", "opera_region", "routes", "system")
+
     def normalize_routing_settings(data):
         normalized = {
             "version": CURRENT_VERSION,
@@ -10256,6 +10051,17 @@ try:
         try:
             if not isinstance(data, dict):
                 return normalized
+            # Незнакомые ключи переносятся как есть, а не выбрасываются.
+            #
+            # Функция собирает результат с нуля, и любой блок, которого нет в
+            # списке выше, исчезал на первом же сохранении. Молча: файл
+            # переписывается целиком, и заметить пропажу можно было только по
+            # тому, что настройка перестала действовать. Из-за этого блок
+            # `relay` было невозможно завести — он не пережил бы ни одного
+            # нажатия «Сохранить».
+            for key, value in data.items():
+                if key not in _OWNED_ROUTING_KEYS:
+                    normalized[key] = value
             normalized["opera_region"] = _normalize_opera_region(
                 data.get("opera_region", data.get("opera_country", data.get("country"))),
                 normalized["opera_region"],
@@ -10315,6 +10121,45 @@ try:
         except:
             pass
         return normalized
+
+    _relay_env_exported = False
+
+    def export_relay_env(settings=None, log_func=None):
+        """Перенести блок `relay` из настроек в os.environ.
+
+        Что именно переносится и почему остальное запрещено - в
+        resources/nova_relay_env.py. Здесь только доставка.
+
+        Через окружение, а не через proxy_config, потому что релей живёт в двух
+        процессах: поток внутри Nova и отдельный интерпретатор NovaWFP\\proxy,
+        импортирующий те же модули. Присваивание полю dataclass видит только
+        первый; окружение наследуют оба, потому что дочерний процесс порождается
+        уже после этого вызова. Ровно по этой причине объявленное поле
+        `proxy_config.cfproxy_user_domain` и осталось незадействованным - оно
+        физически не могло доехать до второго процесса.
+
+        Отсюда же требование к моменту вызова: `_env_bool`/`_env_float`
+        вычисляются на импорте `tgrelay.transparent_relay`, а импорт ленивый
+        (_create_server). Всё, что выставлено позже, на 26 из 35 переменных уже
+        не подействует.
+        """
+        global _relay_env_exported
+        try:
+            if settings is None:
+                settings = load_routing_settings()
+            exported = relay_env_from_settings((settings or {}).get("relay"))
+            for env_name, value in exported.items():
+                os.environ[env_name] = value
+            if exported and not _relay_env_exported:
+                _relay_env_exported = True
+                if log_func:
+                    log_func("[TgRelay] Настройки из routing_settings: "
+                             + ", ".join(sorted(exported)))
+            return exported
+        except Exception as exc:
+            if log_func:
+                log_func(f"[TgRelay] Не удалось применить настройки релея: {exc}")
+            return {}
 
     def load_routing_settings():
         payload = load_json_robust(ROUTING_SETTINGS_PATH, None)
@@ -10981,37 +10826,6 @@ try:
 
     # ================= МОДУЛЬ: NOVA_LOGIC =================
 
-    # === Потокобезопасный ограничитель скорости ===
-    class RateLimiter:
-        """Обеспечивает ограничение скорости для вызовов в многопоточной среде."""
-        def __init__(self, calls_per_second):
-            self.calls_per_second = calls_per_second
-            self.timestamps = deque()
-            self.lock = threading.Lock()
-
-        def acquire(self):
-            with self.lock:
-                now = time.monotonic()
-                
-                # Удаляем старые временные метки, которые вышли за пределы окна в 1 секунду
-                while self.timestamps and now - self.timestamps[0] > 1.0:
-                    self.timestamps.popleft()
-
-                if len(self.timestamps) >= self.calls_per_second:
-                    # Если лимит достигнут, вычисляем время ожидания до старейшей метки
-                    wait_time = (self.timestamps[0] + 1.0) - now
-                    if wait_time > 0:
-                        # Разблокируем на время ожидания, чтобы не блокировать другие потоки
-                        self.lock.release()
-                        time.sleep(wait_time)
-                        self.lock.acquire()
-                        # После ожидания нужно снова проверить и очистить, т.к. состояние могло измениться
-                        now = time.monotonic()
-                        while self.timestamps and now - self.timestamps[0] > 1.0:
-                            self.timestamps.popleft()
-                
-                self.timestamps.append(now)
-
     # === Центральный менеджер DNS ===
     class DNSManager:
         """
@@ -11248,11 +11062,6 @@ try:
         except:
             return False
 
-    def smart_update_general(new_domains_list=None):
-        # Disabled: list/general.txt is user-managed now.
-        # Nova no longer auto-cleans, auto-sorts, or auto-appends it.
-        return False
-
     def add_to_hard_list(domain):
         filepath = os.path.join(get_base_dir(), "temp", HARD_LIST_FILENAME)
         try:
@@ -11287,63 +11096,6 @@ try:
                     return False
         except:
             return False
-
-    # ================= МОДУЛЬ: LOG_FILTER =================
-    def should_ignore(line):
-        text_lower = line.lower().strip()
-        
-        if not text_lower: return True
-
-        # 1. ВАЖНОЕ (Белый список)
-        critical_markers = [
-            "panic", "fatal", "could not read", "error", "fail", "must specify", "unknown option",
-            "не удается", "не найдено", "ошибка"
-        ]
-        
-        if any(m in text_lower for m in critical_markers):
-            if "decryption failed" in text_lower or "crypto failed" in text_lower:
-                return True
-            return False
-
-        # 2. ФИЛЬТРЫ (Черный список)
-        starts_with_filters = (
-            "github version", "read", "adding low-priority", "we have", "profile",
-            "loading", "loaded", "lists summary", "hostlist file", "ipset file",
-            "splits summary", "windivert", "!impostor", "initializing",
-            "(", ")", "outbound", "inbound", "and", "or",
-            "packet: id=", "ip4:", "ip6:", "tcp: len=", "udp: len=",
-            "using cached desync", "desync profile", "* ipset check", "* hostlist check",
-            "hostlist check", "reassemble", "starting reassemble", "delay desync",
-            "discovering", "sending delayed", "replaying", "replay ip4", "replay ip6",
-            "dpi desync src=", "multisplit pos", "normalized multisplit", "seqovl",
-            "sending multisplit", "sending original", "dropping", "not applying tampering",
-            "desync profile changed", "tls", "quic initial", "packet contains",
-            "incoming ttl", "forced wssize", "req retrans", 
-            "auto hostlist", 
-            "sending fake[1]", "changing ip_id", "[d:", "discovered l7",
-            "hostname:", "discovered hostname", "all multisplit pos", "sending",
-            "applying tampering", "resending original",
-            '"outbound and !loopback'
-        )
-        
-        if text_lower.startswith(starts_with_filters):
-            return True
-        
-        if text_lower.startswith("outbound and !loopback"):
-            return True
-
-        contains_filters = [
-            "exclude hostlist", "include hostlist", "exclude ipset",
-            "desync_any_proto is not set", "initial defrag crypto failed",
-            "delayed packets", "fail counter", "threshold reached",
-            "--wf-raw", "fake[1] applied",
-            "session id length mismatch"
-        ]
-        
-        if any(f in text_lower for f in contains_filters):
-            return True
-
-        return False
 
     def explain_winws_exit_code(exit_code, stderr_text=""):
         """
@@ -11396,53 +11148,6 @@ try:
         return None
 
 
-    def get_line_tag(line):
-        text_lower = line.lower()
-
-        transient_tag = _transient_runtime_log_tag(line)
-        if transient_tag:
-            return transient_tag
-
-        if line.startswith("!!! [AUTO]"): return "normal"
-        if line.startswith("[Repair] Start type WinDivert нормализован"):
-            return "info"
-        if "[warning]" in text_lower or "[warn]" in text_lower:
-            return "warning"
-        if "[VPN Detector]" in line and "Обнаружен" in line:
-            return "warning"
-        if "[StrategyBuilder]" in line: return "info"
-        if "[DomainCleaner]" in line:
-            return "info"
-        if any(x in line for x in ["[Check]", "[Check-Init]", "[Evo]", "[Evo-Init]", "[Evo-PreCheck]", "[Evo-1]", "[Init]"]): 
-            return "info"
-        if ("[RU]" in line and "статус:" in text_lower and "connecting" in text_lower) or ("happy eyeballs" in text_lower):
-            return "warning"
-        
-        # Специальное выделение проблем для [RU], [EU]
-        if any(cat in line for cat in ["[RU]", "[EU]"]):
-            if any(x in text_lower for x in ["ошибка", "error", "fail", "не удается", "не найден", "не удалось", "exception", "warning", "warn", "остановка", "падение"]):
-                return "error"
-
-        if any(x in text_lower for x in ["err:", "error", "ошибка", "исключение", "dead", "crash", "could not read", "fatal", "panic", "must specify", "unknown option", "не удается", "не найдено", "repair", "ремонт"]):
-            return "error"
-        # Detect WinDivert-related codes only as standalone diagnostics (avoid false matches in IP:port like :3478).
-        if re.search(r'(?<!\d)(177|34)(?!\d)', text_lower) and any(k in text_lower for k in ["код", "code", "exit", "windivert", "driver"]):
-            return "error"
-        
-        if "fail" in text_lower:
-            return "fail"
-        
-        if "ok (" in text_lower:
-            return "normal"
-        
-        if any(x in text_lower for x in ["успешное подключение", "успешно инициализирован", "ядро активно"]):
-            return "normal"
-        
-        if any(x in text_lower for x in ["пропуск", "удаление", "отмена", "инфо", "успешно"]):
-            return "info"
-            
-        return "normal"
-
 
     TGRELAY_UI_ALERT_TAGS = frozenset(("warning", "error", "fail"))
 
@@ -11456,77 +11161,6 @@ try:
         except:
             return False
 
-
-    # ================= МОДУЛЬ: NOVA_PAYLOAD_GEN =================
-    def create_tls_client_hello(hostname):
-        """Генерирует валидный TLS 1.3 ClientHello с указанным SNI."""
-        hostname_bytes = hostname.encode('utf-8')
-        
-        tls_ver = b'\x03\x03'
-        handshake_type = b'\x01'
-        
-        client_random = os.urandom(32)
-        
-        session_id_len = b'\x20'
-        session_id = os.urandom(32)
-        
-        ciphers = bytes.fromhex("130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f0035")
-        ciphers_len = struct.pack("!H", len(ciphers))
-        
-        compression = b'\x01\x00'
-        
-        extensions = b''
-        
-        ext_sni_type = b'\x00\x00'
-        sni_data = struct.pack("!H", len(hostname_bytes) + 3) + b'\x00' + struct.pack("!H", len(hostname_bytes)) + hostname_bytes
-        ext_sni_len = struct.pack("!H", len(sni_data))
-        extensions += ext_sni_type + ext_sni_len + sni_data
-        
-        ext_ver_type = b'\x00\x2b'
-        ver_data = b'\x03\x02\x03\x04\x03\x03'
-        ext_ver_len = struct.pack("!H", len(ver_data))
-        extensions += ext_ver_type + ext_ver_len + ver_data
-
-        current_len = 38 + len(ciphers) + len(extensions)
-        pad_len = 512 - current_len
-        if pad_len > 0:
-            ext_pad_type = b'\x00\x15'
-            pad_data = b'\x00' * pad_len
-            ext_pad_len = struct.pack("!H", len(pad_data))
-            extensions += ext_pad_type + ext_pad_len + pad_data
-
-        extensions_len = struct.pack("!H", len(extensions))
-        handshake_body = tls_ver + client_random + session_id_len + session_id + ciphers_len + ciphers + compression + extensions_len + extensions
-        handshake_len = struct.pack("!I", len(handshake_body))[1:]
-        handshake_msg = handshake_type + handshake_len + handshake_body
-        record_len = struct.pack("!H", len(handshake_msg))
-        record = b'\x16\x03\x01' + record_len + handshake_msg
-        
-        return record
-    def sanitize_filename(domain):
-        return domain.replace(".", "_")
-
-    def payload_worker(log_callback):
-        """Фоновый процесс генерации фейков (Только TLS)."""
-        time.sleep(5)
-        
-        paths = ensure_structure()
-        bin_dir = get_fake_dir()
-        exclude_file = paths['list_exclude']
-        
-        while not is_closing:
-            try:
-                # FIX: Disabled scanning of exclude.txt (User Request: reduce load + unnecessary fakes)
-                # Just sleep to keep thread alive but idle (or valid logic if needed later)
-                time.sleep(3600)
-                
-                # FIX: Disabled scanning of exclude.txt (User Request: reduce load + unnecessary fakes)
-                # Just sleep to keep thread alive but idle (or valid logic if needed later)
-                time.sleep(3600)
-                
-            except Exception as e:
-                # log_callback(f"[PayloadGen ERROR] Критическая ошибка: {e}")
-                time.sleep(60)
 
     # ================= КОНФИГУРАЦИЯ GUI =================
     LOG_MAX_LINES = 10000
@@ -12168,17 +11802,6 @@ try:
             return runtime_path
         except:
             return os.path.join(get_base_dir(), "list", "youtube.txt")
-
-    def is_youtube_probe_domain(domain):
-        d = (domain or "").strip().lower()
-        return (
-            d == "youtube.com" or d == "www.youtube.com" or d.endswith(".youtube.com") or
-            d == "youtu.be" or d.endswith(".youtu.be") or
-            d == "youtube-nocookie.com" or d.endswith(".youtube-nocookie.com") or
-            d == "ytimg.com" or d.endswith(".ytimg.com") or
-            d == "ggpht.com" or d.endswith(".ggpht.com") or
-            d == "googleusercontent.com" or d.endswith(".googleusercontent.com")
-        )
 
     def get_domain_probe_profile(domain):
         d = (domain or "").strip().lower()
@@ -13672,6 +13295,14 @@ try:
     # ================= MIGRATED UTILS =================
 
     class RateLimiter:
+        """Токен-бакет: ограничивает частоту вызовов в многопоточной среде.
+
+        Работает именно эта реализация. Выше по файлу лежала вторая, на
+        скользящем окне и с докстрокой, — Python молча брал последнюю, так что
+        документация описывала мёртвый код. Вторую убрали, докстроку перенесли
+        сюда.
+        """
+
         def __init__(self, limit_per_sec):
             self.limit = float(limit_per_sec)
             self.tokens = float(limit_per_sec)
@@ -14212,38 +13843,6 @@ try:
                 return True
         return False
 
-    def _remove_domain_from_file(domain_to_remove, file_path, lock=None, rewrite_lines=None):
-        """Потокобезопасно удаляет домен из файла или перезаписывает его новым содержимым."""
-        def operation():
-            if not os.path.exists(file_path): return False
-            try:
-                if rewrite_lines is not None:
-                    # Режим перезаписи: просто записываем новые строки
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.writelines(rewrite_lines)
-                    return True
-                
-                # Режим удаления одной строки
-                if not domain_to_remove: return False
-                
-                with open(file_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                
-                new_lines = [l for l in lines if l.split('#')[0].strip().lower() != domain_to_remove.lower()]
-                
-                if len(new_lines) < len(lines):
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.writelines(new_lines)
-                    return True
-            except: pass
-            return False
-
-        if lock:
-            with lock:
-                return operation()
-        else:
-            return operation()
-
     def load_auto_exclude(log_func=None):
         global auto_excluded_domains
         new_set = set()
@@ -14548,306 +14147,6 @@ try:
                     with pending_exclude_lock:
                         pending_exclude_domains.update(domains_to_process)
                 time.sleep(10) # Пауза в случае сбоя
-    def resolve_and_append_ip(domain, log_func=None):
-        try:
-            resolved_ips = set()
-            infos = socket.getaddrinfo(domain, 0, 0, socket.SOCK_STREAM)
-            for info in infos:
-                ip = info[4][0]
-                if '%' in ip: ip = ip.split('%')[0]
-                if is_warp_ip(ip): continue # Защита IP WARP
-                resolved_ips.add(ip)
-            
-            if resolved_ips:
-                with ip_cache_lock:
-                    with open(IP_CACHE_FILE, "a", encoding="utf-8") as f:
-                        f.write("\n" + "\n".join(resolved_ips))
-                    os.utime(IP_CACHE_FILE, None) # Обновляем дату изменения файла
-        except: pass
-
-    def ip_exclude_updater(log_func):
-        """Фоновый процесс обновления IP-адресов для списка исключений."""
-        global last_full_update, is_closing
-        
-        # USER_REQUEST: Отключить резолвинг IP для списка исключений (Steam slowdown fix)
-        ENABLE_IP_EXCLUDE_RESOLVING = False
-        
-        while not is_closing:
-            try:
-                if not ENABLE_IP_EXCLUDE_RESOLVING:
-                    # log_func("[IP Exclude] Резолвинг отключен.") # Optional spam prevention
-                    time.sleep(3600)
-                    continue
-
-                state_file = os.path.join(get_base_dir(), "temp", "ip_cache_state.json")
-                last_full_update = 0
-                
-                if os.path.exists(state_file):
-                    try:
-                        with open(state_file, "r") as f:
-                            last_full_update = json.load(f).get("last_update", 0)
-                    except: pass
-
-                if not os.path.exists(IP_CACHE_FILE):
-                    need_update = True
-                elif time.time() - last_full_update > 86400:
-                    need_update = True
-                # FIX: Removed mtime check that was bypassing 24h cooldown
-                # Old logic: if exclude.txt was modified -> force update
-                # New logic: Only update once per 24h, regardless of file changes
-                # Files are merged at startup anyway, so IP resolution can wait
-                
-                # Проверка на дисбаланс количества доменов и IP (защита от пустого кэша)
-                if not need_update and os.path.exists(IP_CACHE_FILE) and os.path.exists(paths['list_exclude_auto']):
-                    try:
-                        with open(IP_CACHE_FILE, 'r', encoding='utf-8') as f:
-                            ip_cnt = sum(1 for line in f if line.strip())
-                        with open(paths['list_exclude_auto'], 'r', encoding='utf-8') as f:
-                            dom_cnt = sum(1 for line in f if line.strip())
-                        if dom_cnt > 10 and ip_cnt < (dom_cnt * 0.5):
-                            log_func(f"[IP Exclude] Мало IP ({ip_cnt}) для {dom_cnt} доменов. Принудительное обновление...")
-                            need_update = True
-                    except: pass
-                
-                if need_update:
-                    log_func("[IP Exclude] Фоновое обновление IP для доменов-исключений...")
-                    domains_to_resolve = set()
-                    for fpath in [paths['list_exclude'], paths['list_exclude_auto'], paths['ip_exclude']]:
-                        if os.path.exists(fpath):
-                            try:
-                                with open(fpath, "r", encoding="utf-8") as f:
-                                    for line in f:
-                                        d = line.strip().split('#')[0].strip()
-                                        if d: domains_to_resolve.add(d)
-                            except: pass
-
-                    if domains_to_resolve and not is_closing:
-                        log_func(f"[IP Exclude] Найдено {len(domains_to_resolve)} доменов. Запуск мягкого резолвинга...")
-                        resolved_ips = set()
-                        
-                        for i, d in enumerate(list(domains_to_resolve)):
-                            if is_closing: break
-                            if i > 0 and i % 50 == 0:
-                                log_func(f"[IP Exclude] ... обработано {i}/{len(domains_to_resolve)}")
-                            
-                            # Используем DNSManager. check_cache=True для эффективности.
-                            ip, _ = dns_manager.resolve(d, dns_manager.burst_limiter, check_cache=True)
-                            
-                            if ip and not is_warp_ip(ip):
-                                resolved_ips.add(ip)
-                        
-                        if not is_closing:
-                            try:
-                                os.makedirs(os.path.dirname(IP_CACHE_FILE), exist_ok=True)
-                                with ip_cache_lock:
-                                    with open(IP_CACHE_FILE, "w", encoding="utf-8") as f:
-                                        f.write("\n".join(resolved_ips))
-                                    # Сохраняем время полного обновления
-                                    with open(state_file, "w") as f:
-                                        json.dump({"last_update": time.time()}, f)
-                                log_func(f"[IP Exclude] Обновление IP завершено. Сохранено {len(resolved_ips)} адресов.")
-                            except: pass
-            except Exception as e:
-                log_func(f"[IP Exclude ERROR] Критическая ошибка в цикле: {e}")
-
-            # Пауза 1 час перед следующей проверкой (24ч кулдаун проверяется внутри)
-            for _ in range(3600):
-                if is_closing: return
-                time.sleep(1)
-
-    def domain_cleaner_worker(log_func):
-        """Периодически проверяет все списки на 'мертвые' домены и удаляет их."""
-        return # DISABLED per user request to prevent accidental deletion during network issues
-        
-        while not is_closing:
-            try:
-                # Wait for 10-minute cooldown after strategy checks
-                while not is_closing:
-                    time_since_last = time.time() - last_strategy_check_time
-                    if time_since_last >= 600:  # 10 minutes
-                        break
-                    
-                    if is_closing:
-                        break
-                    
-                    # Wait and check periodically
-                    time.sleep(30)  # Check every 30 seconds
-                
-                if is_closing:
-                    break
-                
-                # Start domain validation
-                base_dir = get_base_dir()
-                list_dir = os.path.join(base_dir, "list")
-                
-                # State File
-                progress_state_file = os.path.join(base_dir, "temp", "domain_cleaner_progress.json")
-                files_to_check = glob.glob(os.path.join(list_dir, "*.txt"))
-                
-                # Load State
-                saved_state = {}
-                try: saved_state = load_json_robust(progress_state_file, {})
-                except: pass
-
-                dead_domains_found = set()
-                total_checked = 0
-
-                if IS_DEBUG_MODE: log_func("[DomainCleaner] Запуск проверки доменов на доступность...")
-
-                for file_path in files_to_check:
-                    if is_closing: break
-                    
-                    # CRITICAL: Stop if strategy checks started (Suspend)
-                    if is_scanning:
-                        if IS_DEBUG_MODE: log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
-                        while not is_closing and is_scanning: time.sleep(10)
-                        # Resume loop (state preserved or reloaded below)
-
-                    fname = os.path.basename(file_path)
-                    
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            lines = f.readlines()
-                        
-                        # Resume Index
-                        start_idx = 0
-                        if fname in saved_state:
-                            start_idx = saved_state[fname].get("idx", 0)
-                            # Validity check (file shrank?)
-                            if start_idx >= len(lines): start_idx = 0
-                        
-                        if start_idx > 0:
-                             if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Возобновление проверки {fname} с позиции {start_idx}...")
-
-                        lock = general_list_lock if "general" in fname else None
-                        batch_dead = set()
-                        lines_processed_count = 0 
-                        deleted_in_session = 0 
-                        progress_path = os.path.join(base_dir, "temp", f"cleaner_{fname}.json")
-                        total_checked = 0
-                        dead_domains_found = set()
-
-                        
-                        def flush_batch_cleaner():
-                            nonlocal deleted_in_session
-                            if not batch_dead: return
-                            try:
-                                def _update():
-                                    if not os.path.exists(file_path): return 0
-                                    with open(file_path, "r", encoding="utf-8") as f: cur = f.readlines()
-                                    out = []
-                                    rem = 0
-                                    for ln in cur:
-                                        d = ln.split('#')[0].strip().lower().split('/')[0].split(':')[0]
-                                        if d in batch_dead: rem += 1
-                                        else: out.append(ln)
-                                    if rem > 0:
-                                        with open(file_path, "w", encoding="utf-8") as f:
-                                            f.writelines(out)
-                                            f.flush()
-                                            os.fsync(f.fileno())
-                                        if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Удалено {rem} несуществующих доменов из {os.path.basename(file_path)}.")
-                                    return rem
-
-                                if lock: 
-                                    with lock: r = _update()
-                                else: r = _update()
-                                
-                                deleted_in_session += r
-                                batch_dead.clear()
-                            except Exception as ex:
-                                log_func(f"[DomainCleaner] Ошибка сохранения: {ex}")
-
-                        # Use ThreadPoolExecutor for parallel domain validation (Efficiency optimization)
-                        chunk_size = 30
-                        with ThreadPoolExecutor(max_workers=8) as executor:
-                            for i in range(start_idx, len(lines), chunk_size):
-                                if is_closing: break
-                                
-                                # Periodically check for cooldown and suspend
-                                t_diff = time.time() - last_strategy_check_time
-                                if t_diff < 600:
-                                    flush_batch_cleaner()
-                                    cur_idx = max(0, i - deleted_in_session)
-                                    saved_state[fname] = {"idx": cur_idx, "timestamp": int(time.time())}
-                                    try: save_json_safe(progress_state_file, saved_state)
-                                    except: pass
-                                    if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Пауза (активность стратегий)")
-                                    break
-                                
-                                if is_scanning:
-                                    if IS_DEBUG_MODE: log_func("[DomainCleaner] Проверка приостановлена (началась проверка стратегий)")
-                                    while not is_closing and is_scanning: time.sleep(10)
-                                    if is_closing: break
-
-                                chunk = lines[i : i + chunk_size]
-                                domains_in_chunk = []
-                                for offset, line in enumerate(chunk):
-                                    line_s = line.strip()
-                                    if not line_s or line_s.startswith('#'): continue
-                                    d_part = line_s.split('/')[0].split(':')[0].strip().lower()
-                                    if not d_part or '.' not in d_part: continue
-                                    domains_in_chunk.append(d_part)
-
-                                if not domains_in_chunk:
-                                    continue
-
-                                # Map domains to validation tasks
-                                futures = {executor.submit(dns_manager.validate_domain_exists, d, dns_manager.cleanup_limiter): d for d in domains_in_chunk}
-                                
-                                for future in as_completed(futures):
-                                    if is_closing: break
-                                    d_part = futures[future]
-                                    try:
-                                        # exists = future.result()
-                                        # total_checked += 1
-                                        # if not exists:
-                                        #     batch_dead.add(d_part)
-                                        #     dead_domains_found.add(d_part)
-                                        #     if IS_DEBUG_MODE: log_func(f"[DomainCleaner] {d_part} не существует")
-                                        #     
-                                        #     if len(batch_dead) >= 10:
-                                        #         flush_batch_cleaner()
-                                        pass
-                                    except Exception:
-                                        # Silent fail for individual DNS queries
-                                        pass
-                                
-                                # Progress tracking (every chunk)
-                                cur_idx = max(0, (i + len(chunk)) - deleted_in_session)
-                                try: save_json_safe(progress_path, {"idx": cur_idx})
-                                except: pass
-                        
-                        flush_batch_cleaner()
-                        
-                        if not is_closing and (time.time() - last_strategy_check_time >= 600):
-                             if os.path.exists(progress_path): 
-                                 try: os.remove(progress_path)
-                                 except: pass
-
-                    except Exception as e:
-                        # Silent error handling
-                        pass
-
-                # Log summary
-                if dead_domains_found:
-                    if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Проверка завершена: удалено {len(dead_domains_found)} доменов из {total_checked} проверенных")
-                else:
-                    if IS_DEBUG_MODE: log_func(f"[DomainCleaner] Проверка завершена: проверено {total_checked} доменов, мёртвых не найдено")
-                
-                # Pause for 24 hours ONLY after the last file check
-                if files_to_check and file_path == files_to_check[-1]:
-                    if IS_DEBUG_MODE: log_func("[DomainCleaner] Полный цикл завершен. Сон 24 часа.")
-                    for _ in range(86400):
-                        if is_closing: break
-                        time.sleep(1)
-                else:
-                    time.sleep(1) # Fast transition to next file
-
-            except Exception as e:
-                # Silent error
-                time.sleep(3600)
-
 
     # ============ ЛЕСТНИЦА ЗАПАСНЫХ СТРАТЕГИЙ (замена hard_1..hard_12) ============
     #
@@ -14905,84 +14204,14 @@ try:
     # доменов: без панели измерять нечем, и добавление сюда ничего не стоит.
     EVOLVING_SERVICES = ("youtube", "cloudflare", "discord")
 
-    # Насколько сильно техника перестраивает соединение. Порядок задан явно:
-    # именно доминирующий режим определяет, чем стратегия будет побеждена.
-    _TECHNIQUE_BY_MODE = {
-        "fake": ("inject", 1), "fakeknown": ("inject", 1), "rst": ("inject", 1), "rstack": ("inject", 1),
-        "ipfrag1": ("fragment", 2), "ipfrag2": ("fragment", 2), "hopbyhop": ("fragment", 2),
-        "destopt": ("fragment", 2), "udplen": ("fragment", 2),
-        "multisplit": ("segment", 3), "split": ("segment", 3), "split2": ("segment", 3),
-        "multidisorder": ("segment", 3), "disorder": ("segment", 3), "tamper": ("segment", 3),
-        "fakedsplit": ("decoy-segment", 4), "fakeddisorder": ("decoy-segment", 4),
-        "hostfakesplit": ("relocate", 5), "syndata": ("relocate", 5), "synack": ("relocate", 5),
-    }
-
-    # Почему получатель игнорирует фейк: испорченный пакет отбрасывает стек или
-    # NIC, пакет вне окна отбрасывает TCP. Это разные классы DPI.
-    _MALFORMED_FOOLING = {"badsum", "md5sig", "hopbyhop", "hopbyhop2"}
-    _OUT_OF_ORDER_FOOLING = {"badseq", "ts", "datanoack"}
-
-    def classify_strategy_niche(args):
-        """Возвращает (техника, дальность, отрицаемость) - грубый портрет атаки.
-
-        Оси намеренно грубые. Точное смещение разреза или число повторов меняют
-        шансы против конкретного DPI, но не класс DPI, и в описателе разбили бы
-        сетку на ячейки, отказывающие одинаково, - ровно та проблема, ради
-        которой всё это и делается.
-        """
-        technique, severity = "other", 0
-        fixed_ttl, has_auto = None, False
-        malformed = out_of_order = False
-
-        for arg in args or []:
-            if not isinstance(arg, str):
-                continue
-            key, _, value = arg.partition("=")
-            if key == "--dpi-desync":
-                for token in value.split(","):
-                    found = _TECHNIQUE_BY_MODE.get(token.strip().lower())
-                    if found and found[1] > severity:
-                        technique, severity = found
-            elif key == "--dpi-desync-ttl":
-                try:
-                    fixed_ttl = int(value)
-                except ValueError:
-                    pass
-            elif key == "--dpi-desync-autottl":
-                has_auto = True
-            elif key == "--dpi-desync-fooling":
-                for token in value.split(","):
-                    token = token.strip().lower()
-                    if token in _MALFORMED_FOOLING:
-                        malformed = True
-                    elif token in _OUT_OF_ORDER_FOOLING:
-                        out_of_order = True
-
-        # autottl перекрывает фиксированный TTL: v1 применяет измеренное число
-        # хопов, а фиксированное значение остаётся запасным, так что поведение на
-        # конкретном соединении - адаптивное.
-        if has_auto:
-            reach = "adaptive"
-        elif fixed_ttl is None:
-            reach = "unbounded"
-        elif fixed_ttl <= 4:
-            reach = "short"
-        elif fixed_ttl <= 8:
-            reach = "medium"
-        else:
-            reach = "long"
-
-        if malformed and out_of_order:
-            deniability = "mixed"
-        elif malformed:
-            deniability = "malformed"
-        elif out_of_order:
-            deniability = "out-of-order"
-        else:
-            deniability = "ttl"
-
-        return (technique, reach, deniability)
-
+    # Классификация ниш переехала в resources/nova_strategy_niche.py.
+    #
+    # Не ради порядка в файле: ту же самую классификацию делает
+    # nova-rs/crates/nova-zapret/src/diversity.rs, и пока обе копии сидели в
+    # разных языках, сверить их было нечем — а этот файл pytest импортировать
+    # не может, он при импорте поднимает права и рисует окно. Вынесенный модуль
+    # проверяется против docs/reference/strategy-niche-table.json, который
+    # порождает Rust. Эталон — таблица, а не любая из копий.
     def select_diverse_ladder(ranked_strategies, limit=ALT_SLOT_LIMIT):
         """Лучший представитель каждой ниши, сильнейшие ниши первыми.
 
@@ -15925,10 +15154,6 @@ try:
                                 
                                 time.sleep(1.0)
                                 continue # Retry immediately
-                                
-                                if attempt == 1:
-                                    log_func(f"[Check] Стратегия вызывает сбой процесса. Пропускаем.")
-                                    return 0 # Возвращаем 0 (blocked), чтобы не ломать воркер возвратом None
                             time.sleep(2) # Delay before retry
                         
                         time.sleep(3.0) # Увеличиваем время на инициализацию winws для надежности
@@ -18117,7 +17342,7 @@ try:
                                 save_json_safe(scores_path, existing_scores)
                                 if IS_DEBUG_MODE: log_func(f"[Sorter-Scores] {svc}: Сохранено {saved_count} scores в {scores_path}")
                             except Exception as e:
-                                if True: log_func(f"[Sorter-Scores] Ошибка сохранения scores для {svc}: {e}")
+                                log_func(f"[Sorter-Scores] Ошибка сохранения scores для {svc}: {e}")
                             
                             if IS_DEBUG_MODE: log_func(f"[Sorter] {svc}: Оптимизация. Проверено: {len(active_candidates)}, Оставлено: {len(final_active)}, Не тронуто: {len(unchecked_strategies)}. Всего: {len(final_list)}")
                             
@@ -18348,10 +17573,6 @@ try:
                                 "telegram": count_domains_in_file("telegram.txt") or 10
                             }
                             
-                            if True:  # Debug
-                                thresholds = {k: int(v * THRESHOLD_PERCENT) for k, v in DOMAIN_COUNTS.items()}
-                                # log_func(f"[Evo-Init] Пороги качества (20%): {thresholds}")
-                            
                             try:
                                 # === VALIDATION: --evo требует результаты Checker ===
                                 if IS_EVO_MODE and not state.get("checks_completed", False):
@@ -18435,24 +17656,20 @@ try:
                                             name = s.get("name", "")
                                             score = strategy_scores.get(("general", name), 0)
                                             
-                                            # Debug: Log filtering decisions
+                                            # Две ветки, одно действие: счётчик
+                                            # общий, а причины отсева разные —
+                                            # «нет оценки» и «оценка ниже
+                                            # порога». Раньше их различал лог, от
+                                            # которого осталось `if ...: pass`.
                                             if score == 0 and name:
-                                                if filtered_general < 3: pass
-
                                                 filtered_general += 1
                                             elif score < min_score_general:
-                                                if filtered_general < 3: pass
-
                                                 filtered_general += 1
                                             else:
                                                 # Passed filter
                                                 strategies_to_evolve.append((s, "general"))
                                                 if len([x for x in strategies_to_evolve if x[1] == "general"]) >= count:
                                                     break
-                                    
-                                    if filtered_general > 0 and False: # Silence
-                                        taken = len([x for x in strategies_to_evolve if x[1] == "general"])
-
                                     
                                     # 2. Специализированные пулы.
                                     #
@@ -18652,11 +17869,9 @@ try:
 
                             log_func(f"{prefix} Сгенерировано {len(evo_tasks)} задач.")
 
-                            if True: pass # Force log
-
 
                             if not strategies_to_evolve:
-                                if IS_DEBUG_MODE or True: log_func(f"[Evo-{stage_idx+1}] Нет стратегий для эволюции. Пропуск этапа.")
+                                log_func(f"[Evo-{stage_idx+1}] Нет стратегий для эволюции. Пропуск этапа.")
                                 continue # Continue to next stage instead of breaking!
                             
                             # === Evolution Stage Message ===
@@ -20617,39 +19832,6 @@ try:
                 pass
         return None
 
-    def get_stable_public_ip_isolated(previous_ip=None, attempts=3, pause_seconds=2.0):
-        """Returns a direct external IP only if it is stable enough to trust."""
-        seen = []
-        counter = collections.Counter()
-
-        total_attempts = max(2, int(attempts or 2))
-        for idx in range(total_attempts):
-            ip = None
-            try:
-                ip = get_public_ip_isolated()
-            except:
-                ip = None
-
-            if ip:
-                seen.append(ip)
-                counter[ip] += 1
-                if counter[ip] >= 2:
-                    return ip
-
-            if idx < (total_attempts - 1):
-                try:
-                    time.sleep(max(0.5, float(pause_seconds)))
-                except:
-                    time.sleep(1)
-
-        if previous_ip and counter.get(previous_ip, 0) > 0:
-            return previous_ip
-
-        if len(counter) == 1 and seen:
-            return seen[0]
-
-        return None
-
     def _resolve_worker(domain):
         ips = []
         try:
@@ -22039,7 +21221,6 @@ try:
             if log_func:
                 log_func(f"[Repair] Не удалось снять DeleteFlag: {e}")
             return False
-            return False
 
     def repair_windivert_driver(log_func=None, exit_code=None, pending_delete_timeout=45.0):
         """
@@ -22414,6 +21595,11 @@ try:
         except: return False
 
     def calculate_file_hash(file_path):
+        # Без try/except намеренно: оба вызова уже стоят под своим except. В
+        # deploy_infrastructure брошенное исключение и есть сигнал «файл занят
+        # winws/warp», после которого копирование откладывается до следующего
+        # старта. Выше по файлу лежала вторая копия, возвращавшая None, — она
+        # никогда не вызывалась и удалена.
         sha256_hash = hashlib.sha256()
         with open(file_path, "rb") as f:
             for byte_block in iter(lambda: f.read(4096), b""):
@@ -23709,14 +22895,12 @@ try:
         
         # === HEAVY / LOWER PRIORITY ===
         _start_worker("NovaVpnMonitor", vpn_monitor_worker, (log_func,), delay=5.0)
-        _start_worker("NovaPayloadWorker", payload_worker, (log_func,), delay=7.0)
         _start_worker("NovaAdvancedStrategyChecker", advanced_strategy_checker_worker, (log_func,), delay=8.0)
         _start_worker("NovaHardStrategyMatcher", hard_strategy_matcher_worker, (log_func,), delay=9.0)
         _start_worker("NovaBoostEvolution", boost_evolution_worker, (log_func,), delay=10.0)
         _start_worker("NovaBoostStrategyMatcher", boost_strategy_matcher_worker, (log_func,), delay=10.5)
         _start_worker("NovaBatchExclude", batch_exclude_worker, (log_func,), delay=11.0)
         
-        _start_worker("NovaDomainCleaner", domain_cleaner_worker, (log_func,), delay=12.0)
 
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
@@ -23731,7 +22915,15 @@ try:
         # === SYNC INIT: Dependencies MUST exist before we try to launch anything ===
         logger = globals().get('log_print', safe_trace)
 
-        pass
+        # Настройки релея - в окружение, и обязательно здесь.
+        #
+        # Ниже по этой же функции поднимаются менеджеры, а вместе с ними
+        # ленивый импорт tgrelay.transparent_relay и запуск отдельного
+        # интерпретатора NovaWFP\proxy. Оба берут значения на импорте, и оба
+        # видят окружение только в том состоянии, в каком оно было к этому
+        # моменту: поток - потому что импорт одноразовый, дочерний процесс -
+        # потому что окружение копируется при спавне.
+        export_relay_env(log_func=logger)
 
         def update_loading_status_sync(msg):
             try:
@@ -27735,6 +26927,14 @@ try:
                     "routes": {key: current_modes.get(key, DEFAULT_ROUTING_SETTINGS["routes"].get(key, "auto")) for key, _label in routing_group_rows},
                     "system": system_settings,
                 }
+                # Второе место, где терялись незнакомые блоки: окно настроек
+                # собирает payload из состояния своих виджетов, а виджетов для
+                # `relay` нет. Раньше сюда вручную переносили только `system`,
+                # поэтому «Сохранить» стирало всё остальное — даже то, что
+                # `normalize_routing_settings` уже научилась беречь.
+                for key, value in (latest_settings or {}).items():
+                    if key not in payload:
+                        payload[key] = value
                 desired_autostart = bool(autostart_state.get("enabled", False))
                 desired_game_overlay = bool(game_overlay_state.get("enabled", False))
                 logger = globals().get("log_print", print)

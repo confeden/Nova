@@ -32,7 +32,10 @@ fn main() {
     let command = std::env::args().nth(1).unwrap_or_else(|| "inspect".to_owned());
 
     let Some(root) = Corpus::find_root() else {
-        eprintln!("error: run this from inside the Nova checkout (needs strat/ and bin/ above the cwd)");
+        eprintln!(
+            "error: no Nova tree above the current directory \
+             (looking for strat/ next to either bin/ or resources/bin/)"
+        );
         std::process::exit(2);
     };
     let corpus = match Corpus::load(&root) {
