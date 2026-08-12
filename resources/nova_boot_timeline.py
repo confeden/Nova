@@ -1,0 +1,151 @@
+"""Сколько заняла каждая фаза запуска и когда она началась.
+
+Зачем вообще. Жалоба на минутный старт разбиралась вручную: в логе метки времени
+с точностью до секунды (`%H:%M:%S`), а весь старт укладывается в 3-8 секунд, так
+что «долго» и «мгновенно» в нём выглядят одинаково. Из 46 секунд того запуска 39
+приходились на одну фазу, и чтобы это увидеть, пришлось сопоставлять строки
+глазами.
+
+Почему не просто «фаза X заняла N мс». Фазы идут параллельно: главный поток
+строит окно, сервис поднимает менеджеры, а шестнадцать воркеров стартуют со
+ступенчатыми задержками. Плоский список длительностей в такой картине врёт —
+сумма получается больше настоящего старта, и непонятно, что кого ждало. Поэтому
+у каждой записи две величины: смещение от начала процесса и длительность. По
+ним видно и что тормозит, и что с чем перекрывается.
+
+Для воркеров длительность бессмысленна — это бесконечные циклы. У них меряется
+другое: насколько фактический старт отстал от запрошенной задержки. Отставание
+означает, что потоку не досталось процессора, и это отдельный диагноз.
+
+Цена: два `time.monotonic()` и добавление в список на фазу, порядка сорока фаз
+за запуск. Отдельного выключателя нет намеренно — выключенная диагностика это
+диагностика, которой не будет в тот единственный раз, когда она нужна.
+"""
+
+import threading
+import time
+
+# Отсчёт от импорта модуля. Он импортируется из nova.pyw в шапке, до всякой
+# работы, так что это практически начало процесса — а точное начало нам и не
+# нужно, важны разницы.
+_T0 = time.monotonic()
+
+_LOCK = threading.Lock()
+_RECORDS = []
+
+# Потолок на случай, если фазой обернут что-нибудь, что вызывается в цикле:
+# диагностика не должна становиться утечкой памяти.
+_MAX_RECORDS = 400
+
+# Ниже этого фазы не показываются: строка про 0 мс не несёт информации, а таких
+# большинство.
+_INTERESTING_MS = 50.0
+
+
+def elapsed_ms():
+    return (time.monotonic() - _T0) * 1000.0
+
+
+def _add(kind, name, offset_ms, duration_ms, detail):
+    with _LOCK:
+        if len(_RECORDS) >= _MAX_RECORDS:
+            return
+        _RECORDS.append((kind, str(name), float(offset_ms), duration_ms, str(detail or "")))
+
+
+class phase:
+    """Контекст-менеджер: меряет длительность и запоминает начало.
+
+    Исключение внутри не проглатывается, но фаза всё равно записывается — как
+    раз упавшая фаза интереснее всего, и потерять её время значит потерять
+    единственный след.
+    """
+
+    __slots__ = ("name", "detail", "_start")
+
+    def __init__(self, name, detail=""):
+        self.name = name
+        self.detail = detail
+
+    def __enter__(self):
+        self._start = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        began = (self._start - _T0) * 1000.0
+        took = (time.monotonic() - self._start) * 1000.0
+        detail = self.detail
+        if exc_type is not None:
+            detail = (detail + " " if detail else "") + f"(упало: {exc_type.__name__})"
+        _add("phase", self.name, began, took, detail)
+        return False
+
+
+def note(name, detail=""):
+    """Мгновенное событие: точка на шкале без длительности."""
+    _add("note", name, elapsed_ms(), None, detail)
+
+
+def worker_started(name, requested_delay=0.0):
+    """Воркер проснулся после своей ступенчатой задержки.
+
+    Записывается отставание, а не длительность: у бесконечного цикла её нет.
+    """
+    began = elapsed_ms()
+    _add("worker", name, began, None, "")
+    return began
+
+
+def records():
+    with _LOCK:
+        return list(_RECORDS)
+
+
+def render(top=12):
+    """Компактный отчёт. Пусто, если мерить нечего."""
+    rows = records()
+    if not rows:
+        return []
+
+    phases = [r for r in rows if r[0] == "phase" and r[3] is not None]
+    notes = [r for r in rows if r[0] == "note"]
+    workers = [r for r in rows if r[0] == "worker"]
+
+    lines = []
+    slow = sorted((r for r in phases if r[3] >= _INTERESTING_MS),
+                  key=lambda r: r[3], reverse=True)[:top]
+    if slow:
+        # По убыванию длительности, а не по времени: самая дорогая фаза должна
+        # быть первой строкой, иначе отчёт снова придётся читать глазами.
+        lines.append("[Boot] Фазы запуска (мс), дороже всего сверху:")
+        for _kind, name, offset, took, detail in slow:
+            tail = f"  {detail}" if detail else ""
+            lines.append(f"[Boot]   {took:8.0f} мс  начало +{offset:.0f} мс  {name}{tail}")
+
+    if notes:
+        marks = ", ".join(f"{name} +{offset:.0f}" for _k, name, offset, _d, _t in notes[:8])
+        lines.append(f"[Boot] Отметки (мс): {marks}")
+
+    if workers:
+        last = max(r[2] for r in workers)
+        lines.append(f"[Boot] Воркеров поднято: {len(workers)}, последний на +{last:.0f} мс")
+
+    total = sum(r[3] for r in phases if r[3] is not None)
+    span = max((r[2] + (r[3] or 0.0)) for r in rows)
+    if span > 0:
+        # Расхождение суммы и промежутка — это и есть мера параллельности. Если
+        # они близки, старт фактически последовательный, и его есть смысл
+        # раскладывать на потоки.
+        lines.append(
+            f"[Boot] Суммарно в фазах {total:.0f} мс, реальный промежуток {span:.0f} мс "
+            f"(параллельность {total / span:.1f}x)"
+        )
+    return lines
+
+
+def reset():
+    """Только для тестов."""
+    global _T0
+    with _LOCK:
+        _RECORDS.clear()
+        _T0 = time.monotonic()

@@ -252,6 +252,7 @@ from nova_platform import is_windows_admin
 from nova_routing_profiles import get_default_app_routing_profiles, match_app_by_process_path
 from nova_strategy_niche import classify_strategy_niche
 from nova_relay_env import relay_env_from_settings
+import nova_boot_timeline as boot_timeline
 from nova_routing_backends import (
     build_app_transport_decisions,
     get_selected_routing_backend_info,
@@ -22872,6 +22873,11 @@ try:
                     delay_left -= step
                 if is_closing:
                     return
+                # Шов номер два. Длительность тут не меряется: воркер - это
+                # бесконечный цикл. Важно, когда он реально проснулся: отставание
+                # от запрошенной задержки означает, что потоку не досталось
+                # процессора, и это отдельный диагноз, а не медленная фаза.
+                boot_timeline.worker_started(name, delay)
                 try:
                     target(*args)
                 except Exception as e:
@@ -22900,6 +22906,21 @@ try:
         _start_worker("NovaBoostEvolution", boost_evolution_worker, (log_func,), delay=10.0)
         _start_worker("NovaBoostStrategyMatcher", boost_strategy_matcher_worker, (log_func,), delay=10.5)
         _start_worker("NovaBatchExclude", batch_exclude_worker, (log_func,), delay=11.0)
+
+        # Отчёт печатается один раз, после последнего ступенчатого воркера.
+        #
+        # Не раньше: до +11 с половина фаз ещё не началась, и отчёт показал бы
+        # ровно то, что успело, создав ложную картину быстрого старта. Запас
+        # сверх последней задержки нужен, потому что отставание воркера - это
+        # само по себе то, что мы хотим увидеть.
+        def _report_boot_timeline():
+            try:
+                for line in boot_timeline.render():
+                    log_func(line)
+            except Exception as e:
+                safe_trace(f"[Boot] Не удалось построить хронологию: {e}")
+
+        _start_worker("NovaBootTimeline", _report_boot_timeline, delay=16.0)
         
 
 
@@ -22970,7 +22991,11 @@ try:
                 def _start_manager_async(label, manager):
                     def _runner():
                         try:
-                            manager.start()
+                            # Шов номер один: через него поднимаются все
+                            # менеджеры, так что одна обёртка здесь заменяет
+                            # десяток отдельных замеров.
+                            with boot_timeline.phase(label):
+                                manager.start()
                         except Exception as e:
                             safe_log(f"[Init] Ошибка запуска {label}: {e}")
                     try:
@@ -23124,8 +23149,9 @@ try:
                     _start_manager_async("NovaRoutingBackendStart", routing_backend_manager)
                 def _start_pac_server_async():
                     try:
-                        pac_manager.start_server()
-                        pac_manager.set_system_proxy()
+                        with boot_timeline.phase("PAC: сервер и системный прокси"):
+                            pac_manager.start_server()
+                            pac_manager.set_system_proxy()
                     except Exception as e:
                         safe_log(f"[Init] Ошибка запуска PAC server/system proxy: {e}")
                 if pac_manager:
@@ -23136,10 +23162,14 @@ try:
                         settings = current_routing_settings or load_routing_settings()
                         sys_settings = settings.get("system") or {}
                         ai_unlock_enabled = bool(sys_settings.get("ai_unlock", True))
-                        if ai_unlock_enabled:
-                            setup_nrpt_dns_unblock(log_func=safe_log)
-                        else:
-                            remove_nrpt_dns_unblock(log_func=safe_log, silent=True)
+                        # Та самая фаза: в разборе жалобы на минутный старт она
+                        # одна давала 39 секунд из 46. Тогда это выяснялось
+                        # сопоставлением строк лога вручную.
+                        with boot_timeline.phase("NRPT: DNS-правила"):
+                            if ai_unlock_enabled:
+                                setup_nrpt_dns_unblock(log_func=safe_log)
+                            else:
+                                remove_nrpt_dns_unblock(log_func=safe_log, silent=True)
                     except Exception as e:
                         safe_log(f"[Init] NRPT setup error: {e}")
                 threading.Thread(target=_setup_nrpt_async, daemon=True, name="NovaNrptSetup").start()
@@ -24029,8 +24059,6 @@ try:
 
                     if not silent and attempt == 0:
                         log_print("Запуск ядра (subprocess)...")
-                        
-                        log_print("Ядро активно")
                         if IS_DEBUG_CLI:
                             cmd_str = subprocess.list2cmdline(args)
                             log_print(f"[Debug] CmdLine: {cmd_str}")
@@ -24039,15 +24067,27 @@ try:
 
                     # Launch via subprocess (LOCAL variable only initially)
                     with winws_startup_lock:
-                        proc = subprocess.Popen(args, cwd=get_base_dir(), 
-                                                        stdout=subprocess.PIPE, 
-                                                        stderr=subprocess.STDOUT,
-                                                        stdin=subprocess.DEVNULL, 
-                                                        text=True, 
-                                                        creationflags=subprocess.CREATE_NO_WINDOW, 
-                                                        encoding='utf-8',
-                                                        errors='replace', 
-                                                        bufsize=1)
+                        with boot_timeline.phase("Ядро: запуск winws"):
+                            proc = subprocess.Popen(args, cwd=get_base_dir(),
+                                                            stdout=subprocess.PIPE,
+                                                            stderr=subprocess.STDOUT,
+                                                            stdin=subprocess.DEVNULL,
+                                                            text=True,
+                                                            creationflags=subprocess.CREATE_NO_WINDOW,
+                                                            encoding='utf-8',
+                                                            errors='replace',
+                                                            bufsize=1)
+
+                    # «Ядро активно» печатается после Popen, а не до него.
+                    #
+                    # Раньше строка стояла на семь строк выше — то есть до
+                    # запуска процесса. Из-за этого все замеры «ядро активно за
+                    # N секунд», включая записанные в ROADMAP, на самом деле
+                    # мерили «за N секунд подошли к запуску». Расхождение
+                    # небольшое, но диагностика, которая врёт о том, что уже
+                    # произошло, хуже отсутствующей.
+                    if not silent and attempt == 0:
+                        log_print("Ядро активно")
                     
                     # NOTE: Do NOT set 'process = proc' yet! 
                     # This prevents StrategyChecker from detecting it as "Active but Crashed" during the 1.0s wait.
