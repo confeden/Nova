@@ -1,4 +1,4 @@
-# version: 1.35
+# version: 1.36
 # Nova PC - Games routing list (TCP patch/update endpoints only)
 #
 # These are the Path of Exile PATCH/UPDATE servers that must go through WARP

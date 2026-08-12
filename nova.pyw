@@ -7661,6 +7661,25 @@ try:
 
 
     def _udp_listen_pids_for_port(port):
+        """Return process IDs that currently hold a UDP port.
+
+        `netstat`, not PowerShell — the same tool the TCP twin above already
+        uses. Измерено на этой машине: спавн `powershell -NoProfile -Command
+        Get-NetUDPEndpoint` стоит ~1450 мс, тот же ответ через netstat — ~23 мс.
+        Шестьдесят раз.
+
+        Само по себе это было бы мелочью, но вызов сидит в цикле ожидания
+        `_start_locked`, который «опрашивает раз в 100 мс» до восьми секунд. С
+        полуторасекундной пробой опрос шёл раз в полторы секунды, и запуск
+        UDP-прокси занимал 14 секунд из примерно двадцати двух, что и показала
+        хронология запуска. Тот же класс, что и NRPT: процесс на операцию,
+        поставленный в цикл.
+
+        Формат строки UDP отличается от TCP — колонки состояния нет:
+        `UDP    0.0.0.0:17871    *:*    7032`.
+        """
+        if os.name != "nt":
+            return set()
         try:
             port = int(port)
         except:
@@ -7669,24 +7688,25 @@ try:
             return set()
         try:
             result = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    f"Get-NetUDPEndpoint -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess",
-                ],
+                ["netstat", "-ano", "-p", "UDP"],
                 capture_output=True,
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 timeout=5,
             )
+            text = f"{result.stdout or ''}\n{result.stderr or ''}"
             pids = set()
-            for line in (result.stdout or "").splitlines():
-                text = str(line or "").strip()
-                if not text:
+            suffix = f":{port}"
+            for raw_line in text.splitlines():
+                parts = str(raw_line or "").split()
+                if len(parts) < 4:
+                    continue
+                if parts[0].upper() != "UDP":
+                    continue
+                if not str(parts[1] or "").endswith(suffix):
                     continue
                 try:
-                    pid = int(text)
+                    pid = int(parts[-1])
                 except:
                     continue
                 if pid > 0:
