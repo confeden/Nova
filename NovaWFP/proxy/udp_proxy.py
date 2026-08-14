@@ -54,9 +54,6 @@ ROUTING_GROUP_ALIASES = {
     "telegram": "telegram",
     "whatsapp": "whatsapp",
     "discord": "discord",
-    "ide": "ide",
-    "cli": "cli",
-    "opencode": "ide",
 }
 
 
@@ -99,8 +96,7 @@ def _get_app_route_mode(app_key: str) -> str:
     apps = payload.get("apps") if isinstance(payload, dict) else {}
     if not isinstance(apps, dict):
         return "auto"
-    legacy_key = "opencode" if key == "ide" else key
-    mode = str(apps.get(legacy_key) or "auto").strip().lower()
+    mode = str(apps.get(key) or "auto").strip().lower()
     if mode not in {"auto", "warp", "opera", "direct"}:
         mode = "auto"
     return mode
@@ -161,10 +157,6 @@ _KERNEL32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENT
 _KERNEL32.Process32FirstW.restype = wintypes.BOOL
 _KERNEL32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
 _KERNEL32.Process32NextW.restype = wintypes.BOOL
-
-
-class UdpFlowSuppressed(OSError):
-    pass
 
 
 class NOVA_WFP_SOCKET_ADDRESS_V1(ctypes.Structure):
@@ -588,7 +580,6 @@ class NovaWfpUdpProxy:
         self._redirect_sessions: Dict[Tuple[str, int], UdpSession] = {}
         self._bad_routes: Dict[Tuple[str, int, str], float] = {}
         self._webview_host_family_cache: Dict[int, Tuple[str, float]] = {}
-        self._suppressed_flows: Dict[Tuple[str, int, str], float] = {}
 
     def log(self, line: str):
         LOG.info(line)
@@ -602,10 +593,6 @@ class NovaWfpUdpProxy:
             return "discord"
         if "whatsapp.exe" in lower or "whatsapp.root.exe" in lower or "whatsapp\\app.exe" in lower:
             return "whatsapp"
-        if any(token in lower for token in ("opencode.exe", "\\opencode\\", "code.exe", "\\vscode\\", "cursor.exe", "\\cursor\\", "windsurf.exe", "\\windsurf\\", "antigravity.exe", "\\antigravity\\", "codex.exe", "\\codex\\")):
-            return "ide"
-        if any(token in lower for token in ("opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe")):
-            return "cli"
         if any(token in lower for token in ("obs64.exe", "obs32.exe", "obs-studio")):
             return "obs"
         if "pathofexile" in lower or "path of exile" in lower or " poe" in lower or lower.endswith("\\poe") or "client.exe" in lower:
@@ -634,12 +621,6 @@ class NovaWfpUdpProxy:
                 visited.add(current_pid)
                 parent_pid, exe_name = snapshot.get(current_pid, (0, ""))
                 lower_name = str(exe_name or "").strip().lower()
-                if lower_name in {"opencode.exe", "code.exe", "cursor.exe", "windsurf.exe", "antigravity.exe", "codex.exe"}:
-                    family = "ide"
-                    break
-                if lower_name in {"opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe"}:
-                    family = "cli"
-                    break
                 if lower_name in {"whatsapp.exe", "whatsapp.root.exe"}:
                     family = "whatsapp"
                     break
@@ -656,26 +637,12 @@ class NovaWfpUdpProxy:
         app_family = self._app_family_from_app_id(app_id)
         if (not app_family) and ("msedgewebview2.exe" in app_id.replace("/", "\\").lower()):
             app_family = self._resolve_webview_host_family(process_id)
-            if app_family == "ide":
-                preferred_egress = 2
-            elif app_family == "whatsapp":
+            if app_family == "whatsapp":
                 preferred_egress = 1
             else:
                 app_family = "webview2"
                 preferred_egress = 3
         return app_family, preferred_egress
-
-    def _log_udp_suppressed_once(self, app_family: str, target_host: str, target_port: int):
-        key = (str(app_family or "").strip().lower(), int(target_port), str(target_host or "").strip())
-        now = time.monotonic()
-        expiry = float(self._suppressed_flows.get(key, 0.0) or 0.0)
-        if expiry > now:
-            return
-        self._suppressed_flows[key] = now + 15.0
-        self.log(
-            f"[NovaWFP][UDP] suppress family={app_family or '-'} "
-            f"target={_mask_ip_for_log(target_host)}:{int(target_port)} reason=tcp-only-eu"
-        )
 
     def build_attempts_for_target(self, host: str, port: int, app_family: str = "", preferred_egress: int = 0):
         now = time.monotonic()
@@ -694,7 +661,7 @@ class NovaWfpUdpProxy:
         else:
             ordered_attempts = proxy_attempts + direct_attempts
 
-        route_mode = _get_app_route_mode(app_family) if app_family in {"discord", "telegram", "whatsapp", "ide", "cli", "obs"} else "auto"
+        route_mode = _get_app_route_mode(app_family) if app_family in {"discord", "telegram", "whatsapp", "obs"} else "auto"
         if route_mode != "auto":
             priority_map = {
                 "warp": {"warp-socks": 0, "opera-http": 1, "direct": 2},
@@ -803,9 +770,6 @@ class NovaWfpUdpProxy:
         if not resolved:
             raise OSError("NovaWFP did not resolve redirected UDP target")
         app_family, preferred_egress = self._classify_redirect_flow(resolved)
-        if app_family == "ide":
-            self._log_udp_suppressed_once(app_family, str(resolved["target_host"]), int(resolved["target_port"]))
-            raise UdpFlowSuppressed("OpenCode UDP suppressed to force TCP EU fallback")
         return self.get_session(
             client_addr,
             str(resolved["target_host"]),
@@ -862,8 +826,6 @@ class NovaWfpUdpProxy:
                         f"target={_mask_ip_for_log(session.target_host)}:{session.target_port} "
                         f"route={session.route_label} size={len(packet)}"
                     )
-            except UdpFlowSuppressed:
-                continue
             except Exception as exc:
                 self.log(
                     f"[NovaWFP][UDP] tx-failed client={client_addr[0]}:{client_addr[1]} "

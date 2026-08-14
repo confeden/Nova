@@ -2,16 +2,22 @@ import json
 import os
 
 
+# IDE и CLI сняты с перехвата: они существовали только ради доступа к нейросетям
+# внутри редакторов и терминалов, а эту задачу решает разблокировка AI через
+# NRPT — подмена DNS, которой перехват трафика не нужен.
 ROUTING_GROUP_ALIASES = {
     "browser": "browser",
     "telegram": "telegram",
     "whatsapp": "whatsapp",
     "discord": "discord",
-    "ide": "ide",
-    "cli": "cli",
     "games": "games",
     "poe": "games",
-    "opencode": "ide",
+    # Без этих двух `_get_app_route_mode` не находил ключ и откатывался на
+    # "browser": строка OBS в настройках управляла чужим режимом, а поток
+    # GamesDirect — тоже. Заметно стало только после того, как файл настроек
+    # вообще начал находиться.
+    "obs": "obs",
+    "games-steam-direct": "games",
 }
 ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
 
@@ -24,8 +30,37 @@ def _safe_bool(value):
 
 
 def _routing_settings_path():
+    """Найти файл настроек там, где его действительно пишет nova.pyw.
+
+    Здесь стояло `dirname(__file__)/temp/routing_settings.json`, то есть
+    `resources/temp/...` — каталога с таким именем нет ни в исходниках, ни в
+    установленной программе. Файл не находился НИКОГДА: настройки читались как
+    {}, режим любого приложения выходил "auto", и `_app_redirect_enabled` в
+    NovaDivert не возвращал False ни разу. Симптом был виден годами и выглядел
+    как «настройка не работает»: в routing_settings.json стоит "ide": "direct",
+    а трафик всё равно перехватывается на 17870.
+
+    Канон — `<base>/temp/routing_settings.json`, рядом лежит устаревшая копия
+    `<base>/routing_settings.json` (nova.pyw пишет обе). Каталог `<base>`
+    считается от этого модуля: из исходников он в `<repo>/resources/`, в
+    установленной программе — в `{app}\\resources\\`, и в обоих случаях
+    родительский каталог и есть нужный. Кандидаты перебираются, потому что
+    помощники запускаются из разных мест, и молчаливый промах здесь стоит
+    ровно того, что уже случилось.
+    """
     try:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp", "routing_settings.json")
+        here = os.path.dirname(os.path.abspath(__file__))
+        roots = (os.path.dirname(here), here, os.path.dirname(os.path.dirname(here)))
+        for root in roots:
+            if not root:
+                continue
+            for candidate in (
+                os.path.join(root, "temp", "routing_settings.json"),
+                os.path.join(root, "routing_settings.json"),
+            ):
+                if os.path.exists(candidate):
+                    return candidate
+        return ""
     except:
         return ""
 
@@ -77,8 +112,7 @@ def _get_app_route_mode(app_key):
         return mode
     legacy_apps = payload.get("apps") if isinstance(payload, dict) else {}
     if isinstance(legacy_apps, dict):
-        legacy_key = "opencode" if key == "ide" else key
-        mode = _normalize_mode(legacy_apps.get(legacy_key), "auto")
+        mode = _normalize_mode(legacy_apps.get(key), "auto")
         if key != "browser" and mode == "auto":
             return _browser_mode_from_legacy_pac(payload)
         return mode

@@ -61,8 +61,6 @@ APP_FAMILY = {
     "Discord": "discord",
     "Telegram": "telegram",
     "WhatsApp": "whatsapp",
-    "IDE": "ide",
-    "CLI": "cli",
     "Games": "games",
     "GamesDirect": "games-steam-direct",
     "OBS": "obs",
@@ -82,8 +80,6 @@ PREFERRED_EGRESS = {
     "discord": 1,   # WARP
     "telegram": 1,  # WARP
     "whatsapp": 1,  # WARP
-    "ide": 2,       # Opera/EU
-    "cli": 0,       # Browser-like auto routing
     "games": 1,     # WARP
     "games-steam-direct": 3,
 }
@@ -475,9 +471,7 @@ class ProcessResolver:
                 return cached["path"], cached["app"]
         path = self._query_image_path(pid)
         app = match_app_by_process_path(path) if path else None
-        if not app and self._is_gemini_cli_node(path, pid):
-            app = "CLI"
-        if app not in {"Discord", "Telegram", "WhatsApp", "IDE", "CLI", "Games", "GamesDirect", "OBS"}:
+        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "GamesDirect", "OBS"}:
             app = None
         with self._lock:
             self._cache[pid] = {"ts": now, "path": path, "app": app}
@@ -493,51 +487,6 @@ class ProcessResolver:
             ok = self._kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
             if ok:
                 return buffer.value[: size.value]
-            return ""
-        finally:
-            self._kernel32.CloseHandle(handle)
-
-    def _is_gemini_cli_node(self, process_path, pid):
-        normalized_path = str(process_path or "").replace("/", "\\").lower()
-        if not normalized_path.endswith("\\node.exe"):
-            return False
-        command_line = str(self._query_command_line(pid) or "").replace("/", "\\").lower()
-        return bool(
-            "\\@google\\gemini-cli\\" in command_line
-            and "\\bundle\\gemini.js" in command_line
-        )
-
-    def _query_command_line(self, pid):
-        handle = self._kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not handle:
-            return ""
-        try:
-            needed = wintypes.ULONG(0)
-            self._ntdll.NtQueryInformationProcess(
-                handle,
-                PROCESS_COMMAND_LINE_INFORMATION,
-                None,
-                0,
-                ctypes.byref(needed),
-            )
-            size = int(needed.value or 0)
-            if size <= ctypes.sizeof(UNICODE_STRING) or size > (1024 * 1024):
-                return ""
-            buffer = ctypes.create_string_buffer(size)
-            status = int(self._ntdll.NtQueryInformationProcess(
-                handle,
-                PROCESS_COMMAND_LINE_INFORMATION,
-                buffer,
-                size,
-                ctypes.byref(needed),
-            ))
-            if status != 0:
-                return ""
-            info = ctypes.cast(buffer, ctypes.POINTER(UNICODE_STRING)).contents
-            if not info.Buffer or int(info.Length or 0) <= 0:
-                return ""
-            return ctypes.wstring_at(info.Buffer, int(info.Length) // ctypes.sizeof(ctypes.c_wchar))
-        except Exception:
             return ""
         finally:
             self._kernel32.CloseHandle(handle)

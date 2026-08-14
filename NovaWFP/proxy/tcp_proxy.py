@@ -144,11 +144,8 @@ ROUTING_GROUP_ALIASES = {
     "telegram": "telegram",
     "whatsapp": "whatsapp",
     "discord": "discord",
-    "ide": "ide",
-    "cli": "cli",
     "games": "games",
     "poe": "games",
-    "opencode": "ide",
 }
 
 
@@ -281,8 +278,7 @@ def _get_app_route_mode(app_key: str) -> str:
     apps = payload.get("apps") if isinstance(payload, dict) else {}
     if not isinstance(apps, dict):
         return "auto"
-    legacy_key = "opencode" if key == "ide" else key
-    mode = str(apps.get(legacy_key) or "auto").strip().lower()
+    mode = str(apps.get(key) or "auto").strip().lower()
     if mode not in {"auto", "warp", "opera", "direct"}:
         mode = "auto"
     return mode
@@ -548,10 +544,6 @@ class NovaWfpTcpProxy:
             or "whatsapp\\app.exe" in lower
         ):
             return "whatsapp"
-        if any(token in lower for token in ("opencode.exe", "\\opencode\\", "code.exe", "\\vscode\\", "cursor.exe", "\\cursor\\", "windsurf.exe", "\\windsurf\\", "antigravity.exe", "\\antigravity\\", "codex.exe", "\\codex\\")):
-            return "ide"
-        if any(token in lower for token in ("opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe")):
-            return "cli"
         if any(token in lower for token in ("obs64.exe", "obs32.exe", "obs-studio")):
             return "obs"
         if "pathofexile" in lower or "path of exile" in lower or " poe" in lower or lower.endswith("\\poe") or "client.exe" in lower:
@@ -580,12 +572,6 @@ class NovaWfpTcpProxy:
                 visited.add(current_pid)
                 parent_pid, exe_name = snapshot.get(current_pid, (0, ""))
                 lower_name = str(exe_name or "").strip().lower()
-                if lower_name in {"opencode.exe", "code.exe", "cursor.exe", "windsurf.exe", "antigravity.exe", "codex.exe"}:
-                    family = "ide"
-                    break
-                if lower_name in {"opencode-cli.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "gemini.exe", "gemini-cli.exe", "codex-cli.exe"}:
-                    family = "cli"
-                    break
                 if lower_name in {"whatsapp.exe", "whatsapp.root.exe"}:
                     family = "whatsapp"
                     break
@@ -901,10 +887,6 @@ class NovaWfpTcpProxy:
             route_mode_key = "whatsapp"
         elif app_family == "games":
             route_mode_key = "games"
-        elif app_family == "ide":
-            route_mode_key = "ide"
-        elif app_family == "cli":
-            route_mode_key = "cli"
         elif app_family == "obs":
             route_mode_key = "obs"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
@@ -1798,9 +1780,7 @@ class NovaWfpTcpProxy:
                 app_family = self._app_family_from_app_id(app_id)
                 if (not app_family) and ("msedgewebview2.exe" in str(app_id or "").replace("/", "\\").lower()):
                     app_family = self._resolve_webview_host_family(int(context.ProcessId))
-                    if app_family == "ide":
-                        preferred_egress = 2
-                    elif app_family == "whatsapp":
+                    if app_family == "whatsapp":
                         preferred_egress = 1
                     else:
                         app_family = "webview2"
