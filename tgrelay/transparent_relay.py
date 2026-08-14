@@ -301,6 +301,70 @@ def _looks_like_http_request(data: bytes) -> bool:
     return any(head.startswith(prefix) for prefix in _HTTP_TRANSPORT_PREFIXES)
 
 
+# Не всё, что приходит на телеграмовский адрес, является MTProto. Обновлятор
+# Telegram Desktop ходит на updates.tdesktop.com, который резолвится в
+# 149.154.167.80 — внутрь диапазона DC2, — и открывает там обычный TLS.
+# Такому сокету путь через /apiws закрыт: WSS несёт MTProto, а не произвольный
+# поток. Раньше он просто отбрасывался, см. ветку unparsed-init.
+#
+# Байты: 0x16 — record type handshake, дальше legacy-версия записи. TLS 1.3
+# по-прежнему пишет туда 0x0301 или 0x0303, так что двух вариантов достаточно.
+_TLS_CLIENT_HELLO_PREFIXES = (b"\x16\x03\x01", b"\x16\x03\x03")
+
+
+def _looks_like_tls_client_hello(data: bytes) -> bool:
+    if not data:
+        return False
+    head = bytes(data[:3])
+    return any(head.startswith(prefix) for prefix in _TLS_CLIENT_HELLO_PREFIXES)
+
+
+# Заголовки CONNECT: конец — пустая строка. Ограничены и по размеру, и по
+# общему времени: клиент, который никогда не пришлёт CRLFCRLF, не должен ни
+# расти в памяти, ни занимать задачу дольше срока.
+_HTTP_HEAD_END = b"\r\n\r\n"
+_HTTP_HEAD_MAX = 8192
+_HTTP_HEAD_TIMEOUT = 5.0
+
+
+def _split_http_authority(target: str) -> Tuple[Optional[str], Optional[int]]:
+    """`host:port` из строки запроса CONNECT.
+
+    IPv6 приходит в скобках (`[2001:db8::1]:443`), поэтому разделить по
+    последнему двоеточию можно только после того, как скобки сняты.
+    """
+    text = str(target or "").strip()
+    if not text:
+        return None, None
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            return None, None
+        host = text[1:end]
+        tail = text[end + 1:]
+        if tail and not tail.startswith(":"):
+            return None, None
+        port_text = tail[1:]
+    else:
+        host, sep, port_text = text.rpartition(":")
+        if not sep:
+            host, port_text = text, ""
+    host = host.strip()
+    if not host:
+        return None, None
+    if not port_text:
+        # CONNECT без порта — не по RFC 9110, но встречается у самодельных
+        # клиентов. Для туннеля осмыслен ровно один порт.
+        return host, 443
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None, None
+    if not 0 < port < 65536:
+        return None, None
+    return host, port
+
+
 def _proto_label(proto: int) -> str:
     if proto == PROTO_ABRIDGED:
         return "abridged"
@@ -1542,7 +1606,7 @@ class TelegramTransparentRelayServer:
         self._wss_first_byte_fail: Dict[Tuple[int, bool, str], Tuple[int, float]] = {}
         self._wss_first_byte_disabled_until: Dict[Tuple[int, bool, str], float] = {}
         self._active_clients = {}
-        self._last_client_mode_seen = {"socks": 0.0, "divert": 0.0}
+        self._last_client_mode_seen = {"socks": 0.0, "divert": 0.0, "http": 0.0}
         self._last_mode_switch_close = 0.0
         self._start_mono = 0.0
         self._last_startup_timeout_log = 0.0
@@ -1799,7 +1863,7 @@ class TelegramTransparentRelayServer:
 
     async def _note_client_mode(self, mode: str) -> None:
         mode = str(mode or "").strip().lower()
-        if mode not in ("socks", "divert"):
+        if mode not in ("socks", "divert", "http"):
             return
         self._last_client_mode_seen[mode] = time.monotonic()
 
@@ -1873,6 +1937,10 @@ class TelegramTransparentRelayServer:
     # taken should not spin.
     _SUPERVISOR_BACKOFF_MAX = 15.0
     _SUPERVISOR_HEALTHY_RUN = 30.0
+    # Сколько раз за одну жизнь релея цикл возобновляется после
+    # InvalidStateError. Живой темп — единицы за сессию, так что до потолка
+    # доходит только по-настоящему сломанный цикл; см. _run_once.
+    _LOOP_RESUME_LIMIT = 20
 
     def _thread_main(self) -> None:
         backoff = 1.0
@@ -1924,7 +1992,53 @@ class TelegramTransparentRelayServer:
                 )
             )
         try:
-            loop.run_until_complete(self._run())
+            # InvalidStateError из IocpProactor._poll — не наша авария и не
+            # повод ронять всё. Место известно точно (windows_events.py:806:
+            # `f.set_exception(e)` при уже завершённом фьючерсе, хотя тремя
+            # строками выше стоит `elif not f.done()`), но воспроизвести его не
+            # удалось: 4152 соединения с обрывами по RST не дали ни одного
+            # случая, межпоточных достроек фьючерсов не зафиксировано, с моим
+            # 501-на-POST корреляции нет (14 отказов, 0 падений). Живой темп
+            # рваный: 4 падения за 7 минут в одну сессию и ни одного за 25
+            # минут под такой же нагрузкой в другую.
+            #
+            # Цена аварии сама по себе — один потерянный результат сокетной
+            # операции. Цена реакции на неё была несоизмеримой: исключение
+            # выходило наружу, супервизор считал это падением и поднимал релей
+            # заново, обрывая ВСЕ живые туннели. Цикл при этом не закрыт —
+            # проверено вкручиванием ровно этого исключения: повторный вход в
+            # run_until_complete возобновляет работу, и пять живых туннелей
+            # переживают аварию (485 эхо против 21 на момент сбоя).
+            #
+            # Поэтому: продолжаем, но громко и с потолком. Если это начнёт
+            # повторяться подряд — значит цикл действительно сломан, и тогда
+            # перезапуск правильнее.
+            task = loop.create_task(self._run())
+            resumed = 0
+            while True:
+                try:
+                    loop.run_until_complete(task)
+                    break
+                except asyncio.InvalidStateError as exc:
+                    resumed += 1
+                    if resumed > self._LOOP_RESUME_LIMIT:
+                        self.log_func(
+                            f"[TgRelay] Цикл не восстанавливается: {self._LOOP_RESUME_LIMIT} "
+                            "подряд InvalidStateError — перезапуск релея."
+                        )
+                        raise
+                    if resumed == 1:
+                        self.log_func(
+                            "[TgRelay] Сбой asyncio (InvalidStateError в IocpProactor._poll); "
+                            "цикл продолжен, туннели сохранены."
+                        )
+                        with contextlib.suppress(Exception):
+                            for line in "".join(traceback.format_exception(exc)).rstrip().splitlines():
+                                self.log_func(f"[TgRelay]   {line}")
+                    else:
+                        self.log_func(
+                            f"[TgRelay] Сбой asyncio: цикл продолжен ({resumed}-й раз за эту жизнь)."
+                        )
         except Exception as exc:
             crashed = True
             # Тип и трассировка, а не только str(exc). Разбор аварии 2026-08-09
@@ -1944,7 +2058,12 @@ class TelegramTransparentRelayServer:
                     task.cancel()
                 if pending:
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.close()
+            # close() тоже под подавлением: он сам зовёт _poll, а именно оттуда
+            # и прилетает InvalidStateError. Незакрытый цикл — утечка одного
+            # объекта, исключение здесь — потерянные `self.loop = None` ниже,
+            # то есть stop() и notify_route_usable(), зовущие в мёртвый цикл.
+            with contextlib.suppress(Exception):
+                loop.close()
             # The loop these belong to is gone; leaving them set would let
             # stop() and notify_route_usable() call into a closed loop.
             self.loop = None
@@ -2044,7 +2163,9 @@ class TelegramTransparentRelayServer:
         self.server = server
         self.running = True
         self.started_event.set()
-        self.log_func(f"[TgRelay] Локальный SOCKS5 relay активен на {self.host}:{self.port}.")
+        self.log_func(
+            f"[TgRelay] Локальный relay активен на {self.host}:{self.port} (SOCKS5 и HTTP CONNECT)."
+        )
         await serve_until_stopped(server, self.stop_event)
 
     async def _schedule_cf_bootstrap_prewarm_wave(self, delay: float = 0.0) -> None:
@@ -2135,6 +2256,16 @@ class TelegramTransparentRelayServer:
                 target_port = int(divert_context.get("target_port") or 0)
                 if not target_host or target_port <= 0:
                     return
+            elif b"A" <= prefetched[:1] <= b"Z":
+                # Метод HTTP начинается с заглавной латинской буквы, SOCKS5 —
+                # с 0x05. Проверка именно на диапазон, а не «всё, что не 0x05»:
+                # иначе бинарный мусор вместо мгновенного отказа висел бы в
+                # ожидании заголовков. См. _http_connect_handshake — без этой
+                # ветки системный прокси Windows до релея не доходит вовсе.
+                client_mode = "http"
+                target_host, target_port, prefetched = await self._http_connect_handshake(
+                    reader, writer, prefetched=prefetched
+                )
             else:
                 client_mode = "socks"
                 target_host, target_port = await self._socks_handshake(reader, writer, prefetched=prefetched)
@@ -2225,8 +2356,15 @@ class TelegramTransparentRelayServer:
                     cache_for = 45.0 if not init_packet else 20.0
                     self._no_probe_until[probe_key] = time.monotonic() + cache_for
                 http_transport = _looks_like_http_request(init_packet)
+                tls_transport = _looks_like_tls_client_hello(init_packet)
+                if http_transport:
+                    probe_reason = "unparsed-init-http-transport"
+                elif tls_transport:
+                    probe_reason = "unparsed-init-tls"
+                else:
+                    probe_reason = "unparsed-init-no-wss"
                 self._log_probe_diag(
-                    "unparsed-init-http-transport" if http_transport else "unparsed-init-no-wss",
+                    probe_reason,
                     target_ip,
                     target_port,
                     len(init_packet or b""),
@@ -2249,7 +2387,14 @@ class TelegramTransparentRelayServer:
                         is_media,
                     )
                     return
-                if _has_custom_cfproxy_domain() and not http_transport:
+                # «Не дошло до WSS — закрываем, пусть клиент переподключится
+                # через WSS» верно только для MTProto: смысл ветки в том, что
+                # сырой TCP к Telegram душит провайдер, а WSS — нет. У TLS-сессии
+                # такого второго шанса нет вовсе, /apiws её не несёт, и закрытие
+                # означает просто оборванное соединение. Так был сломан
+                # обновлятор Telegram Desktop: его хост лежит внутри диапазона
+                # DC2, поэтому попадал сюда и умирал молча.
+                if _has_custom_cfproxy_domain() and not http_transport and not tls_transport:
                     self._log_skipping_fallback(
                         "unparsed-init-no-wss",
                         target_ip,
@@ -2748,6 +2893,81 @@ class TelegramTransparentRelayServer:
         writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", self.port))
         await writer.drain()
         return host, int(port)
+
+    async def _http_reply(self, writer: asyncio.StreamWriter, status: bytes) -> None:
+        try:
+            writer.write(
+                b"HTTP/1.1 " + status + b"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            )
+            await writer.drain()
+        except Exception:
+            pass
+
+    async def _http_connect_handshake(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        prefetched: bytes = b"",
+    ) -> Tuple[Optional[str], Optional[int], bytes]:
+        """`CONNECT host:port` — то же назначение, что у SOCKS5, но по HTTP.
+
+        Нужен не ради полноты протоколов. Системный прокси Windows берёт из PAC
+        только токены PROXY и SOCKS (SOCKS4); `SOCKS5` он не понимает и молча
+        пропускает. Поэтому клиент, стоящий на «использовать системные
+        настройки прокси», доходил до Opera на 1371 и до релея не добирался
+        никогда. С этой веткой PAC может отдать ему `PROXY 127.0.0.1:1372`, и
+        один и тот же слушатель обслуживает оба вида клиентов.
+
+        Возвращает `(host, port, остаток)`. Остаток непуст, когда клиент не стал
+        дожидаться «200» и дослал полезную нагрузку следом за заголовками; эти
+        байты — уже начало туннеля, и потерять их нельзя.
+        """
+        head = bytearray(prefetched or b"")
+        # Срок общий на всё рукопожатие, а не на отдельное чтение. С таймаутом
+        # только внутри wait_for клиент, шлющий по байту раз в четыре секунды,
+        # держал бы задачу столько, сколько ему угодно — а слушатель поднят на
+        # 0.0.0.0 и доступен из локальной сети.
+        deadline = time.monotonic() + _HTTP_HEAD_TIMEOUT
+        while _HTTP_HEAD_END not in head:
+            if len(head) >= _HTTP_HEAD_MAX:
+                await self._http_reply(writer, b"431 Request Header Fields Too Large")
+                return None, None, b""
+            remaining = deadline - time.monotonic()
+            try:
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                chunk = await asyncio.wait_for(reader.read(1024), timeout=remaining)
+            except asyncio.TimeoutError:
+                # Один ответ на оба способа исчерпать срок — не дождаться
+                # первого байта и капать по байту до самого дедлайна.
+                await self._http_reply(writer, b"408 Request Timeout")
+                return None, None, b""
+            if not chunk:
+                return None, None, b""
+            head.extend(chunk)
+        raw_head, _, rest = bytes(head).partition(_HTTP_HEAD_END)
+        request_line = raw_head.split(b"\r\n", 1)[0].decode("latin-1", "ignore").strip()
+        parts = request_line.split()
+        if len(parts) < 2:
+            await self._http_reply(writer, b"400 Bad Request")
+            return None, None, b""
+        method = parts[0].upper()
+        if method != "CONNECT":
+            # Абсолютный URI вместо CONNECT — это обычный проксируемый HTTP, а
+            # релей умеет только туннель. Отвечаем явно: молчащий прокси
+            # выглядит как зависший и диагностируется часами.
+            self.log_func(
+                f"[TgRelay] HTTP-прокси: метод {method or '?'} не поддержан, нужен CONNECT."
+            )
+            await self._http_reply(writer, b"501 Not Implemented")
+            return None, None, b""
+        host, port = _split_http_authority(parts[1])
+        if not host or not port:
+            await self._http_reply(writer, b"400 Bad Request")
+            return None, None, b""
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await writer.drain()
+        return host, int(port), rest
 
     async def _read_probe(self, reader: asyncio.StreamReader, want: int = 64, timeout: float = 4.0, initial: bytes = b"") -> bytes:
         data = bytearray(initial or b"")
