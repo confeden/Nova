@@ -22,6 +22,26 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
     if _root.is_dir() and str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
+def _data_path(*parts):
+    r"""Данные верхнего уровня (`ip/`, `list/`, `temp/`) лежат НЕ рядом с модулем.
+
+    `REPO_ROOT` — на два уровня выше этого файла: из исходников это корень
+    репозитория, где `ip/`, `list/` и `temp/` лежат рядом, а в установленной
+    программе — `{app}\resources` (NovaInstaller.iss:78). Установщик же кладёт
+    списки и `temp/` в `{app}` (:72), поэтому `{app}\resources\ip` не
+    существует и чтение молча давало пустой результат. Из исходников это
+    никогда не проявлялось — отсюда и «у меня работает».
+
+    Существующий файл побеждает; иначе побеждает корень, в котором есть нужный
+    каталог, — так же верно и для файлов, которые ещё предстоит создать.
+    """
+    for root in (REPO_ROOT, REPO_ROOT.parent):
+        candidate = root.joinpath(*parts)
+        if candidate.exists() or candidate.parent.is_dir():
+            return candidate
+    return REPO_ROOT.joinpath(*parts)
+
+
 from tgrelay.transport import open_stream  # noqa: E402
 try:
     from tgrelay.config import CFPROXY_DEFAULT_DOMAINS, get_cfproxy_domains, get_cfproxy_primary_domains  # noqa: E402
@@ -136,7 +156,7 @@ TG_WS_STARTUP_PREWARM_PLAN = (
     (2, True),
     (4, True),
 )
-ROUTING_SETTINGS_PATH = REPO_ROOT / "temp" / "routing_settings.json"
+ROUTING_SETTINGS_PATH = _data_path("temp", "routing_settings.json")
 _ROUTING_SETTINGS_CACHE: dict = {}
 _ROUTING_SETTINGS_MTIME: float = -1.0
 ROUTING_GROUP_ALIASES = {
@@ -178,7 +198,7 @@ _DOMAIN_LISTS_MTIMES = {}
 
 def _load_domain_list(name: str) -> set:
     global _DOMAIN_LISTS_CACHE, _DOMAIN_LISTS_MTIMES
-    path = REPO_ROOT / "list" / f"{name}.txt"
+    path = _data_path("list", f"{name}.txt")
     try:
         mtime = path.stat().st_mtime
     except Exception:
@@ -220,7 +240,7 @@ _IP_LISTS_MTIMES = {}
 
 def _load_ip_list(name: str) -> list:
     global _IP_LISTS_CACHE, _IP_LISTS_MTIMES
-    path = REPO_ROOT / "ip" / f"{name}.txt"
+    path = _data_path("ip", f"{name}.txt")
     try:
         mtime = path.stat().st_mtime
     except Exception:
@@ -584,7 +604,7 @@ class NovaWfpTcpProxy:
     def _load_networks(self, pattern: str):
         nets = []
         try:
-            ip_dir = REPO_ROOT / "ip"
+            ip_dir = _data_path("ip")
             for path in sorted(ip_dir.glob(str(pattern))):
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     for raw_line in f:
@@ -1038,7 +1058,7 @@ class NovaWfpTcpProxy:
         return str(
             os.environ.get(
                 "NOVA_DIVERT_REDIRECT_MAP",
-                str(REPO_ROOT / "temp" / "NovaDivertRedirectMap.json"),
+                str(_data_path("temp", "NovaDivertRedirectMap.json")),
             )
             or ""
         ).strip()
@@ -2003,7 +2023,7 @@ class NovaWfpTcpProxy:
                 with contextlib.suppress(Exception):
                     await serve_task
 def _default_log_file() -> Path:
-    return REPO_ROOT / "temp" / "NovaWfpTcpProxy.log"
+    return _data_path("temp", "NovaWfpTcpProxy.log")
 
 
 def _configure_file_logging(path: Path) -> Path:

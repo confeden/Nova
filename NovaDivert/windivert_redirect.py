@@ -91,6 +91,30 @@ _TELEGRAM_IPV6_NETWORKS = [
 ]
 
 
+def _data_file(*parts):
+    """Файл данных верхнего уровня (`ip/`, `list/`, `temp/`) — не рядом с модулем.
+
+    `BASE_DIR` — каталог на уровень выше `NovaDivert/`. В исходниках это корень
+    репозитория, где `ip/` лежит рядом, и всё сходится. В установленной
+    программе тот же расчёт даёт `{app}\\resources` (NovaInstaller.iss:79), а
+    списки установщик кладёт в `{app}` (:72) — каталога `{app}\\resources\\ip`
+    не существует.
+
+    Цена промаха измерена на чужой машине: `_load_ip_networks` возвращал `[]`,
+    `_is_telegram_target` отвечал False на 149.154.167.51 — адрес DC2 — и ВЕСЬ
+    трафик Telegram считался нетелеграмовским. До 1.36 его на этом месте просто
+    дропали; в 1.36 он уходит в общий прокси мимо релея. В счётчиках это видно
+    как `telegram_offlist_tcp` == `redirected_tcp`.
+    """
+    for root in (BASE_DIR, APP_DIR):
+        if not root:
+            continue
+        candidate = os.path.join(root, *parts)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(BASE_DIR, *parts)
+
+
 def _load_ip_networks(path):
     nets = []
     try:
@@ -749,8 +773,17 @@ class RedirectService:
         self._flow_to_tuples = {}
         self._sessions = {}
         self._log_limiter = {}
-        self._telegram_networks = _load_ip_networks(os.path.join(self.base_dir, "ip", "telegram.txt"))
-        self._games_networks = _load_ip_networks(os.path.join(self.base_dir, "ip", "games.txt"))
+        self._telegram_networks = _load_ip_networks(_data_file("ip", "telegram.txt"))
+        self._games_networks = _load_ip_networks(_data_file("ip", "games.txt"))
+        # Пустой список адресов Telegram — не мелочь: он превращает КАЖДЫЙ поток
+        # клиента в «нетелеграмовский» и уводит его мимо релея. Раньше это
+        # состояние было полностью немым, и распознать его удалось только по
+        # счётчикам на чужой машине. Теперь оно называет себя само.
+        if not self._telegram_networks:
+            self.log(
+                "[NovaDivert][Redirect] ВНИМАНИЕ: список адресов Telegram пуст "
+                f"({_data_file('ip', 'telegram.txt')}). Весь трафик Telegram пойдёт мимо релея."
+            )
 
     def _is_games_target(self, host):
         try:

@@ -21,6 +21,26 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
     if _root.is_dir() and str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
+def _data_path(*parts):
+    r"""Данные верхнего уровня (`ip/`, `list/`, `temp/`) лежат НЕ рядом с модулем.
+
+    `REPO_ROOT` — на два уровня выше этого файла: из исходников это корень
+    репозитория, где `ip/`, `list/` и `temp/` лежат рядом, а в установленной
+    программе — `{app}\resources` (NovaInstaller.iss:78). Установщик же кладёт
+    списки и `temp/` в `{app}` (:72), поэтому `{app}\resources\ip` не
+    существует и чтение молча давало пустой результат. Из исходников это
+    никогда не проявлялось — отсюда и «у меня работает».
+
+    Существующий файл побеждает; иначе побеждает корень, в котором есть нужный
+    каталог, — так же верно и для файлов, которые ещё предстоит создать.
+    """
+    for root in (REPO_ROOT, REPO_ROOT.parent):
+        candidate = root.joinpath(*parts)
+        if candidate.exists() or candidate.parent.is_dir():
+            return candidate
+    return REPO_ROOT.joinpath(*parts)
+
+
 from tgrelay.udp_transport import UdpEndpoint, get_udp_upstream_attempts, open_udp_endpoint  # noqa: E402
 
 
@@ -46,7 +66,7 @@ OPEN_EXISTING = 3
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 ERROR_NOT_FOUND = 1168
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-ROUTING_SETTINGS_PATH = REPO_ROOT / "temp" / "routing_settings.json"
+ROUTING_SETTINGS_PATH = _data_path("temp", "routing_settings.json")
 _ROUTING_SETTINGS_CACHE: dict = {}
 _ROUTING_SETTINGS_MTIME: float = -1.0
 ROUTING_GROUP_ALIASES = {
@@ -847,7 +867,7 @@ class NovaWfpUdpProxy:
 
 
 def _default_log_file() -> Path:
-    return REPO_ROOT / "temp" / "NovaWfpUdpProxy.log"
+    return _data_path("temp", "NovaWfpUdpProxy.log")
 
 
 def _configure_file_logging(path: Path) -> Path:
