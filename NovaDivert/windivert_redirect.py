@@ -1163,8 +1163,25 @@ class RedirectService:
                             }
                         if meta:
                             if meta.get("app_family") == "telegram" and not self._is_telegram_target(parsed["dst_ip"]):
-                                self.state.count("bypassed_tcp")
-                                continue
+                                # Телеграм-процесс, но адрес не телеграмовский:
+                                # обновления, DNS, хосты мини-приложений. Здесь
+                                # стоял `continue`, который перепрыгивал через
+                                # единственный api.send в конце цикла — то есть
+                                # пакет не уходил НИКУДА, при счётчике с именем
+                                # bypassed, читающемся ровно наоборот.
+                                # Просто пропустить его тоже нельзя: meta для
+                                # такого потока существует только когда режим
+                                # Telegram не «direct», и тогда прямой выход —
+                                # это настоящий IP наружу. Правильный адресат
+                                # уже назван самим модулем: для нелистового
+                                # адреса _service_port_for_meta возвращает общий
+                                # tcp_proxy_port, а прокси умеет app_family
+                                # telegram с нетелеграмовским адресом
+                                # (NovaWFP/proxy/tcp_proxy.py, ветка
+                                # is_telegram_app). Отдельный счётчик — потому
+                                # что bypassed_tcp растёт ещё и от потоков без
+                                # meta и одним числом их было не разделить.
+                                self.state.count("telegram_offlist_tcp")
                             service_port = self._service_port_for_meta(meta)
                             # Redirect to the packet's local interface where
                             # the transparent proxy listens on 0.0.0.0.
@@ -1227,8 +1244,11 @@ class RedirectService:
                             meta = self._lookup_flow(parsed)
                             if meta:
                                 if meta.get("app_family") == "telegram" and not self._is_telegram_target(parsed["dst_ip"]):
-                                    self.state.count("bypassed_udp")
-                                    continue
+                                    # Зеркало TCP-ветки выше: `continue` дропал
+                                    # датаграмму, а прямой выпуск раскрыл бы
+                                    # настоящий IP в P2P-звонке. Ведём в общий
+                                    # UDP-прокси и считаем отдельно.
+                                    self.state.count("telegram_offlist_udp")
                                 # Same rule as the TCP branch above: rewrite to
                                 # the packet's own local interface, never to
                                 # 127.0.0.1. A datagram with src=<LAN ip> and
