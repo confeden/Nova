@@ -326,6 +326,11 @@ _HTTP_HEAD_END = b"\r\n\r\n"
 _HTTP_HEAD_MAX = 8192
 _HTTP_HEAD_TIMEOUT = 5.0
 
+# Обрыв со стороны клиента. 64 — ERROR_NETNAME_DELETED, 10053/10054 — обрыв и
+# сброс сокета, 995 — прерванная операция ввода-вывода. Всё это конец
+# соединения, а не отказ релея.
+_CLIENT_GONE_WINERRORS = frozenset({64, 995, 10053, 10054, 10058})
+
 
 def _split_http_authority(target: str) -> Tuple[Optional[str], Optional[int]]:
     """`host:port` из строки запроса CONNECT.
@@ -2668,6 +2673,18 @@ class TelegramTransparentRelayServer:
                 )
         except asyncio.IncompleteReadError:
             pass
+        except OSError as exc:
+            # Клиент ушёл — это не авария релея, а обычный конец соединения, и
+            # чаще всего мы же его и оборвали: Nova сама сбрасывает TCP-сессии
+            # Telegram, чтобы клиент переподключился через релей («сброшено
+            # TCP-сессий N» в логе), а следом сюда прилетает WinError 64.
+            # Пользователь читал это как поломку — строка называется «Ошибка
+            # клиента» и появляется пачками сразу после запуска.
+            if getattr(exc, "winerror", None) in _CLIENT_GONE_WINERRORS or isinstance(
+                exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+            ):
+                return
+            self.log_func(f"[TgRelay] Ошибка клиента {label}: {exc}")
         except Exception as exc:
             try:
                 text = str(exc or "").strip().lower()
