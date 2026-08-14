@@ -1,4 +1,4 @@
-# version: 1.36
+# version: 1.36.1
 t.me
 tdesktop.com
 telegra.ph
