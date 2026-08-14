@@ -4826,11 +4826,32 @@ try:
                 else:
                     discord_route = f"PROXY 127.0.0.1:1371; {last_resort}" if opera_active else last_resort
 
-                telegram_route = _route_for_app_mode(get_routing_app_mode("telegram", routing_settings), ru_route)
+                telegram_mode = get_routing_app_mode("telegram", routing_settings)
+                telegram_route = _route_for_app_mode(telegram_mode, ru_route)
                 tgrelay_port = 1372
-                tgrelay_active = self.is_port_open(tgrelay_port)
+                # Релей перебивает маршрут только пока пользователь не выбрал
+                # егресс сам. warp/opera/direct в настройках — явная воля, а до
+                # сих пор поднятый релей затирал её молча: маршрут переставал
+                # соответствовать тому, что показано в UI.
+                tgrelay_active = self.is_port_open(tgrelay_port) and telegram_mode == "auto"
                 if tgrelay_active:
-                    telegram_route = f"SOCKS5 127.0.0.1:{tgrelay_port}"
+                    # Два токена на один порт, потому что клиенты читают PAC
+                    # по-разному. Chrome/Firefox берут первый понятный им токен
+                    # и используют SOCKS5. Системный прокси Windows
+                    # (WinINET/WinHTTP) слова SOCKS5 не знает, молча его
+                    # пропускает и берёт PROXY — то есть HTTP CONNECT, который
+                    # релей теперь тоже умеет (_http_connect_handshake).
+                    # Именно из-за отсутствия второго токена клиент на
+                    # «системных настройках прокси» уходил в Opera на 1371.
+                    # Хвост — прежняя цепочка (она уже кончается last_resort).
+                    # Без него telegram был единственным маршрутом в PAC вообще
+                    # без запасного пути: отказ 1372 означал не деградацию, а
+                    # полную потерю связи, тогда как ru/eu/discord/whatsapp все
+                    # имеют хвост. Срабатывает только когда 1372 не принимает.
+                    telegram_route = (
+                        f"SOCKS5 127.0.0.1:{tgrelay_port}; "
+                        f"PROXY 127.0.0.1:{tgrelay_port}; {telegram_route}"
+                    )
                 discord_route = _route_for_app_mode(get_routing_app_mode("discord", routing_settings), discord_route)
                 whatsapp_route = _route_for_app_mode(get_routing_app_mode("whatsapp", routing_settings), ru_route)
                 ide_route = _route_for_app_mode(get_routing_app_mode("ide", routing_settings), eu_route)
@@ -4878,6 +4899,30 @@ try:
                     if opera_active
                     else '    if (matchDomain(ai_unlock, host) && matchDomain(eu, host)) return "DIRECT";\n'
                 )
+
+                # Ветка telegram по адресам стояла ниже ru_ips и была для
+                # трафика Telegram недостижима: ip/ru.txt содержит супер-сети
+                # 149.154.0.0/16 и 91.108.0.0/16, накрывающие все DC. Поэтому
+                # релей не получал ничего даже от клиентов, которые SOCKS5
+                # прекрасно понимают, — PAC им 1372 просто не называл.
+                # Клиент набирает DC по адресам, поэтому поднимается ровно
+                # адресная проверка. ДОМЕННУЮ ветку поднимать нельзя, и это
+                # проверено, а не предположено: релей — транспорт MTProto, на
+                # TLS-сессию к t.me / web.telegram.org он отвечает «200» и
+                # закрывает сокет, не передав ни байта (см. открытый вопрос про
+                # _wss_candidate). Подъём доменов сломал бы веб-Telegram и
+                # telegra.ph, которые сейчас нормально ходят через Opera/WARP.
+                # Подъём делается ТОЛЬКО пока релей жив, а пользовательские
+                # списки и exclude остаются выше: это явно выраженная воля
+                # пользователя, её перебивать нельзя.
+                if tgrelay_active:
+                    telegram_ip_priority = (
+                        "        if (matchIpEntries(host, telegram_ips)) {\n"
+                        f'            return "{telegram_route}";\n'
+                        "        }\n"
+                    )
+                else:
+                    telegram_ip_priority = ""
 
                 pac_content = f"""
     function FindProxyForURL(url, host) {{
@@ -5000,7 +5045,7 @@ try:
                 }}
             }}
         }}
-        if (matchIpEntries(host, cloudflare_ips)) {{
+{telegram_ip_priority}        if (matchIpEntries(host, cloudflare_ips)) {{
             return "{ru_route}";
         }}
         for (var i = 0; i < ru_ips.length; i++) {{
@@ -5085,6 +5130,12 @@ try:
                     str(pac_mode),
                     str(pac_config.get("full_target") or "warp"),
                     app_pref_signature,
+                    # Без этого поля подъём релея переписывал файл PAC, но
+                    # refresh_system_options() не звался, и WinINET продолжал
+                    # исполнять прежний скрипт: у него в реестре тот же
+                    # AutoConfigURL с тем же токеном. Маршрут Telegram менялся
+                    # на диске и не менялся в системе.
+                    bool(tgrelay_active),
                 )
                 if route_signature != self._last_route_signature:
                     self._last_route_signature = route_signature
