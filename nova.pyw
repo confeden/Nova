@@ -4654,9 +4654,6 @@ try:
                 discord_domains = get_discord_runtime_domains()
                 telegram_domains = get_telegram_runtime_domains()
                 whatsapp_domains = self._load_domain_list(os.path.join(base, "list", "whatsapp.txt"))
-                ide_domains = self._load_domain_list(os.path.join(base, "list", "ide.txt"))
-                if not ide_domains:
-                    ide_domains = self._load_domain_list(os.path.join(base, "list", "opencode.txt"))
                 telegram_ips = self._load_ip_list(os.path.join(base, "ip", "telegram.txt"))
                 user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_ru.txt"))
                 user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_eu.txt"))
@@ -4852,9 +4849,10 @@ try:
                         f"SOCKS5 127.0.0.1:{tgrelay_port}; "
                         f"PROXY 127.0.0.1:{tgrelay_port}; {telegram_route}"
                     )
-                discord_route = _route_for_app_mode(get_routing_app_mode("discord", routing_settings), discord_route)
-                whatsapp_route = _route_for_app_mode(get_routing_app_mode("whatsapp", routing_settings), ru_route)
-                ide_route = _route_for_app_mode(get_routing_app_mode("ide", routing_settings), eu_route)
+                discord_mode = get_routing_app_mode("discord", routing_settings)
+                whatsapp_mode = get_routing_app_mode("whatsapp", routing_settings)
+                discord_route = _route_for_app_mode(discord_mode, discord_route)
+                whatsapp_route = _route_for_app_mode(whatsapp_mode, ru_route)
                 pac_mode = str(pac_config.get("mode") or "hybrid").strip().lower()
                 pac_full_route = _route_for_target(pac_config.get("full_target"), strict=True)
 
@@ -4876,7 +4874,6 @@ try:
                 telegram_js = "{" + ",".join(f'"{d}":1' for d in telegram_domains) + "}"
                 telegram_ips_js = json.dumps(telegram_ips)
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in whatsapp_domains) + "}"
-                ide_js = "{" + ",".join(f'"{d}":1' for d in ide_domains) + "}"
 
                 # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
                 # kill-switch: DNS для них уже развязан правилами, а blackhole
@@ -4924,6 +4921,30 @@ try:
                 else:
                     telegram_ip_priority = ""
 
+                # Та же тень, что скрывала telegram, накрывала и остальные
+                # приложения — просто молча, потому что в режиме auto маршрут
+                # семейства выводится из ru/eu и совпадает с ними строка в
+                # строку. Стоит пользователю выбрать режим сам — и выбор
+                # переставал действовать: измерено на живой конфигурации,
+                # 13 хостов из 14. discord.com, discord.gg, whatsapp.com лежат
+                # в list/ru.txt, а ветки discord и whatsapp проверяются ниже
+                # ru, поэтому при «warp» в цепочку всё равно попадала Opera.
+                # Поднимаем ветку ровно тогда, когда режим не auto: в auto
+                # подъём — чистый no-op, и менять там нечего.
+                # Ниже пользовательских списков и exclude, но выше
+                # ai_unlock_guard: явно выбранный режим главнее автоматической
+                # разблокировки AI.
+                app_domain_priority = ""
+                for _list_name, _mode, _route in (
+                    ("discord", discord_mode, discord_route),
+                    ("telegram", telegram_mode, telegram_route),
+                    ("whatsapp", whatsapp_mode, whatsapp_route),
+                ):
+                    if str(_mode or "auto").strip().lower() != "auto":
+                        app_domain_priority += (
+                            f'    if (matchDomain({_list_name}, host)) return "{_route}";\n'
+                        )
+
                 pac_content = f"""
     function FindProxyForURL(url, host) {{
     host = (host || "").toLowerCase();
@@ -4951,7 +4972,6 @@ try:
     var telegram = {telegram_js};
     var telegram_ips = {telegram_ips_js};
     var whatsapp = {whatsapp_js};
-    var ide = {ide_js};
     var user_ru_ips = {user_ru_ips_js};
     var user_eu_ips = {user_eu_ips_js};
     var ru_ips = {ru_ips_js};
@@ -5098,12 +5118,11 @@ try:
     if (matchDomain(user_ru, host)) return "{ru_route}";
     if (matchDomain(user_eu, host)) return "{eu_route}";
     if (matchDomain(exclude, host)) return "DIRECT";
-{ai_unlock_guard}    if (matchDomain(eu, host)) return "{eu_route}";
+{app_domain_priority}{ai_unlock_guard}    if (matchDomain(eu, host)) return "{eu_route}";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
     if (matchDomain(telegram, host)) return "{telegram_route}";
     if (matchDomain(whatsapp, host)) return "{whatsapp_route}";
-    if (matchDomain(ide, host)) return "{ide_route}";
     // Cloudflare IP routing is a fallback for unknown domains only.
     // Explicit domain lists above must keep their selected geography.
     if (!isIpV4 && !isIpV6 && anyIpMatches(resolveHostIps(host), cloudflare_ips)) return "{ru_route}";
@@ -8326,11 +8345,6 @@ try:
                     warp_manager=globals().get("warp_manager"),
                     opera_proxy_manager=globals().get("opera_proxy_manager"),
                 ),
-                "ide": build_public_app_transport_plan(
-                    "ide",
-                    warp_manager=globals().get("warp_manager"),
-                    opera_proxy_manager=globals().get("opera_proxy_manager"),
-                ),
             }
 
             return {
@@ -9497,8 +9511,6 @@ try:
             "discord.txt": "discord.media\n",
             "telegram.txt": "telegram.org\nt.me\ntelegra.ph\ntdesktop.com\n",
             "whatsapp.txt": "whatsapp.com\nwhatsapp.net\nwa.me\n",
-            "ide.txt": "",
-            "opencode.txt": "",
             "cloudflare.txt": "",
             "general.txt": "twitter.com\ninstagram.com\n",
             "exclude.txt": "",
@@ -9995,7 +10007,7 @@ try:
 
     ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
     LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
-    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "ide", "cli", "games", "obs")
+    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "games", "obs")
     ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
     OPERA_REGION_VALUES = {"EU", "US"}
     ROUTING_GROUP_ALIASES = {
@@ -10003,21 +10015,9 @@ try:
         "telegram": "telegram",
         "whatsapp": "whatsapp",
         "discord": "discord",
-        "ide": "ide",
-        "cli": "cli",
         "games": "games",
         "poe": "games",
         "pathofexile": "games",
-        "opencode": "ide",
-        "vscode": "ide",
-        "cursor": "ide",
-        "windsurf": "ide",
-        "codex": "ide",
-        "antigravity": "ide",
-        "powershell": "cli",
-        "pwsh": "cli",
-        "cmd": "cli",
-        "gemini": "cli",
         "obs": "obs",
         "obs64": "obs",
         "obs32": "obs",
@@ -10033,8 +10033,6 @@ try:
             "telegram": "auto",
             "whatsapp": "warp",
             "discord": "warp",
-            "ide": "direct",
-            "cli": "direct",
             "games": "auto",
             "obs": "direct",
         },
@@ -10145,7 +10143,6 @@ try:
                         "telegram": "telegram",
                         "whatsapp": "whatsapp",
                         "discord": "discord",
-                        "opencode": "ide",
                     }
                     for old_key, route_key in legacy_map.items():
                         if old_key in apps:
@@ -10601,19 +10598,35 @@ try:
     # to non-blocked IPs without proxying all traffic.
 
     NOVA_NRPT_TAG = "NOVA_DNS_UNBLOCK"
+    # Google-часть выверена замером, а не на глаз: критерий — отдаёт ли
+    # xbox-dns.ru на это имя свой разблокирующий фронтенд 87.228.47.x. Если он
+    # возвращает обычные адреса Google, правило NRPT не даёт ничего и только
+    # тащит сторонний резолвер в непрофильный трафик.
+    #
+    # Убрано по замеру: ".googleapis.com" — подстановочник накрывал fonts,
+    # storage, maps, play и youtubei.googleapis.com, а разблокируются из всего
+    # домена ровно два хоста, они перечислены явно; ".googleusercontent.com" —
+    # это аватарки, Drive и превью YouTube, разблокировки нет;
+    # "accounts.google.com" — обычные адреса, вход в Google ничего не выигрывал;
+    # "gemini.google" — оба резолвера дают один и тот же 216.239.32.61.
+    #
+    # Добавлено по тому же замеру: notebooklm, labs.google, deepmind.google и
+    # cloudcode-pa.googleapis.com — последний это бэкенд Gemini Code Assist,
+    # то есть ровно то, ради чего существовал перехват CLI.
     NOVA_NRPT_NAMESPACES = (
-        ".googleapis.com",
-        ".googleusercontent.com",
-        "accounts.google.com",
         "gemini.google.com",
         ".gemini.google.com",
-        "gemini.google",
-        ".gemini.google",
         "aistudio.google.com",
         ".aistudio.google.com",
         "ai.google.dev",
         ".ai.google.dev",
+        "notebooklm.google.com",
+        "labs.google",
+        ".labs.google",
+        "deepmind.google",
+        ".deepmind.google",
         "generativelanguage.googleapis.com",
+        "cloudcode-pa.googleapis.com",
         "alkalimakersuite-pa.clients6.google.com",
         # OpenAI / ChatGPT
         "openai.com",
@@ -25919,8 +25932,6 @@ try:
             ("telegram", "Telegram"),
             ("whatsapp", "WhatsApp"),
             ("discord", "Discord"),
-            ("ide", "IDE"),
-            ("cli", "CLI"),
             ("games", "Games"),
             ("obs", "OBS"),
         )
