@@ -6,7 +6,197 @@
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=6",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MA77",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=6",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MFF9",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=4",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M5CE",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
                 "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig,badseq",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MDEF",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split2",
+                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badseq,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=8",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MCAD",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badseq,ts",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M78F",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=disorder",
+                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=4",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M25B",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig,ts",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=6",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_ME8C",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MF5E",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MB6F",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=padencap",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
                 "--dpi-desync-fooling=md5sig,ts",
                 "--dpi-desync-split-seqovl=1",
@@ -40,17 +230,17 @@
             ]
         },
         {
-            "name": "general_M18B",
+            "name": "general_M502",
             "args": [
                 "--filter-tcp=80,443",
-                "--dpi-desync=split2",
+                "--dpi-desync=hostfakesplit",
                 "--dpi-desync-fake-tls-mod=padencap",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
                 "--dpi-desync-fooling=badsum",
                 "--dpi-desync-split-seqovl=1",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
                 "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
+                "--dpi-desync-ttl=6",
                 "--new",
                 "--filter-udp=443",
                 "--dpi-desync=fake",
@@ -59,13 +249,32 @@
             ]
         },
         {
-            "name": "general_MD69",
+            "name": "general_ME82",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=padencap",
+                "--dpi-desync-fake-tls-mod=dupsid",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,ts",
+                "--dpi-desync-fooling=ts,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=6",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MD48",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=none",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
                 "--dpi-desync-split-seqovl=1",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
                 "--dpi-desync-autottl=1",
@@ -78,11 +287,163 @@
             ]
         },
         {
-            "name": "general_M36E",
+            "name": "general_M30B",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
+                "--dpi-desync-fake-tls-mod=padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=6",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M117",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=8",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M117",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=8",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MEBE",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MA20",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M2B4",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M233",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=6",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MB3B",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_ME17",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
                 "--dpi-desync-fooling=ts",
                 "--dpi-desync-split-seqovl=1",
@@ -97,32 +458,13 @@
             ]
         },
         {
-            "name": "alt_1_M22F",
+            "name": "general_MFFE",
             "args": [
                 "--filter-tcp=80,443",
-                "--dpi-desync=multisplit",
-                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync=split",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M917",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,ts",
+                "--dpi-desync-fooling=badseq,md5sig",
                 "--dpi-desync-split-seqovl=1",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
                 "--dpi-desync-autottl=1",
@@ -135,13 +477,146 @@
             ]
         },
         {
-            "name": "general_M3BC",
+            "name": "general_MCE3",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badseq,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M639",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts,md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=8",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M398",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=fakedsplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M9CF",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=split",
+                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badsum",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MA39",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=ts,badseq",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=8",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_M0C6",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=8",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MA6F",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=hostfakesplit",
+                "--dpi-desync-fake-tls-mod=dupsid",
+                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+                "--dpi-desync-fooling=md5sig,badseq",
+                "--dpi-desync-split-seqovl=1",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+                "--dpi-desync-autottl=1",
+                "--dpi-desync-ttl=5",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
+            "name": "general_MFBE",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid",
+                "--dpi-desync-fake-tls-mod=none",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
+                "--dpi-desync-fooling=badseq,md5sig",
                 "--dpi-desync-split-seqovl=1",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
                 "--dpi-desync-autottl=1",
@@ -173,187 +648,16 @@
             ]
         },
         {
-            "name": "general_MA2B",
+            "name": "general_M153",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts,badseq",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=6",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M91A",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig,badseq",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=6",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_ME17",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=6",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M1C9",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multidisorder",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MBAC",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=disorder",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig,ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=6",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MA83",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=fakeddisorder",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts,md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M3F8",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multidisorder",
-                "--dpi-desync-fake-tls-mod=dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig,ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_ME30",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MAD0",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
                 "--dpi-desync-fake-tls-mod=rnd,dupsid",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
                 "--dpi-desync-fooling=badseq,ts",
                 "--dpi-desync-split-seqovl=1",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
                 "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=6",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M553",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multidisorder",
-                "--dpi-desync-fake-tls-mod=dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
                 "--dpi-desync-ttl=5",
                 "--new",
                 "--filter-udp=443",
@@ -363,321 +667,17 @@
             ]
         },
         {
-            "name": "general_M151",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig,ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=7",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M511",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MCFD",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badsum",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=6",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M245",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "alt_1_MD48",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "alt_1_M15D",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M1DB",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=datanoack",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M02A",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MB99",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multidisorder",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig,ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M9CA",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig,ts",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=11",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MD51",
+            "name": "general_M7DF",
             "args": [
                 "--filter-tcp=80,443",
                 "--dpi-desync=hostfakesplit",
                 "--dpi-desync-fake-tls-mod=padencap",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M60F",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rnd",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M810",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multidisorder",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badseq,md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=4",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M9E2",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=rndsni",
                 "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
                 "--dpi-desync-fooling=md5sig,badseq",
                 "--dpi-desync-split-seqovl=1",
                 "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
                 "--dpi-desync-autottl=1",
                 "--dpi-desync-ttl=8",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MC86",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=split2",
-                "--dpi-desync-fake-tls-mod=rnd,dupsid",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=md5sig",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=4",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_M063",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=hostfakesplit",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=ts,badseq",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
-                "--new",
-                "--filter-udp=443",
-                "--dpi-desync=fake",
-                "--dpi-desync-repeats=6",
-                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
-            ]
-        },
-        {
-            "name": "general_MDE7",
-            "args": [
-                "--filter-tcp=80,443",
-                "--dpi-desync=multidisorder",
-                "--dpi-desync-fake-tls-mod=none",
-                "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
-                "--dpi-desync-fooling=badsum",
-                "--dpi-desync-split-seqovl=1",
-                "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
-                "--dpi-desync-autottl=1",
-                "--dpi-desync-ttl=5",
                 "--new",
                 "--filter-udp=443",
                 "--dpi-desync=fake",

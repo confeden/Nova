@@ -94,6 +94,7 @@ fubgun.com
 funpay.com
 g2g.com
 ggpht.com
+github.com
 glbgpt.com
 godaddy.com
 goentri.com
@@ -159,6 +160,7 @@ nova.net
 nowpayments.io
 ntfy.sh
 nvidia.com
+objects.githubusercontent.com
 obmen.one
 obsproject.com
 on.aws

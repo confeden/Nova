@@ -22,9 +22,6 @@ domclick.ru
 dzen.ru
 eapteka.ru
 g.co
-github.com
-github.io
-githubassets.com
 gosuslugi.ru
 gov.ru
 gu-st.ru
