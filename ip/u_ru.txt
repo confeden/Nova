@@ -1,2 +1,2 @@
-# version: 1.36.1
+# version: 1.36.2
 # user WARP override IPs/CIDR

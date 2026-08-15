@@ -21796,6 +21796,30 @@ try:
         except Exception as e:
             safe_trace(f"[IP Worker] Error: {e}")
 
+    def warp_route_usable(connected, port_open, socks_ok, failed_recoveries, good_probe_streak):
+        """Считать ли WARP годным для маршрута PAC.
+
+        Обычно достаточно связки «подключён + порт открыт + проба прошла». Но
+        пока восстановление проваливается подряд, одной удачной пробы мало.
+
+        Замерено на машине пользователя: 53 попытки восстановления за 100 минут,
+        «Соединение восстановлено» — НИ РАЗУ, и всё это время PAC писал
+        «WARP 1370 доступен». Проба в 1.8 с изредка проходит на канале, который
+        реального трафика не несёт, и этого хватало, чтобы удержать WARP первым
+        в цепочке — то есть отправить весь RU-трафик в чёрную дыру при живой
+        Opera рядом. Watchdog при этом всё понимал и каждые полминуты писал
+        «порт открыт, но трафик через WARP не проходит».
+
+        Ужесточение узкое: только при двух и более провалившихся подряд
+        восстановлениях и только до двух удачных проб подряд. Успешное
+        восстановление обнуляет счётчик, и правило снова спит.
+        """
+        if not (connected and port_open and socks_ok):
+            return False
+        if failed_recoveries >= 2 and good_probe_streak < 2:
+            return False
+        return True
+
     def proxy_watchdog_worker(log_func):
         """Monitors WARP and Opera Proxy, restarts if crashed."""
         def is_local_port_open(port):
@@ -21828,6 +21852,8 @@ try:
         opera_last_port_down_log_ts = 0.0
         opera_last_recover_fail_log_ts = 0.0
         warp_bad_proxy_streak = 0
+        warp_good_probe_streak = 0
+        warp_failed_recoveries = 0
         warp_last_good_ts = 0.0
         warp_next_recovery_ts = 0.0
         singbox_next_restart_ts = 0.0
@@ -21914,15 +21940,24 @@ try:
 
                     if warp_port_open and warp_socks_ok:
                         warp_bad_proxy_streak = 0
+                        warp_good_probe_streak += 1
                         warp_last_good_ts = now
                         warp_next_recovery_ts = 0.0
                         last_warp_issue_state = None
                     elif warp_port_open and not warp_socks_ok:
                         warp_bad_proxy_streak += 1
+                        warp_good_probe_streak = 0
                     else:
                         warp_bad_proxy_streak = 0
+                        warp_good_probe_streak = 0
 
-                    warp_usable = bool(warp_connected_flag and warp_port_open and warp_socks_ok)
+                    warp_usable = warp_route_usable(
+                        warp_connected_flag,
+                        warp_port_open,
+                        warp_socks_ok,
+                        warp_failed_recoveries,
+                        warp_good_probe_streak,
+                    )
 
                     recover_reason = None
                     issue_state = None
@@ -21962,11 +21997,21 @@ try:
 
                             if recovered:
                                 warp_bad_proxy_streak = 0
+                                warp_failed_recoveries = 0
                                 warp_last_good_ts = time.time()
                                 warp_next_recovery_ts = 0.0
                                 last_warp_issue_state = None
                                 log_func("[RU] Соединение восстановлено.")
                             else:
+                                warp_failed_recoveries += 1
+                                # Второй провал подряд — уже не «моргнуло»:
+                                # говорим об этом один раз, чтобы в логе было
+                                # видно, почему WARP перестал быть первым.
+                                if warp_failed_recoveries == 2:
+                                    log_func(
+                                        "[RU] WARP не восстанавливается: маршрут RU уходит на Opera, "
+                                        "пока проба не пройдёт дважды подряд."
+                                    )
                                 warp_next_recovery_ts = time.time() + 20.0
                                 last_warp_issue_state = "recover_failed"
                                 log_func(f"[RU] Не удалось восстановить WARP автоматически. Последний статус: {warp_status}")

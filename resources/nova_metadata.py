@@ -2,7 +2,7 @@ import os
 import re
 from pathlib import Path
 
-CURRENT_VERSION = "1.36.1"
+CURRENT_VERSION = "1.36.2"
 WINWS_FILENAME = "winws.exe"
 UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
 

@@ -133,7 +133,7 @@
         "--dpi-desync-autottl=5",
         "--dpi-desync-ttl=5"
     ],
-    "version": "1.36.1",
+    "version": "1.36.2",
     "alt_1": [
         "--filter-tcp=80,443",
         "--dpi-desync=hostfakesplit",
