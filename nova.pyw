@@ -16,8 +16,24 @@
 # ------------------------------------------------------------
 import subprocess, sys, importlib, logging, os
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+# В оконной сборке (.pyw, PyInstaller --noconsole) sys.stderr равен None, а
+# StreamHandler копирует его в self.stream на момент создания. Дальше КАЖДАЯ
+# запись через корневой логгер падает в emit с «NoneType object has no attribute
+# write», и logging печатает свою простыню «--- Logging error ---» вместо самого
+# сообщения.
+#
+# Чем это обошлось, видно в захвате с чистой ВМ 2026-08-16: единственным
+# потерянным сообщением оказалось предупреждение релея «Терминатор недоступен —
+# рукопожатия идут своим стеком CPython, маскировка выключена». То есть
+# диагностика, поставленная ровно для того, чтобы поймать молчаливое отключение
+# маскировки, сама и сломалась — и молчание продлилось.
+#
+# Без потока обработчик не нужен: у Nova есть собственный журнал.
+if sys.stderr is None and sys.stdout is None:
+    logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+else:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
 
 # -----------------------------------------------------------------
 # 1) Ensure that the *pip* module exists (some Python builds skip it)

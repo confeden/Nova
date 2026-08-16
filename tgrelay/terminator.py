@@ -53,7 +53,22 @@ def runtime_path() -> str:
     Under `temp/` because both values are regenerated every run — the token is
     not a secret to keep, it is a secret to hold for as long as the helper lives.
     """
+    # Тот же шаг вверх, что и APP_ROOT в transparent_relay.py:40, и по той же
+    # причине: из исходников `tgrelay/` лежит в корне репозитория, а в
+    # установленной программе — в `{app}\\resources\\tgrelay`, тогда как `temp/`
+    # установщик кладёт в `{app}`. Без поправки путь указывал в несуществующий
+    # `{app}\\resources\\temp`, файл не находился, `is_enabled()` отвечал False —
+    # и МАСКИРОВКА TLS БЫЛА ВЫКЛЮЧЕНА У КАЖДОГО УСТАНОВЛЕННОГО ПОЛЬЗОВАТЕЛЯ,
+    # молча. Из исходников всё сходилось, поэтому дефект и дожил до сюда.
+    #
+    # Доказано захватом с чистой ВМ 2026-08-16: терминатор поднят в 17:15:12,
+    # {app}\\temp\\tls_terminator.json существует с валидными port и token, а
+    # релей в 17:17:01 пишет «Терминатор недоступен — рукопожатия идут своим
+    # стеком CPython (отпечаток t13d181100)». Каталога resources\\temp в захвате
+    # нет вовсе.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.basename(root).lower() == "resources":
+        root = os.path.dirname(root)
     return os.path.join(root, "temp", "tls_terminator.json")
 
 

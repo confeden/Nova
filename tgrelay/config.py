@@ -63,9 +63,16 @@ _CF_WS_SECRET_CACHE: List[str] = []
 
 
 def _read_cf_ws_secret_file() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    # `awg/` установщик кладёт в {app}, а этот модуль живёт в {app}\resources\tgrelay,
+    # поэтому одного шага вверх мало — нужен ещё один, как в APP_ROOT
+    # (transparent_relay.py:40). Тот же промах уже стоил выключенной маскировки
+    # TLS в terminator.py.
     candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cf_ws.key"),
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "awg", "cf_ws.key"),
+        os.path.join(here, "cf_ws.key"),
+        os.path.join(root, "awg", "cf_ws.key"),
+        os.path.join(os.path.dirname(root), "awg", "cf_ws.key"),
     ]
     for path in candidates:
         try:

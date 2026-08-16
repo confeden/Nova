@@ -775,15 +775,6 @@ class RedirectService:
         self._log_limiter = {}
         self._telegram_networks = _load_ip_networks(_data_file("ip", "telegram.txt"))
         self._games_networks = _load_ip_networks(_data_file("ip", "games.txt"))
-        # Пустой список адресов Telegram — не мелочь: он превращает КАЖДЫЙ поток
-        # клиента в «нетелеграмовский» и уводит его мимо релея. Раньше это
-        # состояние было полностью немым, и распознать его удалось только по
-        # счётчикам на чужой машине. Теперь оно называет себя само.
-        if not self._telegram_networks:
-            self.log(
-                "[NovaDivert][Redirect] ВНИМАНИЕ: список адресов Telegram пуст "
-                f"({_data_file('ip', 'telegram.txt')}). Весь трафик Telegram пойдёт мимо релея."
-            )
 
     def _is_games_target(self, host):
         try:
@@ -1301,6 +1292,20 @@ class RedirectService:
         with open(self.log_path, "w", encoding="utf-8", newline="") as f:
             f.write("")
         self.log("[NovaDivert][Redirect] starting.")
+        # Именно здесь, а не в __init__: run() парой строк выше усекает этот же
+        # файл режимом "w", поэтому предупреждение, написанное из конструктора,
+        # стиралось до того, как его кто-либо увидел. Диагностика, добавленная в
+        # 1.36.1 ровно для этого случая, была недостижима — нашлось при разборе
+        # захвата с чистой ВМ.
+        #
+        # Пустой список адресов Telegram превращает КАЖДЫЙ поток клиента в
+        # «нетелеграмовский» и уводит его мимо релея; распознать это состояние
+        # иначе как по счётчикам было нельзя.
+        if not self._telegram_networks:
+            self.log(
+                "[NovaDivert][Redirect] ВНИМАНИЕ: список адресов Telegram пуст "
+                f"({_data_file('ip', 'telegram.txt')}). Весь трафик Telegram пойдёт мимо релея."
+            )
         with contextlib.suppress(Exception):
             elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
             self.state.set_meta("elevated", elevated)
