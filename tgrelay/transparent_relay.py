@@ -63,7 +63,11 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return float(default)
 
 
-FIRST_BYTE_STALL_RETRY = _env_bool("NOVA_TG_RELAY_FIRST_BYTE_RETRY", False)
+# Включено по умолчанию с 1.36.3. Выключенным оно ничего не стоило и ничего не
+# давало; цена ошибки в другую сторону измерена — молчащий егресс держит
+# соединение до таймаута, хотя рядом есть отвечающий за полсекунды.
+# NOVA_TG_RELAY_FIRST_BYTE_RETRY=0 возвращает прежнее поведение.
+FIRST_BYTE_STALL_RETRY = _env_bool("NOVA_TG_RELAY_FIRST_BYTE_RETRY", True)
 FIRST_DOWN_UPLOAD_IDLE_GRACE = _env_float(
     "NOVA_TG_RELAY_UPLOAD_IDLE_GRACE",
     6.0,
@@ -833,6 +837,31 @@ def _native_state(dc: int, label: str):
     if not entry or entry[1] <= time.monotonic():
         return None
     return entry[0]
+
+
+def _should_retry_after_stall(bootstrap_canonical: bool, initial: bytes, route_label: str, dc_hint: int) -> bool:
+    """Менять ли егресс, который принял соединение и не прислал ни байта.
+
+    Раньше условие требовало DC строго из (1, 3, 5), и ROADMAP записал механизм
+    как бесполезный: европейские DC2/DC4 в него не попадали. Измерение
+    2026-08-13 показало цену — до `updates.tdesktop.com` (149.154.167.80, это
+    DC2) WARP не дотягивается, рукопожатие TLS истекает за 12.1 с, а Opera
+    отвечает за 0.5 с. SOCKS5 к WARP при этом проходит, поэтому отказ по
+    коннекту такое не ловит: проблема живёт уровнем выше.
+
+    Вместо номера DC — вопрос по существу: доказан ли этот егресс для этого DC.
+    Доказанный не трогаем, даже медленный: отбирать у рабочего канала 0.75 с
+    нельзя. Недоказанный меняем — тот же сигнал уже управляет коротким поводком
+    в `_bridge_streams`, так что это не новая агрессивность, а доведение её до
+    повторной попытки вместо молчаливой сдачи.
+
+    `initial` обязателен: без него нечего переиграть на новом соединении.
+    """
+    if not FIRST_BYTE_STALL_RETRY or bootstrap_canonical or not initial:
+        return False
+    if str(route_label or "").strip().lower() != "warp-socks":
+        return False
+    return _native_state(dc_hint, route_label) is not True
 
 
 def _native_candidate_labels() -> List[str]:
@@ -3186,13 +3215,7 @@ class TelegramTransparentRelayServer:
                 self._route_preference_until[pref_key] = (str(route_label).strip().lower(), time.monotonic() + 300.0)
         except Exception:
             pass
-        if (
-            FIRST_BYTE_STALL_RETRY
-            and (not bootstrap_canonical)
-            and initial
-            and str(route_label or "").strip().lower() == "warp-socks"
-            and int(dc_hint or 0) in (1, 3, 5)
-        ):
+        if _should_retry_after_stall(bootstrap_canonical, initial, route_label, dc_hint):
             try:
                 prefetched_reply = await asyncio.wait_for(
                     upstream_reader.read(1),
