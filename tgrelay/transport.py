@@ -33,27 +33,71 @@ def _tag(exc: BaseException, reached: int) -> BaseException:
 
 _upstream_provider = None
 
-_warned_bare_hello = False
+_log_func = None
 
 
-def _warn_bare_hello_once() -> None:
-    """Say once per process that the handshakes stopped being shaped.
+def set_log_func(func) -> None:
+    """Направить строки этого модуля в тот же журнал, что и остальной релей.
 
-    Once, not per connection: the relay opens dozens of tunnels a minute and a
-    line on each would bury the log. Once is enough — the condition is
-    process-wide and does not come back on its own.
+    Раньше они шли только через `logging`, а внутри Nova это корневой логгер,
+    у которого в оконной сборке нет потока вовсе. Поэтому единственное
+    сообщение, ради которого весь этот модуль и существует («маскировка
+    выключена»), попадало в захват только из `NovaWFP/proxy/tcp_proxy.py` —
+    единственного клиентского процесса, который настраивает FileHandler. Релей,
+    работающий потоком внутри Nova, не говорил об этом ничего.
     """
-    global _warned_bare_hello
-    if _warned_bare_hello:
-        return
-    _warned_bare_hello = True
+    global _log_func
+    _log_func = func if callable(func) else None
+
+
+def _say(message: str, warning: bool = False) -> None:
+    func = _log_func
+    if callable(func):
+        try:
+            func(message)
+            return
+        except Exception:
+            pass
     try:
-        logging.getLogger("tg-mtproto-proxy").warning(
-            "[TgRelay] Терминатор недоступен — рукопожатия идут своим стеком CPython "
-            "(отпечаток t13d181100). Релей работает, маскировка выключена."
-        )
+        logger = logging.getLogger("tg-mtproto-proxy")
+        (logger.warning if warning else logger.info)(message)
     except Exception:
         pass
+
+
+_noted_tls_verdict = False
+
+
+def _note_tls_verdict_once(enabled: bool) -> None:
+    """Сказать один раз за процесс, шифруется ли рукопожатие терминатором.
+
+    Один раз, не на каждое соединение: релей открывает десятки туннелей в
+    минуту. И обязательно ОБЕ ветки: до 1.37 при работающей маскировке журнал
+    молчал, при молча выключенной — тоже молчал, так что отличить одно от
+    другого можно было только рассуждением об отсутствии строки. Ровно поэтому
+    дефект относительного пути в `runtime_path()` дожил до каждого
+    установленного пользователя. Вывод о маскировке должен читаться из журнала
+    прямо, а не выводиться из тишины.
+
+    Говорится в момент решения, а не после удачного рукопожатия: иначе процесс,
+    у которого все туннели упали, снова не сказал бы ничего.
+    """
+    global _noted_tls_verdict
+    if _noted_tls_verdict:
+        return
+    _noted_tls_verdict = True
+    if enabled:
+        _say(
+            "[TgRelay] Маскировка TLS включена: рукопожатия выполняет терминатор на "
+            f"127.0.0.1:{terminator.terminator_port()}, форма {terminator.active_profile()}."
+        )
+        return
+    _say(
+        "[TgRelay] Терминатор недоступен — рукопожатия идут своим стеком CPython "
+        "(отпечаток t13d181100). Релей работает, маскировка выключена. "
+        f"Файл параметров: {terminator.runtime_path()}",
+        warning=True,
+    )
 
 
 def set_upstream_provider(provider: Optional[Callable[[], List[Dict[str, object]]]]) -> None:
@@ -259,6 +303,7 @@ async def open_tls_stream(
     # and failures still arrive as an annotated OSError. Off unless configured,
     # so this stays a lever rather than a migration.
     if terminator.is_enabled():
+        _note_tls_verdict_once(True)
         return await terminator.open_shaped_stream(
             target_host,
             int(target_port),
@@ -272,7 +317,7 @@ async def open_tls_stream(
     # helper that died mid-session drops the whole relay back to CPython's hello
     # here — and it used to do that without saying a word. The relay keeps
     # working; what it loses is the only thing this indirection exists for.
-    _warn_bare_hello_once()
+    _note_tls_verdict_once(False)
 
     sock, label = await asyncio.to_thread(
         _open_tunnel_socket_sync,

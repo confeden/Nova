@@ -34,7 +34,13 @@ from .raw_websocket import (
     offers_deflate,
     set_sock_opts,
 )
-from .transport import open_stream, open_tls_stream, set_upstream_provider, get_upstream_attempts
+from .transport import (
+    open_stream,
+    open_tls_stream,
+    set_upstream_provider,
+    get_upstream_attempts,
+    set_log_func as set_transport_logger,
+)
 
 
 log = logging.getLogger("nova.telegram.relay")
@@ -1604,6 +1610,9 @@ class TelegramTransparentRelayServer:
         # Egress switching happens in module-level code shared with the NovaWFP
         # proxy; route it to the same console the rest of the relay writes to.
         set_wss_egress_logger(self.log_func)
+        # То же и для вердикта о маскировке TLS: без этого он оставался в
+        # `logging`, а у корневого логгера в оконной сборке нет потока.
+        set_transport_logger(self.log_func)
         self.upstream_provider = upstream_provider
         self.warp_bootstrap_waiter = warp_bootstrap_waiter
         self.thread = None
