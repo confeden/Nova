@@ -22,6 +22,9 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
     if _root.is_dir() and str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
+APP_ROOT = REPO_ROOT.parent if REPO_ROOT.name.lower() == "resources" else REPO_ROOT
+
+
 def _data_path(*parts):
     r"""Данные верхнего уровня (`ip/`, `list/`, `temp/`) лежат НЕ рядом с модулем.
 
@@ -29,17 +32,32 @@ def _data_path(*parts):
     репозитория, где `ip/`, `list/` и `temp/` лежат рядом, а в установленной
     программе — `{app}\resources` (NovaInstaller.iss:78). Установщик же кладёт
     списки и `temp/` в `{app}` (:72), поэтому `{app}\resources\ip` не
-    существует и чтение молча давало пустой результат. Из исходников это
-    никогда не проявлялось — отсюда и «у меня работает».
+    существует и чтение молча давало пустой результат.
 
-    Существующий файл побеждает; иначе побеждает корень, в котором есть нужный
-    каталог, — так же верно и для файлов, которые ещё предстоит создать.
+    Корень определяется тем же правилом, что и `APP_ROOT` в
+    `tgrelay/transparent_relay.py`: перешагнуть каталог по имени `resources`.
+    Оно однозначно, а прежняя эвристика — нет и стоила ещё одного тихого отказа
+    у установленных пользователей. Она звучала «существующий файл побеждает,
+    иначе побеждает корень, в котором есть нужный каталог» и проверялась как
+    `candidate.exists() or candidate.parent.is_dir()`. Для файла (`ip/x.txt`)
+    это работает: `{app}\resources\ip` не каталог, кандидат отвергается. А для
+    САМОГО КАТАЛОГА (`_data_path("ip")`) родителем оказывается корень, который
+    существует всегда, — и первый же кандидат `{app}\resources\ip` принимался,
+    хотя его нет. Единственный такой вызов — `_load_networks`, и в захвате с ВМ
+    это видно строкой `discord-networks=0 telegram-networks=0
+    whatsapp-networks=0`: `_is_telegram_target` отвечал False на любой адрес, а
+    значит off-list трафик Telegram не разбирался как MTProto (:1819), не
+    получал своего порядка егрессов (:860) и не отслеживался на залипание
+    (:1947).
+
+    Существующий путь побеждает — файл он или каталог; иначе побеждает `{app}`,
+    что верно и для файлов, которые ещё предстоит создать (`temp/*.log`).
     """
-    for root in (REPO_ROOT, REPO_ROOT.parent):
+    for root in (APP_ROOT, REPO_ROOT):
         candidate = root.joinpath(*parts)
-        if candidate.exists() or candidate.parent.is_dir():
+        if candidate.exists():
             return candidate
-    return REPO_ROOT.joinpath(*parts)
+    return APP_ROOT.joinpath(*parts)
 
 
 from tgrelay.transport import open_stream  # noqa: E402

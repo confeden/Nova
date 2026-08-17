@@ -21,24 +21,27 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
     if _root.is_dir() and str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
+APP_ROOT = REPO_ROOT.parent if REPO_ROOT.name.lower() == "resources" else REPO_ROOT
+
+
 def _data_path(*parts):
     r"""Данные верхнего уровня (`ip/`, `list/`, `temp/`) лежат НЕ рядом с модулем.
 
-    `REPO_ROOT` — на два уровня выше этого файла: из исходников это корень
-    репозитория, где `ip/`, `list/` и `temp/` лежат рядом, а в установленной
-    программе — `{app}\resources` (NovaInstaller.iss:78). Установщик же кладёт
-    списки и `temp/` в `{app}` (:72), поэтому `{app}\resources\ip` не
-    существует и чтение молча давало пустой результат. Из исходников это
-    никогда не проявлялось — отсюда и «у меня работает».
+    Копия правила из `tcp_proxy.py` — оба помощника обязаны считать одинаково;
+    там же расписано, чем обошлась прежняя эвристика с
+    `candidate.parent.is_dir()`. Здесь она не выстрелила только потому, что все
+    вызовы двухсоставные (`temp/...`), но расхождение между двумя копиями
+    одного резолвера — это следующий такой же тихий отказ.
 
-    Существующий файл побеждает; иначе побеждает корень, в котором есть нужный
-    каталог, — так же верно и для файлов, которые ещё предстоит создать.
+    Корень определяется тем же правилом, что и `APP_ROOT` в
+    `tgrelay/transparent_relay.py`: перешагнуть каталог по имени `resources`.
+    Существующий путь побеждает — файл он или каталог; иначе побеждает `{app}`.
     """
-    for root in (REPO_ROOT, REPO_ROOT.parent):
+    for root in (APP_ROOT, REPO_ROOT):
         candidate = root.joinpath(*parts)
-        if candidate.exists() or candidate.parent.is_dir():
+        if candidate.exists():
             return candidate
-    return REPO_ROOT.joinpath(*parts)
+    return APP_ROOT.joinpath(*parts)
 
 
 from tgrelay.udp_transport import UdpEndpoint, get_udp_upstream_attempts, open_udp_endpoint  # noqa: E402
