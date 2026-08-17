@@ -1,10 +1,11 @@
-# version: 1.36.2
+# version: 1.37
 1337x.to
 1e100cdn.net
 7tv.app
 7tv.io
 abuseipdb.com
 accounts.google.com
+activatica.org
 adguard-mail.com
 adobe.com
 adobe.io
@@ -16,6 +17,7 @@ announcekit.app
 anydesk.com
 archive.org
 arena.ai
+arkoselabs.com
 arm.com
 arrow.com
 awswaf.com
@@ -55,8 +57,6 @@ cloudflarestream.com
 cloudfront.net
 coinbase.com
 comicbook.com
-content-assets.pathofexile.com
-content.pathofexile.com
 cryptocloud.plus
 cryptomus.com
 cursor.directory
@@ -74,6 +74,7 @@ dw.com
 ecosyste.ms
 edgee.ai
 element.io
+emp.bbc.co.uk
 engagement.ai
 etoneya.su
 evolution-x.org
@@ -110,11 +111,13 @@ groq.com
 hdkinoteatr.com
 hexed.it
 hls.ttvnw.net
+hlsloader.com
 ibb.co
 instagram.com
 ip-tracker.org
 iplogger.org
 island-of-pleasure.site
+issuehunt.io
 jabber.fr
 jnn-pa.googleapis.com
 killedbygoogle.com
@@ -166,6 +169,7 @@ obsproject.com
 on.aws
 onorca.dev
 ookla.com
+open.live.bbc.co.uk
 optimizely.com
 pacloudflare.com
 pathofbuilding.community
@@ -182,6 +186,7 @@ proxyliberty.com
 proxynova.com
 puter.chat
 puter.site
+raw.githubusercontent.com
 recaptcha.net
 receive-sms.io
 redav.online
@@ -251,6 +256,7 @@ userscript.zone
 vecpea.com
 vector.im
 vercel-storage.com
+vercel.app
 verisoul.ai
 vultrusercontent.com
 warp.dev

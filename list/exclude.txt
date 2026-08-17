@@ -1,4 +1,4 @@
-# version: 1.36.2
+# version: 1.37
 1c-bitrix.ru
 akamaihd.net
 apteka-april.ru
