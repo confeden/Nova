@@ -17,23 +17,45 @@
 import subprocess, sys, importlib, logging, os
 
 # В оконной сборке (.pyw, PyInstaller --noconsole) sys.stderr равен None, а
-# StreamHandler копирует его в self.stream на момент создания. Дальше КАЖДАЯ
-# запись через корневой логгер падает в emit с «NoneType object has no attribute
-# write», и logging печатает свою простыню «--- Logging error ---» вместо самого
-# сообщения.
+# StreamHandler подставляет его и ЗАПОМИНАЕТ в self.stream НА МОМЕНТ СОЗДАНИЯ
+# (`if stream is None: stream = sys.stderr` в CPython). Дальше каждая запись
+# через корневой логгер падает в emit с «NoneType object has no attribute
+# write».
 #
-# Чем это обошлось, видно в захвате с чистой ВМ 2026-08-16: единственным
-# потерянным сообщением оказалось предупреждение релея «Терминатор недоступен —
-# рукопожатия идут своим стеком CPython, маскировка выключена». То есть
-# диагностика, поставленная ровно для того, чтобы поймать молчаливое отключение
-# маскировки, сама и сломалась — и молчание продлилось.
+# Но у Nova поток появляется позже: ниже по файлу `sys.stderr = RedirectText()`
+# заворачивает его в собственный журнал и окно. Обработчику, снявшему копию на
+# импорте, это уже не поможет — а вот тому, кто спрашивает `sys.stderr` в момент
+# записи, поможет. Поэтому поток берётся поздно, а не рано.
 #
-# Без потока обработчик не нужен: у Nova есть собственный журнал.
-if sys.stderr is None and sys.stdout is None:
-    logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
-else:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+# Чем стоила ранняя привязка, видно в захвате с чистой ВМ 2026-08-16:
+# предупреждение релея «Терминатор недоступен — маскировка выключена» попало в
+# nova_console.log не как сообщение, а внутри простыни «--- Logging error ---»,
+# которую logging печатает при отказе emit. То есть диагностика, поставленная
+# ровно для поимки молчаливого отключения маскировки, доехала случайно и в
+# нечитаемом виде. Заменить её на NullHandler было бы хуже, а не лучше: тогда
+# она не доехала бы вовсе.
+class _LateStderrHandler(logging.Handler):
+    """Пишет в тот `sys.stderr`, который есть при записи, а не при создании."""
+
+    def emit(self, record):
+        stream = sys.stderr
+        if stream is None:
+            # Окно ещё не поднялось — писать физически некуда. Это не отказ.
+            return
+        try:
+            stream.write(self.format(record) + "\n")
+            flush = getattr(stream, "flush", None)
+            if callable(flush):
+                flush()
+        except Exception:
+            # Молча и намеренно: штатный handleError пишет туда же, откуда мы
+            # только что получили отказ.
+            pass
+
+
+_root_log_handler = _LateStderrHandler()
+_root_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_root_log_handler])
 
 # -----------------------------------------------------------------
 # 1) Ensure that the *pip* module exists (some Python builds skip it)
