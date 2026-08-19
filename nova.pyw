@@ -10648,9 +10648,32 @@ try:
     # "accounts.google.com" — обычные адреса, вход в Google ничего не выигрывал;
     # "gemini.google" — оба резолвера дают один и тот же 216.239.32.61.
     #
-    # Добавлено по тому же замеру: notebooklm, labs.google, deepmind.google и
-    # cloudcode-pa.googleapis.com — последний это бэкенд Gemini Code Assist,
-    # то есть ровно то, ради чего существовал перехват CLI.
+    # Добавлено по тому же замеру: notebooklm, labs.google, deepmind.google.
+    #
+    # ОТДАНО ДРУГОЙ ПРОГРАММЕ ВЛАДЕЛЬЦА (решение владельца):
+    # cloudcode-pa.googleapis.com и generativelanguage.googleapis.com входят в
+    # её собственный набор правил NRPT, а два хозяина одного namespace дерутся:
+    # Nova ставит свои правила пачкой «удалить и создать заново», то есть на
+    # каждом старте сносила бы чужое правило на то же имя. Те же соображения
+    # касались бы daily-cloudcode-pa.googleapis.com и antigravity-unleash.goog,
+    # но их у Nova никогда и не было.
+    #
+    # На маршрутизацию это не влияет, и проверено, а не предположено: оба имени
+    # отсутствуют в list/eu.txt, как и любой их родительский суффикс
+    # (googleapis.com там нет вовсе). Ветка ai_unlock требует
+    # `matchDomain(ai_unlock, host) && matchDomain(eu, host)`, поэтому для них
+    # она не могла сработать ни до правки, ни после. Переносить их в
+    # NOVA_AI_KILLSWITCH_EXEMPT_EXTRA «чтобы сохранить PAC» было бы мёртвой
+    # настройкой — тот самый случай «ветка присутствует, верна и недостижима».
+    #
+    # groq.com добавлен по просьбе владельца. ЗАМЕР НЕ ПОДТВЕРДИЛ ПОЛЬЗУ и не
+    # опроверг: в день добавления xbox-dns.ru отдавал обычные адреса на ВСЕ
+    # имена, включая контрольные (gemini.google.com -> 142.251.154.2,
+    # cloudcode-pa -> 172.217.119.4), то есть сервис был в своём «выключенном»
+    # состоянии и критерий 87.228.47.x нельзя было применить ни к чему.
+    # Перемерить, когда сервис снова разблокирует контрольные имена: если на
+    # groq он тогда отдаст обычный адрес — правило не даёт ничего и тащит
+    # сторонний резолвер в непрофильный трафик, и его надо убрать.
     NOVA_NRPT_NAMESPACES = (
         "gemini.google.com",
         ".gemini.google.com",
@@ -10663,8 +10686,6 @@ try:
         ".labs.google",
         "deepmind.google",
         ".deepmind.google",
-        "generativelanguage.googleapis.com",
-        "cloudcode-pa.googleapis.com",
         "alkalimakersuite-pa.clients6.google.com",
         # OpenAI / ChatGPT
         "openai.com",
@@ -10678,6 +10699,12 @@ try:
         ".claude.com",
         "anthropic.com",
         ".anthropic.com",
+        # Groq. Пара «домен + поддерево», как у всех остальных поставщиков:
+        # сам groq.com — это сайт, а работают api.groq.com и console.groq.com,
+        # и без второй строки правило не покрыло бы ровно то, ради чего его
+        # просили.
+        "groq.com",
+        ".groq.com",
     )
     # xbox-dns.ru servers (v4 + v6)
     NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
@@ -10687,6 +10714,9 @@ try:
     # это оправдано, а гнать туда же Microsoft и GitHub незачем: им достаточно не
     # попадать в blackhole 127.0.0.1:1, когда Opera недоступна.
     # Оба домена лежат в list/eu.txt, поэтому без этого списка их убивал kill-switch.
+    # Присутствие в eu.txt здесь обязательно, а не совпадение: ветка звучит как
+    # `matchDomain(ai_unlock, host) && matchDomain(eu, host)`, и без второй
+    # половины запись в этом списке недостижима.
     NOVA_AI_KILLSWITCH_EXEMPT_EXTRA = (
         "copilot.microsoft.com",
         "githubcopilot.com",
