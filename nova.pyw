@@ -21772,23 +21772,56 @@ try:
             "Accept-Encoding": "identity",
         })
 
+        # Источник — релизы основного репозитория. Обращений всего два в сутки
+        # (при запуске и раз в 8 часов), так что безымянный лимит GitHub в 60
+        # запросов в час на адрес не мешает даже за общим NAT; неудача здесь не
+        # ломает ничего, кроме самой проверки.
         try:
-            response = session.get(UPDATE_URL, timeout=10)
+            response = session.get(
+                UPDATE_URL,
+                timeout=10,
+                headers={"Accept": "application/vnd.github+json"},
+            )
             response.raise_for_status()
             data = response.json()
         except Exception as e:
             return None, str(e)
 
-        latest_version = str(data.get("version") or "").strip()
-        download_url = str(data.get("url") or data.get("installer_url") or "").strip()
-        expected_hash = data.get("sha256") or data.get("hash") or data.get("checksum")
-        release_url = str(data.get("release_url") or data.get("page_url") or "").strip()
+        # Тег вида v1.38 — версия продукта; ведущая v в номер не входит.
+        tag_name = str(data.get("tag_name") or "").strip()
+        latest_version = tag_name[1:] if tag_name[:1].lower() == "v" else tag_name
+        release_url = str(data.get("html_url") or "").strip()
+
+        download_url = ""
+        checksum_url = ""
+        for asset in (data.get("assets") or []):
+            name = str(asset.get("name") or "").strip().lower()
+            link = str(asset.get("browser_download_url") or "").strip()
+            if name == "novasetup.exe":
+                download_url = link
+            elif name == "novasetup.exe.sha256":
+                checksum_url = link
+
+        if not latest_version or not download_url:
+            return None, f"в релизе {tag_name or '?'} нет тега или файла NovaSetup.exe"
+
+        # Контрольная сумма лежит отдельным файлом рядом с установщиком: у API
+        # релизов своей нет. Отсутствие файла не срывает проверку обновлений, но
+        # тогда установщик запустится без сверки — об этом говорится вслух перед
+        # запуском, а не замалчивается.
+        expected_hash = None
+        if checksum_url:
+            try:
+                checksum_response = session.get(checksum_url, timeout=10)
+                checksum_response.raise_for_status()
+                text = (checksum_response.text or "").strip()
+                # Формат sha256sum — «хэш  имя файла»; голый хэш тоже принимаем.
+                expected_hash = text.split()[0] if text else None
+            except Exception:
+                expected_hash = None
 
         if expected_hash and ":" in expected_hash:
             expected_hash = expected_hash.split(":", 1)[1]
-
-        if not latest_version or not download_url:
-            return None, "version.json не содержит version/url"
 
         manifest = {
             "version": latest_version,
@@ -21897,6 +21930,14 @@ try:
                     0x10,
                 )
                 return
+        elif log_func:
+            # Раньше отсутствие суммы просто пропускало проверку и молчало.
+            # Речь о запуске исполняемого файла: если сверять не с чем, это
+            # должно быть видно в журнале, а не выясняться потом.
+            log_func(
+                "[Update] ВНИМАНИЕ: в релизе нет NovaSetup.exe.sha256, "
+                "установщик запускается без сверки контрольной суммы."
+            )
 
         if log_func:
             log_func("[Update] Установщик загружен. Запускаю мастер обновления...")

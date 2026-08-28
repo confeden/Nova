@@ -4,7 +4,14 @@ from pathlib import Path
 
 CURRENT_VERSION = "1.38.0"
 WINWS_FILENAME = "winws.exe"
-UPDATE_URL = "https://confeden.github.io/nova_updates/version.json"
+# Обновления берутся прямо из релизов основного репозитория, а не из отдельного
+# version.json. Одно место вместо двух: релиз опубликован — обновление доступно,
+# промежуточного файла, который надо не забыть обновить, больше нет.
+#
+# Именно /releases/latest, а не /releases: GitHub исключает отсюда черновики и
+# предрелизы. Пока сборка лежит черновиком, пользователям она не предлагается, и
+# ни один технический предрелиз не может подменить собой версию продукта.
+UPDATE_URL = "https://api.github.com/repos/confeden/Nova/releases/latest"
 
 
 def get_project_root(start_path=None):
