@@ -28,8 +28,10 @@ on:
       - "nova-rs/**"
       - ".github/workflows/build_tls_terminator.yml"
 
+# Публикация уехала в confeden/nova_updates, поэтому в собственный репозиторий
+# этот workflow больше ничего не пишет — только читает при checkout.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -153,13 +155,24 @@ jobs:
       #    описанием. Всё, что должно пережить следующую сборку, обязано лежать
       #    в этом файле.
       #
-      #    --prerelease, чтобы этот тег не подменял собой последний релиз Nova
-      #    в списке: он не версия продукта и пользователю не нужен.
+      #    Публикуется в confeden/nova_updates, а не рядом с релизами Nova. На
+      #    странице релизов основного репозитория этот файл попадался на глаза
+      #    пользователям, которым он не нужен, и выглядел как ещё один вариант
+      #    загрузки. nova_updates уже служит той же служебной цели — там лежит
+      #    version.json автообновления, — и токен для записи туда уже заведён
+      #    (secrets.UPDATES_TOKEN, им же пользуется publish_update.yml).
+      #    github.token сюда не годится: он ограничен своим репозиторием.
+      #
+      #    Адрес загрузки при этом остаётся постоянным, потому что тег
+      #    неподвижен: .../nova_updates/releases/download/tls-terminator/...
+      #
+      #    --prerelease сохранён: это по-прежнему технический артефакт, а не
+      #    версия продукта, и помечать его как последний релиз незачем.
       - name: Publish to release
         if: inputs.publish || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}
         run: |
           $notes = @"
           Это технический файл, он нужен только для разработки. Скачивать и запускать его - не нужно, если вы не пытаетесь собирать Nova самостоятельно.
@@ -172,10 +185,12 @@ jobs:
           [![Download Nova](https://a.fsdn.com/con/app/sf-download-button)](https://sourceforge.net/projects/nova-pc/files/tls-terminator/)
           "@
           $notes | Out-File -FilePath dist/notes.md -Encoding utf8
-          gh release delete tls-terminator --yes --cleanup-tag 2>$null
+          $repo = "confeden/nova_updates"
+          gh release delete tls-terminator --repo $repo --yes --cleanup-tag 2>$null
           gh release create tls-terminator `
             dist/nova-tls-terminator.exe `
             dist/nova-tls-terminator.exe.sha256 `
+            --repo $repo `
             --title "TLS terminator (сборка из nova-rs)" `
             --prerelease `
             --notes-file dist/notes.md

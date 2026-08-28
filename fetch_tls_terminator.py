@@ -36,7 +36,12 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-REPO = os.environ.get("NOVA_TLS_TERMINATOR_REPO", "confeden/Nova")
+# Терминатор публикуется в отдельный репозиторий, а не рядом с релизами Nova:
+# на странице релизов он попадался на глаза пользователям, которым не нужен, и
+# выглядел как ещё один файл для скачивания. nova_updates уже служит той же
+# служебной цели (там лежит version.json автообновления), поэтому нового места
+# заводить не понадобилось.
+REPO = os.environ.get("NOVA_TLS_TERMINATOR_REPO", "confeden/nova_updates")
 TAG = os.environ.get("NOVA_TLS_TERMINATOR_TAG", "tls-terminator")
 FILENAME = "nova-tls-terminator.exe"
 
