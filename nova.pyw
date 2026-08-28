@@ -21793,35 +21793,27 @@ try:
         release_url = str(data.get("html_url") or "").strip()
 
         download_url = ""
-        checksum_url = ""
+        digest = ""
         for asset in (data.get("assets") or []):
-            name = str(asset.get("name") or "").strip().lower()
-            link = str(asset.get("browser_download_url") or "").strip()
-            if name == "novasetup.exe":
-                download_url = link
-            elif name == "novasetup.exe.sha256":
-                checksum_url = link
+            if str(asset.get("name") or "").strip().lower() == "novasetup.exe":
+                download_url = str(asset.get("browser_download_url") or "").strip()
+                digest = str(asset.get("digest") or "").strip()
+                break
 
         if not latest_version or not download_url:
             return None, f"в релизе {tag_name or '?'} нет тега или файла NovaSetup.exe"
 
-        # Контрольная сумма лежит отдельным файлом рядом с установщиком: у API
-        # релизов своей нет. Отсутствие файла не срывает проверку обновлений, но
-        # тогда установщик запустится без сверки — об этом говорится вслух перед
-        # запуском, а не замалчивается.
+        # Контрольную сумму считает сам GitHub и отдаёт её полем digest вида
+        # «sha256:<hex>» — класть рядом отдельный файл с суммой незачем.
+        #
+        # Префикс именно проверяется, а не отбрасывается: calculate_file_hash
+        # считает sha256, и если GitHub когда-нибудь начнёт присылать другой
+        # алгоритм, молчаливое сравнение дало бы вечное «сумма не совпала» на
+        # исправном файле. Неизвестный алгоритм — это отсутствие суммы, и
+        # обновление о нём предупредит перед запуском установщика.
         expected_hash = None
-        if checksum_url:
-            try:
-                checksum_response = session.get(checksum_url, timeout=10)
-                checksum_response.raise_for_status()
-                text = (checksum_response.text or "").strip()
-                # Формат sha256sum — «хэш  имя файла»; голый хэш тоже принимаем.
-                expected_hash = text.split()[0] if text else None
-            except Exception:
-                expected_hash = None
-
-        if expected_hash and ":" in expected_hash:
-            expected_hash = expected_hash.split(":", 1)[1]
+        if digest.lower().startswith("sha256:"):
+            expected_hash = digest.split(":", 1)[1].strip() or None
 
         manifest = {
             "version": latest_version,
@@ -21935,8 +21927,8 @@ try:
             # Речь о запуске исполняемого файла: если сверять не с чем, это
             # должно быть видно в журнале, а не выясняться потом.
             log_func(
-                "[Update] ВНИМАНИЕ: в релизе нет NovaSetup.exe.sha256, "
-                "установщик запускается без сверки контрольной суммы."
+                "[Update] ВНИМАНИЕ: GitHub не дал sha256 для установщика, "
+                "он запускается без сверки контрольной суммы."
             )
 
         if log_func:
