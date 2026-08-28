@@ -21758,11 +21758,28 @@ try:
         refresh_update_button(snapshot)
         return snapshot
 
-    def fetch_update_manifest():
-        try:
-            import requests
-        except ImportError as e:
-            return None, f"Ошибка импорта requests: {e}"
+    # Как достучаться до GitHub: сначала напрямую, потом через собственный
+    # прокси Nova.
+    #
+    # Замерено на машине владельца: api.github.com и
+    # release-assets.githubusercontent.com (куда редиректит скачивание
+    # установщика) не отвечают напрямую — 0 успешных TCP-подключений из трёх, —
+    # тогда как github.com отвечает за 68 мс. Тот же запрос к API через Opera на
+    # 1371 проходит за 771 мс. Программа, которая существует ради обхода
+    # блокировок, не должна оставаться без обновлений из-за блокировки.
+    #
+    # Прямая попытка идёт первой: когда блокировки нет, она быстрее и не грузит
+    # туннель. SOCKS5 на 1370 не используется — requests понимает socks5://
+    # только с PySocks, которого в сборке нет, а HTTP-прокси на 1371 закрывает
+    # тот же случай.
+    UPDATE_PROXY_URL = "http://127.0.0.1:1371"
+
+    def _update_transports():
+        yield None
+        yield {"http": UPDATE_PROXY_URL, "https": UPDATE_PROXY_URL}
+
+    def _new_update_session():
+        import requests
 
         session = requests.Session()
         session.trust_env = False
@@ -21771,21 +21788,38 @@ try:
             "Accept": "*/*",
             "Accept-Encoding": "identity",
         })
+        return session
 
-        # Источник — релизы основного репозитория. Обращений всего два в сутки
-        # (при запуске и раз в 8 часов), так что безымянный лимит GitHub в 60
-        # запросов в час на адрес не мешает даже за общим NAT; неудача здесь не
-        # ломает ничего, кроме самой проверки.
+    def fetch_update_manifest():
         try:
-            response = session.get(
-                UPDATE_URL,
-                timeout=10,
-                headers={"Accept": "application/vnd.github+json"},
-            )
-            response.raise_for_status()
-            data = response.json()
-        except Exception as e:
-            return None, str(e)
+            session = _new_update_session()
+        except ImportError as e:
+            return None, f"Ошибка импорта requests: {e}"
+
+        # Обращений всего два в сутки (при запуске и раз в 8 часов), так что
+        # безымянный лимит GitHub в 60 запросов в час на адрес не мешает даже за
+        # общим NAT; неудача здесь не ломает ничего, кроме самой проверки.
+        data = None
+        last_error = None
+        for proxies in _update_transports():
+            try:
+                response = session.get(
+                    UPDATE_URL,
+                    # Отдельно на подключение и на чтение: заблокированный хост
+                    # съедал все десять секунд на установлении соединения, хотя
+                    # доступный отвечает за 68 мс. Пять секунд с запасом хватает
+                    # даже плохому каналу, а запасной путь ждать не заставляет.
+                    timeout=(5, 10),
+                    headers={"Accept": "application/vnd.github+json"},
+                    proxies=proxies,
+                )
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as e:
+                last_error = e
+        if data is None:
+            return None, str(last_error)
 
         # Тег вида v1.38 — версия продукта; ведущая v в номер не входит.
         tag_name = str(data.get("tag_name") or "").strip()
@@ -21866,32 +21900,50 @@ try:
             log_func(f"[Update] Скачивание установщика Nova {version}...")
 
         try:
-            session = requests.Session()
-            session.trust_env = False
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-                "Accept": "*/*",
-                "Accept-Encoding": "identity",
-            })
+            session = _new_update_session()
 
-            with session.get(download_url, stream=True, timeout=180) as response:
-                response.raise_for_status()
-                total_size = int(response.headers.get("content-length", 0))
-                downloaded = 0
-                last_log_time = 0.0
+            # Тот же обход, что и у проверки версии, и здесь он нужен даже
+            # больше: скачивание редиректит на release-assets.githubusercontent.com,
+            # а тот у владельца не отвечает вовсе. Предложить обновление и не
+            # суметь его скачать — худший из исходов, поэтому запасной путь через
+            # собственный прокси обязателен.
+            last_error = None
+            downloaded_ok = False
+            for proxies in _update_transports():
+                try:
+                    with session.get(download_url, stream=True, timeout=180, proxies=proxies) as response:
+                        response.raise_for_status()
+                        total_size = int(response.headers.get("content-length", 0))
+                        downloaded = 0
+                        last_log_time = 0.0
 
-                with open(partial_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=131072):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
+                        with open(partial_path, "wb") as f:
+                            for chunk in response.iter_content(chunk_size=131072):
+                                if not chunk:
+                                    continue
+                                f.write(chunk)
+                                downloaded += len(chunk)
 
-                        now = time.time()
-                        if log_func and total_size > 0 and (now - last_log_time) > 2.0:
-                            percent = (downloaded / total_size) * 100.0
-                            log_func(f"[Update] Скачано {downloaded/1024/1024:.1f} MB / {total_size/1024/1024:.1f} MB ({percent:.0f}%)")
-                            last_log_time = now
+                                now = time.time()
+                                if log_func and total_size > 0 and (now - last_log_time) > 2.0:
+                                    percent = (downloaded / total_size) * 100.0
+                                    log_func(f"[Update] Скачано {downloaded/1024/1024:.1f} MB / {total_size/1024/1024:.1f} MB ({percent:.0f}%)")
+                                    last_log_time = now
+                    downloaded_ok = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    # Оборванная закачка оставляет частичный файл: следующая
+                    # попытка обязана начать с чистого места, иначе к её байтам
+                    # припишутся чужие.
+                    try:
+                        if os.path.exists(partial_path):
+                            os.remove(partial_path)
+                    except:
+                        pass
+
+            if not downloaded_ok:
+                raise last_error or RuntimeError("не удалось скачать установщик")
 
             os.replace(partial_path, installer_path)
         except Exception as e:
@@ -23016,16 +23068,26 @@ try:
         my_run_id = SERVICE_RUN_ID
         
         first_run = True
+        # Обычный ритм — при запуске и раз в восемь часов. Короткая пауза нужна
+        # только чтобы пережить первые минуты, пока туннели ещё не поднялись:
+        # три попытки по пять минут, дальше обычный ритм независимо от исхода,
+        # чтобы наглухо отрезанная машина не долбилась в сеть бесконечно.
+        UPDATE_NORMAL_PAUSE_SEC = 28800
+        UPDATE_RETRY_PAUSE_SEC = 300
+        UPDATE_RETRY_LIMIT = 3
+        consecutive_failures = 0
 
         while not is_closing:
             # Zombie Killer
             if SERVICE_RUN_ID != my_run_id:
                 break
             
+            check_failed = False
             try:
                 set_update_state(checking=True)
                 manifest, error = fetch_update_manifest()
                 if error:
+                    check_failed = True
                     set_update_state(checking=False)
                     if first_run:
                         log_func(f"[Update] Не удалось получить данные обновления: {error}")
@@ -23041,11 +23103,24 @@ try:
                         set_update_state(announced_version=None)
 
             except Exception as e:
+                check_failed = True
                 log_func(f"[Update] Ошибка: {e}")
-            
-            # Пауза 8 часов перед следующей проверкой
+
+            # Обычная пауза — 8 часов. Но неудачная проверка ждать восемь часов
+            # не должна, и вот почему: воркер стартует через 1.5 с после запуска,
+            # а собственный прокси Nova поднимается только к ~12-й секунде
+            # (замерено по таймлайну загрузки). На заблокированном канале первая
+            # проверка проваливает и прямой путь, и запасной — просто потому, что
+            # туннеля ещё нет. Раньше это стоило бы суток без обновлений.
             first_run = False
-            for _ in range(28800):
+            if check_failed and consecutive_failures < UPDATE_RETRY_LIMIT:
+                consecutive_failures += 1
+                pause_seconds = UPDATE_RETRY_PAUSE_SEC
+            else:
+                consecutive_failures = 0
+                pause_seconds = UPDATE_NORMAL_PAUSE_SEC
+
+            for _ in range(pause_seconds):
                 if is_closing: return
                 time.sleep(1)
     def learning_data_flush_worker():
