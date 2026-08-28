@@ -1,4 +1,4 @@
-# version: 1.37
+# version: 1.38.0
 wa.me
 whatsapp.com
 whatsapp.net

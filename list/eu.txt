@@ -1,4 +1,4 @@
-# version: 1.37
+# version: 1.38.0
 4pda.to
 4pda.ws
 agent-router.org
@@ -15,6 +15,12 @@ chatgpt.com
 codegpt.co
 collaborator.pro
 copilot.microsoft.com
+cursor-cdn.com
+cursor-marketplace.com
+cursor.com
+cursor.sh
+cursor.so
+cursorapi.com
 digikey.com
 digikeyassets.com
 digiseller.mycdn.ink
@@ -41,6 +47,7 @@ intel.com
 invideo.io
 jestkii.com
 kilo.ai
+kinozal.tv
 kodikplayer.com
 lh3.googleusercontent.com
 lpsg.com

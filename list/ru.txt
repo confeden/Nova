@@ -1,4 +1,4 @@
-# version: 1.37
+# version: 1.38.0
 1337x.to
 1e100cdn.net
 7tv.app
@@ -20,6 +20,8 @@ arena.ai
 arkoselabs.com
 arm.com
 arrow.com
+aspose.app
+avatars.githubusercontent.com
 awswaf.com
 azure.com
 b-cdn.net
@@ -86,10 +88,12 @@ fb.me
 fbcdn.net
 fbsbx.com
 filterblade.xyz
+fineshare.com
 flagcdn.com
 flixster.com
 fontawesome.com
 frankerfacez.com
+freebuff.com
 fsdn.com
 fubgun.com
 funpay.com
@@ -107,7 +111,8 @@ googleads.g.doubleclick.net
 googlevideo.com
 greasyfork.org
 grokusercontent.com
-groq.com
+happyscribe.com
+hdclub.ua
 hdkinoteatr.com
 hexed.it
 hls.ttvnw.net
@@ -123,7 +128,6 @@ jnn-pa.googleapis.com
 killedbygoogle.com
 kinobox.tv
 kinohub.vip
-kinozal.tv
 laozhang.ai
 litellm.ai
 live-video.net
@@ -158,6 +162,7 @@ neuralwriter.com
 nnmclub.to
 nnmstatic.win
 notion.site
+nova-app.eu
 nova.app
 nova.net
 nowpayments.io
@@ -166,6 +171,7 @@ nvidia.com
 objects.githubusercontent.com
 obmen.one
 obsproject.com
+ohi-s.com
 on.aws
 onorca.dev
 ookla.com

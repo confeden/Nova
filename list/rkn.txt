@@ -1,4 +1,4 @@
-# version: 1.37
+# version: 1.38.0
 #
 # Probe panel for the strategy checker: every candidate strategy is scored by
 # how many of these domains open through it. Panel size multiplies straight

@@ -1,6 +1,7 @@
-# version: 1.37
+# version: 1.38.0
 1c-bitrix.ru
 akamaihd.net
+apptracer.ru
 apteka-april.ru
 apteka.ru
 bitrix24.by
@@ -27,6 +28,7 @@ gov.ru
 gu-st.ru
 imgsmail.ru
 kaspersky.com
+mail.ru
 megafon.ru
 mozilla.cloudflare-dns.com
 ok.me
@@ -44,6 +46,7 @@ sber.ru
 sberbank.ru
 sberdevices.ru
 security.cloudflare-dns.com
+speed.cloudflare.com
 steam-chat.com
 steam.tv
 steamcommunity.com
@@ -73,6 +76,7 @@ vk.me
 vk.ru
 vkuser.net
 vkuseraudio.net
+vkuserphoto.ru
 vkuservideo.net
 vkvideo.ru
 wb-bank.ru

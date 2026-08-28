@@ -1,28 +1,41 @@
-# version: 1.37
-# Nova PC - Games routing list (TCP patch/update endpoints only)
+# version: 1.38.0
+# Nova PC - Games routing list (Path of Exile endpoints reached by IP)
 #
-# These are the Path of Exile PATCH/UPDATE servers that must go through WARP
-# when the "Games" app route mode is "auto", so provider throttling of the
-# update check/download is bypassed.
+# The WinDivert redirect claims these IPs without process metadata, on the ports
+# in GAMES_STATIC_FALLBACK_PORTS (windivert_redirect.py). That path exists
+# because process attribution loses a race on a process's very first connection
+# - which is exactly the connection the launcher makes.
 #
-# IMPORTANT: this list must contain ONLY patch/update hosts, NOT gameplay
-# servers. In Games/Auto, process-aware Path of Exile TCP (including gameplay)
-# uses WARP. tcp_proxy.py guards this static IP fallback to patch ports
-# (80/443); other game TCP ports are captured by process metadata. The
-# WinDivert redirect layer uses this list only when the flow observer misses
-# the launcher's early patch connection.
+# IMPORTANT: this fallback is NOT process-scoped. Any process talking to an
+# address on this list, on one of those ports, goes through WARP. Only add an
+# address that belongs to GGG alone.
 #
-# Determined empirically by capturing D:\Games\PoE\Client.exe traffic with
-# Wireshark: the launcher uses hardcoded IPs (no DNS) and opens TLS 1.3 to
-# the patching server immediately on launch.
+# --- Measured live 2026-08-23 through the running redirect ---
+# patch.pathofexile.com resolves (via a per-deployment pacloudflare.com CNAME,
+# so this WILL drift again) to 172.65.204.172. Its protocol is raw TCP on port
+# 12995, NOT HTTPS: send 01 04 and the server answers 181 bytes naming the
+# content CDN (https://patch.poecdn.com/<version>/). Confirmed working both
+# direct (35 ms) and through WARP (137 ms).
 #
-# --- Verified patch/content endpoints (from live capture) ---
-# These PoE patch CDN hosts ARE reachable via WARP and must go through WARP so
-# provider throttling is bypassed.
+# Port 443 on 172.65.204.172 accepts TCP and then drops the connection right
+# after the ClientHello - through WARP and through Opera alike. This is NOT the
+# SNI-based DPI reset an earlier note here claimed: Cloudflare Spectrum simply
+# exposes no TLS service on that address. Do not read a 443 failure here as
+# censorship.
+#
+# The content CDN (patch.poecdn.com -> 2.17.144.x, Akamai) is reachable
+# directly and needs no entry here, and must not get one: those addresses are
+# shared Akamai anycast and this fallback would drag unrelated traffic to WARP.
+#
+# What actually broke Path of Exile was Nova itself, not the network. The
+# redirect hijacked a connection whose SYN it had missed, into a proxy that
+# never saw the handshake (ROADMAP G36), and this fallback registered no return
+# path at all, so its own redirects hung in SYN-SENT (G35). Both fixed - so
+# re-measure before blaming this list again.
+#
 # 94.131.191.1 is intentionally EXCLUDED: WARP times out / blocks it, so it only
 # causes the patch to fail.
-172.65.90.21           # Cloudflare-fronted PoE patch CDN (reachable via WARP)
-172.65.90.23           # Cloudflare-fronted PoE patch CDN mirror (reachable via WARP)
+172.65.204.172          # patch.pathofexile.com (Cloudflare Spectrum, ports 12995/20481)
 
 # 77.111.244.0/22 must never appear here. It is Opera/SurfEasy VPN
 # infrastructure, not GGG: 77.111.247.19 is eu2.sec-tunnel.com, 77.111.244.47 is
@@ -34,5 +47,8 @@
 # --- Optional broader ranges (uncomment if updates still stall) ---
 # 94.131.176.0/20       # Yandex Cloud Kazakhstan - WARP does NOT route this, keep off
 # 185.62.202.0/24       # GGG-associated hosts - unreachable, keep off
+# 109.200.195.0/24      # ru-patch.poecdn.com's block - both known IPs timed out, keep off until re-verified
 # 111.88.96.0/24
-# 172.64.0.0/13         # all Cloudflare (use ONLY if patch CDN IPs change; risks catching gameplay)
+# 172.64.0.0/13         # all Cloudflare (DO NOT enable: this static-IP branch is not process-scoped -- it
+#                         would route ANY unmatched process's port 80/443 traffic to any Cloudflare site
+#                         through WARP, not just PoE)
