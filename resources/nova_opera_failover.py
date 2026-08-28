@@ -149,3 +149,27 @@ class OperaFailoverController:
 def build_full_dial_proxy_args(proxy):
     proxy = str(proxy or "").strip()
     return ["-proxy", proxy] if proxy else []
+
+
+DEFAULT_OPERA_FAKE_SNI = "www.microsoft.com"
+
+
+def build_fake_sni_args(domain=None):
+    """Подменить имя в ClientHello, которым opera-proxy зовёт свой эндпоинт.
+
+    По умолчанию opera-proxy отправляет туда настоящее имя (`eu1.sec-tunnel.com`
+    и подобные), и режут именно по нему. Измерено живьём на 77.111.244.47:
+    с настоящим SNI рукопожатие не доходит вовсе (таймаут 9.4 с), с нейтральным
+    именем сервер отвечает за 3.4 с, без SNI — TLS 1.3 за 1.3 с. Без подмены
+    opera-proxy зависал на выборе сервера и не открывал порт 1371 совсем.
+
+    Сквозные сертификаты от подмены не страдают: сервер SurfEasy на SNI не
+    смотрит, а внутренний TLS до сайта идёт своим чередом — проверено curl без
+    `-k`, 200 и с cloudflare.com, и с google.com. Регион тоже остаётся: выход
+    показал loc=NL, colo=AMS.
+
+    Пустая строка отключает подмену — на сети, где режут само подставляемое
+    имя, это может понадобиться.
+    """
+    domain = DEFAULT_OPERA_FAKE_SNI if domain is None else str(domain or "").strip()
+    return ["-fake-SNI", domain] if domain else []

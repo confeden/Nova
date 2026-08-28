@@ -31,6 +31,7 @@ WINDIVERT_LAYER_SOCKET = 3
 
 WINDIVERT_EVENT_FLOW_ESTABLISHED = 1
 WINDIVERT_EVENT_FLOW_DELETED = 2
+WINDIVERT_EVENT_SOCKET_BIND = 3
 WINDIVERT_EVENT_SOCKET_CONNECT = 4
 
 WINDIVERT_FLAG_SNIFF = 1
@@ -56,6 +57,19 @@ WINDIVERT_REDIRECT_NETWORK_PRIORITY = -1190
 WINDIVERT_REDIRECT_EVENT_PRIORITY = 1191
 WINDIVERT_FLAG_OUTBOUND_BIT = 1 << 17
 WINDIVERT_FLAG_LOOPBACK_BIT = 1 << 18
+
+TCP_FLAG_SYN = 0x02
+TCP_FLAG_ACK = 0x10
+REDIRECTED_FLOW_TTL_SECONDS = 900.0
+REDIRECT_SWEEP_INTERVAL_SECONDS = 30.0
+
+# Ports the static ip/games.txt fallback may claim without process metadata.
+# 80/443 is the patch/update CDN; 12995 and 20481 are Path of Exile's login and
+# game protocol ports. The list is IP-scoped to GGG's Cloudflare front, so no
+# other application can be caught by these ports. They are here and not left to
+# the process-aware path because that path loses a race on a process's very
+# first connection - which is exactly the login connection.
+GAMES_STATIC_FALLBACK_PORTS = (80, 443, 12995, 20481)
 
 APP_FAMILY = {
     "Discord": "discord",
@@ -194,6 +208,7 @@ def _app_udp_redirect_enabled(app):
 EVENT_LABELS = {
     WINDIVERT_EVENT_FLOW_ESTABLISHED: "flow-established",
     WINDIVERT_EVENT_FLOW_DELETED: "flow-deleted",
+    WINDIVERT_EVENT_SOCKET_BIND: "socket-bind",
     WINDIVERT_EVENT_SOCKET_CONNECT: "socket-connect",
 }
 
@@ -772,6 +787,8 @@ class RedirectService:
         self._tuple_to_flow = {}
         self._flow_to_tuples = {}
         self._sessions = {}
+        self._redirected_tcp = {}
+        self._redirect_sweep_ts = 0.0
         self._log_limiter = {}
         self._telegram_networks = _load_ip_networks(_data_file("ip", "telegram.txt"))
         self._games_networks = _load_ip_networks(_data_file("ip", "games.txt"))
@@ -868,6 +885,15 @@ class RedirectService:
         proto_num = int(data.Protocol)
         if proto_num not in {IPPROTO_TCP, IPPROTO_UDP}:
             return None
+        # A WebRTC/ICE UDP socket binds a local port and sendto()s several
+        # candidates without ever connect()-ing, so SOCKET_CONNECT/FLOW_ESTABLISHED
+        # never fire for it and it was invisible to the redirect map entirely
+        # (map stayed "udp":{} while bypassed_udp climbed). BIND is the only
+        # event such a socket produces; it has no remote address, so it can only
+        # feed a local-port-keyed session (_index_bind_payload), not a full flow.
+        is_bind = int(addr.event) == WINDIVERT_EVENT_SOCKET_BIND
+        if is_bind and (source != "socket" or proto_num != IPPROTO_UDP):
+            return None
         pid = int(data.ProcessId)
         process_path, app = self.resolver.resolve(pid)
         if app not in APP_FAMILY:
@@ -878,14 +904,32 @@ class RedirectService:
         if proto_num == IPPROTO_UDP and (direct_bypass or not _app_udp_redirect_enabled(app)):
             return None
         local_ip = self._format_addr(data.LocalAddr)
-        remote_ip = self._format_addr(data.RemoteAddr)
-        if ":" in local_ip or ":" in remote_ip:
+        if ":" in local_ip:
             return None
         local_port = int(data.LocalPort)
+        protocol = "udp" if proto_num == IPPROTO_UDP else "tcp"
+        if is_bind:
+            return {
+                "protocol": protocol,
+                "source": source,
+                "event": "socket-bind",
+                "app": app,
+                "app_family": APP_FAMILY.get(app, ""),
+                "pid": pid,
+                "exe": process_path,
+                "local_ip": local_ip,
+                "local_port": local_port,
+                "remote_ip": "",
+                "remote_port": 0,
+                "flow_key": "",
+                "timestamp": time.time(),
+            }
+        remote_ip = self._format_addr(data.RemoteAddr)
+        if ":" in remote_ip:
+            return None
         remote_port = int(data.RemotePort)
         if not _is_global_target(remote_ip):
             return None
-        protocol = "udp" if proto_num == IPPROTO_UDP else "tcp"
         flow_key = f"{protocol}|{local_ip}|{local_port}|{remote_ip}|{remote_port}|{pid}"
         return {
             "protocol": protocol,
@@ -950,6 +994,36 @@ class RedirectService:
             "source": "windivert",
         }, protocol=protocol)
 
+    def _index_bind_payload(self, payload):
+        """SOCKET_BIND has no remote address, so it can only seed a session
+        keyed by local port — enough for the network worker to attribute an
+        outbound datagram to an app before any remote is known (see the
+        _lookup_session fallback in _network_worker's UDP branch)."""
+        protocol = str(payload.get("protocol") or "udp").strip().lower()
+        local_ip = payload["local_ip"]
+        local_port = int(payload["local_port"])
+        meta = {
+            "protocol": protocol,
+            "app": payload.get("app"),
+            "app_family": payload.get("app_family"),
+            "pid": int(payload.get("pid") or 0),
+            "exe": payload.get("exe") or "",
+            "local_ip": local_ip,
+            "local_port": local_port,
+            "remote_ip": "",
+            "remote_port": 0,
+            "preferred_egress": PREFERRED_EGRESS.get(str(payload.get("app_family") or ""), 1),
+            "service_port": self._service_port_for_app_family(payload.get("app_family"), None),
+        }
+        with self._flow_lock:
+            key = (protocol, local_ip.lower(), local_port)
+            existing = self._sessions.get(key)
+            if existing and existing.get("remote_ip"):
+                # A real flow/connect event for this port already knows the
+                # remote; do not clobber it with a remote-less bind entry.
+                return
+            self._sessions[key] = meta
+
     def _remove_flow_payload(self, payload):
         flow_key = str(payload.get("flow_key") or "")
         protocol = str(payload.get("protocol") or "tcp").strip().lower()
@@ -959,6 +1033,7 @@ class RedirectService:
             tuples = self._flow_to_tuples.pop(flow_key, set())
             for item in tuples:
                 self._tuple_to_flow.pop(item, None)
+                self._redirected_tcp.pop(item, None)
             self._sessions.pop((protocol, local_ip.lower(), local_port), None)
         if local_ip and local_port:
             self.map.remove(local_ip, local_port, protocol=protocol)
@@ -990,6 +1065,8 @@ class RedirectService:
                     continue
                 if payload["event"] in {"flow-established", "socket-connect"}:
                     self._index_flow_payload(payload)
+                elif payload["event"] == "socket-bind":
+                    self._index_bind_payload(payload)
                 elif payload["event"] == "flow-deleted":
                     self._remove_flow_payload(payload)
         except Exception as exc:
@@ -1033,6 +1110,90 @@ class RedirectService:
                 except Exception:
                     continue
         return {}
+
+    def _is_redirected_flow(self, flow_key):
+        with self._flow_lock:
+            return flow_key in self._redirected_tcp
+
+    def _guard_late_attribution(self, flow_key, meta, opens_flow):
+        """Не уводить в прокси поток, чей SYN мы уже пропустили наружу.
+
+        Метаданные процесса могут опоздать: событие сокета и сам пакет читают
+        два разных потока, и на ПЕРВОМ соединении процесса пакет обгоняет
+        событие. Измерено вживую: у отдельных запусков curl мимо прошло 6 из 9,
+        а внутри одного процесса подряд — первое соединение мимо, все
+        последующие пойманы.
+
+        К моменту, когда meta появляется, соединение уже установлено напрямую с
+        настоящим сервером. Увести его середину в прокси нельзя: у прокси нет
+        состояния для потока, чьё рукопожатие он не принимал, и соединение
+        умирает молча — клиент шлёт, ответа нет никогда, в логе прокси пусто.
+        Так пропадал вход Path of Exile: 172.65.204.172:12995 напрямую
+        доступен, коннект проходил, а первый же байт исчезал. Пусть такой поток
+        идёт напрямую — так он хотя бы работает.
+        """
+        if not meta or opens_flow or self._is_redirected_flow(flow_key):
+            return meta
+        self.state.count("late_attribution_tcp")
+        return {}
+
+    def _remember_redirect_flow(self, flow_key, parsed, meta, service_port):
+        """Записать поток, чей SYN мы увели в прокси, и обратный путь для него.
+
+        Две вещи, без которых перенаправление TCP не работает вовсе.
+
+        Первая — сессия. Обратный пакет от прокси восстанавливается в
+        `_lookup_session` по локальному адресу клиента, а заполняло эту таблицу
+        только событие потока (`_index_flow_payload`). У запасного пути по
+        `ip/games.txt` события потока нет по определению: он срабатывает именно
+        тогда, когда метаданных процесса ещё нет. SYN уходил в прокси, прокси
+        отвечал SYN-ACK со своего адреса, клиент такого отправителя не ждал — и
+        соединение навсегда оставалось в SYN-SENT. В логе прокси при этом не
+        было ни строчки: `_handle_client` вызывается только после рукопожатия.
+        Проверено вживую: connect на 172.65.204.172:443 — редирект в логе есть,
+        accepted у прокси нет, клиент отваливается по таймауту.
+
+        Вторая — отметка самого потока. По ней `_network_worker` отличает
+        соединение, которое мы вели с самого SYN, от чужого, уже установленного
+        напрямую.
+        """
+        now = time.time()
+        session = {
+            "protocol": "tcp",
+            "app": meta.get("app"),
+            "app_family": meta.get("app_family") or "",
+            "pid": int(meta.get("pid") or 0),
+            "exe": meta.get("exe") or "",
+            "local_ip": parsed["src_ip"],
+            "local_port": int(parsed["src_port"]),
+            "remote_ip": parsed["dst_ip"],
+            "remote_port": int(parsed["dst_port"]),
+            "preferred_egress": int(meta.get("preferred_egress") or 1),
+            "service_port": int(service_port),
+            "synthetic": True,
+            "ts": now,
+        }
+        session_key = ("tcp", str(parsed["src_ip"]).lower(), int(parsed["src_port"]))
+        with self._flow_lock:
+            self._redirected_tcp[flow_key] = now
+            existing = self._sessions.get(session_key)
+            if not existing or not existing.get("remote_ip"):
+                self._sessions[session_key] = session
+            if now - float(self._redirect_sweep_ts or 0.0) >= REDIRECT_SWEEP_INTERVAL_SECONDS:
+                self._redirect_sweep_ts = now
+                for stale in [
+                    key for key, ts in self._redirected_tcp.items()
+                    if now - float(ts or 0.0) > REDIRECTED_FLOW_TTL_SECONDS
+                ]:
+                    self._redirected_tcp.pop(stale, None)
+                # Синтетические сессии не удаляет никто: события flow-deleted
+                # для потока без метаданных процесса не приходит.
+                for stale in [
+                    key for key, value in self._sessions.items()
+                    if value.get("synthetic")
+                    and now - float(value.get("ts") or 0.0) > REDIRECTED_FLOW_TTL_SECONDS
+                ]:
+                    self._sessions.pop(stale, None)
 
     def _should_log(self, key):
         now = time.time()
@@ -1109,6 +1270,15 @@ class RedirectService:
 
                     # App -> remote: redirect to the local transparent TCP proxy.
                     elif int(parsed["dst_port"]) not in {self.tcp_proxy_port, self.telegram_relay_port} and _is_global_target(parsed["dst_ip"]):
+                        flow_key = _tuple_key(
+                            "tcp",
+                            parsed["src_ip"],
+                            parsed["src_port"],
+                            parsed["dst_ip"],
+                            parsed["dst_port"],
+                        )
+                        tcp_flags = int(parsed.get("flags") or 0)
+                        opens_flow = bool(tcp_flags & TCP_FLAG_SYN) and not (tcp_flags & TCP_FLAG_ACK)
                         meta = self._lookup_flow(parsed)
                         direct_app_flow = bool(
                             meta and meta.get("app_family") == "games-steam-direct"
@@ -1119,7 +1289,7 @@ class RedirectService:
                             not meta
                             and not direct_app_flow
                             and _current_route_mode_for_app("Games") != "direct"
-                            and int(parsed["dst_port"]) in (80, 443)
+                            and int(parsed["dst_port"]) in GAMES_STATIC_FALLBACK_PORTS
                             and self._is_games_target(parsed["dst_ip"])
                         ):
                             # Observer may have missed the socket-connect event for the PoE
@@ -1134,6 +1304,7 @@ class RedirectService:
                                 "pid": 0,
                                 "preferred_egress": 1,
                             }
+                        meta = self._guard_late_attribution(flow_key, meta, opens_flow)
                         if meta:
                             if meta.get("app_family") == "telegram" and not self._is_telegram_target(parsed["dst_ip"]):
                                 # Телеграм-процесс, но адрес не телеграмовский:
@@ -1169,6 +1340,7 @@ class RedirectService:
                             )
                             recalc = True
                             send_addr = _as_local_proxy_inbound(addr)
+                            self._remember_redirect_flow(flow_key, parsed, meta, service_port)
                             self.state.count("redirected_tcp", {
                                 "event": "redirect",
                                 "app": meta.get("app"),
@@ -1215,6 +1387,13 @@ class RedirectService:
                                 })
                         elif self.udp_proxy_port > 0 and int(parsed["dst_port"]) != self.udp_proxy_port and _is_global_target(parsed["dst_ip"]):
                             meta = self._lookup_flow(parsed)
+                            if not meta:
+                                # No CONNECT/FLOW event for this exact 5-tuple — normal
+                                # for ICE, which never connect()s. Fall back to the
+                                # bind-only session (local port only, see
+                                # _index_bind_payload); the packet's own destination
+                                # below still carries the real candidate address.
+                                meta = self._lookup_session("udp", parsed["src_ip"], parsed["src_port"])
                             if meta:
                                 if meta.get("app_family") == "telegram" and not self._is_telegram_target(parsed["dst_ip"]):
                                     # Зеркало TCP-ветки выше: `continue` дропал
@@ -1259,6 +1438,17 @@ class RedirectService:
                                         f"{parsed['src_ip']}:{parsed['src_port']} -> {parsed['dst_ip']}:{parsed['dst_port']} "
                                         f"via {proxy_host}:{self.udp_proxy_port}"
                                     )
+                                # Keep the session's remote pointed at whichever
+                                # candidate this app most recently sent to — same
+                                # last-write-wins rule _index_flow_payload already
+                                # applies to _sessions, so the proxy->app restore
+                                # branch above (keyed the same way) spoofs the right
+                                # source instead of an empty or stale one.
+                                with self._flow_lock:
+                                    session = self._sessions.get(("udp", str(parsed["src_ip"]).lower(), int(parsed["src_port"])))
+                                    if session is not None:
+                                        session["remote_ip"] = parsed["dst_ip"]
+                                        session["remote_port"] = parsed["dst_port"]
                             else:
                                 self.state.count("bypassed_udp")
                 self.api.send(handle, modified, send_addr, recalc=recalc)

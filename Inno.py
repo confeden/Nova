@@ -534,6 +534,7 @@ def require_paths(base_dir: Path) -> None:
                            + "\n - ".join(str(base_dir / name) for name in empty))
 
     ensure_tls_terminator(base_dir)
+    ensure_nova_engine(base_dir)
 
 
 def ensure_tls_terminator(base_dir: Path) -> None:
@@ -572,6 +573,61 @@ def ensure_tls_terminator(base_dir: Path) -> None:
 
     if not Path(path).exists():
         raise RuntimeError(f"Терминатор TLS не появился по пути {path}.")
+
+
+def ensure_nova_engine(base_dir: Path) -> None:
+    """Собрать bin/nova-engine.exe локально, свежим на каждую сборку.
+
+    В отличие от терминатора, nova-engine (крейт nova-cli) не тянет BoringSSL
+    и вообще ни одного C-зависимого крейта — feature `shape` принадлежит
+    только nova-tls и в графе зависимостей nova-cli не участвует. Значит
+    I3/I5 (терминатор нельзя собрать локально, релиз всегда byte-иной) сюда
+    не относятся: `cargo build --release` воспроизводим на обычной машине,
+    и у Action enum, в отличие от TLS ClientHello, нет наблюдаемой формы,
+    которую цензор мог бы отличить. Поэтому — без публикации на GitHub,
+    без fetch-скрипта, просто пересобрать перед каждой упаковкой.
+
+    Отсутствие cargo не валит сборку установщика: команда «Сообщить о
+    заблокированном сайте» в этом случае сама сообщит, что nova-engine.exe
+    не найден, и ничего не сделает — тот же принцип, что и у терминатора:
+    сначала работает установщик, потом одна конкретная функция.
+    """
+    if os.environ.get("NOVA_SKIP_NOVA_ENGINE", "") == "1":
+        print("[Engine] NOVA_SKIP_NOVA_ENGINE=1 — nova-engine.exe в сборку не попадёт.")
+        return
+
+    nova_rs_dir = base_dir / "nova-rs"
+    if not nova_rs_dir.exists():
+        print("[Engine] nova-rs/ отсутствует — nova-engine.exe в сборку не попадёт.")
+        return
+
+    cargo = shutil.which("cargo")
+    if not cargo:
+        print("[Engine] cargo не найден в PATH — nova-engine.exe в сборку не попадёт.")
+        return
+
+    print("[Engine] Сборка nova-engine.exe (cargo build --release -p nova-cli)...")
+    result = subprocess.run(
+        [cargo, "build", "--release", "-p", "nova-cli"],
+        cwd=str(nova_rs_dir),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Сборка nova-engine (nova-cli) провалилась:\n"
+            f"{result.stdout}\n{result.stderr}\n"
+            "  Собрать без него: NOVA_SKIP_NOVA_ENGINE=1"
+        )
+
+    built = nova_rs_dir / "target" / "release" / "nova-engine.exe"
+    if not built.exists():
+        raise RuntimeError(f"cargo build завершился успешно, но {built} не появился.")
+
+    bin_dir = base_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built, bin_dir / "nova-engine.exe")
+    print(f"[Engine] nova-engine.exe обновлён: {bin_dir / 'nova-engine.exe'}")
 
 
 def build_embedded_assets_module(base_dir: Path) -> Path:

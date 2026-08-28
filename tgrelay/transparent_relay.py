@@ -336,6 +336,11 @@ _HTTP_HEAD_END = b"\r\n\r\n"
 _HTTP_HEAD_MAX = 8192
 _HTTP_HEAD_TIMEOUT = 5.0
 
+# Тот же смысл, что у _HTTP_HEAD_TIMEOUT, и намеренно рядом с ним: срок общий на
+# всё рукопожатие SOCKS5. Раньше здесь стояли отдельные пятисекундные таймауты на
+# каждом чтении — см. _socks_handshake.
+_SOCKS_HANDSHAKE_TIMEOUT = 5.0
+
 # Обрыв со стороны клиента. 64 — ERROR_NETNAME_DELETED, 10053/10054 — обрыв и
 # сброс сокета, 995 — прерванная операция ввода-вывода. Всё это конец
 # соединения, а не отказ релея.
@@ -2907,44 +2912,75 @@ class TelegramTransparentRelayServer:
         return True
 
     async def _socks_handshake(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, prefetched: bytes = b"") -> Tuple[Optional[str], Optional[int]]:
-        header_bytes = bytearray(prefetched or b"")
-        while len(header_bytes) < 2:
-            header_bytes.extend(await asyncio.wait_for(reader.readexactly(2 - len(header_bytes)), timeout=5.0))
-        header = bytes(header_bytes[:2])
-        if header[0] != 0x05:
-            writer.write(b"\x05\xff")
-            await writer.drain()
-            return None, None
-        methods = await asyncio.wait_for(reader.readexactly(header[1]), timeout=5.0)
-        if 0x00 not in methods:
-            writer.write(b"\x05\xff")
-            await writer.drain()
-            return None, None
-        writer.write(b"\x05\x00")
-        await writer.drain()
+        # Срок общий на всё рукопожатие, а не на каждое чтение. Раньше здесь у
+        # каждого readexactly были свои 5 секунд, поэтому клиент, шлющий по байту
+        # раз в четыре секунды, продлевал их бесконечно и держал задачу столько,
+        # сколько ему угодно, — ровно та ошибка, о которой G22, и слушатель поднят
+        # на 0.0.0.0, то есть доступен из локальной сети. HTTP-ветку на общий срок
+        # перевели тогда же, эту забыли.
+        deadline = time.monotonic() + _SOCKS_HANDSHAKE_TIMEOUT
+        buf = bytearray(prefetched or b"")
 
-        req = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
-        ver, cmd, _, atyp = req
-        if ver != 0x05 or cmd != 0x01:
-            writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
+        async def take(count: int) -> bytes:
+            """Ровно count байт, но не дольше общего срока рукопожатия.
+
+            readexactly, а не read: перебор испортил бы начало туннеля — клиент
+            вправе дослать полезную нагрузку сразу за запросом, а вызывающий
+            обнуляет prefetched после нас. Остаток от prefetched при этом не
+            теряется, он живёт в buf до следующего take.
+            """
+            if count <= 0:
+                return b""
+            while len(buf) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                buf.extend(
+                    await asyncio.wait_for(
+                        reader.readexactly(count - len(buf)), timeout=remaining
+                    )
+                )
+            out = bytes(buf[:count])
+            del buf[:count]
+            return out
+
+        async def refuse(reply: bytes) -> Tuple[Optional[str], Optional[int]]:
+            # G22: отвечаем всегда. Молчащий прокси выглядит зависшим и
+            # диагностируется часами.
+            with contextlib.suppress(Exception):
+                writer.write(reply)
+                await writer.drain()
             return None, None
 
-        if atyp == 0x01:
-            addr_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
-            host = socket.inet_ntoa(addr_bytes)
-        elif atyp == 0x03:
-            ln = (await asyncio.wait_for(reader.readexactly(1), timeout=5.0))[0]
-            host_bytes = await asyncio.wait_for(reader.readexactly(ln), timeout=5.0)
-            host = host_bytes.decode("ascii", "ignore")
-        elif atyp == 0x04:
-            addr_bytes = await asyncio.wait_for(reader.readexactly(16), timeout=5.0)
-            host = str(ipaddress.IPv6Address(addr_bytes))
-        else:
-            writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+        try:
+            header = await take(2)
+            if header[0] != 0x05:
+                return await refuse(b"\x05\xff")
+            methods = await take(header[1])
+            if 0x00 not in methods:
+                return await refuse(b"\x05\xff")
+            writer.write(b"\x05\x00")
             await writer.drain()
-            return None, None
-        port = struct.unpack("!H", await asyncio.wait_for(reader.readexactly(2), timeout=5.0))[0]
+
+            ver, cmd, _, atyp = await take(4)
+            if ver != 0x05 or cmd != 0x01:
+                return await refuse(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+
+            if atyp == 0x01:
+                host = socket.inet_ntoa(await take(4))
+            elif atyp == 0x03:
+                ln = (await take(1))[0]
+                host = (await take(ln)).decode("ascii", "ignore")
+            elif atyp == 0x04:
+                host = str(ipaddress.IPv6Address(await take(16)))
+            else:
+                return await refuse(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+            port = struct.unpack("!H", await take(2))[0]
+        except asyncio.TimeoutError:
+            # Один ответ на оба способа исчерпать срок — не прислать первый байт
+            # и капать по байту до самого дедлайна.
+            return await refuse(b"\x05\xff")
+
         writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", self.port))
         await writer.drain()
         return host, int(port)

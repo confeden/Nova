@@ -151,6 +151,28 @@ TG_TCP_FALLBACK_IPS = {
     203: "91.105.192.100",
 }
 TG_WS_CF_FIRST_DCS = {1, 5}
+
+# Games/Auto prefers WARP for everything, and the destination port decides only
+# how strict that preference is.
+#
+# WARP is not a compromise here, it is the fast path: measured three times in a
+# row on the real patch object, direct gave 0.06-0.08 MB/s against WARP's
+# 13.6-16.7 MB/s. The provider throttles patch.poecdn.com to a crawl, so an
+# earlier reading of "direct is 6-10x faster" was taken while WARP was being
+# torn down every 20 s by a recovery loop, and is retracted.
+#
+# The game's own protocol (Path of Exile patches and logs in over raw TCP on
+# 12995, gameplay on 20481) is pinned to WARP with no fallback at all: that
+# connection is cut mid-session when it runs direct - the client says
+# "Disconnected from patching server before patching completed" - so letting it
+# escape to Opera or direct buys a broken session and leaks the real IP.
+# Bulk HTTP on 80/443 keeps Opera and direct behind WARP instead. A crawling
+# download still finishes; a pinned one that cannot reach a dead WARP does not.
+GAMES_BULK_HTTP_PORTS = (80, 443)
+
+# Сколько миллисекунд соединение должно продержаться без единого байта в ответ,
+# чтобы считать маршрут мёртвым, а не просто оборванным клиентом.
+ROUTE_DEAD_MIN_MS = 2500
 TG_WS_CF_FIRST_MEDIA_DCS = {
     int(item)
     for item in str(os.environ.get("NOVA_TG_WS_CF_FIRST_MEDIA_DCS", "5") or "")
@@ -726,6 +748,36 @@ class NovaWfpTcpProxy:
         except Exception:
             return
 
+    def _remember_route_outcome(
+        self,
+        target_host: str,
+        target_port: int,
+        route_scope: str,
+        sent_bytes: int,
+        received_bytes: int,
+        duration_ms: int,
+    ) -> bool:
+        """Забыть маршрут, который открылся, но не принёс ни байта.
+
+        `_route_label_cache_put` вызывается сразу после открытия соединения —
+        то есть маршрут закрепляется на 5 минут ещё до того, как по нему прошёл
+        хоть один байт. Одной неудачи хватало, чтобы прилипнуть к мёртвому пути.
+        Наблюдалось живьём: у Discord попытка через WARP отваливается по
+        таймауту в 0.75 с, пока туннель занят закачкой патча, поэтому
+        соединение уходило в `direct` и там закреплялось — а `direct` для
+        162.159.133.234 заблокирован. Дальше 8 соединений подряд молчали по
+        19 секунд каждое, ни разу не попробовав WARP заново.
+
+        Отправили и не получили ничего — значит запоминать нечего.
+        """
+        try:
+            if int(sent_bytes) > 0 and int(received_bytes) == 0 and int(duration_ms) >= ROUTE_DEAD_MIN_MS:
+                self._route_label_cache_pop(target_host, int(target_port), route_scope=route_scope)
+                return True
+        except Exception:
+            return False
+        return False
+
     def _bad_route_key(self, target_host: str, target_port: int, label: str, route_scope: str = "") -> str:
         return (
             f"{self._route_scope_value(route_scope)}|{str(target_host).strip()}:{int(target_port)}|"
@@ -971,10 +1023,15 @@ class NovaWfpTcpProxy:
             if is_eu_route_target and route_mode == "opera":
                 attempts = ["opera-http"]
 
-        # Games/Auto TCP is strict-WARP while the local WARP SOCKS listener is
-        # active. Launcher and gameplay retries must not silently escape through
-        # Opera/direct or inherit a transient bad-route decision.
-        if games_auto_warp and self._warp_socks_available():
+        # The game's own protocol port is pinned to WARP while the local SOCKS
+        # listener is active: launcher and gameplay retries must not silently
+        # escape through Opera/direct or inherit a transient bad-route decision.
+        # Bulk HTTP is deliberately left unpinned - see GAMES_BULK_HTTP_PORTS.
+        if (
+            games_auto_warp
+            and int(target_port or 0) not in GAMES_BULK_HTTP_PORTS
+            and self._warp_socks_available()
+        ):
             attempts = ["warp-socks"]
             try:
                 for cache_port in (int(target_port or 0), 0):
@@ -1961,6 +2018,38 @@ class NovaWfpTcpProxy:
                 f"[NovaWFP][Proxy] closed={peer_label} target={target_host}:{target_port}{target_note} route={route_label} "
                 f"duration_ms={duration_ms} up={sent_bytes} down={received_bytes}"
             )
+            self._remember_route_outcome(
+                target_host,
+                int(target_port),
+                route_scope,
+                sent_bytes,
+                received_bytes,
+                duration_ms,
+            )
+            if (
+                app_family == "games"
+                and str(route_label) == "direct"
+                and sent_bytes > 0
+                and received_bytes == 0
+                and duration_ms >= ROUTE_DEAD_MIN_MS
+            ):
+                # Games/Auto now starts bulk HTTP on the direct path because it
+                # is much faster. If the provider cuts that path the request
+                # goes out and nothing ever comes back, which no connect-time
+                # attempt loop can see. Remember it per host so the next patch
+                # object takes WARP instead - that is what makes Auto flexible
+                # rather than a fixed choice between fast and working.
+                self._bad_route_cache_put(
+                    target_host,
+                    int(target_port),
+                    "direct",
+                    route_scope=route_scope,
+                    all_ports=True,
+                )
+                self.log_func(
+                    f"[NovaWFP][Proxy] games-direct-cut target={target_host}:{target_port} "
+                    f"up={sent_bytes} down=0 after {duration_ms} ms; host moved to WARP"
+                )
             if (
                 self._is_telegram_target(target_host)
                 and str(route_label) in {"warp-socks", "opera-http"}

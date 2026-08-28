@@ -267,7 +267,7 @@ from nova_console_logging import (
     get_default_session_console_log_path,
 )
 from nova_metadata import CURRENT_VERSION, UPDATE_URL, WINWS_FILENAME
-from nova_opera_failover import OperaFailoverController, build_full_dial_proxy_args
+from nova_opera_failover import OperaFailoverController, build_fake_sni_args, build_full_dial_proxy_args
 
 # FIX: In compiled (PyInstaller) builds, CURRENT_VERSION is frozen at build time.
 # If the installer overwrites nova_metadata.py on disk with a newer version,
@@ -290,6 +290,7 @@ from nova_platform import is_windows_admin
 from nova_routing_profiles import get_default_app_routing_profiles, match_app_by_process_path
 from nova_strategy_niche import classify_strategy_niche
 from nova_relay_env import relay_env_from_settings
+from nova_socks_probe import probe_socks5_payload
 import nova_boot_timeline as boot_timeline
 import nova_win_routes
 from nova_routing_backends import (
@@ -608,6 +609,16 @@ def restart_nova():
             restart_args = ["--restart", "--force-instance"]
             if getattr(restart_nova, "_log_was_open", False):
                 restart_args.insert(0, "--show-log")
+            # --debug has to survive a self-restart. Without this dev-run.cmd's
+            # flag was dropped by the first automatic restart — and Nova restarts
+            # itself on a strategy change, so in practice the process a developer
+            # ends up looking at almost never had it. IS_DEBUG_MODE went False
+            # there, every debug-gated line stopped being printed, and the result
+            # reads exactly like a logging bug: the console log simply lacks lines
+            # the code plainly writes. Only the CLI form is carried; when debug
+            # came from the marker file the new process finds that file itself.
+            if _has_debug_cli_flag():
+                restart_args.append("--debug")
             
             # Formulate the definitive launch command
             is_nuitka = "__compiled__" in dir() or globals().get("__compiled__") is not None
@@ -727,6 +738,7 @@ try:
     import tkinter as tk
     import tkinter.ttk as ttk
     from tkinter import messagebox
+    from tkinter import simpledialog
 except ImportError as e:
     ctypes.windll.user32.MessageBoxW(0, f"Critical Error: Failed to load Tkinter.\n\n{e}", "Nova Boot Error", 0x10)
     sys.exit(1)
@@ -1122,7 +1134,26 @@ try:
                     if is_frozen_exe:
                         if not os.path.exists(internal_path):
                             continue # В exe нет такого файла
-                        
+
+                        def _same_file(a, b):
+                            return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+                        if _same_file(internal_path, target_path):
+                            # Бандла для list/, ip/ и strat/ не существует:
+                            # PyInstaller не получает для них --add-data, и в
+                            # установленном дереве нет resources/list. Поэтому
+                            # get_internal_path() доходит до последнего кандидата
+                            # — get_base_dir() — и возвращает тот же самый файл.
+                            # «Восстановление» тогда означает копирование файла в
+                            # самого себя. На этой системе оно падает с
+                            # PermissionError и файл остаётся цел, но полагаться
+                            # на это нельзя: copyfile открывает приёмник на
+                            # запись, то есть один шаг отделяет от обрезания
+                            # пользовательского списка. Восстанавливать нечем —
+                            # выходим молча, вместо ошибки в журнале на каждый
+                            # устаревший файл.
+                            continue
+
                         if not os.path.exists(target_path):
                             needs_replace_from_exe = True
                             action = "Missing -> Restored from Bundle"
@@ -2009,6 +2040,29 @@ try:
             except:
                 pass
 
+        def _awg_profile_identity_key(self, profile_path):
+            """The real WireGuard identity a profile connects as, not its filename.
+
+            Multiple .conf files routinely share one PrivateKey/Address (the same
+            registered WARP account exported under different Jc/Jmin/.../I1
+            obfuscation presets and Endpoint) — grouping by filename alone would
+            let rotation exhaust every preset of one account before ever trying
+            a different one.
+            """
+            try:
+                parsed = self._parse_awg_source_profile(profile_path)
+                key = str(parsed.get("interface", {}).get("privatekey", "")).strip()
+                if key:
+                    return key
+                addr = str(parsed.get("interface", {}).get("address", "")).strip()
+                if addr:
+                    return addr
+            except:
+                pass
+            # Unparseable file: treat it as its own identity rather than
+            # colliding it with every other unparseable file under one key.
+            return os.path.basename(profile_path)
+
         def _get_ordered_awg_profiles(self):
             profiles = []
             for source_name, source_dir in (
@@ -2029,21 +2083,49 @@ try:
                             "name": os.path.splitext(os.path.basename(path))[0],
                             "path": path,
                             "source": source_name,
+                            "identity": self._awg_profile_identity_key(path),
                         })
                 except:
                     continue
 
             preferred = self._load_preferred_awg_profile_name().lower()
             rank_map = self._load_awg_profile_rank_map()
+            # Deterministic pre-sort (user before builtin, then remembered rank,
+            # then name) decides draw order *within* each identity group.
             profiles.sort(
                 key=lambda p: (
                     0 if str(p.get("source", "user")).lower() == "user" else 1,
-                    0 if str(p.get("name", "")).lower() == preferred else 1,
                     rank_map.get(str(p.get("name", "")).lower(), 10**9),
                     str(p.get("name", "")).lower(),
                 )
             )
-            return profiles
+
+            # Round-robin across identity groups: one profile from every
+            # identity before a second one from any, so a rotation that has to
+            # try several profiles in a row samples different WARP accounts
+            # instead of exhausting one account's obfuscation presets first.
+            groups = {}
+            for p in profiles:
+                groups.setdefault(p["identity"], []).append(p)
+            ordered = []
+            remaining = True
+            while remaining:
+                remaining = False
+                for bucket in groups.values():
+                    if bucket:
+                        ordered.append(bucket.pop(0))
+                        if bucket:
+                            remaining = True
+
+            # A profile that already proved itself this run still gets first
+            # refusal -- resuming mid-session should not discard a working
+            # identity in favour of the round-robin's next pick.
+            if preferred:
+                for i, p in enumerate(ordered):
+                    if str(p.get("name", "")).lower() == preferred:
+                        ordered.insert(0, ordered.pop(i))
+                        break
+            return ordered
 
         def _build_awg_runtime_config_path(self, profile_name):
             try:
@@ -2293,15 +2375,20 @@ try:
                 if self.active_backend != "awg":
                     self.is_connected = False
 
-        def _test_awg_backend_ready(self, port=None, timeout=8.0):
+        def _curl_socks_backend_ready(self, use_port, budget):
+            """Прежняя проба: TLS к cloudflare.com с резолвом имени в туннеле.
+
+            Дорогая — процесс, рукопожатие TLS и DNS ради одного бита, — поэтому
+            вызывается только там, где на ответ «нет» кто-то рвёт живой туннель,
+            и по NOVA_WARP_PROBE_LEGACY_CURL=1. Её независимость от быстрой пробы
+            здесь и есть ценность: другой адрес, другой порт, другой протокол —
+            совпасть в ошибке им намного труднее, чем повторить одну и ту же.
+            """
             try:
-                use_port = int(port or self.port)
-                if not self.is_port_open(use_port):
-                    return False
                 curl_cmd = [
                     "curl.exe",
                     "--socks5-hostname", f"127.0.0.1:{use_port}",
-                    "--max-time", str(max(4, int(timeout))),
+                    "--max-time", str(max(4, int(budget))),
                     "--silent",
                     "--show-error",
                     "https://cloudflare.com/cdn-cgi/trace",
@@ -2313,16 +2400,83 @@ try:
                     encoding="utf-8",
                     errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW,
-                    timeout=max(6, int(timeout) + 4),
+                    timeout=max(6, int(budget) + 4),
                 )
                 text = f"{result.stdout or ''}\n{result.stderr or ''}"
                 return result.returncode == 0 and ("ip=" in text or "warp=" in text)
             except:
                 return False
 
-        def _is_awg_backend_healthy(self, timeout=2.0):
+        def _test_awg_backend_ready(self, port=None, timeout=8.0, confirm=False):
+            """Проходит ли настоящий трафик через локальный SOCKS-порт бэкенда.
+
+            Быстрый путь — сокетная проба (`nova_socks_probe`): SOCKS5 CONNECT по
+            литеральному адресу плюс обычный HTTP-запрос. Ни процесса, ни TLS, ни
+            DNS. Сторож зовёт это каждые 3 секунды, и прежний curl платил за один
+            бит информации запуском процесса, рукопожатием TLS и резолвом имени
+            внутри туннеля — последнее вдобавок превращало медленный резолвер в
+            «трафик умер».
+            Connect-only проверкой обойтись нельзя: wireproxy отвечает на CONNECT
+            авансом, до того как хоть байт пересёк туннель (O5).
+
+            Бюджет держится не ниже 4 с — ровно тот, что curl получал раньше
+            (`--max-time max(4, timeout)`), чтобы ни один вызывающий не стал
+            строже, чем был.
+
+            confirm=True добавляет подтверждение старой пробой; ставится только
+            перед сносом живого туннеля, чтобы для этого пришлось ошибиться двум
+            независимым проверкам сразу.
+            """
             try:
-                return bool(self._test_awg_backend_ready(self.port, timeout=timeout))
+                use_port = int(port or self.port)
+                if not self.is_port_open(use_port):
+                    return False
+            except:
+                return False
+
+            budget = max(4.0, float(timeout or 0.0))
+
+            try:
+                if _env_bool_global("NOVA_WARP_PROBE_LEGACY_CURL", False):
+                    return self._curl_socks_backend_ready(use_port, budget)
+            except:
+                pass
+
+            try:
+                if probe_socks5_payload(use_port, budget=budget):
+                    return True
+            except Exception:
+                pass
+
+            if not confirm:
+                return False
+            return self._curl_socks_backend_ready(use_port, budget)
+
+        # Перебор профилей при восстановлении ограничен и уходит в паузу.
+        # Без этого один вызов _recover_awg_backend проходил весь пул из 50
+        # профилей подряд: замерено 32 смены за 13 минут, около 25 минут на
+        # круг. Окно повторов у сторожа (RETRY_WINDOW = 60 с) при такой
+        # длительности не срабатывает никогда, поэтому пауза нужна здесь.
+        # Цена перебора не только во времени: каждая смена рвёт туннель, по
+        # которому в этот момент идёт передача (закачка патча оборвалась на
+        # 10.8 МБ из 20.4), и тратит ещё одну регистрацию Cloudflare — ровно
+        # то вычерпывание аккаунтов, о котором G33.
+        AWG_RECOVERY_PROFILE_BUDGET = 4
+        AWG_RECOVERY_PAUSE_BASE_SEC = 60.0
+        AWG_RECOVERY_PAUSE_MAX_SEC = 900.0
+        AWG_PERSONAL_FAIL_LIMIT = 3
+
+        # Итог последнего recover_connection(): "restored" — туннель правда
+        # переподняли, "healthy" — чинить было нечего (проба вызывающего
+        # разошлась с проверкой здесь), "failed" / "busy" — не вышло.
+        # Сторож обязан их различать: раньше он на "healthy" писал
+        # «Соединение восстановлено» и обнулял счётчик провалов, то есть
+        # врал в лог и прятал деградацию от warp_route_usable.
+        last_recovery_outcome = ""
+
+        def _is_awg_backend_healthy(self, timeout=2.0, confirm=False):
+            try:
+                return bool(self._test_awg_backend_ready(self.port, timeout=timeout, confirm=confirm))
             except:
                 return False
 
@@ -2330,6 +2484,14 @@ try:
             try:
                 if not os.path.exists(self.wireproxy_awg_path):
                     return False
+
+                if allow_personal_identity and int(getattr(self, "_awg_personal_fail_streak", 0) or 0) >= self.AWG_PERSONAL_FAIL_LIMIT:
+                    # Личный профиль падал подряд столько раз, что дешевле его
+                    # не пробовать: каждая попытка — ещё один запуск процесса
+                    # и ещё 2 с ожидания (против 10 с у встроенных ключей),
+                    # а встроенные всё равно идут следующими. Счётчик
+                    # обнуляется, как только личный профиль снова заработает.
+                    allow_personal_identity = False
 
                 cfg_path = self._write_awg_runtime_config(
                     profile,
@@ -2416,6 +2578,8 @@ try:
                     if self.awg_process and self.awg_process.poll() is not None:
                         break
                     if self._test_awg_backend_ready(self.port, timeout=0.5):
+                        if using_personal_identity:
+                            self._awg_personal_fail_streak = 0
                         self.is_connected = True
                         self.mark_bootstrap(True)
                         self._remember_successful_awg_profile(self.awg_active_profile_name)
@@ -2433,6 +2597,7 @@ try:
             used_personal_identity = bool(profile.get("using_personal_identity"))
             self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
             if allow_personal_identity and used_personal_identity and not is_closing:
+                self._awg_personal_fail_streak = int(getattr(self, "_awg_personal_fail_streak", 0) or 0) + 1
                 self.log_func(f"[RU] [AWG] Личный Cloudflare профиль не прошёл handshake для {profile.get('name', 'awg')}. Пробуем встроенные ключи.")
                 return self._start_awg_proxy_backend(profile, allow_personal_identity=False)
             return False
@@ -2465,20 +2630,70 @@ try:
         def _recover_awg_backend(self, reason=""):
             if is_closing:
                 return False
+            if time.time() < float(getattr(self, "_awg_recovery_block_until", 0.0) or 0.0):
+                # Пауза после безрезультатного круга. Процесс уже остановлен,
+                # порт 1370 закрыт — вызывающие получают отказ за миллисекунды
+                # вместо восьмисекундного таймаута на каждую попытку и уходят
+                # на Opera сами.
+                self.last_recovery_outcome = "failed"
+                return False
+            if self._is_awg_backend_healthy(timeout=2.0, confirm=True):
+                # Последний рубеж перед сносом живого туннеля, поэтому
+                # confirm=True: быстрая проба перепроверяется старой, через
+                # другой адрес и другой протокол. Туннель жив — значит проба
+                # вызывающего поймала один медленный раунд-трип, а не смерть
+                # трафика. Раньше строка «Восстановление профиля» печаталась
+                # до этой проверки, поэтому лог сообщал о восстановлении,
+                # которого не было, — на маргинальном канале по три строки
+                # каждые ~12 секунд.
+                self._awg_recovery_fail_streak = 0
+                self._awg_recovery_block_until = 0.0
+                self.is_connected = True
+                self.last_recovery_outcome = "healthy"
+                return True
             reason_txt = str(reason or "").strip()
             if reason_txt:
                 self.log_func(f"[RU] [AWG] Восстановление профиля: {reason_txt}.")
-            if self._is_awg_backend_healthy(timeout=2.0):
-                self.is_connected = True
-                return True
             current_name = str(getattr(self, "awg_active_profile_name", "") or "").strip().lower()
             self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
             profiles = self._get_ordered_awg_profiles()
             if current_name:
-                profiles.sort(key=lambda p: 0 if str(p.get("name", "")).strip().lower() == current_name else 1)
+                current_identity = next(
+                    (p.get("identity") for p in profiles if str(p.get("name", "")).strip().lower() == current_name),
+                    None,
+                )
+                if current_identity is not None:
+                    # Deprioritise every profile on the identity that just
+                    # failed, not only the one file that was tried -- its other
+                    # obfuscation presets are the same WARP account and just as
+                    # likely blocked. Everything else keeps _get_ordered_awg_profiles'
+                    # round-robin order, so recovery samples a different account
+                    # first rather than another preset of the same one.
+                    profiles.sort(key=lambda p: 1 if p.get("identity") == current_identity else 0)
+                else:
+                    profiles.sort(key=lambda p: 0 if str(p.get("name", "")).strip().lower() == current_name else 1)
+            tried = 0
             for profile in profiles:
+                if is_closing or tried >= self.AWG_RECOVERY_PROFILE_BUDGET:
+                    break
+                tried += 1
                 if self._start_awg_proxy_backend(profile):
+                    self._awg_recovery_fail_streak = 0
+                    self._awg_recovery_block_until = 0.0
+                    self.last_recovery_outcome = "restored"
                     return True
+            streak = int(getattr(self, "_awg_recovery_fail_streak", 0) or 0) + 1
+            self._awg_recovery_fail_streak = streak
+            pause = min(
+                self.AWG_RECOVERY_PAUSE_BASE_SEC * (2 ** (streak - 1)),
+                self.AWG_RECOVERY_PAUSE_MAX_SEC,
+            )
+            self._awg_recovery_block_until = time.time() + pause
+            self.log_func(
+                f"[RU] [AWG] Испробовано профилей: {tried} из {len(profiles)}, трафик не пошёл ни на одном. "
+                f"Пауза {int(pause)} с, маршрут RU идёт через Opera."
+            )
+            self.last_recovery_outcome = "failed"
             return False
 
         def _normalize_warp_port_specs(self, ports_raw):
@@ -3921,10 +4136,17 @@ try:
             return False
 
         def recover_connection(self, reason=""):
-            """Best-effort runtime recovery for stuck/disconnected WARP sessions."""
+            """Best-effort runtime recovery for stuck/disconnected WARP sessions.
+
+            Возвращает bool «связь есть», а *что именно произошло* кладёт в
+            last_recovery_outcome — без этого вызывающий не отличает реальное
+            переподнятие туннеля от «пришли, а чинить нечего».
+            """
+            self.last_recovery_outcome = "failed"
             if is_closing:
                 return False
             if getattr(self, "_is_starting_now", False) or getattr(self, "_is_recovering_now", False):
+                self.last_recovery_outcome = "busy"
                 return False
 
             self._is_recovering_now = True
@@ -3932,6 +4154,7 @@ try:
                 if getattr(self, "active_backend", "") == "awg":
                     if self._is_awg_backend_healthy(timeout=2.0):
                         self.is_connected = True
+                        self.last_recovery_outcome = "healthy"
                         return True
                     self.is_connected = False
                     return self._recover_awg_backend(reason=reason)
@@ -3967,6 +4190,7 @@ try:
                         self.set_proxy_port(self.port)
                         self.set_proxy_mode()
                         if self.wait_for_connection(timeout=8):
+                            self.last_recovery_outcome = "restored"
                             return True
                     except:
                         pass
@@ -3982,10 +4206,14 @@ try:
 
                 try:
                     if self.is_connected:
-                        return bool(self.wait_for_connection(timeout=8))
+                        restored = bool(self.wait_for_connection(timeout=8))
+                        self.last_recovery_outcome = "restored" if restored else "failed"
+                        return restored
                 except:
                     pass
-                return bool(self.is_connected and self.is_port_open(self.port))
+                restored = bool(self.is_connected and self.is_port_open(self.port))
+                self.last_recovery_outcome = "restored" if restored else "failed"
+                return restored
             finally:
                 self._is_recovering_now = False
 
@@ -4903,15 +5131,21 @@ try:
                 ru_ips_js = json.dumps(ru_ips)
                 eu_ips_js = json.dumps(eu_ips)
                 cloudflare_ips_js = json.dumps(cloudflare_ips)
-                exclude_js = "{" + ",".join(f'"{d}":1' for d in exclude_domains) + "}"
-                user_ru_js = "{" + ",".join(f'"{d}":1' for d in user_ru_domains) + "}"
-                user_eu_js = "{" + ",".join(f'"{d}":1' for d in user_eu_domains) + "}"
-                ru_js = "{" + ",".join(f'"{d}":1' for d in ru_domains) + "}"
-                eu_js = "{" + ",".join(f'"{d}":1' for d in eu_domains) + "}"
-                discord_js = "{" + ",".join(f'"{d}":1' for d in discord_domains) + "}"
-                telegram_js = "{" + ",".join(f'"{d}":1' for d in telegram_domains) + "}"
+                # sorted(), а не порядок множества: matchDomain — поиск по
+                # ключу, порядок ему безразличен, зато байты PAC становятся
+                # воспроизводимыми. На них ниже считается подпись, по которой
+                # решается, звать ли refresh_system_options(); порядок обхода
+                # set у строк меняется от запуска к запуску, и без сортировки
+                # подпись «менялась» бы там, где не менялось ничего.
+                exclude_js = "{" + ",".join(f'"{d}":1' for d in sorted(exclude_domains)) + "}"
+                user_ru_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_ru_domains)) + "}"
+                user_eu_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_eu_domains)) + "}"
+                ru_js = "{" + ",".join(f'"{d}":1' for d in sorted(ru_domains)) + "}"
+                eu_js = "{" + ",".join(f'"{d}":1' for d in sorted(eu_domains)) + "}"
+                discord_js = "{" + ",".join(f'"{d}":1' for d in sorted(discord_domains)) + "}"
+                telegram_js = "{" + ",".join(f'"{d}":1' for d in sorted(telegram_domains)) + "}"
                 telegram_ips_js = json.dumps(telegram_ips)
-                whatsapp_js = "{" + ",".join(f'"{d}":1' for d in whatsapp_domains) + "}"
+                whatsapp_js = "{" + ",".join(f'"{d}":1' for d in sorted(whatsapp_domains)) + "}"
 
                 # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
                 # kill-switch: DNS для них уже развязан правилами, а blackhole
@@ -5178,6 +5412,7 @@ try:
                         pass
                 os.replace(pac_temp_path, self.pac_file)
 
+                import hashlib as _hashlib
                 cloudflare_ip_signature = tuple(tuple(entry) for entry in cloudflare_ips)
                 app_pref_signature = tuple((key, get_routing_group_mode(key, routing_settings)) for key in ROUTING_GROUP_KEYS)
                 route_signature = (
@@ -5193,11 +5428,21 @@ try:
                     # AutoConfigURL с тем же токеном. Маршрут Telegram менялся
                     # на диске и не менялся в системе.
                     bool(tgrelay_active),
+                    # Та же ошибка, но для списков: перечисленные выше поля
+                    # описывают только состояние прокси и режимы, поэтому
+                    # добавление домена в list/ru.txt или list/eu.txt меняло
+                    # содержимое PAC и не меняло подпись — система об этом
+                    # никогда не узнавала. Подпись по самим байтам скрипта
+                    # ловит любое настоящее изменение и молчит, когда байты
+                    # те же.
+                    _hashlib.md5(pac_content.encode("utf-8", errors="ignore")).hexdigest(),
                 )
+                system_refreshed = False
                 if route_signature != self._last_route_signature:
                     self._last_route_signature = route_signature
                     # Force OS and browsers to immediately re-fetch the PAC file
                     self.refresh_system_options()
+                    system_refreshed = True
 
                 # Log routing states only when they change.
                 eu_route_state = "opera" if opera_active else "down"
@@ -5227,6 +5472,7 @@ try:
                 if status_signature != getattr(self, "_last_status_signature", None):
                     self._last_status_signature = status_signature
                     self.refresh_system_options()
+                    system_refreshed = True
 
                 proxy_diag_state = (bool(opera_port_open), bool(opera_proxy_ok))
                 if proxy_diag_state != self._last_proxy_diag_state:
@@ -5259,8 +5505,15 @@ try:
                         self.log_func(f"[PAC] Режим PAC: полный через {str(pac_config.get('full_target') or 'warp').upper()}.")
                     else:
                         self.log_func("[PAC] Режим PAC: отключён, трафик браузеров идёт напрямую.")
+                # True означает «система уже уведомлена полным
+                # refresh_system_options()», чтобы вызывающий не добивал
+                # сверху лёгким refresh_pac_runtime(): тот перезаписывает
+                # AutoConfigURL новым токеном уже ПОСЛЕ уведомления, и
+                # объявленным остаётся предыдущий адрес.
+                return system_refreshed
             except Exception as e:
                 self.log_func(f"[PAC] Ошибка генерации: {e}")
+                return False
 
         def start_server(self):
             """Starts a simple HTTP server to serve the PAC file."""
@@ -5389,70 +5642,146 @@ try:
                 if IS_DEBUG_MODE:
                     self.log_func(f"[PAC] Ошибка остановки сервера: {e}")
 
-        def set_system_proxy(self):
-            """Configures Windows to use the PAC file."""
+        # Windows takes proxy settings from HKCU by default. The Group Policy
+        # «Make proxy settings per-machine (rather than per-user)» writes
+        # ProxySettingsPerUser=0 and points Windows at HKLM instead — and then the
+        # per-user copy is not merely ignored, it is actively dropped: Nova wrote
+        # AutoConfigURL to HKCU, immediately called INTERNET_OPTION_SETTINGS_CHANGED,
+        # WinINET re-read the machine settings, and the value was gone seconds later.
+        #
+        # Measured on the owner's machine: policy = 0 (and it survives a reboot),
+        # HKLM held no AutoConfigURL at all, and 43 browser processes opened **zero**
+        # connections to any Nova port. The PAC existed, was correct and was served —
+        # `flibusta.is` resolved to `PROXY 127.0.0.1:1371; DIRECT` under node — and was
+        # never used by anything, while the only line in the log was a debug-level
+        # «Системный прокси настроен на Nova PAC».
+        INTERNET_SETTINGS_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        PROXY_POLICY_PATH = r"SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
+        PROXY_VALUE_NAMES = ("AutoConfigURL", "AutoDetect", "ProxyEnable",
+                             "ProxyServer", "ProxyOverride")
+
+        def _proxy_settings_are_per_machine(self):
+            """True when the policy sends Windows to HKLM for proxy settings."""
             try:
-                # Backup current settings
-                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-                try:
-                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
-                    try:
-                        self.registry_backup['AutoConfigURL'] = winreg.QueryValueEx(key, 'AutoConfigURL')[0]
-                    except:
-                        pass
-                    try:
-                        self.registry_backup['AutoDetect'] = winreg.QueryValueEx(key, 'AutoDetect')[0]
-                    except:
-                        pass
-                    try:
-                        self.registry_backup['ProxyEnable'] = winreg.QueryValueEx(key, 'ProxyEnable')[0]
-                    except:
-                        pass
-                    try:
-                        self.registry_backup['ProxyServer'] = winreg.QueryValueEx(key, 'ProxyServer')[0]
-                    except:
-                        pass
-                    try:
-                        self.registry_backup['ProxyOverride'] = winreg.QueryValueEx(key, 'ProxyOverride')[0]
-                    except:
-                        pass
-                    try:
-                        winreg.CloseKey(key)
-                    except:
-                        pass
-                except: pass
-                try:
-                    # If ProxyEnable was 1, we should remember that? 
-                    # Actually, if we use AutoConfig, ProxyEnable is usually ignored or works with it.
-                    # Safe bet: Just set AutoConfigURL.
-                    pass 
-                except: pass
-                
-                # Set new settings
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE)
-                pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac"
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, self.PROXY_POLICY_PATH) as key:
+                    return int(winreg.QueryValueEx(key, "ProxySettingsPerUser")[0]) == 0
+            except FileNotFoundError:
+                return False  # absent means per-user, the Windows default
+            except:
+                return False
+
+        def _internet_settings_targets(self):
+            """Every hive Nova must keep in step; the effective one comes last.
+
+            HKCU stays in the list even under the per-machine policy: it is one
+            registry write, it is what the machine falls back to the moment the
+            policy is lifted, and restore has to clean it either way.
+            """
+            targets = [(winreg.HKEY_CURRENT_USER, "HKCU")]
+            if self._proxy_settings_are_per_machine():
+                targets.append((winreg.HKEY_LOCAL_MACHINE, "HKLM"))
+            return targets
+
+        def _effective_internet_settings_hive(self):
+            """The hive Windows will actually read, i.e. the last target."""
+            return self._internet_settings_targets()[-1]
+
+        def _read_autoconfig_url(self, hive):
+            try:
+                with winreg.OpenKey(hive, self.INTERNET_SETTINGS_PATH) as key:
+                    value = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+                return value if isinstance(value, str) else None
+            except:
+                return None
+
+        def _write_pac_url(self, hive, pac_url):
+            """Stamp AutoConfigURL (plus the two switches PAC needs) into one hive."""
+            with winreg.OpenKey(hive, self.INTERNET_SETTINGS_PATH, 0, winreg.KEY_WRITE) as key:
                 winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
-                self._system_pac_enabled = True
-                # Keep system switches explicitly enabled for PAC scenarios.
                 # Some Windows builds ignore AutoConfigURL when AutoDetect is off.
                 try:
                     winreg.SetValueEx(key, "AutoDetect", 0, winreg.REG_DWORD, 1)
                 except:
                     pass
                 try:
-                    # Keep static proxy disabled so browsers follow PAC routing rules strictly.
+                    # Static proxy off, so browsers follow PAC rules strictly.
                     winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
                 except:
                     pass
-                try:
-                    winreg.CloseKey(key)
-                except:
-                    pass
-                
-                # Notify system
-                # InternetSetOption needed to flush cache, but python wrapper implies ctypes.
-                # Simple registry change might require a browser restart or refresh.
-                # To make it instant, we call InternetSetOption.
+
+        def _verify_system_proxy_applied(self):
+            """Read back what Windows will really use, and say so when it is not us.
+
+            Writing the registry is not applying the proxy — G18's lesson, one hive
+            further out. Without this read-back a total failure was indistinguishable
+            from success, and stayed invisible for as long as it took a user to notice
+            that a domain in `list/eu.txt` simply did not open.
+            """
+            hive, label = self._effective_internet_settings_hive()
+            current = self._read_autoconfig_url(hive) or ""
+            if "nova.pac" in current.lower():
+                if IS_DEBUG_MODE:
+                    self.log_func(f"[System] PAC действует через {label}: {current}")
+                return True
+            if label == "HKLM":
+                self.log_func(
+                    "[System] ВНИМАНИЕ: политика ProxySettingsPerUser=0 требует общесистемных "
+                    "настроек прокси, а записать AutoConfigURL в HKLM не удалось. Браузеры пойдут "
+                    "мимо Nova. Нужен запуск от администратора."
+                )
+            else:
+                self.log_func(
+                    "[System] ВНИМАНИЕ: AutoConfigURL не удержался в реестре. "
+                    "Браузеры пойдут мимо Nova."
+                )
+            return False
+
+        def _backup_proxy_values(self, hive, label):
+            """Snapshot one hive's proxy values under its own label.
+
+            Per-hive, not flat: restore has to put HKCU's values back into HKCU and
+            HKLM's into HKLM, and a flat dict silently mixed them.
+            """
+            store = self.registry_backup.setdefault(label, {})
+            try:
+                with winreg.OpenKey(hive, self.INTERNET_SETTINGS_PATH, 0, winreg.KEY_READ) as key:
+                    for name in self.PROXY_VALUE_NAMES:
+                        try:
+                            store[name] = winreg.QueryValueEx(key, name)[0]
+                        except:
+                            pass
+            except:
+                pass
+
+        def set_system_proxy(self):
+            """Configures Windows to use the PAC file, in the hive it actually reads."""
+            try:
+                pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac"
+                written = []
+                failed = []
+
+                for hive, label in self._internet_settings_targets():
+                    self._backup_proxy_values(hive, label)
+                    try:
+                        self._write_pac_url(hive, pac_url)
+                        written.append(label)
+                    except Exception as e:
+                        failed.append(f"{label}: {e}")
+
+                if not written:
+                    self.log_func(
+                        f"[System] Ошибка настройки прокси: {'; '.join(failed) or 'нет доступа к реестру'}"
+                    )
+                    return
+                self._system_pac_enabled = True
+                if failed:
+                    self.log_func(
+                        f"[System] Прокси записан не везде ({', '.join(written)}); "
+                        f"не удалось — {'; '.join(failed)}."
+                    )
+
+                # InternetSetOption makes the change instant instead of waiting for a
+                # browser restart.
                 self.refresh_system_options()
                 # Apply WinHTTP proxy only when explicitly enabled and 1371 is usable.
                 if self._sync_winhttp_proxy:
@@ -5461,115 +5790,138 @@ try:
                             self._apply_winhttp_proxy()
                     except:
                         pass
-                
-                if IS_DEBUG_MODE: self.log_func("[System] Системный прокси настроен на Nova PAC.")
+
+                # Deliberately after refresh_system_options(): that notification is
+                # exactly what used to erase the value, so a read-back before it would
+                # confirm nothing.
+                if self._verify_system_proxy_applied() and IS_DEBUG_MODE:
+                    self.log_func("[System] Системный прокси настроен на Nova PAC.")
             except Exception as e:
                 self.log_func(f"[System] Ошибка настройки прокси: {e}")
+
+        def _restore_targets(self):
+            """Hives to clean: the ones in force now, plus any Nova actually wrote to.
+
+            The union matters because the policy can be lifted while Nova runs — then
+            `_internet_settings_targets()` no longer names HKLM, and a machine-wide
+            AutoConfigURL pointing at a dead PAC server would outlive the program.
+            """
+            hives = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
+            labels = [label for _, label in self._internet_settings_targets()]
+            for label in self.registry_backup.keys():
+                if label not in labels:
+                    labels.append(label)
+            return [(hives[label], label) for label in labels if label in hives]
 
         def restore_system_proxy(self):
             """Restores original settings - forcibly clears Nova proxy settings."""
             try:
-                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE | winreg.KEY_READ)
-                
-                # Check current AutoConfigURL - only clear if it's Nova's PAC
-                try:
-                    current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
-                    if "nova.pac" in current_pac or "127.0.0.1:1371" in current_pac:
-                        # It's Nova's PAC - delete it
+                cleaned = []
+                for hive, label in self._restore_targets():
+                    store = self.registry_backup.get(label, {})
+                    try:
+                        key = winreg.OpenKey(hive, self.INTERNET_SETTINGS_PATH, 0,
+                                             winreg.KEY_WRITE | winreg.KEY_READ)
+                    except Exception as e:
+                        self.log_func(f"[System] Ошибка восстановления прокси ({label}): {e}")
+                        continue
+                    try:
+                        # Only clear AutoConfigURL when it is ours — another tool may own
+                        # the machine-wide setting.
                         try:
-                            winreg.DeleteValue(key, "AutoConfigURL")
-                            self.log_func("[System] AutoConfigURL удалён.")
-                        except WindowsError as e:
-                            self.log_func(f"[System] Ошибка удаления AutoConfigURL: {e}")
-                except FileNotFoundError:
-                    # AutoConfigURL doesn't exist - that's fine
-                    pass
-                except Exception as e:
-                    self.log_func(f"[System] Ошибка чтения AutoConfigURL: {e}")
-                
-                # Also clear ProxyServer if it's pointing to Nova
-                try:
-                    current_proxy = winreg.QueryValueEx(key, "ProxyServer")[0]
-                    if "127.0.0.1:1370" in current_proxy or "127.0.0.1:1371" in current_proxy:
-                        winreg.DeleteValue(key, "ProxyServer")
-                        self.log_func("[System] ProxyServer удалён.")
-                except FileNotFoundError:
-                    pass
-                except Exception as e:
-                    pass  # ProxyServer might not exist
+                            current_pac = str(winreg.QueryValueEx(key, "AutoConfigURL")[0])
+                            if "nova.pac" in current_pac or "127.0.0.1:1371" in current_pac:
+                                try:
+                                    winreg.DeleteValue(key, "AutoConfigURL")
+                                    cleaned.append(label)
+                                except OSError as e:
+                                    self.log_func(f"[System] Ошибка удаления AutoConfigURL ({label}): {e}")
+                        except FileNotFoundError:
+                            pass
+                        except Exception as e:
+                            self.log_func(f"[System] Ошибка чтения AutoConfigURL ({label}): {e}")
 
-                # Restore backed-up switch values where available.
-                try:
-                    if "AutoDetect" in self.registry_backup:
-                        winreg.SetValueEx(key, "AutoDetect", 0, winreg.REG_DWORD, int(self.registry_backup.get("AutoDetect", 0)))
-                except:
-                    pass
-                try:
-                    if "ProxyEnable" in self.registry_backup:
-                        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, int(self.registry_backup.get("ProxyEnable", 0)))
-                except:
-                    pass
-                try:
-                    old_proxy_server = self.registry_backup.get("ProxyServer")
-                    if old_proxy_server:
-                        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, str(old_proxy_server))
-                    elif "ProxyServer" in self.registry_backup:
-                        # Explicitly clear empty backed value.
+                        # Also clear ProxyServer if it is pointing at Nova.
                         try:
-                            winreg.DeleteValue(key, "ProxyServer")
+                            current_proxy = str(winreg.QueryValueEx(key, "ProxyServer")[0])
+                            if "127.0.0.1:1370" in current_proxy or "127.0.0.1:1371" in current_proxy:
+                                winreg.DeleteValue(key, "ProxyServer")
                         except:
                             pass
-                except:
-                    pass
-                try:
-                    if "ProxyOverride" in self.registry_backup:
-                        old_override = self.registry_backup.get("ProxyOverride")
-                        if old_override:
-                            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, str(old_override))
-                        else:
+
+                        # Restore backed-up switch values where available.
+                        for name in ("AutoDetect", "ProxyEnable"):
                             try:
-                                winreg.DeleteValue(key, "ProxyOverride")
+                                if name in store:
+                                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(store.get(name, 0)))
                             except:
                                 pass
-                except:
-                    pass
-                
-                winreg.CloseKey(key)
+                        for name in ("ProxyServer", "ProxyOverride"):
+                            try:
+                                if name not in store:
+                                    continue
+                                old_value = store.get(name)
+                                if old_value:
+                                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(old_value))
+                                else:
+                                    # Explicitly clear an empty backed value.
+                                    try:
+                                        winreg.DeleteValue(key, name)
+                                    except:
+                                        pass
+                            except:
+                                pass
+                    finally:
+                        try:
+                            winreg.CloseKey(key)
+                        except:
+                            pass
+
                 self._system_pac_enabled = False
                 self.refresh_system_options()
                 self._restore_winhttp_proxy()
+                if cleaned:
+                    self.log_func(f"[System] AutoConfigURL удалён ({', '.join(cleaned)}).")
                 self.log_func("[System] Настройки прокси восстановлены.")
             except Exception as e:
                 self.log_func(f"[System] Ошибка восстановления прокси: {e}")
 
+        def _stamp_pac_token(self, hive):
+            """Re-stamp AutoConfigURL with a fresh cache-busting token in one hive.
+
+            Recreates the value too when Nova owns the route and Windows or a browser
+            cleanup has removed it — otherwise browsers silently bypass PAC rules.
+            """
+            owns_route = bool(
+                self._system_pac_enabled
+                and not is_closing
+                and bool(globals().get("is_service_active", False))
+            )
+            try:
+                with winreg.OpenKey(hive, self.INTERNET_SETTINGS_PATH, 0,
+                                    winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                    try:
+                        current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+                        ours = isinstance(current_pac, str) and "nova.pac" in current_pac.lower()
+                    except FileNotFoundError:
+                        ours = False
+                    except:
+                        return False
+                    # Someone else's AutoConfigURL is never overwritten unless Nova is
+                    # the one currently routing.
+                    if not (ours or owns_route):
+                        return False
+                    pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time() * 1000)}"
+                    winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                    return True
+            except:
+                return False
+
         def refresh_system_options(self):
             try:
-                import winreg
-                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE)
-                # Refresh PAC cache-busting token. If Nova is active and owns PAC
-                # routing, recreate AutoConfigURL when Windows/browser cleanup has
-                # removed it; otherwise browsers silently bypass PAC rules.
-                try:
-                    current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
-                    if isinstance(current_pac, str) and "nova.pac" in current_pac.lower():
-                        pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
-                        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
-                    elif self._system_pac_enabled and not is_closing and bool(globals().get("is_service_active", False)):
-                        pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
-                        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
-                except FileNotFoundError:
-                    try:
-                        if self._system_pac_enabled and not is_closing and bool(globals().get("is_service_active", False)):
-                            pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time())}"
-                            winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
-                    except:
-                        pass
-                except:
-                    pass
-                winreg.CloseKey(key)
-                
+                for hive, _label in self._internet_settings_targets():
+                    self._stamp_pac_token(hive)
+
                 INTERNET_OPTION_SETTINGS_CHANGED = 39
                 INTERNET_OPTION_REFRESH = 37
                 ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
@@ -5579,22 +5931,8 @@ try:
         def refresh_pac_runtime(self):
             """Lightweight PAC refresh for ru/eu/ip list edits without full proxy rebinding."""
             try:
-                import winreg
-                key_path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE)
-                try:
-                    current_pac = winreg.QueryValueEx(key, "AutoConfigURL")[0]
-                    if isinstance(current_pac, str) and "nova.pac" in current_pac.lower():
-                        pac_url = f"http://127.0.0.1:{self.server_port}/nova.pac?t={int(time.time() * 1000)}"
-                        winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
-                except FileNotFoundError:
-                    pass
-                except:
-                    pass
-                try:
-                    winreg.CloseKey(key)
-                except:
-                    pass
+                for hive, _label in self._internet_settings_targets():
+                    self._stamp_pac_token(hive)
             except:
                 pass
             try:
@@ -6249,6 +6587,11 @@ try:
                         "-country", self.country,
                     ] + selection_args
                     cmd.extend(build_full_dial_proxy_args(full_dial_proxy))
+                    # Провайдер режет туннель Opera по имени эндпоинта в
+                    # ClientHello, из-за чего opera-proxy зависал на выборе
+                    # сервера и порт 1371 не открывался вовсе. Подробности и
+                    # замеры — в build_fake_sni_args.
+                    cmd.extend(build_fake_sni_args(os.environ.get("NOVA_OPERA_FAKE_SNI")))
                     if base_proxy:
                         # API-only bootstrap: init/discover via proxy, Opera tunnel direct.
                         cmd.extend(["-api-proxy", base_proxy])
@@ -10666,14 +11009,9 @@ try:
     # NOVA_AI_KILLSWITCH_EXEMPT_EXTRA «чтобы сохранить PAC» было бы мёртвой
     # настройкой — тот самый случай «ветка присутствует, верна и недостижима».
     #
-    # groq.com добавлен по просьбе владельца. ЗАМЕР НЕ ПОДТВЕРДИЛ ПОЛЬЗУ и не
-    # опроверг: в день добавления xbox-dns.ru отдавал обычные адреса на ВСЕ
-    # имена, включая контрольные (gemini.google.com -> 142.251.154.2,
-    # cloudcode-pa -> 172.217.119.4), то есть сервис был в своём «выключенном»
-    # состоянии и критерий 87.228.47.x нельзя было применить ни к чему.
-    # Перемерить, когда сервис снова разблокирует контрольные имена: если на
-    # groq он тогда отдаст обычный адрес — правило не даёт ничего и тащит
-    # сторонний резолвер в непрофильный трафик, и его надо убрать.
+    # groq.com убран по перемеру (см. D9): при активном xbox-dns.ru (контроль
+    # cloudcode-pa -> 87.228.47.204) groq.com отдал ровно тот же адрес
+    # (64.239.109.193), что и обычный резолвер — правило не даёт ничего.
     NOVA_NRPT_NAMESPACES = (
         "gemini.google.com",
         ".gemini.google.com",
@@ -10699,12 +11037,29 @@ try:
         ".claude.com",
         "anthropic.com",
         ".anthropic.com",
-        # Groq. Пара «домен + поддерево», как у всех остальных поставщиков:
-        # сам groq.com — это сайт, а работают api.groq.com и console.groq.com,
-        # и без второй строки правило не покрыло бы ровно то, ради чего его
-        # просили.
-        "groq.com",
-        ".groq.com",
+        # YouTube. Не нейросеть, но механизм подмены DNS здесь единственный,
+        # который помогает. Провайдер отвечает NXDOMAIN на youtube.com и на
+        # любой его поддомен, причём одинаково через 8.8.8.8 и через 1.1.1.1 —
+        # то есть перехватывает обычный DNS на лету, а не фильтрует у себя.
+        # Измерено методом D9/D13 по всему list/youtube.txt: расходятся ровно
+        # 2 хоста из 22 (youtube.com, www.youtube.com), плюс m/music/studio/tv,
+        # тогда как ytimg.com и googlevideo.com отвечают одинаково. Гасится
+        # ровно то имя, которое набирают руками: страница не открывается
+        # («нет подключения к интернету»), хотя видео-CDN цел и через WARP
+        # сайт отдаётся за 0.7 с.
+        #
+        # На маршрут это не влияет: ai_unlock_guard возвращает DIRECT только
+        # для домена, который есть и в list/eu.txt, а youtube там отсутствует —
+        # он в list/ru.txt, то есть остаётся на WARP.
+        "youtube.com",
+        ".youtube.com",
+        # Cursor was tried here and removed (see D13/D9): measured against an
+        # active xbox-dns.ru (control cloudcode-pa -> 87.228.47.204), all 6
+        # domains matched a plain resolver exactly — no DNS-level block to
+        # route around. Moved to list/eu.txt instead, on the owner's call:
+        # Cursor is Chromium-based like a browser, so if it is blocked at
+        # the connection level rather than DNS, the PAC eu-branch has a
+        # chance of catching it where NRPT could not.
     )
     # xbox-dns.ru servers (v4 + v6)
     NOVA_NRPT_NAMESERVERS = "'111.88.96.50','111.88.96.51','2a00:ab00:1233:26::50','2a00:ab00:1233:26::51'"
@@ -10733,11 +11088,13 @@ try:
     def _nrpt_clean_on_exit_enabled():
         """Сносить ли правила при остановке/выходе.
 
-        По умолчанию правила остаются: они помечены тегом и сверяются при старте,
-        а пересоздание стоит полного круга PowerShell на каждом запуске.
-        NOVA_NRPT_CLEAN_ON_EXIT=1 возвращает прежнее поведение.
+        По умолчанию — да: неработающая Nova не должна оставлять DNS через
+        сторонний резолвер (тот же принцип, что и для AutoConfigURL). Цена —
+        один PowerShell-проход (~0.5-2 с) на следующем запуске вместо
+        мгновенной проверки тега. NOVA_NRPT_CLEAN_ON_EXIT=0 возвращает старое
+        поведение (правила переживают выход ради скорости перезапуска).
         """
-        return _env_bool_global("NOVA_NRPT_CLEAN_ON_EXIT", False)
+        return _env_bool_global("NOVA_NRPT_CLEAN_ON_EXIT", True)
 
     def _check_nrpt_rules_applied(log_func=None):
         """Check if all required NRPT rules with NOVA_DNS_UNBLOCK tag are already applied."""
@@ -10863,11 +11220,12 @@ try:
                 log_func(f"[NRPT] Ошибка удаления DNS-правил: {e}")
 
     def remove_nrpt_dns_unblock_on_exit(log_func=None, silent=True):
-        """Путь остановки/выхода: по умолчанию правила остаются на месте.
+        """Путь остановки/выхода: по умолчанию правила сносятся вместе с Nova.
 
-        Правила помечены тегом NOVA_DNS_UNBLOCK и сверяются при старте, поэтому
-        сохранённый набор даёт быстрый путь (одна проверка вместо пересоздания).
-        Отключение ai_unlock пользователем по-прежнему сносит их сразу.
+        Правила помечены тегом NOVA_DNS_UNBLOCK; если следующий запуск найдёт
+        их всё же на месте (NOVA_NRPT_CLEAN_ON_EXIT=0), сверка по тегу даёт
+        быстрый путь вместо пересоздания. Отключение ai_unlock пользователем
+        по-прежнему сносит их сразу, независимо от этого флага.
         """
         if not _nrpt_clean_on_exit_enabled():
             return
@@ -11254,7 +11612,12 @@ try:
 
     log_window = None
     log_text_widget = None
-    auto_scroll_enabled = True 
+    # Whether the log window is actually on screen. A plain flag rather than a
+    # log_window.state() call: it is read from the <Configure> handler, which fires
+    # for every pixel of a main-window drag.
+    log_window_shown = False
+    _log_align_bound = False
+    auto_scroll_enabled = True
     app_mutex = None
     early_log_buffer = []  # Buffer for logs before log_window is created
     cached_log_size = "700x450"
@@ -12027,7 +12390,12 @@ try:
         global cached_log_size
         if not log_window or not root: return
         if event and event.widget != root: return
-        
+        # Event-driven calls only matter while the window is visible. A hidden log
+        # window was being re-measured and re-positioned for every <Configure> of the
+        # main window — i.e. on every pixel of a drag — for nothing. Explicit calls
+        # (event is None) still run: show_log_window() needs them.
+        if event is not None and not log_window_shown: return
+
         try:
             # Получаем геометрию основного окна
             if forced_main_geom:
@@ -12340,7 +12708,15 @@ try:
                     # save_window_state(log_size=geom) # Оптимизация: сохраняем только при выходе
 
         log_window.bind('<Configure>', save_log_size)
-        root.bind('<Configure>', align_log_window_to_main)
+        # add="+" is load-bearing: a plain root.bind() replaces every other handler
+        # for that sequence on root, and two exist by the time the log window is first
+        # created — the main-window geometry save and the routing-settings alignment.
+        # Opening the log used to silently unbind both. The flag keeps a re-created
+        # window from stacking duplicate handlers.
+        global _log_align_bound
+        if not _log_align_bound:
+            root.bind('<Configure>', align_log_window_to_main, add="+")
+            _log_align_bound = True
         
         # === НОВОЕ: Кнопка Telegram внизу (добавляем ПЕРЕД контентом) ===
         bottom_frame = tk.Frame(log_window, bg=LOG_THEME["panel"], height=21)  # 150% от высоты строки
@@ -12618,19 +12994,22 @@ try:
         log_text_widget.bind_all("<Control-a>", select_all)
         log_text_widget.bind_all("<Control-A>", select_all)
 
-        # Flush early log buffer now that log_window is ready
+        # Flush early log buffer now that log_window is ready. One batch, not one
+        # Tcl round trip per line — this loop was the bulk of the first-open delay.
         global early_log_buffer
         if early_log_buffer:
-            for msg in early_log_buffer:
-                try: _safe_log_insert(msg)
-                except: pass
+            try:
+                _insert_log_batch(early_log_buffer)
+            except: pass
             early_log_buffer = []
 
 
-    def show_log_window(): 
+    def show_log_window():
+        global log_window_shown
         ensure_log_window_created()
+        log_window_shown = True
         align_log_window_to_main()
-        
+
         log_window.deiconify()
         log_window.lift()
         log_window.attributes('-topmost', False)
@@ -12660,7 +13039,9 @@ try:
         btn_logs.config(text="Скрыть лог")
 
 
-    def hide_log_window(): 
+    def hide_log_window():
+        global log_window_shown
+        log_window_shown = False
         if log_window: log_window.withdraw()
         btn_logs.config(text="Показать лог")
 
@@ -12668,6 +13049,19 @@ try:
         ensure_log_window_created()
         if log_window.state() == "normal": hide_log_window()
         else: show_log_window()
+
+    def precreate_log_window():
+        """Build the log window while the app is idle, so the first click is instant.
+
+        Creating the Toplevel, the Text widget, the context menus and the resize grip
+        is the remaining cost once the buffer flush is batched; paying it here means a
+        click only has to deiconify. Stays withdrawn, and align_log_window_to_main()
+        does nothing until it is shown.
+        """
+        try:
+            ensure_log_window_created()
+        except Exception as e:
+            safe_trace(f"[UI] Не удалось заранее создать окно лога: {e}")
     
     # === SCROLL LOGIC HELPER ===
     LOG_SCROLL_STATE = {
@@ -12785,35 +13179,73 @@ try:
         if root:
             root.after(0, lambda m=message: _safe_log_insert(m))
 
-    def _safe_log_insert(string):
-        global early_log_buffer
+    def _build_log_entry(string):
+        """Filter, tag and mask one raw line. None means the line is dropped."""
         if should_suppress_strategy_noise(string):
-            return
+            return None
         tag = get_line_tag(string)
         if should_hide_tgrelay_in_ui(string, tag):
+            return None
+        return mask_ips_in_text(string), tag
+
+    def _insert_log_batch(rows):
+        """Insert already-filtered (timestamp, text, tag) rows in one Tcl round trip.
+
+        The old path did configure + index + insert + see + configure **per line**.
+        Harmless at one line a second, ruinous on the startup buffer: measured here,
+        500 buffered lines cost 1641 ms that way against 2.5 ms batched — that delay
+        was most of the several seconds the log window took to appear on first click.
+        `see()` is the expensive half, because it forces a scroll recomputation for
+        every single line; the batch needs exactly one, at the end.
+        """
+        if not rows:
             return
-        string = mask_ips_in_text(string)
-        lw_exists = log_window and tk.Toplevel.winfo_exists(log_window)
-        
-        if lw_exists:
-            try:
-                # FIX: Enable widget before insert (might be disabled by LiveProgressManager)
-                log_text_widget.configure(state=tk.NORMAL)
-                
-                if int(log_text_widget.index('end-1c').split('.')[0]) > LOG_MAX_LINES:
-                    log_text_widget.delete('1.0', '101.0')
-                
-                ts = time.strftime("%H:%M:%S")
-                log_text_widget.insert(tk.END, f"{ts} {string.strip()}\n", tag)
-                if should_auto_scroll(): log_text_widget.see(tk.END)
-                
-                # FIX: Restore disabled state
-                log_text_widget.configure(state=tk.DISABLED)
-            except: pass
+        try:
+            log_text_widget.configure(state=tk.NORMAL)
+
+            # Trim once for the whole batch, with slack, so a full buffer does not
+            # make every later insert trim again.
+            total = int(log_text_widget.index('end-1c').split('.')[0]) + len(rows)
+            if total > LOG_MAX_LINES:
+                drop = total - LOG_MAX_LINES + 100
+                log_text_widget.delete('1.0', f'{drop + 1}.0')
+
+            # Tk's insert takes alternating text/tag pairs, so consecutive lines
+            # sharing a tag collapse into one chunk.
+            args = []
+            run_tag = None
+            run = []
+            for ts, text, tag in rows:
+                if tag != run_tag:
+                    if run:
+                        args.extend(["".join(run), run_tag])
+                    run = []
+                    run_tag = tag
+                run.append(f"{ts} {str(text).strip()}\n")
+            if run:
+                args.extend(["".join(run), run_tag])
+
+            log_text_widget.insert(tk.END, *args)
+            if should_auto_scroll():
+                log_text_widget.see(tk.END)
+            log_text_widget.configure(state=tk.DISABLED)
+        except: pass
+
+    def _safe_log_insert(string):
+        global early_log_buffer
+        entry = _build_log_entry(string)
+        if entry is None:
+            return
+        text, tag = entry
+
+        if log_window and tk.Toplevel.winfo_exists(log_window):
+            _insert_log_batch([(time.strftime("%H:%M:%S"), text, tag)])
         else:
-            # Buffer logs until log_window is created
+            # Buffer until log_window exists. Stamped here rather than at flush
+            # time: flushing used to stamp every buffered line with the moment the
+            # window opened, collapsing the whole startup history onto one second.
             if len(early_log_buffer) < 500:
-                early_log_buffer.append(string)
+                early_log_buffer.append((time.strftime("%H:%M:%S"), text, tag))
 
     class RedirectText(object):
         def write(self, string):
@@ -12829,24 +13261,20 @@ try:
                 pass # Root not created yet
 
         def _safe_write(self, string):
-            string = mask_ips_in_text(string)
-            if should_suppress_strategy_noise(string): return
             if should_ignore(string): return
-            tag = get_line_tag(string)
-            if should_hide_tgrelay_in_ui(string, tag): return
-            
-            # === TIMESTAMP ADDED ===
-            ts = time.strftime("%H:%M:%S")
-            string_to_insert = f"{ts} {string.strip()}\n"
+            entry = _build_log_entry(string)
+            if entry is None: return
+            text, tag = entry
+            if "could not read" in text.lower():
+                tag = "error"
             if log_window and tk.Toplevel.winfo_exists(log_window):
-                try:
-                    if int(log_text_widget.index('end-1c').split('.')[0]) > LOG_MAX_LINES:
-                        log_text_widget.delete('1.0', '101.0')
-                    if "could not read" in string_to_insert.lower():
-                        tag = "error"
-                    log_text_widget.insert(tk.END, string_to_insert, tag)
-                    if should_auto_scroll(): log_text_widget.see(tk.END)
-                except: pass
+                # Through _insert_log_batch, not a bare insert: this path used to
+                # write straight into the widget without touching its state, and
+                # _safe_log_insert leaves it DISABLED — so from the first log_print()
+                # onwards every print()/safe_trace() line was silently rejected by Tk
+                # and never appeared in the window. The console log file kept them,
+                # which is why the loss was invisible.
+                _insert_log_batch([(time.strftime("%H:%M:%S"), text, tag)])
 
         def flush(self): pass
     
@@ -13357,15 +13785,14 @@ try:
     def on_tray_quit(icon, item):
         try:
             icon.stop()
-            # on_closing() # Avoid direct circular call or early call
-            # Just signal app to close?
-            # Better: use root.event_generate("WM_DELETE_WINDOW")?
-            # Or assume on_closing handles it.
-            # actually we called on_closing() in original code, but we must ensure it is defined.
-            # If on_tray_quit is called, on_closing MUST be defined by then (runtime).
-            root.quit() 
-            os._exit(0)
         except: pass
+        try:
+            # Route through on_closing() (main thread, via after()) instead of
+            # os._exit(0) here directly: a bare exit skipped restore_system_proxy(),
+            # leaving AutoConfigURL pointed at a dead PAC server after tray-quit.
+            root.after(0, on_closing)
+        except:
+            os._exit(0)
 
     def init_tray_icon():
         global TRAY_ICON
@@ -21691,11 +22118,19 @@ try:
                 
                 # Logic Flow
                 if vpn_changed:
-                    # 1. Update PAC content only.
-                    # Do not force-refresh WinINet/system proxy settings here:
-                    # ru/eu/ip list edits only change PAC payload, and aggressive
-                    # INTERNET_OPTION_SETTINGS_CHANGED calls can tear down active
-                    # browser connections on every domain append.
+                    # 1. Update PAC content, then tell the system exactly once.
+                    #
+                    # Раньше здесь стоял только лёгкий refresh_pac_runtime():
+                    # боялись, что INTERNET_OPTION_SETTINGS_CHANGED на каждую
+                    # правку списка рвёт живые соединения браузера. Опасение
+                    # верное для дребезга состояния прокси, но цена оказалась
+                    # другой: правка list/ru.txt меняла PAC на диске и не
+                    # менялась в системе — WinINET и браузеры продолжали
+                    # исполнять прежний скрипт до перезапуска Nova. Теперь
+                    # generate_pac() держит в подписи хэш самих байтов PAC,
+                    # поэтому полное уведомление уходит ровно один раз на
+                    # настоящее изменение, а на повторных опросах без правок
+                    # не уходит вовсе.
                     if pac_manager:
                         # Pass last-known proxy states as overrides to prevent live
                         # re-probing of warp/opera. Without overrides, generate_pac()
@@ -21708,8 +22143,13 @@ try:
                         if _sig is not None:
                             _warp_ov = bool(_sig[0])
                             _opera_ov = bool(_sig[1])
-                        pac_manager.generate_pac(warp_override=_warp_ov, opera_override=_opera_ov)
-                        pac_manager.refresh_pac_runtime()
+                        pac_applied = bool(
+                            pac_manager.generate_pac(warp_override=_warp_ov, opera_override=_opera_ov)
+                        )
+                        if not pac_applied:
+                            # Байты PAC не изменились (правка в комментарии,
+                            # регистре, дубликате) — хватит лёгкого толчка.
+                            pac_manager.refresh_pac_runtime()
                         log_func("[PAC] Списки VPN обновлены")
                         
                 restart_reasons = []
@@ -21922,9 +22362,19 @@ try:
         warp_bad_proxy_streak = 0
         warp_good_probe_streak = 0
         warp_failed_recoveries = 0
+        warp_false_alarm_streak = 0
+        warp_false_alarm_notified = False
+        warp_last_issue_log_ts = 0.0
+        warp_last_recover_fail_log_ts = 0.0
         warp_last_good_ts = 0.0
         warp_next_recovery_ts = 0.0
         singbox_next_restart_ts = 0.0
+        # Порог «трафик умер» растёт после каждой ложной тревоги и снова
+        # опускается, когда канал полминуты отвечает чисто.
+        WARP_TRAFFIC_DEAD_BASE_STREAK = 2
+        WARP_TRAFFIC_DEAD_MAX_EXTRA = 4
+        WARP_FALSE_ALARM_FORGIVE_STREAK = 20
+        WARP_ISSUE_LOG_INTERVAL_SEC = 45.0
         startup_state_hold_until = time.time() + 12.0
         startup_fast_retry_until = time.time() + 150.0
         startup_pending_route_signature = None
@@ -21946,6 +22396,10 @@ try:
                     last_warp_port_state = None
                     last_warp_issue_state = None
                     warp_bad_proxy_streak = 0
+                    warp_false_alarm_streak = 0
+                    warp_false_alarm_notified = False
+                    warp_last_issue_log_ts = 0.0
+                    warp_last_recover_fail_log_ts = 0.0
                     warp_last_good_ts = 0.0
                     warp_next_recovery_ts = 0.0
                     continue
@@ -22012,6 +22466,19 @@ try:
                         warp_last_good_ts = now
                         warp_next_recovery_ts = 0.0
                         last_warp_issue_state = None
+                        if warp_good_probe_streak >= WARP_FALSE_ALARM_FORGIVE_STREAK:
+                            # Канал держится чисто ~минуту — прошлые ложные
+                            # тревоги больше ни о чём не говорят, опускаем порог.
+                            # Здесь же гасится warp_failed_recoveries: раньше его
+                            # обнуляла любая «успешная» попытка, включая пустую,
+                            # а теперь только настоящее восстановление. Без
+                            # затухания счётчик застревал бы навсегда, если
+                            # WARP выправился сам, и warp_route_usable снимал
+                            # бы RU с WARP на каждой одиночной неудачной пробе.
+                            warp_false_alarm_streak = 0
+                            warp_failed_recoveries = 0
+                            warp_last_issue_log_ts = 0.0
+                            warp_last_recover_fail_log_ts = 0.0
                     elif warp_port_open and not warp_socks_ok:
                         warp_bad_proxy_streak += 1
                         warp_good_probe_streak = 0
@@ -22031,6 +22498,18 @@ try:
                     issue_state = None
                     enough_time_since_good = (now - warp_last_good_ts) >= 10.0 if warp_last_good_ts else True
 
+                    # Каждая ложная тревога поднимает планку на одну пробу.
+                    # На AWG-бэкенде проба сторожа — это curl с --max-time 4
+                    # через туннель: один медленный HTTPS-раунд-трип на
+                    # загруженном канале нормален и «смертью трафика» не
+                    # является. С базовым порогом 2 такой канал давал полный
+                    # цикл «проблема → восстановление → восстановлено»
+                    # каждые ~12 секунд, ничего при этом не восстанавливая.
+                    traffic_dead_streak_needed = (
+                        WARP_TRAFFIC_DEAD_BASE_STREAK
+                        + min(warp_false_alarm_streak, WARP_TRAFFIC_DEAD_MAX_EXTRA)
+                    )
+
                     if not warp_starting and not warp_recovering:
                         if ("disconnected" in warp_status_low) and warp_connected_flag:
                             recover_reason = f"warp-cli сообщает Disconnected ({warp_status})"
@@ -22044,13 +22523,14 @@ try:
                         elif warp_connected_flag and not warp_port_open and enough_time_since_good:
                             recover_reason = f"локальный SOCKS порт {warp_port} закрыт"
                             issue_state = "port_down"
-                        elif warp_connected_flag and warp_port_open and not warp_socks_ok and warp_bad_proxy_streak >= 2 and enough_time_since_good:
+                        elif warp_connected_flag and warp_port_open and not warp_socks_ok and warp_bad_proxy_streak >= traffic_dead_streak_needed and enough_time_since_good:
                             recover_reason = f"порт {warp_port} открыт, но трафик через WARP не проходит"
                             issue_state = "traffic_dead"
 
                     if recover_reason and len(retry_timestamps) < MAX_RETRIES:
-                        if last_warp_issue_state != issue_state:
+                        if last_warp_issue_state != issue_state and (now - warp_last_issue_log_ts) >= WARP_ISSUE_LOG_INTERVAL_SEC:
                             log_func(f"[RU] Обнаружена проблема WARP: {recover_reason}. Запуск восстановления...")
+                            warp_last_issue_log_ts = now
                         last_warp_issue_state = issue_state
 
                         if now >= warp_next_recovery_ts:
@@ -22062,12 +22542,45 @@ try:
                             except Exception as e:
                                 if IS_DEBUG_MODE:
                                     log_func(f"[RU] [Diag] Ошибка восстановления WARP: {e}")
+                            recovery_outcome = str(getattr(warp_manager, "last_recovery_outcome", "") or "")
 
-                            if recovered:
+                            if recovered and recovery_outcome == "healthy":
+                                # Ничего не восстанавливали: собственная проверка
+                                # менеджера разошлась с пробой сторожа. Писать
+                                # «Соединение восстановлено» здесь — врать в лог,
+                                # а обнулять warp_failed_recoveries — прятать
+                                # деградацию от warp_route_usable. Поэтому только
+                                # поднимаем планку и молчим в trace.
+                                warp_false_alarm_streak += 1
                                 warp_bad_proxy_streak = 0
-                                warp_failed_recoveries = 0
                                 warp_last_good_ts = time.time()
                                 warp_next_recovery_ts = 0.0
+                                last_warp_issue_state = None
+                                if not warp_false_alarm_notified:
+                                    # Ровно одна строка на сеанс: пользователю
+                                    # надо знать, что канал маргинальный, но
+                                    # повторять это каждые полминуты — тот же
+                                    # спам, от которого мы уходим.
+                                    warp_false_alarm_notified = True
+                                    log_func(
+                                        "[RU] Ложное срабатывание пробы WARP: туннель жив, "
+                                        "восстанавливать нечего. Порог проверки поднят, "
+                                        "дальнейшие такие случаи в журнал не пишутся."
+                                    )
+                                elif IS_DEBUG_MODE:
+                                    safe_trace(
+                                        f"[RU] [Watchdog] Ложная тревога WARP ({recover_reason}); "
+                                        f"порог проб поднят до "
+                                        f"{WARP_TRAFFIC_DEAD_BASE_STREAK + min(warp_false_alarm_streak, WARP_TRAFFIC_DEAD_MAX_EXTRA)}."
+                                    )
+                            elif recovered:
+                                warp_bad_proxy_streak = 0
+                                warp_failed_recoveries = 0
+                                warp_false_alarm_streak = 0
+                                warp_last_good_ts = time.time()
+                                warp_next_recovery_ts = 0.0
+                                warp_last_issue_log_ts = 0.0
+                                warp_last_recover_fail_log_ts = 0.0
                                 last_warp_issue_state = None
                                 log_func("[RU] Соединение восстановлено.")
                             else:
@@ -22082,7 +22595,12 @@ try:
                                     )
                                 warp_next_recovery_ts = time.time() + 20.0
                                 last_warp_issue_state = "recover_failed"
-                                log_func(f"[RU] Не удалось восстановить WARP автоматически. Последний статус: {warp_status}")
+                                # Тот же троттлинг, что у Opera (45 с): мёртвый
+                                # WARP иначе печатает эту строку каждые 20 с
+                                # часами подряд.
+                                if (now - warp_last_recover_fail_log_ts) >= WARP_ISSUE_LOG_INTERVAL_SEC:
+                                    log_func(f"[RU] Не удалось восстановить WARP автоматически. Последний статус: {warp_status}")
+                                    warp_last_recover_fail_log_ts = now
                 
                 # Check Opera Proxy availability (process can be None on failed start).
                 if opera_proxy_manager:
@@ -23109,7 +23627,7 @@ try:
         except: pass
         root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
         root.after(0, lambda: status_label.config(text="ПОДКЛЮЧЕНИЕ", fg=COLOR_TEXT_WARNING))
-        
+
         paths = ensure_structure()
         
         # Гарантируем существование файлов исключений перед запуском winws
@@ -24210,7 +24728,14 @@ try:
         # === НЕМЕДЛЕННОЕ обновление UI ===
         if root and not restart_mode:
             root.after(0, lambda: btn_toggle.config(text="ПОДКЛЮЧИТЬ"))
-            root.after(0, lambda: status_label.config(text="ОСТАНОВЛЕНО", fg=COLOR_TEXT_FAIL))
+            # restart_nova() (ПКМ -> "Перезапустить Nova") calls this same full
+            # stop before killing the process; without this check its own
+            # "ПЕРЕЗАПУСК" label got overwritten back to "ОСТАНОВЛЕНО" here a
+            # moment later.
+            if getattr(restart_nova, "_in_progress", False):
+                root.after(0, lambda: status_label.config(text="ПЕРЕЗАПУСК", fg=COLOR_TEXT_WARNING))
+            else:
+                root.after(0, lambda: status_label.config(text="ОСТАНОВЛЕНО", fg=COLOR_TEXT_FAIL))
         
         try:
             if 'novadivert_redirect_manager' in globals() and novadivert_redirect_manager:
@@ -26842,8 +27367,66 @@ try:
 
         refresh_main_connection_indicators()
 
+        def report_blocked_site():
+            """Ручной запуск классификатора Cloudflare (S15).
+
+            Сейчас ни к чему не привязано: пункт контекстного меню, который её
+            вызывал, снят. Функция цела, потому что автоматического триггера у
+            классификатора нет и не предвидится — домен вне всех списков для
+            Nova структурно невидим, — так что это его единственный вход.
+            """
+            try:
+                hostname = simpledialog.askstring(
+                    "Nova",
+                    "Домен, который не открывается (например, example.com):",
+                    parent=root,
+                )
+            except Exception:
+                hostname = None
+            hostname = (hostname or "").strip().strip(".").lower()
+            if not hostname:
+                return
+
+            def _worker():
+                try:
+                    import nova_cloudflare_classify as _cf_classify
+                    base_dir = get_base_dir()
+                    list_dir = os.path.join(base_dir, "list")
+                    cloudflare_cidr_path = os.path.join(base_dir, "ip", "cloudflare.txt")
+                    bin_path = os.path.join(get_bin_dir(), "nova-engine.exe")
+                    warp_ok = False
+                    try:
+                        wm = globals().get("warp_manager")
+                        if wm and bool(getattr(wm, "is_connected", False)):
+                            warp_port = int(globals().get("WARP_PORT", 1370))
+                            warp_ok = bool(is_local_port_open_quick(warp_port, timeout=1.0))
+                    except Exception:
+                        warp_ok = False
+                    result = _cf_classify.classify_and_maybe_reroute(
+                        hostname, list_dir, cloudflare_cidr_path, bin_path,
+                        warp_available=warp_ok, log_func=log_print,
+                    )
+                except Exception as e:
+                    result = {"status": "engine_error", "detail": str(e)}
+                message = {
+                    "already_routed": f"{hostname} уже входит в существующие списки маршрутизации.",
+                    "reachable": f"{hostname} открывается напрямую — добавлять некуда.",
+                    "probe_inconclusive": f"Не удалось подтвердить, что {hostname} находится за Cloudflare.",
+                    "engine_error": f"Не удалось проверить {hostname}: {result.get('detail')}",
+                    "kept": f"{hostname} проверен, маршрут менять не требуется.",
+                    "rerouted": f"{hostname} добавлен в RU-маршрут — заработает в течение нескольких секунд.",
+                }.get(result.get("status"), str(result))
+                root.after(0, lambda: native_message_box(message, "Nova"))
+
+            threading.Thread(target=_worker, daemon=True).start()
+
         main_context_menu = tk.Menu(root, tearoff=0)
         main_context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
+        # Пункт «Сообщить о заблокированном сайте…» снят по просьбе владельца.
+        # Сам report_blocked_site оставлен намеренно: это единственный способ
+        # запустить классификатор Cloudflare (S15), и возврат пункта — ровно
+        # одна строка здесь. Удалять его вместе с пунктом значило бы выбросить
+        # рабочий тракт целиком.
 
         def show_main_context_menu(event):
             try: 
@@ -26915,6 +27498,11 @@ try:
         
         # Запуск фоновых задач
         root.after(1200, lambda: launch_background_tasks())
+
+        # Окно лога строится заранее, в простое, а не под первым щелчком.
+        # Отдельно от launch_background_tasks и позже неё: это работа для Tk-потока,
+        # и она не должна конкурировать с первой отрисовкой.
+        root.after(2500, lambda: root.after_idle(precreate_log_window))
         
         check_scan_status_loop() 
         
