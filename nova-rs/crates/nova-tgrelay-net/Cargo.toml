@@ -1,0 +1,22 @@
+[package]
+name = "nova-tgrelay-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "I/O layer for the Telegram transparent relay: the 1372 listener driving nova-tgrelay's protocol state machines over tokio."
+
+# Split out from nova-tgrelay on purpose. That crate stays dependency-free so the
+# protocol decisions can be tested without a runtime; every dependency the relay
+# actually needs to touch a socket lives here, where it is visible.
+[dependencies]
+nova-tgrelay.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"

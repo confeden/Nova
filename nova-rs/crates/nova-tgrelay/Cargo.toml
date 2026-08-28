@@ -1,0 +1,18 @@
+[package]
+name = "nova-tgrelay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Protocol core for the Telegram transparent relay: client dispatch, CONNECT parsing, WSS route classification and MTProto framing."
+
+# Deliberately dependency-free. The AES-CTR keystream the framing needs sits
+# behind the `KeyStream` trait instead of a crypto crate, so the part that
+# actually decides where a byte boundary falls is testable on its own and the
+# port can be reviewed without a supply chain attached to it.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

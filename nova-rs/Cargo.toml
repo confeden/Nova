@@ -7,12 +7,14 @@ members = [
     "crates/nova-health",
     "crates/nova-probe",
     "crates/nova-tls",
+    "crates/nova-tgrelay",
+    "crates/nova-tgrelay-net",
     "crates/nova-zapret",
     "crates/nova-cli",
 ]
 
 [workspace.package]
-version = "1.37.0"
+version = "1.38.0"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Brent"]
@@ -29,6 +31,9 @@ nova-cloudflare = { path = "crates/nova-cloudflare" }
 nova-health = { path = "crates/nova-health" }
 nova-routing = { path = "crates/nova-routing" }
 nova-tls = { path = "crates/nova-tls" }
+nova-tgrelay = { path = "crates/nova-tgrelay" }
+nova-tgrelay-net = { path = "crates/nova-tgrelay-net" }
+tokio = "1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
