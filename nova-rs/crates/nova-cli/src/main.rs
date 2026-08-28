@@ -12,8 +12,10 @@
 //! cargo run -p nova-cli -- mine        breed across all pools, report new rules
 //! cargo run -p nova-cli -- learn       watch the learner converge, offline
 //! cargo run -p nova-cli -- budget      show the background exploration schedule
+//! cargo run -p nova-cli -- cloudflare-classify   one JSON request on stdin -> one JSON verdict on stdout
 //! ```
 
+mod cloudflare_cmd;
 mod corpus;
 mod validate;
 
@@ -30,6 +32,13 @@ use validate::{Validator, Verdict};
 
 fn main() {
     let command = std::env::args().nth(1).unwrap_or_else(|| "inspect".to_owned());
+
+    // Stateless, no Nova tree required -> dispatched before Corpus::find_root()
+    // (and before the "nova engine {version} root {path}" banner below) so a
+    // Python caller gets nothing but the one JSON line on stdout it asked for.
+    if command == "cloudflare-classify" {
+        std::process::exit(cloudflare_cmd::run());
+    }
 
     let Some(root) = Corpus::find_root() else {
         eprintln!(
@@ -57,7 +66,9 @@ fn main() {
         "learn" => learn(&corpus),
         "budget" => budget(),
         other => {
-            eprintln!("unknown command {other:?}; try inspect | import | evolve | mine | learn | budget");
+            eprintln!(
+                "unknown command {other:?}; try inspect | import | evolve | mine | learn | budget | cloudflare-classify"
+            );
             std::process::exit(2);
         }
     }
