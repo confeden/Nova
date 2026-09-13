@@ -1,4 +1,4 @@
-# version: 1.38.0
+# version: 1.39
 # Nova PC - Games routing list (Path of Exile endpoints reached by IP)
 #
 # The WinDivert redirect claims these IPs without process metadata, on the ports

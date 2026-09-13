@@ -1,4 +1,4 @@
-# version: 1.38.0
+# version: 1.39
 #
 # Discord's hosts, duplicated here from CANONICAL_DISCORD_DOMAINS in nova.pyw.
 #

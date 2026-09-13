@@ -1,4 +1,4 @@
-# version: 1.38.0
+# version: 1.39
 1337x.to
 1e100cdn.net
 7tv.app
@@ -35,6 +35,7 @@ breakingcopyright.com
 brevo.com
 buildwithfern.com
 cdn.bsky.app
+cdn.intergient.com
 cdninstagram.com
 cfapi.net
 chartbeat.com
@@ -111,6 +112,7 @@ googleads.g.doubleclick.net
 googlevideo.com
 greasyfork.org
 grokusercontent.com
+hailuoai.video
 happyscribe.com
 hdclub.ua
 hdkinoteatr.com
@@ -145,6 +147,7 @@ meduza.io
 meet.google.com
 meshworld.in
 microsoft.com
+minimax.io
 mktoweb.com
 mmcdn.com
 mobi-films.com
@@ -277,6 +280,9 @@ windscribe.com
 windscribe.net
 workos.com
 wsimg.com
+www.debian.org
+www.vdsina.com
+www.virustotal.com
 x.com
 xv-ru.com
 xvideos-cdn.com
