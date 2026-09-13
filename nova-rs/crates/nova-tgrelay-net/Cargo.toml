@@ -13,10 +13,48 @@ description = "I/O layer for the Telegram transparent relay: the 1372 listener d
 # actually needs to touch a socket lives here, where it is visible.
 [dependencies]
 nova-tgrelay.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
+# The phase vocabulary (`Reached`) is already shared with `tgrelay/phase.py`, so
+# a dial failure reports how far it got in the same words the classifier and the
+# logs use, instead of inventing a second set.
+nova-probe.workspace = true
+# `BlockSignature` - the shared vocabulary `tgrelay/phase.py` mirrors. Used to
+# decide whether a failure could plausibly be the substituted SNI's fault.
+nova-core.workspace = true
+# The terminator protocol is line-delimited JSON, and its server side is
+# nova-tls's binary. Both already in the workspace.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# A WebSocket client must mask every frame with an unpredictable key. Already in
+# this workspace's dependency tree, so naming it here adds nothing to the build.
+getrandom = "0.3"
+# The obfuscation keystream MTProto framing is read through. RustCrypto rather
+# than the BoringSSL already in this workspace: that one is gated behind
+# nova-tls's `shape` feature because building it needs a C toolchain plus NASM,
+# and the relay must not inherit that. Pure Rust, no build script.
+aes = "0.8"
+ctr = "0.9"
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros", "sync"] }
+# RFC 6455 §4.2.2: the server proves it did the handshake with
+# base64(sha1(key + GUID)). The Python never checks it; see src/upgrade.rs.
+sha1 = "0.11.0"
+# The Worker's handshake signature: HMAC-SHA256 over "<window>|<host>".
+# Same RustCrypto family as sha1 above, so `digest` is already in the tree.
+hmac = "0.13.0"
+sha2 = "0.11.0"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "rt-multi-thread", "macros"] }
+# `test-util` is what gives `#[tokio::test(start_paused = true)]`. The traffic
+# log's interval has a 2 s floor, so without a controllable clock that one test
+# would cost real seconds for no extra coverage.
+tokio = { workspace = true, features = [
+    "net",
+    "io-util",
+    "time",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "test-util",
+] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -704,10 +704,25 @@ fn socks5_connect(socket: &mut TcpStream, target: &Target) -> Result<(), Failure
     }
     if head[1] != 0x00 {
         // The proxy answered and declined. That is the proxy's verdict about
-        // the destination, not a fault of ours.
+        // the destination, not a fault of ours — and the pair below has to say
+        // so, because `RESOLVED`+`CLOSED` classifies as `blackholed` on the
+        // Python side, which is *our* fault and parks the egress for 90 s. The
+        // comment used to be right while the constants were not: measured on a
+        // live session, every media attempt against a public zone's `kwsN-1`
+        // name (no DNS record, so code 0x04 here) parked both egresses in turn.
+        //
+        // 0x01 "general failure" and 0x02 "not allowed by ruleset" stay ours:
+        // the first could be the proxy's own fault and the second is the proxy
+        // refusing us by policy. Mirrors `phase.SOCKS5_DESTINATION_FAILURE`.
+        let (reached, ended) = match head[1] {
+            0x03 => (reached::RESOLVED, ended::REFUSED), // network unreachable
+            0x04 => (reached::NOTHING, ended::CLOSED),   // host unreachable: the proxy's DNS said no
+            0x05 => (reached::RESOLVED, ended::REFUSED), // refused by the destination
+            _ => (reached::RESOLVED, ended::CLOSED),
+        };
         return Err(Failure::new(
-            reached::RESOLVED,
-            if head[1] == 0x05 { ended::REFUSED } else { ended::CLOSED },
+            reached,
+            ended,
             format!("SOCKS5 CONNECT failed with code {}", head[1]),
         ));
     }
@@ -756,10 +771,18 @@ fn http_connect(socket: &mut TcpStream, target: &Target) -> Result<(), Failure> 
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
     if status != 200 {
-        // The proxy spoke HTTP back, so it works and it said no.
+        // The proxy spoke HTTP back, so it works and it said no. *What* it said
+        // no to decides who is charged: 502/504 is its verdict on the upstream,
+        // while 403/407 is it declining us and stays ours. `HTTP_STATUS` with
+        // `RESOLVED` classifies as `blackholed`, so the upstream cases need the
+        // refusal pair instead. Mirrors `phase.HTTP_CONNECT_DESTINATION_FAILURE`.
+        let (reached, ended) = match status {
+            502 | 504 => (reached::RESOLVED, ended::REFUSED),
+            _ => (reached::RESOLVED, ended::HTTP_STATUS),
+        };
         return Err(Failure::new(
-            reached::RESOLVED,
-            ended::HTTP_STATUS,
+            reached,
+            ended,
             format!("HTTP CONNECT returned {status}"),
         ));
     }
