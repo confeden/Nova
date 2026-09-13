@@ -29,6 +29,12 @@ Third-party upstream links used by Nova (brief reference list):
 - amneziawg-go / AmneziaWG-related AWG support: https://github.com/amnezia-vpn/amneziawg-go
 - tg-ws-proxy based Telegram relay work: https://github.com/Flowseal/tg-ws-proxy
 - zapret / winws: https://github.com/bol-van/zapret
+- usque (MASQUE): https://github.com/Diniboy1123/usque
+- warp-plus: https://github.com/bepass-org/warp-plus
+- quic-go: https://github.com/quic-go/quic-go
+- uTLS: https://github.com/refraction-networking/utls
+- gVisor: https://github.com/google/gvisor
+- Tor and lyrebird: https://www.torproject.org/
 - Cloudflare WARP: https://developers.cloudflare.com/warp-client/
 - Wintun: https://www.wintun.net/
 - Microsoft Visual C++ Redistributable: https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist

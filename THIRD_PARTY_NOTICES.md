@@ -26,6 +26,46 @@ Upstream: `https://github.com/amnezia-vpn/amneziawg-go`
 License: MIT
 Local notice text: `licenses/third_party/amneziawg-go-MIT.txt`
 
+`bin/nova-go.exe`
+Nova's Go helper (WARP registration and endpoint scanning, MASQUE), built by
+Nova from `nova-go/`. It links the following open-source components:
+- usque — `https://github.com/Diniboy1123/usque` — MIT —
+  `licenses/third_party/usque-MIT.txt`
+- connect-ip-go (fork) — `https://github.com/Diniboy1123/connect-ip-go` — MIT —
+  `licenses/third_party/connect-ip-go-MIT.txt`
+- warp-plus (`ipscanner`, `warp`) — `https://github.com/bepass-org/warp-plus` —
+  MIT — `licenses/third_party/warp-plus-MIT.txt`
+- quic-go — `https://github.com/quic-go/quic-go` — MIT —
+  `licenses/third_party/quic-go-MIT.txt`
+- uTLS — `https://github.com/refraction-networking/utls` — BSD-3-Clause —
+  `licenses/third_party/utls-BSD-3-Clause.txt`
+- wireguard-go (`tun/netstack`) — `https://git.zx2c4.com/wireguard-go` — MIT —
+  `licenses/third_party/wireguard-go-MIT.txt`
+- gVisor — `https://github.com/google/gvisor` — Apache-2.0 —
+  `licenses/third_party/gvisor-Apache-2.0.txt`
+- go-socks5 — `https://github.com/things-go/go-socks5` — MIT —
+  `licenses/third_party/go-socks5-MIT.txt`
+- Go standard library and `golang.org/x/*` — BSD-3-Clause —
+  `licenses/third_party/golang-x-BSD-3-Clause.txt`
+
+`bin/tor/nova-tor.exe`, `bin/tor/nova-lyrebird.exe`, `bin/tor/geoip`,
+`bin/tor/geoip6`, `bin/tor/pt_config.json`
+Unmodified files from the official Tor Expert Bundle 15.0.22 (tor 0.4.9.12,
+lyrebird 0.8.1), renamed from `tor.exe` and `lyrebird.exe` so that Nova never
+stops a Tor installation that belongs to the user. They run as separate
+programs.
+Upstream: `https://www.torproject.org/download/tor/`
+Licenses: Tor — BSD-3-Clause with bundled components
+(`licenses/third_party/tor-BSD-3-Clause.txt`, OpenSSL
+`licenses/third_party/openssl-Apache-2.0.txt`, Libevent
+`licenses/third_party/libevent-BSD-3-Clause.txt`, zlib
+`licenses/third_party/zlib.txt`); this build of Tor states that it is covered
+by the GNU GPL (`licenses/third_party/GPL-3.0.txt`); lyrebird — BSD-3-Clause
+and GPL-3.0-or-later parts, with the texts of all its dependencies in
+`licenses/third_party/lyrebird.txt`. Source code:
+`https://gitlab.torproject.org/tpo/core/tor` and
+`https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird`.
+
 `tgrelay/*`
 Telegram relay support includes vendored or adapted code derived from
 `Flowseal/tg-ws-proxy`
