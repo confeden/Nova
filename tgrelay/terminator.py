@@ -198,11 +198,19 @@ async def _dial_once(
     if not status.get("ok"):
         _abort(writer)
         message = str(status.get("error") or "TLS helper refused the tunnel")
-        raise _tag(
-            OSError(message),
-            int(status.get("reached", phase.Reached.NOTHING)),
-            int(status.get("ended", phase.Ended.CLOSED)),
-        )
+        reached = int(status.get("reached", phase.Reached.NOTHING))
+        ended = int(status.get("ended", phase.Ended.CLOSED))
+        # The helper's own verdict is believed for everything it can see better
+        # than we can — except this one family, where it has been reporting the
+        # proxy's answer about the destination as though the egress had gone
+        # quiet. `RESOLVED`+`CLOSED` classifies as `blackholed`, which is our
+        # fault and parks the egress for 90 s; the truth is `dns_failure`, which
+        # is nobody's. Derived from the message, so it agrees with whichever
+        # side is right and needs no lockstep release.
+        corrected = phase.proxy_verdict(message)
+        if corrected is not None:
+            reached, ended = int(corrected[0]), int(corrected[1])
+        raise _tag(OSError(message), reached, ended)
     return reader, writer
 
 

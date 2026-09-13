@@ -23,6 +23,19 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
 
 APP_ROOT = REPO_ROOT.parent if REPO_ROOT.name.lower() == "resources" else REPO_ROOT
 
+# `temp/` надо считать опубликованным: его прикладывают к отчётам о проблеме.
+# Имя пользователя Windows внутри пути программы опознаёт человека, а для
+# классификации приложения нужен хвост пути, а не начало.
+try:
+    from nova_privacy import redact_user_path, redact_user_paths_in_text
+except Exception:  # модуль не найден — лучше писать полный путь, чем упасть
+    def redact_user_path(value):
+        return value
+
+    def redact_user_paths_in_text(value):
+        return value
+
+
 
 def _data_path(*parts):
     r"""Данные верхнего уровня (`ip/`, `list/`, `temp/`) лежат НЕ рядом с модулем.
@@ -772,14 +785,14 @@ class NovaWfpUdpProxy:
                 f"[NovaWFP][UDP] redirect-resolve-map client={client_addr[0]}:{client_addr[1]} "
                 f"local={resolved.get('local_host')}:{resolved.get('local_port')} "
                 f"target={_mask_ip_for_log(resolved.get('target_host'))}:{resolved.get('target_port')} "
-                f"egress={resolved.get('preferred_egress')} app={resolved.get('app_id') or resolved.get('app_family') or '-'}"
+                f"egress={resolved.get('preferred_egress')} app={redact_user_path(resolved.get('app_id') or resolved.get('app_family') or '-')}"
             )
         else:
             self.log(
                 f"[NovaWFP][UDP] redirect-resolve client={client_addr[0]}:{client_addr[1]} "
                 f"local={resolved['local_host']}:{resolved['local_port']} "
                 f"target={_mask_ip_for_log(resolved['target_host'])}:{resolved['target_port']} "
-                f"egress={resolved['preferred_egress']} app={resolved['app_id']}"
+                f"egress={resolved['preferred_egress']} app={redact_user_path(resolved['app_id'])}"
             )
         return resolved
 

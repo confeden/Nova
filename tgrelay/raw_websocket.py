@@ -30,6 +30,11 @@ _st_BBQ4s = struct.Struct('>BBQ4s')
 _st_H = struct.Struct('>H')
 _st_Q = struct.Struct('>Q')
 
+# Потолки на то, что собеседник может заставить нас разместить в памяти.
+# Ни то ни другое не достижимо честным трафиком этого пути.
+MAX_FRAME_PAYLOAD = 16 * 1024 * 1024
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
 # Framing only — there is deliberately no `connect` here any more.
 #
 # This module used to own a second entry point: a `connect` staticmethod with
@@ -87,6 +92,7 @@ def set_sock_opts(transport, buffer_size):
 class RawWebSocket:
     __slots__ = ('reader', 'writer', '_closed')
 
+    OP_CONTINUATION = 0x0
     OP_BINARY = 0x2
     OP_CLOSE = 0x8
     OP_PING = 0x9
@@ -114,8 +120,17 @@ class RawWebSocket:
         await self.writer.drain()
 
     async def recv(self) -> Optional[bytes]:
+        # Фрагменты собираются, а не теряются. Раньше кадр с opcode 0x1/0x2
+        # возвращался сразу, без взгляда на FIN, а продолжения (opcode 0x0)
+        # проходили мимо через `continue`: фрагментированное сообщение
+        # приезжало обрезанным по первому куску, остальное молча исчезало.
+        # Ошибки при этом нет нигде — у MTProto своё обрамление поверх, так что
+        # клиент видит не сбой, а тихо рассинхронизированный поток.
+        # Воспроизведено на живом коде: три кадра "frag"/"ment"/"ed" отдавали
+        # b"frag" и упирались в EOF. Тест: tests/test_tgrelay_ws_fragments.py.
+        pending = None
         while not self._closed:
-            opcode, payload = await self._read_frame()
+            opcode, payload, fin = await self._read_frame()
 
             if opcode == self.OP_CLOSE:
                 self._closed = True
@@ -141,7 +156,28 @@ class RawWebSocket:
                 continue
 
             if opcode in (0x1, 0x2):
-                return payload
+                if pending is not None:
+                    raise ConnectionError(
+                        "WebSocket data frame arrived while a fragmented message was open"
+                    )
+                if fin:
+                    return payload
+                pending = bytearray(payload)
+                continue
+
+            if opcode == self.OP_CONTINUATION:
+                if pending is None:
+                    raise ConnectionError(
+                        "WebSocket continuation frame arrived with no message open"
+                    )
+                if len(pending) + len(payload) > MAX_MESSAGE_BYTES:
+                    raise ConnectionError(
+                        f"WebSocket message exceeds {MAX_MESSAGE_BYTES} bytes across fragments"
+                    )
+                pending.extend(payload)
+                if fin:
+                    return bytes(pending)
+                continue
             continue
         return None
 
@@ -180,7 +216,7 @@ class RawWebSocket:
             return _st_BBH4s.pack(fb, 0x80 | 126, length, mask_key) + masked
         return _st_BBQ4s.pack(fb, 0x80 | 127, length, mask_key) + masked
 
-    async def _read_frame(self) -> Tuple[int, bytes]:
+    async def _read_frame(self) -> Tuple[int, bytes, bool]:
         hdr = await self.reader.readexactly(2)
         # RSV1..RSV3 are zero unless an extension was negotiated, and no
         # extension ever is. Reading straight past them is how a deflated frame
@@ -191,15 +227,24 @@ class RawWebSocket:
                 f"WebSocket frame reserved bits set ({hdr[0] & 0x70:#04x}); "
                 "an unnegotiated extension is in use and its payload cannot be decoded"
             )
+        fin = bool(hdr[0] & 0x80)
         opcode = hdr[0] & 0x0F
         length = hdr[1] & 0x7F
         if length == 126:
             length = _st_H.unpack(await self.reader.readexactly(2))[0]
         elif length == 127:
             length = _st_Q.unpack(await self.reader.readexactly(8))[0]
+        # Длина приходит с провода и доходит до readexactly как есть, то есть
+        # любой собеседник может заказать аллокацию на 2**63 байт. По этому
+        # пути ничего крупного не ходит: собственные выгрузки уходят чтениями
+        # по 64 КиБ, медиакадры Telegram меньше.
+        if length > MAX_FRAME_PAYLOAD:
+            raise ConnectionError(
+                f"WebSocket frame declares {length} bytes, over the {MAX_FRAME_PAYLOAD} limit"
+            )
         if hdr[1] & 0x80:
             mask_key = await self.reader.readexactly(4)
             payload = await self.reader.readexactly(length)
-            return opcode, _xor_mask(payload, mask_key)
+            return opcode, _xor_mask(payload, mask_key), fin
         payload = await self.reader.readexactly(length)
-        return opcode, payload
+        return opcode, payload, fin

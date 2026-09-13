@@ -24,6 +24,23 @@ for _path in (os.path.join(BASE_DIR, "resources"), BASE_DIR, APP_DIR):
 from nova_routing_profiles import match_app_by_process_path
 from nova_transport_plans import _get_app_route_mode
 
+# Лог пишется удержанным handle с потолком по размеру: open+close на каждую
+# строку стоил 228 мкс против 3.8 мкс, а ротации не было вовсе.
+try:
+    from nova_temp_log import CappedLog
+except Exception:  # модуль не доехал — лучше писать по-старому, чем не писать
+    CappedLog = None
+
+
+# `temp/` надо считать опубликованным: его прикладывают к отчётам о проблеме, а
+# имя пользователя Windows внутри пути программы опознаёт человека.
+try:
+    from nova_privacy import redact_user_path
+except Exception:  # модуль не найден — полный путь лучше, чем упавший помощник
+    def redact_user_path(value):
+        return value
+
+
 
 WINDIVERT_LAYER_NETWORK = 0
 WINDIVERT_LAYER_FLOW = 2
@@ -510,6 +527,12 @@ class ProcessResolver:
                 return cached["path"], cached["app"]
         path = self._query_image_path(pid)
         app = match_app_by_process_path(path) if path else None
+        # Классификация уже сделана по полному пути; дальше он только
+        # пересказывается — в карту на диске и в лог. Снимаем имя здесь, один
+        # раз для всех потребителей. Хвост пути остаётся: по нему приложение
+        # и опознаётся дальше (`_app_family_from_app_id` ищет в нём подстроки
+        # вроде `telegram desktop`).
+        path = redact_user_path(path)
         if app not in {"Discord", "Telegram", "WhatsApp", "Games", "GamesDirect", "OBS"}:
             app = None
         with self._lock:
@@ -770,6 +793,7 @@ class RedirectService:
         self.base_dir = BASE_DIR
         self.bin_dir = os.path.join(self.base_dir, "bin")
         self.log_path = log_path
+        self._log_sink = None
         self.state_path = state_path
         self.map = RedirectMap(map_path)
         self.tcp_proxy_port = int(tcp_proxy_port)
@@ -863,11 +887,16 @@ class RedirectService:
         )
 
     def log(self, message):
-        line = f"{time.strftime('%H:%M:%S')} {message}\n"
+        line = f"{time.strftime('%H:%M:%S')} {message}"
+        sink = self._log_sink
+        if sink is not None:
+            sink.write(line)
+            return
+        # Запасной путь: без модуля — как раньше, дорого, но работает.
         with self._write_lock:
             os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
             with open(self.log_path, "a", encoding="utf-8", newline="") as f:
-                f.write(line)
+                f.write(line + "\n")
 
     def write_state(self):
         payload = self.state.snapshot()
@@ -1479,8 +1508,12 @@ class RedirectService:
     def run(self):
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
-        with open(self.log_path, "w", encoding="utf-8", newline="") as f:
-            f.write("")
+        if CappedLog is not None:
+            # truncate=True — лог за этот запуск, а не за все прошлые.
+            self._log_sink = CappedLog(self.log_path, truncate=True)
+        else:
+            with open(self.log_path, "w", encoding="utf-8", newline="") as f:
+                f.write("")
         self.log("[NovaDivert][Redirect] starting.")
         # Именно здесь, а не в __init__: run() парой строк выше усекает этот же
         # файл режимом "w", поэтому предупреждение, написанное из конструктора,

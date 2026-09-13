@@ -95,6 +95,12 @@ CF_MEDIA_BAD_TTL = _env_float(
 )
 FALLBACK_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_FALLBACK_LOG_INTERVAL", 8.0, minimum=1.0)
 SKIP_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_SKIP_LOG_INTERVAL", 300.0, minimum=1.0)
+# Сколько ждать первого байта от клиента. Молчащий сокет — не поломка:
+# Telegram гоняет транспорты наперегонки, открывает :443 и :80 к одному DC и
+# пишет только в победивший, а при выключенном в клиенте прокси оба приезжают
+# сюда через redirect. Проигравший стоит молча до этого срока.
+CLIENT_FIRST_BYTE_TIMEOUT = _env_float("NOVA_TG_RELAY_CLIENT_FIRST_BYTE_TIMEOUT", 5.0, minimum=1.0)
+SILENT_CLIENT_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_SILENT_CLIENT_LOG_INTERVAL", 60.0, minimum=1.0)
 CF_FALLBACK_ENABLED = _env_bool("NOVA_TG_RELAY_CF_FALLBACK", True)
 # How long a target stays marked as "Telegram is racing its HTTP transport
 # here". Cleared early whenever a route becomes usable again.
@@ -112,6 +118,34 @@ CF_FIRST_DCS = {
     for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "1,2,3,4,5,203") or "").replace(";", ",").split(",")
     if item.strip().isdigit()
 }
+# Telegram's own web route goes first for media, and the Worker is the reserve.
+#
+# The order used to be the other way round for one reason: the Worker was the
+# only thing that carried media at all. That is no longer what the measurements
+# say. `kwsN-1.web.telegram.org` at the DC redirect IP, over warp-socks, carries
+# media here with no Cloudflare in the path — Telegram bans WARP egress for raw
+# MTProto (a native req_pq stays silent for 6 s on every DC) but not for WSS to
+# web.telegram.org. Meanwhile the owned zone is a **finite daily budget**, and
+# spending it first means spending it on sessions the free route would have
+# served.
+#
+# Deliberately a plain boolean and not another `..._DCS` list: G16 is exactly
+# the trap of a per-DC default that flips half the DCs when written out, and
+# `NOVA_TG_RELAY_CF_FIRST_DCS` / `_MEDIA_DCS` are on the settings denylist for
+# that reason. An explicit list still wins over this switch, so D11's opt-in
+# ordering is untouched.
+MEDIA_WEB_FIRST = _env_bool("NOVA_TG_RELAY_MEDIA_WEB_FIRST", True)
+# How many owned-Worker requests this process has made, and when it last said
+# so. The daily budget is spent by the whole install base, and nothing in the
+# logs said what one machine contributes (`open-issues.md#o6`); this counts the
+# handshakes that actually reached the Worker — a reply with an HTTP status,
+# which is what Cloudflare bills — split by media, because that is the axis the
+# routing decisions are made on.
+CF_WORKER_USAGE_LOG_INTERVAL = _env_float("NOVA_TG_RELAY_CF_USAGE_LOG_INTERVAL", 3600.0, minimum=60.0)
+_cf_worker_requests = {"media": 0, "plain": 0}
+_cf_worker_usage_logged = [0.0]
+
+
 CF_FIRST_MEDIA_DCS = {
     int(item)
     for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_MEDIA_DCS", "2,4,5,203") or "").replace(";", ",").split(",")
@@ -347,6 +381,11 @@ _SOCKS_HANDSHAKE_TIMEOUT = 5.0
 _CLIENT_GONE_WINERRORS = frozenset({64, 995, 10053, 10054, 10058})
 
 
+def _burst_tail(suppressed: int, interval: float) -> str:
+    """Хвост строки-ограничителя: сколько таких же было подавлено."""
+    return f" Ещё {suppressed} за последние {int(interval)} с." if suppressed else ""
+
+
 def _split_http_authority(target: str) -> Tuple[Optional[str], Optional[int]]:
     """`host:port` из строки запроса CONNECT.
 
@@ -523,6 +562,154 @@ def _cf_domain_base(domain: str) -> str:
         if domain == base or domain.endswith("." + base):
             return base
     return ""
+
+
+# --- Cloudflare's daily Worker budget ---------------------------------------
+#
+# `429` with `error code: 1027` is Cloudflare saying the Worker behind this zone
+# has spent its daily request allowance. It is not a per-connection hiccup and
+# it is not the SNI's fault: every name in the zone answers the same way, from
+# every egress, until the counter resets at 00:00 UTC.
+#
+# It used to be read, used to decide the egress was healthy, and then dropped.
+# Nothing said so in the log — on a live session `nova_console.log` carried no
+# line with either number — and the domain re-entered the race six seconds later
+# (`CF_MEDIA_BAD_TTL`). For media that is fatal rather than merely wasteful:
+# only the owned zone has `kwsN-1` records, the public zones answer NXDOMAIN for
+# them, so the client spent the rest of the UTC day reconnecting every eight
+# seconds and never loaded a single photo.
+CF_QUOTA_STATUS = 429
+# 0 keeps the honest answer — the time left in the UTC day. The override is for
+# tests, and for the day Cloudflare charges the budget on some other clock.
+CF_QUOTA_TTL_OVERRIDE = _env_float("NOVA_TG_RELAY_CF_QUOTA_TTL", 0.0, minimum=0.0)
+CF_QUOTA_TTL_MIN = 300.0
+_cf_zone_quota_until: Dict[str, float] = {}
+
+
+def _seconds_to_utc_midnight(now: Optional[float] = None) -> float:
+    """How long Cloudflare's daily counter has left to run."""
+    now = float(now if now is not None else time.time())
+    return max(60.0, 86400.0 - (now % 86400.0))
+
+
+def _cf_quota_ttl() -> float:
+    if CF_QUOTA_TTL_OVERRIDE > 0.0:
+        return float(CF_QUOTA_TTL_OVERRIDE)
+    return max(CF_QUOTA_TTL_MIN, _seconds_to_utc_midnight())
+
+
+def _cf_note_quota_exhausted(exc: BaseException, domain: str) -> bool:
+    """Step a whole zone aside until its Worker budget resets.
+
+    Ours only. A 429 from one of the public Workers is somebody else's budget on
+    somebody else's schedule; the per-domain bench already covers that without
+    having to guess when it clears.
+    """
+    if not isinstance(exc, WsHandshakeError):
+        return False
+    if int(getattr(exc, "status_code", 0) or 0) != CF_QUOTA_STATUS:
+        return False
+    if not is_owned_cf_domain(domain):
+        return False
+    base = _cf_domain_base(domain) or str(domain or "").strip().lower()
+    if not base:
+        return False
+    ttl = _cf_quota_ttl()
+    now = time.monotonic()
+    previous = float(_cf_zone_quota_until.get(base, 0.0) or 0.0)
+    _cf_zone_quota_until[base] = max(previous, now + ttl)
+    if previous <= now:
+        _log_wss_egress(
+            f"[TgRelay] Свой Cloudflare-воркер исчерпал суточную квоту (429/1027): зона {base} "
+            f"отключена на {int(ttl // 3600)} ч {int((ttl % 3600) // 60)} мин, до сброса счётчика "
+            f"в 00:00 UTC. Медиа и остальной WSS идут запасным маршрутом."
+        )
+    return True
+
+
+def _cf_domain_is_media(domain: str) -> bool:
+    """`kwsN-1.<zone>` is the media sibling; `kwsN.<zone>` is not."""
+    head = str(domain or "").split(".", 1)[0].strip().lower()
+    return head.startswith("kws") and head.endswith("-1")
+
+
+def _cf_note_worker_request(domain: str) -> None:
+    """One handshake reached our own Worker — the unit Cloudflare charges for."""
+    if not is_owned_cf_domain(domain):
+        return
+    _cf_worker_requests["media" if _cf_domain_is_media(domain) else "plain"] += 1
+    now = time.monotonic()
+    last = float(_cf_worker_usage_logged[0] or 0.0)
+    if last <= 0.0:
+        # Start the clock at the first request rather than at import, so the
+        # first line covers a real interval instead of however long the process
+        # sat idle before anyone opened Telegram.
+        _cf_worker_usage_logged[0] = now
+        return
+    if (now - last) < CF_WORKER_USAGE_LOG_INTERVAL:
+        return
+    _cf_worker_usage_logged[0] = now
+    media = int(_cf_worker_requests["media"])
+    plain = int(_cf_worker_requests["plain"])
+    _log_wss_egress(
+        f"[TgRelay] Запросов к своему воркеру с этой машины: {media + plain} "
+        f"(медиа {media}, остальное {plain}) за {int((now - last) / 60)} мин."
+    )
+
+
+def _cf_zone_out_of_quota(domain: str) -> bool:
+    base = _cf_domain_base(domain) or str(domain or "").strip().lower()
+    if not base:
+        return False
+    return float(_cf_zone_quota_until.get(base, 0.0) or 0.0) > time.monotonic()
+
+
+def _cf_clear_zone_quota(domain: str) -> None:
+    """A handshake got through, so whatever the counter said, it says no more."""
+    base = _cf_domain_base(domain) or str(domain or "").strip().lower()
+    if not base:
+        return
+    if float(_cf_zone_quota_until.pop(base, 0.0) or 0.0) > time.monotonic():
+        _log_wss_egress(
+            f"[TgRelay] Квота Cloudflare-воркера восстановлена: зона {base} снова в работе."
+        )
+
+
+def _cf_owned_zone_available() -> bool:
+    """Is at least one zone we control still answering?"""
+    try:
+        bases = get_cfproxy_primary_domains("NOVA_TG_RELAY_CF_DOMAINS")
+    except Exception:
+        bases = []
+    now = time.monotonic()
+    for base in bases:
+        base = str(base or "").strip().lower()
+        if base and float(_cf_zone_quota_until.get(base, 0.0) or 0.0) <= now:
+            return True
+    return False
+
+
+def _cf_route_worth_reconnecting(is_media: bool = False) -> bool:
+    """Is there still a WSS route worth closing the client for?
+
+    Every "close instead of falling back to raw TCP" branch below rests on one
+    bet: the ISP throttles Telegram's own protocol, so a reconnect over WSS
+    beats a fallback. `_has_custom_cfproxy_domain()` was standing in for that
+    bet and it is a constant — config.py always puts the owned zone in the list
+    — so the bet was never re-examined, not even once the Worker had stopped
+    answering at all.
+
+    Media is where that goes wrong. Only the owned zone carries the `kwsN-1`
+    records a media session needs, so when its budget is gone there is nothing
+    left to reconnect to and the loop runs until the quota resets. Plain TCP is
+    a poor path, but "poor" beats "none": for the rest of the traffic the public
+    zones are still there, which is why the answer differs by `is_media`.
+    """
+    if not _has_custom_cfproxy_domain():
+        return False
+    if not bool(is_media):
+        return True
+    return _cf_owned_zone_available()
 
 
 def _canonical_dc_ips(dc: int) -> List[str]:
@@ -1103,10 +1290,13 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
     ordered = _order_wss_attempts(attempts)
     if len(ordered) < 2:
         try:
-            return await _connect_websocket_once(host, domain, timeout, attempts, ordered[0] if ordered else None)
+            result = await _connect_websocket_once(host, domain, timeout, attempts, ordered[0] if ordered else None)
         except BaseException as exc:
             _note_sni_verdict(exc, domain, _attempt_signature(exc))
+            _cf_note_quota_exhausted(exc, domain)
             raise
+        _cf_clear_zone_quota(domain)
+        return result
 
     # Split the caller's budget so probing a dead egress cannot stretch the
     # whole attempt past what the CF race is willing to wait for.
@@ -1117,6 +1307,7 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
         try:
             result = await _connect_websocket_once(host, domain, attempt_timeout, [attempt], attempt)
             _mark_wss_egress_good(label)
+            _cf_clear_zone_quota(domain)
             if index:
                 _log_wss_egress_switch(label, domain)
             return result
@@ -1128,6 +1319,7 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
                 signature = _attempt_signature(exc)
                 exc.nova_signature = signature
                 _note_sni_verdict(exc, domain, signature)
+                _cf_note_quota_exhausted(exc, domain)
                 raise
             last_error = exc
         except (asyncio.TimeoutError, OSError) as exc:
@@ -1153,6 +1345,40 @@ async def _connect_websocket_target(host: str, domain: str, timeout: float = 8.0
             continue
         _mark_wss_egress_bad(label, domain)
     raise last_error if last_error is not None else WsHandshakeError(0, "no upstream attempts available")
+
+
+# An upgrade reply is a few hundred bytes; Cloudflare's is under one KiB. The
+# cap is here for the same reason the frame-length cap is in raw_websocket: the
+# size of the allocation is chosen by the far side, not by this one.
+MAX_UPGRADE_HEADER_LINES = 128
+
+
+async def _read_upgrade_head(reader, timeout: float):
+    """Read the reply header block under **one** deadline for the whole block.
+
+    A `wait_for` around a single `readline` bounds one read, not the exchange: a
+    peer that sends one header just inside the budget holds the attempt open for
+    as long as it likes. That is G22 again, after the SOCKS handshake, and it was
+    reproduced on this very loop before it was changed: 4.86 s against a 0.5 s
+    budget, and it stopped only because the harness ran out of lines
+    (`temp/upgrade_head_dribble.py`).
+
+    Extracted from `_connect_websocket_once` so the budget can be tested without
+    a TLS stack behind it.
+    """
+    deadline = time.monotonic() + float(timeout)
+    response_lines = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("upgrade reply did not complete within the budget")
+        line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if len(response_lines) >= MAX_UPGRADE_HEADER_LINES:
+            raise WsHandshakeError(0, "upgrade reply header block too long")
+        response_lines.append(line.decode("utf-8", errors="replace").strip())
+    return response_lines
 
 
 async def _connect_websocket_once(host: str, domain: str, timeout: float, attempts, attempt=None):
@@ -1199,17 +1425,16 @@ async def _connect_websocket_once(host: str, domain: str, timeout: float, attemp
         writer.write(req)
         await writer.drain()
 
-        response_lines = []
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-            if line in (b"\r\n", b"\n", b""):
-                break
-            response_lines.append(line.decode("utf-8", errors="replace").strip())
+        response_lines = await _read_upgrade_head(reader, timeout)
         if not response_lines:
             writer.close()
             await writer.wait_closed()
             raise WsHandshakeError(0, "empty response")
         status_code, first_line = persona.status_of(response_lines)
+        # Counted here and nowhere earlier: an attempt that died at TCP or TLS
+        # never reached the Worker and is not billed. A reply — 101 or refusal —
+        # means it ran.
+        _cf_note_worker_request(domain)
         headers = persona.parse_headers(response_lines[1:])
         if status_code != 101:
             writer.close()
@@ -1649,6 +1874,11 @@ class TelegramTransparentRelayServer:
         self._cf_idle: Dict[Tuple[int, bool, bool], deque] = {}
         self._cf_refilling = set()
         self._last_skip_log: Dict[Tuple[str, str, int, int, bool], float] = {}
+        # Метод -> (сколько подавлено с прошлой записи, когда записали).
+        self._http_method_refusals: Dict[str, Tuple[int, float]] = {}
+        # Адрес клиента -> (сколько подавлено, когда записали).
+        self._silent_clients: Dict[str, Tuple[int, float]] = {}
+        self._client_timeouts: Dict[str, Tuple[int, float]] = {}
         self._route_scoring: Dict[Tuple[int, str], float] = {}  # (dc, route_label_type): score
         # Ключ (dc, is_media, route_kind) — см. _wss_route_kind.
         self._wss_first_byte_fail: Dict[Tuple[int, bool, str], Tuple[int, float]] = {}
@@ -2137,6 +2367,101 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
 
+    def _log_burst(self, bucket, key: str, interval: float, render) -> None:
+        """Первая строка всплеска сразу, остальные — счётчиком в следующей.
+
+        `render(suppressed)` строит сообщение; ноль означает, что подавлять было
+        нечего. Ограничитель — украшение, поэтому любая его поломка обязана
+        заканчиваться записью, а не молчанием: «стало тише» и «перестало
+        работать» в логе выглядят одинаково.
+
+        Хвост всплеска, за которым ничего не последовало, так и не будет назван.
+        Осознанный размен: строка «было ещё N» без нового события никому не
+        нужна, а таймер ради неё пришлось бы держать.
+        """
+        suppressed = 0
+        try:
+            now = time.monotonic()
+            seen, last = bucket.get(key, (0, 0.0))
+            if last and (now - last) < float(interval):
+                bucket[key] = (seen + 1, last)
+                return
+            bucket[key] = (0, now)
+            suppressed = seen
+        except Exception:
+            pass
+        self.log_func(render(suppressed))
+
+    def _log_unsupported_http_method(self, method: str) -> None:
+        """Одна строка на всплеск, а не на каждый запрос.
+
+        Telegram Desktop гоняет свой HTTP-транспорт параллельно с TCP, и через
+        прокси это выглядит как поток POST'ов: 110 одинаковых строк за 19 минут
+        живой работы. Ответить 501 надо каждому, писать в лог — нет.
+        """
+        method = str(method or "").strip().upper() or "?"
+        self._log_burst(
+            self._http_method_refusals,
+            method,
+            FALLBACK_LOG_INTERVAL,
+            lambda n: (
+                f"[TgRelay] HTTP-прокси: метод {method} не поддержан, нужен CONNECT."
+                + _burst_tail(n, FALLBACK_LOG_INTERVAL)
+            ),
+        )
+
+    def _log_silent_client(self, label: str) -> None:
+        """Клиент подключился и не прислал ни байта. Это не «Ошибка клиента».
+
+        Разобрано по отчёту пользователя, у которого «посыпались ошибки» сразу
+        после того, как он выключил прокси в клиенте Telegram: 52 строки
+        «Ошибка клиента … timed out» за 5 минут — и при этом 102 туннеля, 101 из
+        них с входящим трафиком, 2.86 МБ за час. Не сломалось ничего; сломано
+        было слово «Ошибка» в строке про совершенно штатную гонку транспортов.
+        """
+        peer = str(label or "?").rsplit(":", 1)[0] or "?"
+        self._log_burst(
+            self._silent_clients,
+            peer,
+            SILENT_CLIENT_LOG_INTERVAL,
+            lambda n: (
+                f"[TgRelay] Клиент {label} молчал {int(CLIENT_FIRST_BYTE_TIMEOUT)} с и закрыт — "
+                f"обычно это проигравший сокет в гонке транспортов Telegram, а не сбой."
+                + _burst_tail(n, SILENT_CLIENT_LOG_INTERVAL)
+            ),
+        )
+
+
+    def _log_client_timeout(self, label: str, exc: BaseException) -> None:
+        """Истёк срок — но чей?
+
+        Строка называлась «Ошибка клиента <адрес клиента>», и адрес в ней —
+        единственное, что видит читатель. Между тем `socket.create_connection`
+        в `transport.py` отдаёт ровно `TimeoutError('timed out')`, когда не
+        достучался до **вышестоящего** узла: клиент тут ни при чём, он просто
+        тот, для кого канал поднимали. Пустое сообщение (`''`) отдаёт
+        `asyncio.wait_for` — по нему эти два случая и различимы.
+
+        Отчёт, с которого разобрано: 52 такие строки за 5 минут, и в том же логе
+        102 туннеля, 101 с входящим трафиком, 2.86 МБ за час. Всплеск совпал с
+        `WSS empty response` и `TCP fallback ... down=0`, то есть с тем, что
+        душили канал наверх.
+        """
+        detail = str(exc or "").strip()
+        peer = str(label or "?").rsplit(":", 1)[0] or "?"
+        self._log_burst(
+            self._client_timeouts,
+            peer,
+            SILENT_CLIENT_LOG_INTERVAL,
+            lambda n: (
+                f"[TgRelay] Канал для клиента {label} не поднят: истёк срок"
+                + (f" ({detail})" if detail else "")
+                + ". Обычно это вышестоящий узел, а не клиент."
+                + _burst_tail(n, SILENT_CLIENT_LOG_INTERVAL)
+            ),
+        )
+
+
     def _log_skipping_fallback(self, reason: str, target_ip: str, target_port: int, dc_hint: int, is_media: bool) -> None:
         try:
             key = (
@@ -2296,7 +2621,17 @@ class TelegramTransparentRelayServer:
         prefetched_ws_task = None
         client_key = None
         try:
-            prefetched = await asyncio.wait_for(reader.readexactly(1), timeout=5.0)
+            try:
+                prefetched = await asyncio.wait_for(
+                    reader.readexactly(1), timeout=CLIENT_FIRST_BYTE_TIMEOUT
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                # Разбирается здесь, а не в общем обработчике внизу: там
+                # «истёк срок» может означать что угодно — рукопожатие SOCKS,
+                # ответ прокси, застрявший туннель. Здесь он означает ровно
+                # одно, и это не сбой.
+                self._log_silent_client(label)
+                return
             divert_context = await self._lookup_divert_context(peer)
             if divert_context:
                 client_mode = "divert"
@@ -2388,7 +2723,9 @@ class TelegramTransparentRelayServer:
             # anyway. Keep a near-zero probe there; retain longer probing only
             # for likely media sockets where WSS path can still matter.
             if not predicted_is_media:
-                probe_timeout = 0.25 if _has_custom_cfproxy_domain() else 0.25
+                # Обе ветки условия здесь были одинаковыми (0.25), а сам предикат
+                # — константа True (G54). Ни выбора, ни разницы: остаётся число.
+                probe_timeout = 0.25
             else:
                 probe_timeout = 0.15 if int(target_port or 0) == 80 else 0.6
             init_packet = await self._read_probe(reader, want=64, timeout=probe_timeout, initial=prefetched)
@@ -2442,7 +2779,7 @@ class TelegramTransparentRelayServer:
                 # означает просто оборванное соединение. Так был сломан
                 # обновлятор Telegram Desktop: его хост лежит внутри диапазона
                 # DC2, поэтому попадал сюда и умирал молча.
-                if _has_custom_cfproxy_domain() and not http_transport and not tls_transport:
+                if _cf_route_worth_reconnecting(is_media) and not http_transport and not tls_transport:
                     self._log_skipping_fallback(
                         "unparsed-init-no-wss",
                         target_ip,
@@ -2496,7 +2833,7 @@ class TelegramTransparentRelayServer:
                 # try it instead unless the last attempts proved it silent for
                 # this DC. Either way the outcome is recorded, so the next
                 # connection decides on evidence rather than on the assumption.
-                if _has_custom_cfproxy_domain() and not _native_worth_trying(dc_hint):
+                if _cf_route_worth_reconnecting(False) and not _native_worth_trying(dc_hint):
                     self._log_skipping_fallback(
                         "parsed-non-media-cf-failed",
                         target_ip,
@@ -2523,7 +2860,7 @@ class TelegramTransparentRelayServer:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
-                if _has_custom_cfproxy_domain():
+                if _cf_route_worth_reconnecting(False):
                     self._log_skipping_fallback(
                         "non-ws-capable",
                         target_ip,
@@ -2539,7 +2876,7 @@ class TelegramTransparentRelayServer:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
-                if _has_custom_cfproxy_domain():
+                if _cf_route_worth_reconnecting(is_media):
                     # Raw Telegram TCP is throttled on this route. During the
                     # short WSS cooldown, close and let Telegram reconnect once
                     # the circuit opens again without spending more Worker calls.
@@ -2578,7 +2915,7 @@ class TelegramTransparentRelayServer:
             if ws is None and not prefetched_route_consumed:
                 ws, route_label = await self._connect_ws_route(dc_hint, target_ip, is_media, label)
             if ws is None:
-                if _has_custom_cfproxy_domain():
+                if _cf_route_worth_reconnecting(is_media):
                     return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=True)
                 return
@@ -2598,7 +2935,7 @@ class TelegramTransparentRelayServer:
             except Exception:
                 with contextlib.suppress(Exception):
                     await ws.close()
-                if _has_custom_cfproxy_domain():
+                if _cf_route_worth_reconnecting(is_media):
                     self._cf_note_bad_route_label(route_label, is_media, ttl=CF_MEDIA_BAD_TTL)
                     self._note_wss_first_byte_result(dc_hint, is_media, 0, route_label)
                     return
@@ -2635,10 +2972,16 @@ class TelegramTransparentRelayServer:
                 f"route={route_label} target={target_ip}:{target_port} duration_ms={duration_ms} up={up + len(init_packet)} down={down}"
             )
             if int(down or 0) > 0:
+                # The watchdog exists to move media off a route that is
+                # technically alive and practically useless. With the owned
+                # Worker out of budget there is nowhere to move: the retry
+                # lands on the same web route and starts from zero bytes, so
+                # a slow tunnel is strictly better than a restarted one.
                 media_stalled = bool(
                     is_media
                     and int(down or 0) < MEDIA_WSS_MIN_PROGRESS
                     and int(duration_ms or 0) >= 1800
+                    and _cf_owned_zone_available()
                 )
                 if media_stalled:
                     self._cf_note_bad_route_label(route_label, True, ttl=CF_MEDIA_BAD_TTL)
@@ -2693,7 +3036,7 @@ class TelegramTransparentRelayServer:
                 verdict = "first-byte timeout" if first_byte_timed_out else "empty close (peer sent nothing)"
                 # Skip TCP fallback when CF domains are available — ISP throttles
                 # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
-                if _has_custom_cfproxy_domain():
+                if _cf_route_worth_reconnecting(is_media):
                     self.log_func(
                         f"[TgRelay] WSS {verdict}; skipping TCP fallback (ISP throttled): proto={_proto_label(init_info.proto)} "
                         f"dc={dc_hint or '?'} media={is_media} target={target_ip}:{target_port} "
@@ -2716,6 +3059,24 @@ class TelegramTransparentRelayServer:
                 )
         except asyncio.IncompleteReadError:
             pass
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            # Отдельно и **до** OSError. `TimeoutError` — его подкласс с Python
+            # 3.3, а `socket.timeout` и `asyncio.TimeoutError` с 3.10/3.11 — это
+            # он же, поэтому ветка ниже перехватывала все таймауты первой, а
+            # подавление стартового окна в `except Exception` не могло
+            # исполниться ни разу. Проверено по двум собранным логам: строки
+            # «Стартовое окно» нет ни в одном.
+            try:
+                start_age = (time.monotonic() - float(self._start_mono or 0.0)) if self._start_mono else 999.0
+                if start_age < 45.0:
+                    now = time.monotonic()
+                    if (now - float(self._last_startup_timeout_log or 0.0)) > FALLBACK_LOG_INTERVAL:
+                        self._last_startup_timeout_log = now
+                        self.log_func("[TgRelay] Стартовое окно: ждём стабилизацию WARP/SOCKS, клиентские timeout временно подавлены.")
+                    return
+            except Exception:
+                pass
+            self._log_client_timeout(label, exc)
         except OSError as exc:
             # Клиент ушёл — это не авария релея, а обычный конец соединения, и
             # чаще всего мы же его и оборвали: Nova сама сбрасывает TCP-сессии
@@ -2729,17 +3090,6 @@ class TelegramTransparentRelayServer:
                 return
             self.log_func(f"[TgRelay] Ошибка клиента {label}: {exc}")
         except Exception as exc:
-            try:
-                text = str(exc or "").strip().lower()
-                start_age = (time.monotonic() - float(self._start_mono or 0.0)) if self._start_mono else 999.0
-                if text == "timed out" and start_age < 45.0:
-                    now = time.monotonic()
-                    if (now - float(self._last_startup_timeout_log or 0.0)) > 8.0:
-                        self._last_startup_timeout_log = now
-                        self.log_func("[TgRelay] Стартовое окно: ждём стабилизацию WARP/SOCKS, клиентские timeout временно подавлены.")
-                    return
-            except Exception:
-                pass
             self.log_func(f"[TgRelay] Ошибка клиента {label}: {exc}")
         finally:
             if client_key is not None:
@@ -2890,7 +3240,7 @@ class TelegramTransparentRelayServer:
                 return True
             # Skip TCP fallback when CF domains are available — ISP throttles
             # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
-            if _has_custom_cfproxy_domain():
+            if _cf_route_worth_reconnecting(False):
                 self.log_func(
                     f"[TgRelay] WSS empty response; skipping TCP fallback (ISP throttled): proto={proto_label} dc={dc_hint} "
                     f"target={target_ip}:{target_port} replay={len(replay_initial)} duration_ms={duration_ms}"
@@ -3047,9 +3397,7 @@ class TelegramTransparentRelayServer:
             # Абсолютный URI вместо CONNECT — это обычный проксируемый HTTP, а
             # релей умеет только туннель. Отвечаем явно: молчащий прокси
             # выглядит как зависший и диагностируется часами.
-            self.log_func(
-                f"[TgRelay] HTTP-прокси: метод {method or '?'} не поддержан, нужен CONNECT."
-            )
+            self._log_unsupported_http_method(method)
             await self._http_reply(writer, b"501 Not Implemented")
             return None, None, b""
         host, port = _split_http_authority(parts[1])
@@ -3377,7 +3725,7 @@ class TelegramTransparentRelayServer:
             self._last_wss_route_log[key] = now
         except Exception:
             pass
-        action = "closing for a clean WSS reconnect" if _has_custom_cfproxy_domain() else "switching to TCP fallback"
+        action = "closing for a clean WSS reconnect" if _cf_route_worth_reconnecting(is_media) else "switching to TCP fallback"
         self.log_func(
             f"[TgRelay] WSS path unavailable for DC{dc_hint} target={target_ip} media={is_media}; {action}."
         )
@@ -3515,6 +3863,7 @@ class TelegramTransparentRelayServer:
             is_media
             and 0 < int(down or 0) < MEDIA_WSS_MIN_PROGRESS
             and int(duration_ms or 0) >= 1800
+            and _cf_owned_zone_available()
         )
         self._note_wss_first_byte_result(dc_hint, is_media, 0 if media_stalled else down, route_label)
         if media_stalled:
@@ -3566,7 +3915,18 @@ class TelegramTransparentRelayServer:
             str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "") or "").strip()
             or str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_MEDIA_DCS", "") or "").strip()
         )
-        cf_first = self._cf_first(dc_hint, is_media) if cf_order_configured else True
+        # Media goes to Telegram's own web route first and keeps the Worker in
+        # reserve — the budget is finite and the free route demonstrably carries
+        # media on this network. The exception is a web route already in its
+        # first-byte cooldown: trying it ahead of the Worker would only move the
+        # stall earlier, and the circuit exists to say exactly that.
+        web_first = bool(is_media) and MEDIA_WEB_FIRST and not cf_order_configured
+        if web_first and self._wss_first_byte_disabled(dc_hint, is_media, route_kind="web"):
+            web_first = False
+        if cf_order_configured:
+            cf_first = self._cf_first(dc_hint, is_media)
+        else:
+            cf_first = not web_first
         custom_cf_first = bool(
             allow_cf and CF_FALLBACK_ENABLED and _has_custom_cfproxy_domain() and cf_first
         )
@@ -3631,6 +3991,11 @@ class TelegramTransparentRelayServer:
             return dc in CF_FIRST_MEDIA_DCS
         return dc in CF_FIRST_DCS
 
+    @staticmethod
+    def _still_pending(task_domains, pending):
+        """The subset of the race that has not been dealt with yet."""
+        return [(task, domain) for task, domain in task_domains if task in pending]
+
     async def _cleanup_cf_race_tasks(self, task_domains, is_media: bool) -> None:
         for task, domain in task_domains:
             try:
@@ -3684,7 +4049,11 @@ class TelegramTransparentRelayServer:
             if bool(is_media)
             else 0.0
         )
-        race_width = min(max(1, int(CF_CONNECT_RACE_WIDTH)), len(ordered))
+        # Media races one deep. The public zones have no `kwsN-1` record at
+        # all, so a three-wide race there wins nothing and costs three
+        # concurrent dials — each of which can park an egress for 90 s on a
+        # failure that belongs to the domain, not to the egress.
+        race_width = 1 if bool(is_media) else min(max(1, int(CF_CONNECT_RACE_WIDTH)), len(ordered))
 
         async def _open_candidate(domain: str):
             ws, upstream_label = await _connect_websocket_target(
@@ -3723,7 +4092,12 @@ class TelegramTransparentRelayServer:
                         if wait_timeout <= 0.0:
                             for task in pending:
                                 task.cancel()
-                            asyncio.create_task(self._cleanup_cf_race_tasks(task_domains, bool(is_media)))
+                            # Only what is still in flight. Handing over the whole
+                            # list re-awaits the tasks this loop already processed, and
+                            # a failed one is charged a second time: measured 1.0 -> 0.25
+                            # for a single failure (temp/race_double_bench.py), where one
+                            # charge leaves 0.5. The winner path below already filters.
+                            asyncio.create_task(self._cleanup_cf_race_tasks(self._still_pending(task_domains, pending), bool(is_media)))
                             return None, ""
                     done, pending = await asyncio.wait(
                         pending,
@@ -3733,10 +4107,10 @@ class TelegramTransparentRelayServer:
                     if not done:
                         for task in pending:
                             task.cancel()
-                        asyncio.create_task(self._cleanup_cf_race_tasks(task_domains, bool(is_media)))
+                        asyncio.create_task(self._cleanup_cf_race_tasks(self._still_pending(task_domains, pending), bool(is_media)))
                         return None, ""
                 except asyncio.CancelledError:
-                    asyncio.create_task(self._cleanup_cf_race_tasks(task_domains, bool(is_media)))
+                    asyncio.create_task(self._cleanup_cf_race_tasks(self._still_pending(task_domains, pending), bool(is_media)))
                     raise
                 winner = None
                 for task in done:
@@ -3800,6 +4174,12 @@ class TelegramTransparentRelayServer:
         filtered = []
         for domain in ordered:
             normalized = str(domain or "").strip().lower()
+            # A zone whose Worker has spent its daily budget answers every
+            # name in it with the same 429. Racing them is a guaranteed loss
+            # that still spends the media connect budget, so the zone steps
+            # aside whole rather than one domain at a time.
+            if _cf_zone_out_of_quota(normalized):
+                continue
             if float(self._cf_bad_domain_until.get(normalized, 0.0) or 0.0) > now:
                 continue
             filtered.append(domain)

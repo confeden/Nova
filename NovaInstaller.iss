@@ -67,6 +67,14 @@ Name: "{app}\resources\NovaWFP"
 Name: "{app}\resources\NovaWFP\proxy"
 Name: "{app}\resources\NovaDivert"
 Name: "{app}\resources\tgrelay"
+; User-owned: generated WARP/Proton profiles, MASQUE identities and imports live
+; here, so the folders survive uninstall. Inno.py stages only the shared pool,
+; proton_nodes.json and the relay key into profiles (PROFILES_SHIP_WHITELIST).
+Name: "{app}\profiles"; Flags: uninsneveruninstall
+Name: "{app}\profiles\MASQUE"; Flags: uninsneveruninstall
+Name: "{app}\profiles\AWG Cloudflare"; Flags: uninsneveruninstall
+Name: "{app}\profiles\AWG Proton"; Flags: uninsneveruninstall
+Name: "{app}\profiles\Custom"; Flags: uninsneveruninstall
 
 [Files]
 Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "list\u_ru.txt,list\u_eu.txt,ip\u_ru.txt,ip\u_eu.txt,bin\sing-box.exe,routing_settings.json,README.md,THIRD_PARTY_NOTICES.md,LICENSE,licenses,licenses\*,NovaWFP,NovaWFP\*,NovaDivert,NovaDivert\*,tgrelay,tgrelay\*"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -99,6 +107,25 @@ Type: filesandordirs; Name: "{app}\resources\pyruntime"
 Type: filesandordirs; Name: "{app}\resources\setuptools"
 Type: filesandordirs; Name: "{app}\resources\*.dist-info"
 Type: filesandordirs; Name: "{app}\resources\__pycache__"
+; Profiles moved from {app}\awg to {app}\profiles; Nova itself migrates the rest on
+; start. Only what earlier installers put into awg is removed here: the WARPv*.conf
+; pool (including names retired by later pools) and the keys, so a stale legacy
+; relay key can never win the fallback read. User .conf files in awg are left for
+; the in-app migration, which moves them to profiles\Custom and removes the empty dir.
+; Inno.py refuses to build while nova.pyw still reads awg (require_profile_sources).
+Type: files; Name: "{app}\awg\WARPv*.conf"
+Type: files; Name: "{app}\awg\opera_relay.key"
+Type: files; Name: "{app}\awg\cf_ws.key"
+; The shipped pool is overwritten by name only, so a name dropped from a newer pool
+; would stay forever: classified "bundled" by its WARPv name, undeletable in the UI
+; and kept in the auto round-robin with a revoked key. WARPv* names belong to Nova;
+; the current pool is laid down right after this. Nothing else in profiles is
+; touched: generated, imported and MASQUE profiles and the keys are the user's.
+Type: files; Name: "{app}\profiles\AWG Cloudflare\WARPv*.conf"
+; Rendered wireproxy configs of earlier releases. They carry private keys, and temp
+; is the folder attached to problem reports (I19); the runtime now renders into
+; profiles\.runtime.
+Type: filesandordirs; Name: "{app}\temp\awg-runtime"
 
 [Icons]
 Name: "{autoprograms}\Nova"; Filename: "{app}\Nova.exe"
@@ -145,16 +172,16 @@ begin
 
   Script :=
     '$ErrorActionPreference=''SilentlyContinue''; ' +
-    '$procs = Get-Process -Name Nova, winws, opera-proxy*, warp* -ErrorAction SilentlyContinue; ' +
+    '$procs = Get-Process -Name Nova, winws, opera-proxy*, warp*, nova-go, nova-tor, nova-lyrebird -ErrorAction SilentlyContinue; ' +
     '$svc = Get-CimInstance Win32_SystemDriver -Filter "Name=''WinDivert''" -ErrorAction SilentlyContinue; ' +
     'if ($procs -or ($svc -and $svc.State -eq ''Running'')) { ' +
     '  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); ' +
     '  if (-not $isAdmin) { ' +
-    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
+    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-tor.exe /IM nova-lyrebird.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '    Start-Process sc.exe -ArgumentList ''stop CloudflareWARP'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '    Start-Process sc.exe -ArgumentList ''stop WinDivert'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '  } else { ' +
-    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe; ' +
+    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-tor.exe /IM nova-lyrebird.exe; ' +
     '    sc.exe stop CloudflareWARP; ' +
     '    sc.exe stop WinDivert; ' +
     '  } ' +

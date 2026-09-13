@@ -147,8 +147,16 @@ def build_public_tcp_upstream_attempts(
     include_direct=True,
     warp_timeout=1.2,
     opera_timeout=1.0,
+    secondary=None,
 ):
+    """`secondary` = {"kind": "opera"|"tor", "ready": bool, "http_port": int} names the reserve slot.
+
+    With Tor as the reserve the `opera-http` attempt points at Tor's HTTP CONNECT port instead of
+    Opera; the label stays, because every ordering rule knows the secondary slot by it.
+    """
     attempts = []
+    secondary = secondary if isinstance(secondary, dict) else None
+    secondary_is_tor = bool(secondary) and str(secondary.get("kind") or "").strip().lower() == "tor"
 
     try:
         if warp_manager is not None:
@@ -174,8 +182,21 @@ def build_public_tcp_upstream_attempts(
     except:
         pass
 
+    if secondary_is_tor:
+        if secondary.get("ready"):
+            attempts.append(
+                {
+                    "kind": "http",
+                    "host": "127.0.0.1",
+                    "port": int(secondary.get("http_port") or 1378),
+                    "label": "opera-http",
+                    "egress": "tor",
+                    # Tor builds a circuit before CONNECT answers.
+                    "timeout": max(float(opera_timeout), 10.0),
+                }
+            )
     try:
-        if opera_proxy_manager is not None:
+        if opera_proxy_manager is not None and not secondary_is_tor:
             port_open = False
             proxy_ok = False
             try:
@@ -215,6 +236,7 @@ def build_public_app_transport_plan(
     *,
     warp_manager=None,
     opera_proxy_manager=None,
+    secondary=None,
 ):
     route_mode = _get_app_route_mode(app_key)
     normalized_app = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
@@ -225,6 +247,7 @@ def build_public_app_transport_plan(
         warp_manager=warp_manager,
         opera_proxy_manager=opera_proxy_manager,
         include_direct=include_direct,
+        secondary=secondary,
     )
     by_label = {
         str((attempt or {}).get("label") or (attempt or {}).get("kind") or "").strip().lower(): attempt

@@ -24,6 +24,19 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
 
 APP_ROOT = REPO_ROOT.parent if REPO_ROOT.name.lower() == "resources" else REPO_ROOT
 
+# `temp/` надо считать опубликованным: его прикладывают к отчётам о проблеме.
+# Имя пользователя Windows внутри пути программы опознаёт человека, а для
+# классификации приложения нужен хвост пути, а не начало.
+try:
+    from nova_privacy import redact_user_path, redact_user_paths_in_text
+except Exception:  # модуль не найден — лучше писать полный путь, чем упасть
+    def redact_user_path(value):
+        return value
+
+    def redact_user_paths_in_text(value):
+        return value
+
+
 
 def _data_path(*parts):
     r"""Данные верхнего уровня (`ip/`, `list/`, `temp/`) лежат НЕ рядом с модулем.
@@ -61,6 +74,28 @@ def _data_path(*parts):
 
 
 from tgrelay.transport import open_stream  # noqa: E402
+
+# Which egress the "opera-http" slot is right now (Opera or Tor) and whether the primary exits
+# abroad: nova.pyw publishes both to temp/vpn-egress.json, this process only reads it. Without the
+# module every decision stays what it was before the two-slot model: Opera on 1371, EU to Opera.
+try:
+    import nova_vpn_slots as _vpn_slots  # noqa: E402
+except Exception:  # pragma: no cover - an old install without the module keeps the old routing
+    _vpn_slots = None
+
+_EGRESS_STATE_CACHE = (
+    _vpn_slots.EgressStateCache(str(_data_path("temp", _vpn_slots.EGRESS_STATE_FILENAME)))
+    if _vpn_slots is not None else None
+)
+
+
+def _egress_state():
+    if _EGRESS_STATE_CACHE is None:
+        return None
+    try:
+        return _EGRESS_STATE_CACHE.get()
+    except Exception:
+        return None
 try:
     from tgrelay.config import CFPROXY_DEFAULT_DOMAINS, get_cfproxy_domains, get_cfproxy_primary_domains  # noqa: E402
     from tgrelay.transparent_relay import (  # noqa: E402
@@ -857,7 +892,21 @@ class NovaWfpTcpProxy:
                 "first_byte_timeout": 3.0,
             },
         }
+        if label == "opera-http" and _vpn_slots is not None:
+            # The secondary slot: Opera's 1371, or Tor's HTTP CONNECT port when Tor is the reserve.
+            state = _egress_state()
+            if state is not None:
+                return _vpn_slots.secondary_http_attempt(state, timeout=3.0, first_byte_timeout=2.4)
         return dict(mapping[label]) if label in mapping else None
+
+    @staticmethod
+    def _primary_carries_eu_traffic() -> bool:
+        """The primary tunnel is up and exits outside Russia, so EU-list traffic may take it."""
+        state = _egress_state()
+        if not state:
+            return False
+        primary = state.get("primary") or {}
+        return bool(primary.get("up") and primary.get("foreign"))
 
     @staticmethod
     def _effective_first_byte_timeout(attempt: dict, telegram_media: bool = False) -> float:
@@ -1021,7 +1070,13 @@ class NovaWfpTcpProxy:
                     attempts.append(label)
             attempts = _reorder_route_labels(route_mode, attempts)
             if is_eu_route_target and route_mode == "opera":
-                attempts = ["opera-http"]
+                # EU traffic has to leave Russia. The secondary always does; the primary does
+                # only when its measured exit is abroad (Proton, or Cloudflare outside Russia) --
+                # then it goes first and the secondary becomes its fallback (nova_vpn_slots).
+                if self._primary_carries_eu_traffic() and self._warp_socks_available():
+                    attempts = ["warp-socks", "opera-http"]
+                else:
+                    attempts = ["opera-http"]
 
         # The game's own protocol port is pinned to WARP while the local SOCKS
         # listener is active: launcher and gameplay retries must not silently
@@ -1116,6 +1171,13 @@ class NovaWfpTcpProxy:
                         elif label == "opera-http":
                             attempt["timeout"] = min(float(attempt.get("timeout") or 3.0), 1.1)
                             attempt["first_byte_timeout"] = min(float(attempt.get("first_byte_timeout") or 2.4), 1.1)
+                if label == "opera-http" and attempt.get("egress") == "tor":
+                    # The per-app caps above are tuned for Opera's ~1 s CONNECT. Tor builds a
+                    # circuit first; capped the same way, every Tor attempt would time out.
+                    fresh = _vpn_slots.secondary_http_attempt({"secondary": {"kind": "tor"}})
+                    attempt["timeout"] = max(float(attempt.get("timeout") or 0.0), fresh["timeout"])
+                    attempt["first_byte_timeout"] = max(
+                        float(attempt.get("first_byte_timeout") or 0.0), fresh["first_byte_timeout"])
                 rendered.append(attempt)
         return rendered
 
@@ -1270,9 +1332,10 @@ class NovaWfpTcpProxy:
                     route_scope=route_scope,
                     ttl=bad_ttl,
                 )
+                egress = str(attempt.get("egress") or "")
                 self.log_func(
                     f"[NovaWFP][Proxy] attempt-failed target={target_host}:{target_port} "
-                    f"route={label} ms={elapsed_ms} error={exc}"
+                    f"route={label}{'/' + egress if egress == 'tor' else ''} ms={elapsed_ms} error={exc}"
                 )
         if last_error is None:
             last_error = OSError("no upstream attempts available")
@@ -1988,12 +2051,12 @@ class NovaWfpTcpProxy:
                 self.log_func(
                     f"[NovaWFP][Proxy] context pid={int(context.ProcessId)} ipver={int(context.IpVersion)} "
                     f"proto={int(context.Protocol)} egress={int(context.PreferredEgress)} "
-                    f"family={app_family or '-'} app={app_id}"
+                    f"family={app_family or '-'} app={redact_user_path(app_id)}"
                 )
             elif divert_context is not None:
                 self.log_func(
                     f"[NovaWFP][Proxy] divert-context pid={int(divert_context.get('process_id') or 0)} "
-                    f"egress={int(preferred_egress)} family={app_family or '-'} app={app_id}"
+                    f"egress={int(preferred_egress)} family={app_family or '-'} app={redact_user_path(app_id)}"
                 )
 
             # Redirect records are useful for a direct proxy socket. The current first

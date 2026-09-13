@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
+import ast
 import base64
+import contextlib
 import ctypes
+import fnmatch
 import hashlib
 import json
 import os
@@ -8,7 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "resources"))
 from nova_metadata import read_project_version  # noqa: E402
@@ -55,13 +59,64 @@ PYI_WORK_DIR = TEMP_ROOT / "work"
 PYI_SPEC_DIR = TEMP_ROOT / "spec"
 PYI_ASSET_DIR = TEMP_ROOT / "embedded_assets"
 
-TOP_LEVEL_DIRS = ("ip", "list", "strat", "fake", "awg", "licenses")
+TOP_LEVEL_DIRS = ("ip", "list", "strat", "fake", "profiles", "licenses")
 RESOURCE_DIRS = ("bin",)
+# profiles/ mixes what Nova ships with what belongs to one person: the
+# developer's own WARP identity (WARPgen_*.conf, warp_identity.json), a Proton
+# account seed and the confs issued for it, MASQUE credentials, imported configs
+# in Custom/ and rendered runtime configs with private keys in .runtime/.
+# Copying the folder wholesale would put all of that into every installer, so it
+# is the one top-level dir that is staged by name: only the patterns below leave
+# the machine, and verify_staged_profiles() re-walks the staged tree and fails
+# the build if anything else got there anyway.
+PROFILES_DIRNAME = "profiles"
+LEGACY_AWG_DIRNAME = "awg"
+PROFILE_GROUP_DIRS = ("MASQUE", "Custom", "AWG Proton", "AWG Cloudflare")
+PROFILES_SHIP_WHITELIST = (
+    "AWG Cloudflare/WARPv*.conf",    # shared seed pool, refreshed by name on upgrade
+    "AWG Proton/proton_nodes.json",  # public starter node list
+    "opera_relay.key",               # relay password; rotates with every release
+)
+# Shipped names never carry spaces or brackets. "WARPv1_11 (legacy).conf" and
+# "x (2).conf" are what migration and import produce on a collision — a local
+# leftover, not a pool file — and must not match WARPv*.conf by accident.
+PROFILES_SHIP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# What earlier releases kept in awg/ and now lives in profiles/: (name pattern,
+# group folder under profiles/, "" for the profiles/ root). The installer's
+# [InstallDelete] removes exactly these from {app}\awg, so the build refuses to
+# run while nova.pyw still reads them there, and while a copy is left behind in
+# the dev tree's awg/ (a newer relay key written there would be ignored by the
+# build and deleted by the migration on the next start).
+LEGACY_AWG_MOVED_FILES = (
+    ("WARPv*.conf", "AWG Cloudflare"),
+    ("opera_relay.key", ""),
+    ("cf_ws.key", ""),
+)
+# Tor comes from the official Tor Expert Bundle, renamed so that name-based
+# kills (NovaInstaller.iss, restore_nova_network.ps1) never hit the user's own
+# Tor Browser. RESOURCE_DIRS copies bin/ recursively, so bin/tor ships as-is.
+TOR_BIN_SUBDIR = "tor"
+TOR_REQUIRED_FILES = ("nova-tor.exe", "nova-lyrebird.exe")
+TOR_OPTIONAL_FILES = ("geoip", "geoip6", "pt_config.json")
+NOVA_GO_FILENAME = "nova-go.exe"
+NOVA_GO_SOURCE_DIR = "nova-go"
+NOVA_GO_PACKAGE = "./cmd/nova-go"
+NOVA_GO_BUILD_TIMEOUT = 1800
+NOVA_GO_SMOKE_TIMEOUT = 30
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Nova's own modules live in resources/ in the source tree, which is the same
 # place the installer puts them ({app}/resources). Source layout and installed
 # layout are therefore identical, and the helper processes resolve imports the
 # same way in development as they do on a user's machine.
-RESOURCE_ROOT_FILES = ("nova_routing_profiles.py", "nova_transport_plans.py")
+# nova_privacy.py здесь по той же причине, что и остальные два: его
+# импортируют NovaDivert и NovaWFP, а они исполняются отдельным
+# интерпретатором и видят только то, что лежит на диске. Пропуск ниже
+# молчаливый (`if src_file.exists()`), так что забытое имя не заметно.
+# nova_vpn_slots.py: tcp_proxy.py and tgrelay/transport.py read the two-slot egress state through it
+# (which egress the reserve is, whether the primary exits abroad). Missing, they fall back to the
+# pre-1.39 routing in silence -- so it must be listed here, not merely present in the tree.
+RESOURCE_ROOT_FILES = ("nova_routing_profiles.py", "nova_transport_plans.py", "nova_privacy.py", "nova_temp_log.py",
+                       "nova_vpn_slots.py")
 RESOURCE_SOURCE_DIR = "resources"
 ROOT_DOC_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md")
 # The proxy helpers (NovaWFP\proxy\tcp_proxy.py, udp_proxy.py) run as separate
@@ -98,7 +153,9 @@ REPO_SOURCE_FILES = (
     Path("tgrelay") / "udp_transport.py",
     Path("tgrelay") / "transparent_relay.py",
 )
-NON_EMPTY_DIRS = ("bin", "fake", "ip", "list", "strat", "awg")
+# profiles/ is not here: any((profiles).iterdir()) is satisfied by an empty group
+# folder and proves nothing. require_profile_sources() checks the actual files.
+NON_EMPTY_DIRS = ("bin", "fake", "ip", "list", "strat")
 # nova.pyw bootstraps its own dependencies when run from source (see the
 # `sys.frozen` guard around _ensure_pip), and PyInstaller cannot see that the
 # code is dead in a frozen build - it just follows `import pip` and bundles the
@@ -111,7 +168,8 @@ PYI_EXCLUDED_MODULES = (
     "numpy", "nuitka", "PyInstaller", "pytest", "_pytest", "rich", "pygments",
     "docutils", "nh3", "zstandard", "IPython", "matplotlib", "pandas",
 )
-IGNORED_PATTERNS = ("*.old", "*.tmp", "__pycache__", "old", "warp_official")
+# *.part: an interrupted install_binary() leaves one next to the exe in bin/.
+IGNORED_PATTERNS = ("*.old", "*.tmp", "*.part", "__pycache__", "old", "warp_official")
 USER_OVERRIDE_HEADER_DEFAULTS = {
     ("list", "u_ru.txt"): "# user WARP override domains\n",
     ("list", "u_eu.txt"): "# user Opera override domains\n",
@@ -192,6 +250,273 @@ def copytree_filtered(src: Path, dst: Path) -> None:
         raise RuntimeError(f"Source path is missing: {src}")
     safe_rmtree(dst)
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*IGNORED_PATTERNS))
+
+
+def is_shippable_profile_path(rel_path: str) -> bool:
+    """Может ли файл (путь относительно profiles/) попасть в установщик.
+
+    Сравнение по сегментам, а не fnmatch по всей строке: у fnmatch `*`
+    проглатывает `/`, и `AWG Cloudflare/WARPv*.conf` пропустил бы
+    `AWG Cloudflare/WARPvX/чужой.conf`. Регистр учитывается: белый список —
+    это имена, которые мы сами кладём, а не то, как их найдёт Проводник.
+    """
+    parts = PurePosixPath(str(rel_path).replace("\\", "/")).parts
+    if not parts or not PROFILES_SHIP_NAME_RE.match(parts[-1]):
+        return False
+    for pattern in PROFILES_SHIP_WHITELIST:
+        pattern_parts = PurePosixPath(pattern).parts
+        if len(pattern_parts) != len(parts):
+            continue
+        if all(fnmatch.fnmatchcase(part, pat) for part, pat in zip(parts, pattern_parts)):
+            return True
+    return False
+
+
+def verify_staged_profiles(staged_root: Path) -> None:
+    """Провалить сборку, если в подготовленном profiles/ есть хоть что-то лишнее.
+
+    Проверка идёт по готовому дереву, а не по списку скопированного: она ловит
+    и будущую правку, которая вернёт profiles/ в общий copytree. Найденное
+    удаляется сразу — личный ключ не должен остаться даже в папке сборки.
+    """
+    if not staged_root.exists():
+        return
+    offenders = []
+    for dirpath, dirnames, filenames in os.walk(staged_root):
+        rel_dir = Path(dirpath).relative_to(staged_root)
+        for name in dirnames:
+            rel = (rel_dir / name).as_posix()
+            if rel not in PROFILE_GROUP_DIRS:
+                offenders.append(rel + "/")
+        for name in filenames:
+            rel = (rel_dir / name).as_posix()
+            if not is_shippable_profile_path(rel):
+                offenders.append(rel)
+    if not offenders:
+        return
+    safe_rmtree(staged_root)
+    leftover = " (удалить не удалось — удалите вручную!)" if staged_root.exists() else ""
+    raise RuntimeError(
+        f"В подготовленном {staged_root} оказались файлы вне белого списка{leftover}:\n - "
+        + "\n - ".join(sorted(offenders))
+        + "\n  Белый список: " + ", ".join(PROFILES_SHIP_WHITELIST)
+        + "\n  Это личные данные разработчика (свои WARP/Proton/MASQUE, Custom, .runtime) —"
+          " в установщик они попасть не должны."
+    )
+
+
+def stage_profiles(src: Path, dst: Path) -> list[str]:
+    """Разложить profiles/ в staging строго по PROFILES_SHIP_WHITELIST.
+
+    Пустые папки групп создаются всегда: установщик кладёт их пользователю,
+    и импорт/генерация пишут туда без собственного mkdir. Возвращает список
+    скопированных путей (относительно profiles/, через `/`).
+    """
+    safe_rmtree(dst)
+    if dst.exists():
+        raise RuntimeError(f"Не удалось очистить {dst} перед раскладкой профилей.")
+    for group in PROFILE_GROUP_DIRS:
+        (dst / group).mkdir(parents=True, exist_ok=True)
+
+    staged = []
+    for pattern in PROFILES_SHIP_WHITELIST:
+        pattern_parts = PurePosixPath(pattern).parts
+        src_dir = src.joinpath(*pattern_parts[:-1])
+        if not src_dir.is_dir():
+            continue
+        with os.scandir(src_dir) as entries:
+            # Ссылки не копируются: symlink в группе мог бы увести за личным файлом.
+            names = sorted(entry.name for entry in entries if entry.is_file(follow_symlinks=False))
+        for name in names:
+            rel = "/".join((*pattern_parts[:-1], name))
+            if not fnmatch.fnmatchcase(name, pattern_parts[-1]) or not is_shippable_profile_path(rel):
+                continue
+            target = dst.joinpath(*pattern_parts[:-1], name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_dir / name, target)
+            staged.append(rel)
+
+    verify_staged_profiles(dst)
+    return staged
+
+
+def nova_pyw_layout_problems(source: str) -> list[str]:
+    """Почему nova.pyw ещё живёт в раскладке awg/; пустой список — перешёл на profiles/.
+
+    Разбор через AST, а не поиск подстроки: комментарий «awg/opera_relay.key»
+    или «migrate_legacy_layout(» в тексте ничего не читает и ничего не переносит.
+    Признаки прежней раскладки — те, что были в nova.pyw до переезда:
+    AWG_PROFILES_DIRNAME = "awg" и путь, собранный из "awg" и имени ключа или
+    конфига. Признак новой — настоящий вызов migrate_legacy_layout().
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        return [f"nova.pyw не разбирается ({exc.msg}, строка {exc.lineno}) — раскладку профилей не проверить"]
+
+    legacy_path_re = re.compile(r"(?i)(?:^|[\\/])" + re.escape(LEGACY_AWG_DIRNAME) + r"[\\/]+[^\\/]+\.(?:key|conf)$")
+    migrates = False
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name == "migrate_legacy_layout":
+                migrates = True
+            args = [a.value if isinstance(a, ast.Constant) and isinstance(a.value, str) else None
+                    for a in node.args]
+            for left, right in zip(args, args[1:]):
+                if (left is not None and right is not None and left.lower() == LEGACY_AWG_DIRNAME
+                        and right.lower().endswith((".key", ".conf"))):
+                    problems.append(f"строка {node.lineno}: путь {left}/{right}")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = node.value
+            if (isinstance(value, ast.Constant) and value.value == LEGACY_AWG_DIRNAME
+                    and any(isinstance(t, ast.Name) and t.id == "AWG_PROFILES_DIRNAME" for t in targets)):
+                problems.append(f'строка {node.lineno}: AWG_PROFILES_DIRNAME = "{LEGACY_AWG_DIRNAME}"')
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if legacy_path_re.search(node.value):
+                problems.append(f"строка {node.lineno}: путь {node.value}")
+    if not migrates:
+        problems.append("нет вызова nova_profiles.migrate_legacy_layout() — awg/ на старте не переносится")
+    return problems
+
+
+def _short_list(names: list[str], limit: int = 8) -> str:
+    shown = ", ".join(names[:limit])
+    return shown + (f" и ещё {len(names) - limit}" if len(names) > limit else "")
+
+
+def legacy_awg_leftovers(base_dir: Path) -> list[str]:
+    """Что осталось в прежнем awg/ из того, что теперь живёт в profiles/.
+
+    Любой такой файл — повод остановить сборку, в каком бы состоянии ни был
+    profiles/. Сборка берёт только profiles/, так что новый ключ релея,
+    записанный по старой памяти в awg/, молча не попал бы в установщик (релей
+    ответит 407 на nova-pc-<версия>, а отсюда это выглядит мёртвым релеем), а
+    перенос при следующем запуске удалил бы его как «прежний». Содержимое
+    сравнивается по sha256 и никогда не печатается.
+    """
+    legacy = base_dir / LEGACY_AWG_DIRNAME
+    if not legacy.is_dir():
+        return []
+    try:
+        entries = sorted((p for p in legacy.iterdir() if p.is_file()), key=lambda p: p.name.lower())
+    except OSError as exc:
+        return [f"{legacy} не читается: {exc}"]
+
+    problems = []
+    for pattern, group in LEGACY_AWG_MOVED_FILES:
+        where = f"{PROFILES_DIRNAME}/{group}/" if group else f"{PROFILES_DIRNAME}/"
+        label = f"{LEGACY_AWG_DIRNAME}/{pattern}"
+        same, differ, unmoved = [], [], []
+        for entry in entries:
+            if not fnmatch.fnmatchcase(entry.name.lower(), pattern.lower()):
+                continue
+            counterpart = (base_dir / PROFILES_DIRNAME / group / entry.name) if group \
+                else (base_dir / PROFILES_DIRNAME / entry.name)
+            if not counterpart.is_file():
+                unmoved.append(entry.name)
+                continue
+            try:
+                identical = sha256_file(entry) == sha256_file(counterpart)
+            except OSError:
+                identical = False
+            (same if identical else differ).append(entry.name)
+
+        def detail(names):
+            return f" ({_short_list(names)})" if "*" in pattern else ""
+
+        if same:
+            problems.append(f"{label}{detail(same)}: такой же файл уже в {where} — удалите прежний из"
+                            f" {LEGACY_AWG_DIRNAME}/, актуальная копия в {where}")
+        if differ:
+            problems.append(f"{label}{detail(differ)}: в {LEGACY_AWG_DIRNAME}/ и {where} разное содержимое —"
+                            f" оставьте актуальное в {where}, прежнее удалите из {LEGACY_AWG_DIRNAME}/")
+        if unmoved:
+            problems.append(f"{label}{detail(unmoved)}: в {where} такого нет — запустите Nova из исходников"
+                            " (перенос awg → profiles делается на старте)")
+        if pattern == "opera_relay.key" and (same or differ or unmoved):
+            problems[-1] += (f"\n   Ключ релея нового выпуска кладётся в {PROFILES_DIRNAME}/opera_relay.key:"
+                             f" перенос на старте удаляет {LEGACY_AWG_DIRNAME}/opera_relay.key,"
+                             f" если в {PROFILES_DIRNAME}/ ключ уже есть.")
+    return problems
+
+
+def require_profile_sources(base_dir: Path) -> None:
+    """Проверить, что в profiles/ есть то, без чего установка не работает.
+
+    Не «папка не пустая»: пустая папка группы проходит такую проверку, а
+    установщик уезжает без пула WARP и без ключа релея (без ключа релей
+    выглядит мёртвым, CLAUDE.md). Проверяются сами файлы.
+
+    Сначала — что упаковываемый nova.pyw вообще читает profiles/. Установщик
+    кладёт пул и ключ только туда, а [InstallDelete] стирает
+    {app}\\awg\\WARPv*.conf и {app}\\awg\\opera_relay.key: с nova.pyw, который ищет
+    их в awg/, каждое обновление теряет пул AWG и ключ релея.
+    """
+    main_script = base_dir / "nova.pyw"
+    try:
+        reader_problems = nova_pyw_layout_problems(main_script.read_text(encoding="utf-8", errors="replace"))
+    except OSError as exc:
+        reader_problems = [f"{main_script} не читается: {exc}"]
+    if reader_problems:
+        raise RuntimeError(
+            f"{main_script} ещё читает прежний {LEGACY_AWG_DIRNAME}/ — установщик с profiles/ собирать нельзя:\n - "
+            + "\n - ".join(reader_problems)
+            + "\n  Установщик кладёт пул и ключ релея в profiles\\, а [InstallDelete] удаляет"
+              " {app}\\awg\\WARPv*.conf и {app}\\awg\\opera_relay.key: такая сборка останется без пула AWG"
+              " и без ключа релея (релей выглядит мёртвым)."
+            + "\n  Сначала интеграция nova_profiles в nova.pyw. Файлы из awg/ до неё не трогайте:"
+              " работающая Nova читает их именно там."
+        )
+
+    profiles = base_dir / PROFILES_DIRNAME
+    problems = legacy_awg_leftovers(base_dir)
+
+    cloudflare_dir = profiles / "AWG Cloudflare"
+    pool = []
+    if cloudflare_dir.is_dir():
+        pool = [p for p in cloudflare_dir.iterdir()
+                if p.is_file() and is_shippable_profile_path(f"AWG Cloudflare/{p.name}")]
+    if not pool:
+        problems.append(f"нет ни одного WARPv*.conf в {cloudflare_dir}")
+
+    relay_key = profiles / "opera_relay.key"
+    if not relay_key.is_file():
+        problems.append(f"нет ключа релея {relay_key}")
+    else:
+        try:
+            if not relay_key.read_bytes().strip():
+                problems.append(f"ключ релея пуст: {relay_key}")
+        except OSError as exc:
+            problems.append(f"ключ релея не читается: {relay_key} ({exc})")
+
+    if problems:
+        raise RuntimeError("Профили для установщика не готовы:\n - " + "\n - ".join(problems))
+
+    nodes = profiles / "AWG Proton" / "proton_nodes.json"
+    if not nodes.is_file():
+        print(f"[WARN] {nodes} отсутствует: выпуск Proton останется без запасного списка узлов.")
+    print(f"[BUILD] Профили: {len(pool)} WARPv*.conf, ключ релея на месте.")
+
+
+def require_tor_binaries(base_dir: Path) -> None:
+    """Tor не собирается: бинарники кладутся из Tor Expert Bundle руками."""
+    tor_dir = base_dir / "bin" / TOR_BIN_SUBDIR
+    missing = [str(tor_dir / name) for name in TOR_REQUIRED_FILES if not (tor_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Нет бинарников Tor:\n - " + "\n - ".join(missing)
+            + "\n  Источник: Tor Expert Bundle (windows x86_64), распаковать в bin/tor и переименовать"
+              " tor.exe -> nova-tor.exe, lyrebird.exe -> nova-lyrebird.exe."
+            + "\n  Переименование обязательно: установщик убивает помощников по имени образа"
+              " и не должен задеть Tor Browser пользователя."
+        )
+    for name in TOR_OPTIONAL_FILES:
+        if not (tor_dir / name).is_file():
+            print(f"[WARN] {tor_dir / name} отсутствует — Tor поедет без него.")
 
 
 def _extract_top_comment_header(content: str) -> str:
@@ -533,8 +858,13 @@ def require_paths(base_dir: Path) -> None:
         raise RuntimeError("Required project directories are empty:\n - "
                            + "\n - ".join(str(base_dir / name) for name in empty))
 
+    # Cheap file checks first, so a missing key or Tor binary fails before minutes of builds.
+    require_tor_binaries(base_dir)
+    require_profile_sources(base_dir)
+
     ensure_tls_terminator(base_dir)
     ensure_nova_engine(base_dir)
+    ensure_nova_go(base_dir)
 
 
 def ensure_tls_terminator(base_dir: Path) -> None:
@@ -628,6 +958,250 @@ def ensure_nova_engine(base_dir: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built, bin_dir / "nova-engine.exe")
     print(f"[Engine] nova-engine.exe обновлён: {bin_dir / 'nova-engine.exe'}")
+
+
+def nova_go_build_env(base_env=None) -> dict:
+    """Окружение сборки nova-go: всё, от чего зависят байты, задано явно.
+
+    -trimpath, -buildid= и -buildvcs=false делают выход функцией исходников,
+    тулчейна и флагов: дерево всегда «грязное» (G29), и без -buildvcs=false
+    каждая сборка несла бы свой vcs.modified. GOPROXY=off — сборка не ходит в
+    сеть молча; GOTOOLCHAIN=local — не скачивает чужой тулчейн; GOWORK=off —
+    go.work где-то выше по дереву не подменяет модули.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    env.update({
+        "CGO_ENABLED": "0",
+        "GOOS": "windows",
+        "GOARCH": "amd64",
+        "GOAMD64": "v1",
+        "GOTOOLCHAIN": "local",
+        "GOPROXY": "off",
+        "GOWORK": "off",
+        "GOFLAGS": "-mod=readonly -trimpath -buildvcs=false",
+    })
+    return env
+
+
+def nova_go_build_command(go: str, version: str, out_path: Path) -> list[str]:
+    return [
+        go, "build",
+        f"-ldflags=-s -w -buildid= -X main.version={version}",
+        "-o", str(out_path),
+        NOVA_GO_PACKAGE,
+    ]
+
+
+def nova_go_missing_replace_dirs(src_dir: Path) -> list[str]:
+    """Локальные `replace` из go.mod, чьих каталогов нет на диске.
+
+    Без этой проверки чистый клон падает посреди `go build` сообщением о
+    модуле, по которому не понять, что не хватает соседнего репозитория.
+    """
+    missing = []
+    in_block = False
+    for raw in (src_dir / "go.mod").read_text(encoding="utf-8").splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if in_block:
+            if line == ")":
+                in_block = False
+                continue
+            body = line
+        elif line.startswith("replace"):
+            body = line[len("replace"):].strip()
+            if body == "(":
+                in_block = True
+                continue
+        else:
+            continue
+        if "=>" not in body:
+            continue
+        right = body.split("=>", 1)[1].strip()
+        if right.startswith('"'):
+            end = right.find('"', 1)
+            target, rest = (right[1:end], right[end + 1:].strip()) if end > 0 else (right[1:], "")
+        else:
+            target, _, rest = right.partition(" ")
+            rest = rest.strip()
+        if rest:
+            continue  # module@version replacement, resolved from the module cache
+        if not (target.startswith(("./", "../", ".\\", "..\\")) or os.path.isabs(target)):
+            continue
+        if not (src_dir / target).is_dir():
+            missing.append(target)
+    return missing
+
+
+def install_binary(built: Path, target: Path) -> None:
+    """Положить собранный exe на место так, чтобы запущенная Nova не мешала.
+
+    Тот же приём, что у терминатора (fetch_tls_terminator.py): запись во
+    временный файл рядом, затем os.replace; если exe занят работающим
+    процессом, Windows не даёт его перезаписать, но даёт переименовать —
+    старый уходит в `.old` и удаляется следующей сборкой.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in (".old", ".part"):
+        leftover = target.with_name(target.name + suffix)
+        if leftover.exists():
+            try:
+                leftover.unlink()
+            except OSError as exc:
+                print(f"[WARN] Не удалось удалить {leftover}: {exc}")
+    part = target.with_name(target.name + ".part")
+    shutil.copy2(built, part)
+    try:
+        os.replace(part, target)
+        return
+    except PermissionError:
+        pass
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise RuntimeError(f"Не удалось записать {target}: {exc}") from exc
+
+    aside = target.with_name(target.name + ".old")
+    moved_aside = False
+    try:
+        os.replace(target, aside)
+        moved_aside = True
+        os.replace(part, target)
+        print(f"[Go] {target.name} был запущен; заменён, прежний файл удалится следующей сборкой.")
+    except OSError as exc:
+        if moved_aside and not target.exists():
+            # Never leave bin/ without the helper: put the running image's name back.
+            try:
+                os.replace(aside, target)
+            except OSError as restore_exc:
+                print(f"[WARN] Не удалось вернуть {aside} -> {target}: {restore_exc}")
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise RuntimeError(f"Не удалось заменить {target}: {exc}. Закройте Nova и повторите.") from exc
+
+
+def smoke_test_nova_go(exe: Path, version: str) -> str:
+    """`nova-go.exe version` обязан завершиться успешно и назвать версию сборки."""
+    try:
+        result = subprocess.run(
+            [str(exe), "version"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=NOVA_GO_SMOKE_TIMEOUT, creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{exe} не запускается: {exc}") from exc
+    output = (result.stdout or "").strip()
+    if result.returncode != 0 or version not in output.split():
+        raise RuntimeError(
+            f"{exe} version: код {result.returncode}, вывод {output!r}, ожидалась версия {version}.\n"
+            f"{(result.stderr or '').strip()}"
+        )
+    return output
+
+
+def build_nova_go(src_dir: Path, out_path: Path, version: str, go: str) -> None:
+    # go build runs with cwd=src_dir: a relative -o would land inside nova-go/.
+    out_path = Path(out_path).resolve()
+    cmd = nova_go_build_command(go, version, out_path)
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(src_dir), env=nova_go_build_env(),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=NOVA_GO_BUILD_TIMEOUT, creationflags=CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Сборка nova-go не уложилась в {NOVA_GO_BUILD_TIMEOUT} с.\n  Собрать без него: NOVA_SKIP_NOVA_GO=1"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Не удалось запустить {go}: {exc}") from exc
+    if result.returncode != 0:
+        hint = ""
+        if "GOPROXY=off" in (result.stderr or ""):
+            # By analogy with G50 (cargo): crates.io/proxy.golang.org are blocked here,
+            # Nova's own egress on 1371 is the way out. Unverified for Go.
+            hint = ("\n  Модуля нет в кэше, а сеть сборке запрещена (GOPROXY=off). Докачать один раз:"
+                    "\n    cd nova-go && HTTPS_PROXY=http://127.0.0.1:1371 go mod download")
+        raise RuntimeError(
+            f"Сборка nova-go провалилась (код {result.returncode}):\n"
+            f"{result.stdout}\n{result.stderr}{hint}\n"
+            "  Собрать без него: NOVA_SKIP_NOVA_GO=1"
+        )
+    if not out_path.is_file():
+        raise RuntimeError(f"go build завершился успешно, но {out_path} не появился.")
+
+
+def ensure_nova_go(base_dir: Path) -> None:
+    """Собрать bin/nova-go.exe локально, свежим на каждую сборку.
+
+    Модель nova-engine, а не терминатора: Go при -trimpath/-buildid=/
+    -buildvcs=false и CGO_ENABLED=0 воспроизводим, форма ClientHello
+    (uTLS, quic-go) задана исходниками, а не машиной сборки, так что
+    публиковать бинарник ради формы (I3/I5) незачем.
+
+    В отличие от nova-engine, отсутствие инструментов не пропускается молча:
+    MASQUE, генератор WARP и Proton — видимые пользователю функции. Если
+    собрать нечем, берётся уже лежащий exe той же версии; иначе сборка
+    падает с понятной причиной.
+    """
+    target = base_dir / "bin" / NOVA_GO_FILENAME
+    if os.environ.get("NOVA_SKIP_NOVA_GO", "") == "1":
+        state = f"в сборку попадёт имеющийся {target}" if target.is_file() else "nova-go.exe в сборку не попадёт"
+        print(f"[Go] NOVA_SKIP_NOVA_GO=1 — без пересборки; {state}.")
+        return
+
+    version = read_version(base_dir / "nova.pyw")
+    if not re.fullmatch(r"[0-9A-Za-z._+-]+", version):
+        raise RuntimeError(f"CURRENT_VERSION {version!r} нельзя передать в -X main.version.")
+
+    src_dir = base_dir / NOVA_GO_SOURCE_DIR
+    go = shutil.which("go")
+    blocker = ""
+    if not (src_dir / "go.mod").is_file():
+        blocker = f"{src_dir / 'go.mod'} отсутствует"
+    elif not go:
+        blocker = "go не найден в PATH"
+    else:
+        missing = nova_go_missing_replace_dirs(src_dir)
+        if missing:
+            blocker = "нет каталогов из replace в go.mod: " + ", ".join(missing)
+
+    if blocker:
+        if not target.is_file():
+            raise RuntimeError(
+                f"nova-go.exe не собран, а собрать нечем: {blocker}.\n"
+                "  Собрать без него: NOVA_SKIP_NOVA_GO=1"
+            )
+        # A helper from another release may not speak this nova.pyw's CLI.
+        try:
+            smoke_test_nova_go(target, version)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{blocker}, а имеющийся {target} не подходит: {exc}\n"
+                "  Собрать без него: NOVA_SKIP_NOVA_GO=1"
+            ) from exc
+        print(f"[Go] {blocker} — беру имеющийся {target} (версия {version} совпадает).")
+        return
+
+    try:
+        go_version = subprocess.run(
+            [go, "env", "GOVERSION"], env=nova_go_build_env(), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60, creationflags=CREATE_NO_WINDOW,
+        ).stdout.strip() or "?"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        go_version = f"? ({exc})"
+    print(f"[Go] Сборка nova-go.exe {version} ({go_version}, GOAMD64=v1, CGO_ENABLED=0)...")
+
+    with tempfile.TemporaryDirectory(prefix="nova-go-build-") as tmp:
+        built = Path(tmp) / NOVA_GO_FILENAME
+        build_nova_go(src_dir, built, version, go)
+        smoke_test_nova_go(built, version)
+        digest = sha256_file(built)
+        install_binary(built, target)
+    if sha256_file(target) != digest:
+        raise RuntimeError(f"{target} после установки не совпадает с собранным файлом.")
+    print(f"[Go] nova-go.exe обновлён: {target} (sha256 {digest})")
 
 
 def build_embedded_assets_module(base_dir: Path) -> Path:
@@ -808,7 +1382,11 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
     for folder_name in TOP_LEVEL_DIRS:
         src_dir = base_dir / folder_name
         dst_dir = staging_dir / folder_name
-        if src_dir.exists():
+        if folder_name == PROFILES_DIRNAME:
+            staged_profiles = stage_profiles(src_dir, dst_dir)
+            print(f"[BUILD] profiles: {len(staged_profiles)} файлов по белому списку, "
+                  f"группы: {', '.join(PROFILE_GROUP_DIRS)}")
+        elif src_dir.exists():
             copytree_filtered(src_dir, dst_dir)
         else:
             dst_dir.mkdir(parents=True, exist_ok=True)
@@ -847,6 +1425,12 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
             safe_rmtree(d)
 
     (staging_dir / "temp").mkdir(parents=True, exist_ok=True)
+
+    # Last word before Inno packs the tree: nothing after this line adds files.
+    verify_staged_profiles(staging_dir / PROFILES_DIRNAME)
+    if (staging_dir / LEGACY_AWG_DIRNAME).exists():
+        safe_rmtree(staging_dir / LEGACY_AWG_DIRNAME)
+        raise RuntimeError(f"В staging появился прежний {LEGACY_AWG_DIRNAME}/ — профили кладутся только в profiles/.")
 
     return staging_dir
 

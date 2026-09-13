@@ -111,6 +111,60 @@ def needs_different_egress(signature: str) -> bool:
     return signature in _DIFFERENT_EGRESS
 
 
+# --- Whose failure was it, the egress or the destination? -------------------
+#
+# An egress that answers "I could not reach that host" has proved it works: it
+# accepted the connection, read the request and replied. Charging that to the
+# egress is how one dead hostname takes the working egress down with it, and it
+# happened for real — the media race offers `kwsN-1.<zone>` for every zone while
+# only the owned zone has that record, so every media attempt parked both
+# egresses for 90 s on somebody else's NXDOMAIN.
+#
+# The table lives here because two dial paths need the same answer and they are
+# in different languages: `transport.py` when the TLS terminator is unavailable,
+# and the Rust helper (`nova-tls/src/bin/tls-terminator.rs`) when it is, which
+# is the normal case. The helper reports `reached`/`ended` itself, and the
+# normalisation below is applied to its reply as well — it is derived from the
+# message alone, so it gives the same answer whichever side got it right.
+#
+# Only codes that unambiguously describe the *destination* are mapped. A proxy
+# refusing us (SOCKS 0x02 "not allowed by ruleset", HTTP 403/407) or failing in
+# a way that could be its own (SOCKS 0x01 "general failure") is left alone and
+# stays charged to the egress: guessing in the egress's favour there would hide
+# a genuinely dead egress, which is the failure the parking exists to catch.
+SOCKS5_DESTINATION_FAILURE = {
+    0x03: (Reached.RESOLVED, Ended.REFUSED),   # network unreachable
+    0x04: (Reached.NOTHING, Ended.CLOSED),     # host unreachable — the proxy's DNS said no
+    0x05: (Reached.RESOLVED, Ended.REFUSED),   # refused by the destination itself
+}
+HTTP_CONNECT_DESTINATION_FAILURE = {
+    502: (Reached.RESOLVED, Ended.REFUSED),
+    504: (Reached.RESOLVED, Ended.REFUSED),
+}
+# Exactly as both dial paths spell them. A test pins these strings, because the
+# normalisation reads them rather than a structured field.
+_SOCKS5_PREFIX = "SOCKS5 CONNECT failed with code "
+_HTTP_PREFIXES = ("HTTP CONNECT returned ", "HTTP CONNECT failed: ")
+
+
+def proxy_verdict(message):
+    """(reached, ended) when a proxy reported the destination, else None."""
+    text = str(message or "").strip()
+    if text.startswith(_SOCKS5_PREFIX):
+        tail = text[len(_SOCKS5_PREFIX):].split()[:1]
+        if tail and tail[0].isdigit():
+            return SOCKS5_DESTINATION_FAILURE.get(int(tail[0]))
+        return None
+    for prefix in _HTTP_PREFIXES:
+        if not text.startswith(prefix):
+            continue
+        for token in text[len(prefix):].replace("/", " ").split():
+            if token.isdigit() and len(token) == 3:
+                return HTTP_CONNECT_DESTINATION_FAILURE.get(int(token))
+        return None
+    return None
+
+
 def is_not_our_fault(signature: str) -> bool:
     """True when the failure says nothing about Nova's configuration.
 

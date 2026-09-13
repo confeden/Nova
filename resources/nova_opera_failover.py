@@ -24,11 +24,15 @@ class OperaFailoverController:
         warp_failure_limit=2,
         retry_base_sec=300.0,
         retry_max_sec=1800.0,
+        allow_alternate=True,
     ):
         self.direct_failure_limit = max(1, int(direct_failure_limit))
         self.warp_failure_limit = max(1, int(warp_failure_limit))
         self.retry_base_sec = max(30.0, float(retry_base_sec))
         self.retry_max_sec = max(self.retry_base_sec, float(retry_max_sec))
+        # The temporary EU -> AM fallback substitutes the region. Allowed only while the
+        # secondary VPN is on «Авто»; a region the user named is retried in place (I1).
+        self.allow_alternate = bool(allow_alternate)
         self.desired_country = "EU"
         self.current_country = "EU"
         self.transport = "direct"
@@ -120,13 +124,26 @@ class OperaFailoverController:
         region = "US" if self.current_country == "AM" else self.current_country
         return f"{region}/WARP" if self.transport == "warp" else region
 
+    def set_allow_alternate(self, allowed):
+        """Allow or forbid the EU -> AM fallback; forbidding it while on AM returns to EU at once."""
+        self.allow_alternate = bool(allowed)
+        if not self.allow_alternate and self.current_country != self.desired_country:
+            return self.begin_desired_retry()
+        return self.current_decision("alternate-policy")
+
     def _switch_to_alternate(self, now, reason):
-        # Only EU has an explicit AM fallback. A user-selected US/AM region is
-        # retried in place instead of silently changing to another region.
+        # Only EU has an explicit AM fallback, and only while the region is Nova's choice.
+        # A user-selected region is retried in place instead of silently changing to another one.
         if self.desired_country != "EU":
             self.direct_failures = 0
             self.warp_failures = 0
             return self.current_decision("desired-am-retry")
+        if not self.allow_alternate:
+            self.transport = "direct"
+            self.full_proxy = ""
+            self.direct_failures = 0
+            self.warp_failures = 0
+            return self.current_decision("desired-eu-retry")
 
         self.current_country = "AM"
         self.transport = "direct"

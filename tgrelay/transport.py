@@ -6,7 +6,7 @@ import ssl
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import terminator
-from .phase import Reached
+from .phase import Reached, proxy_verdict
 
 
 _ssl_ctx = ssl.create_default_context()
@@ -30,6 +30,28 @@ def _tag(exc: BaseException, reached: int) -> BaseException:
         except Exception:
             pass
     return exc
+
+
+def _tag_destination_failure(exc: BaseException, message: str) -> BaseException:
+    """Mark a failure the egress reported but did not cause.
+
+    The verdict table is `phase.proxy_verdict` — shared, because the Rust TLS
+    terminator dials through the same proxies and has to answer this the same
+    way. Returns the exception either way; unmapped messages stay unannotated
+    and keep being charged to the egress.
+    """
+    verdict = proxy_verdict(message)
+    if verdict is None:
+        return exc
+    reached, ended = verdict
+    _tag(exc, int(reached))
+    if not hasattr(exc, "nova_ended"):
+        try:
+            exc.nova_ended = int(ended)
+        except Exception:
+            pass
+    return exc
+
 
 _upstream_provider = None
 
@@ -105,10 +127,41 @@ def set_upstream_provider(provider: Optional[Callable[[], List[Dict[str, object]
     _upstream_provider = provider
 
 
+_default_egress_cache = None
+
+
+def _default_secondary_attempt() -> Dict[str, object]:
+    """The secondary slot as the helper processes see it: Opera's 1371 or Tor's CONNECT port.
+
+    Only the provider-less path lands here (the out-of-process helpers); nova.pyw hands the
+    in-process relay its own provider. The state file is nova.pyw's, see nova_vpn_slots.
+    """
+    global _default_egress_cache
+    try:
+        import os
+        import nova_vpn_slots
+
+        if _default_egress_cache is None:
+            here = os.path.dirname(os.path.abspath(__file__))
+            root = os.path.dirname(here)
+            if os.path.basename(root).lower() == "resources":
+                root = os.path.dirname(root)
+            _default_egress_cache = nova_vpn_slots.EgressStateCache(
+                os.path.join(root, "temp", nova_vpn_slots.EGRESS_STATE_FILENAME))
+        attempt = nova_vpn_slots.secondary_http_attempt(_default_egress_cache.get())
+        if attempt.get("egress") != "tor":
+            # Opera keeps the caller's own timeout, as this default always did; Tor needs its longer one.
+            attempt.pop("timeout", None)
+            attempt.pop("first_byte_timeout", None)
+        return attempt
+    except Exception:
+        return {"kind": "http", "host": "127.0.0.1", "port": 1371, "label": "opera-http"}
+
+
 def _default_attempts() -> List[Dict[str, object]]:
     return [
         {"kind": "socks5", "host": "127.0.0.1", "port": 1370, "label": "warp-socks"},
-        {"kind": "http", "host": "127.0.0.1", "port": 1371, "label": "opera-http"},
+        _default_secondary_attempt(),
         {"kind": "direct", "label": "direct"},
     ]
 
@@ -182,7 +235,8 @@ def _connect_via_socks5(sock: socket.socket, target_host: str, target_port: int)
     if header[0] != 0x05:
         raise OSError(f"invalid SOCKS5 version in reply: {header!r}")
     if header[1] != 0x00:
-        raise OSError(f"SOCKS5 CONNECT failed with code {header[1]}")
+        message = f"SOCKS5 CONNECT failed with code {header[1]}"
+        raise _tag_destination_failure(OSError(message), message)
 
     atyp = header[3]
     if atyp == 0x01:
@@ -216,7 +270,8 @@ def _connect_via_http(sock: socket.socket, target_host: str, target_port: int) -
     except Exception:
         status_code = 0
     if status_code != 200:
-        raise OSError(f"HTTP CONNECT failed: {first_line}")
+        message = f"HTTP CONNECT returned {status_code} ({first_line})"
+        raise _tag_destination_failure(OSError(message), message)
 
 
 def _open_tunnel_socket_sync(
