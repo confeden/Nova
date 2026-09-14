@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nova"
+description = "Nova - восстановление доступа к сайтам и сервисам при фильтрации трафика"
+readme = "README.md"
+license = { file = "LICENSE" }
+dynamic = ["version"]
+requires-python = ">=3.12"
+dependencies = [
+    "requests",
+    "urllib3",
+    "Pillow",
+    "pystray",
+    "cryptography",
+]
+
+# Версия живёт только в resources/nova_metadata.py (CURRENT_VERSION) -
+# дублировать её здесь не нужно.
+[tool.hatch.version]
+path = "resources/nova_metadata.py"
+pattern = '(?m)^CURRENT_VERSION\s*=\s*"(?P<version>[^"]+)"'
+
+# nova.pyw - приложение, а не устанавливаемый пакет: колесо не собираем,
+# метаданные нужны инструментам (pip/uv) только для резолва зависимостей.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.uv]
+package = false
