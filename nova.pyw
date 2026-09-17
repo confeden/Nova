@@ -303,8 +303,10 @@ import nova_vpn_slots
 import nova_exit_probe
 import nova_latency
 import nova_issuance
+import nova_wg_probe
 import nova_boot_timeline as boot_timeline
 import nova_win_routes
+import nova_dns_ai
 from nova_routing_backends import (
     build_app_transport_decisions,
     get_selected_routing_backend_info,
@@ -1721,6 +1723,10 @@ try:
     # кнопки ПОДКЛЮЧИТЬ. Отдельный флаг, а не is_service_active: индикатор
     # обязан отличать «ещё подключаемся» от «сознательно не подключались».
     awaiting_manual_connect = False
+    # Момент последнего полного старта (start_nova_service без restart_mode); стоп обнуляет.
+    # is_service_active встаёт в True лишь через несколько секунд старта, и без этой отметки
+    # request_nova_start не отличил бы «ещё запускаемся» от «остановлено».
+    service_start_requested_at = 0.0
     has_connected_once = False
     is_restarting = False # Флаг перезапуска (Hot Swap)
     is_vpn_active = False
@@ -2346,6 +2352,14 @@ try:
                 lines.append(f"DNS = {dns_value}")
             if mtu_value:
                 lines.append(f"MTU = {mtu_value}")
+            try:
+                listen_port = int(profile.get("listen_port") or 0)
+            except (TypeError, ValueError):
+                listen_port = 0
+            if 0 < listen_port < 65536:
+                # The local port a pre-start handshake got an answer from (_preprobe_proton_profile):
+                # the tunnel's own handshake then takes the path that is known to reach our key.
+                lines.append(f"ListenPort = {listen_port}")
             for awg_line in (parsed.get("awg_lines") or []):
                 if awg_line:
                     lines.append(awg_line)
@@ -2615,8 +2629,67 @@ try:
             except:
                 return False
 
+        # Pre-start handshake of a Proton node (nova_wg_probe). Measured 2026-09-15, owner's PC: a live
+        # node answers a given (local port, node port) pair always or never -- its entry address spreads
+        # flows over servers, not all of which take our key -- so wireproxy's random local port failed
+        # about one start in three, and retried from that same port until the deadline. 36 of 50 issued
+        # nodes answered no port at all. Five local ports find a live node (it answered 50-100 % of the
+        # pairs) and turn a dead one into a skip of a few seconds instead of a 10 s deadline.
+        PROTON_PREPROBE_ATTEMPTS = 5
+        PROTON_PREPROBE_TIMEOUT_SEC = 1.5
+
+        def _preprobe_proton_profile(self, profile, log_skip=True):
+            """Handshake a Proton node from a few local ports; the nova_wg_probe result.
+
+            An answer is recorded as the node's liveness and distance; silence as a silent probe. When the
+            probe cannot be built (no key or endpoint in the file) or cannot be sent (a local socket error)
+            the result says ok with no port: the start then goes on exactly as before.
+            """
+            target = nova_profiles.handshake_probe_target(profile)
+            if target is None:
+                return {"ok": True, "rtt_ms": None, "source_port": None, "attempts": 0, "error": "no-target"}
+            started = time.monotonic()
+            result = nova_wg_probe.probe_endpoint(
+                target["private_key"], target["peer_public_key"], target["host"], target["port"],
+                cover=target["cover"], attempts=self.PROTON_PREPROBE_ATTEMPTS,
+                timeout=self.PROTON_PREPROBE_TIMEOUT_SEC, should_stop=lambda: is_closing,
+            )
+            if result.get("error") in ("stopped", "cookie"):
+                # Not a verdict about the node: a stop, or a server under load that wants a cookie round,
+                # which wireproxy does itself -- the start then goes on without a pinned port.
+                return result
+            profile_id = str(profile.get("id") or profile.get("name") or "")
+            name = nova_profiles.split_profile_id(profile_id)[1] or profile_id
+            if str(result.get("error") or "").startswith("oserror-"):
+                # Nor is a probe this machine could not send: no route while the network comes up at logon or
+                # an adapter reconnects. Read as silence, a recovery walk would skip every live node within a
+                # second and store each as silent for hours; unpinned, wireproxy's own deadline decides as before.
+                if log_skip:
+                    self.log_func(f"[RU] [AWG] {name}: рукопожатие не отправлено ({result.get('error')}) — "
+                                  "запускаем без закреплённого порта.")
+                return dict(result, ok=True, source_port=None)
+            with contextlib.suppress(Exception):
+                nova_profiles.record_handshake_probes(get_base_dir(), {profile_id: result})
+            if result.get("ok"):
+                if IS_DEBUG_MODE:
+                    self.log_func(f"[RU] [AWG] {name}: узел ответил на рукопожатие за {result.get('rtt_ms')} мс "
+                                  f"(локальный порт {result.get('attempts')}-й по счёту) — закрепляем его.")
+            elif log_skip:
+                self.log_func(f"[RU] [AWG] {name}: узел не ответил на рукопожатие ни с одного из "
+                              f"{result.get('attempts')} локальных портов за {time.monotonic() - started:.1f} с — пропускаем.")
+            return result
+
         def _start_awg_proxy_backend(self, profile, allow_personal_identity=True):
+            if isinstance(profile, dict) and str(profile.get("group") or "") == nova_profiles.GROUP_PROTON:
+                # A «Проверить» of this key waits, and decides its conflict only after the helper is up.
+                target = nova_profiles.handshake_probe_target(profile)
+                with _wg_identity_lock(target["private_key"] if target else ""):
+                    return self._launch_awg_proxy_backend(profile, allow_personal_identity)
+            return self._launch_awg_proxy_backend(profile, allow_personal_identity)
+
+        def _launch_awg_proxy_backend(self, profile, allow_personal_identity=True):
             try:
+                profile.pop("listen_port", None)
                 if not os.path.exists(self.wireproxy_awg_path):
                     return False
 
@@ -2670,6 +2743,20 @@ try:
                         self.log_func(f"[RU] [AWG] Порт {self.port} всё ещё занят. Пропускаем профиль {profile.get('name', 'awg')}.")
                         self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
                         return False
+
+                if str(profile.get("group") or "") == nova_profiles.GROUP_PROTON:
+                    # After the previous helper is gone: a handshake beside a live tunnel on this key
+                    # would take the key over from it.
+                    verdict = self._preprobe_proton_profile(profile)
+                    if not verdict.get("ok"):
+                        self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
+                        return False
+                    if verdict.get("source_port"):
+                        profile["listen_port"] = int(verdict["source_port"])
+                        cfg_path = self._write_awg_runtime_config(
+                            profile,
+                            allow_personal_identity=allow_personal_identity,
+                        ) or cfg_path
 
                 os.makedirs(self.temp_dir, exist_ok=True)
                 self.awg_log_handle = open(self.awg_log_path, "w", encoding="utf-8", errors="ignore")
@@ -5428,6 +5515,23 @@ try:
                 events.append(payload)
         return events
 
+    _wg_identity_locks = {}
+    _wg_identity_locks_guard = threading.Lock()
+
+    def _wg_identity_lock(identity):
+        """The one lock of a WireGuard key: a Proton start and a profile check never overlap on it.
+
+        Two sessions of one key at once break one of them (measured 2026-09-15): on Proton a finished
+        handshake takes the key over from the other server ~15 s later; on Cloudflare a live tunnel plus two
+        new sessions dropped one of the new ones after its first handshake. Re-entrant: a start may retry itself.
+        """
+        digest = hashlib.sha256(str(identity or "").encode("utf-8")).hexdigest()[:16] if identity else ""
+        with _wg_identity_locks_guard:
+            lock = _wg_identity_locks.get(digest)
+            if lock is None:
+                lock = _wg_identity_locks[digest] = threading.RLock()
+            return lock
+
     def _pick_free_loopback_port():
         """A free 127.0.0.1 port chosen by the OS (never one of Nova's fixed ports)."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
@@ -5549,15 +5653,26 @@ try:
 
         def issue_proton(self, force=False, wait=False):
             def _work():
+                base = get_base_dir()
+                # What this install's own tunnels and pre-start handshakes proved, never a probe run
+                # for the purpose: nodes that carried traffic keep their places in the new set.
+                try:
+                    liveness = nova_profiles.proton_liveness(nova_profiles.list_profiles(base),
+                                                             nova_profiles.load_stats(base))
+                except Exception:
+                    liveness = None
                 result = nova_proton.issue_profiles(
-                    get_base_dir(),
+                    base,
                     log=self.log_func,
                     proxies=_api_proxies(),
                     force=bool(force),
                     progress=self._progress("proton"),
+                    liveness=liveness,
                 )
                 if result.get("ok"):
-                    return True, f"готово: {int(result.get('count') or 0)} профилей"
+                    alive = result.get("alive")
+                    suffix = f", проверенных подключением узлов {int(alive)}" if alive else ""
+                    return True, f"готово: {int(result.get('count') or 0)} профилей{suffix}"
                 return False, f"не удалось: {result.get('error') or 'причина неизвестна'}"
 
             return self._run("proton", _work, wait, "NovaProtonIssue")
@@ -5733,15 +5848,45 @@ try:
             payload, _using_personal = wm._render_awg_runtime_payload(profile, allow_personal_identity=allow_personal)
             if not payload:
                 return {"ok": False, "ms": None, "message": "не удалось собрать конфигурацию"}
-            test_key = self._private_key_of(payload)
-            live_cfg = getattr(wm, "awg_runtime_config_path", "") if getattr(wm, "active_backend", "") == "awg" else ""
-            if test_key and live_cfg:
-                with contextlib.suppress(Exception):
-                    with open(live_cfg, "r", encoding="utf-8", errors="ignore") as live_f:
-                        if self._private_key_of(live_f.read()) == test_key:
-                            # WireGuard roams one key to the newest endpoint: the check would cut the tunnel.
-                            return {"ok": False, "ms": None, "_record": False,
-                                    "message": "тот же ключ, что у активного профиля — проверка оборвала бы подключение"}
+            identity = str((nova_profiles.parse_awg_conf(payload).get("interface") or {}).get("privatekey") or "")
+            with _wg_identity_lock(identity):
+                # Decided under the lock: a Proton start or another check may have taken this key while we waited.
+                live_cfg = getattr(wm, "awg_runtime_config_path", "") if getattr(wm, "active_backend", "") == "awg" else ""
+                live_text = ""
+                if live_cfg:
+                    with contextlib.suppress(OSError):
+                        with open(live_cfg, "r", encoding="utf-8", errors="ignore") as live_f:
+                            live_text = live_f.read()
+                # A key shared with the live tunnel is measured safe on Cloudflare only; elsewhere the check is skipped.
+                conflict = nova_profiles.live_check_conflict(payload, live_text, record.get("group", ""))
+                if conflict:
+                    live_name = nova_profiles.split_profile_id(getattr(wm, "active_profile_id", ""))[1] or "активный профиль"
+                    if conflict == nova_profiles.CHECK_CONFLICT_SINGLE_SESSION:
+                        message = (f"Proton держит ключ на одном сервере: пока подключён «{live_name}», "
+                                   "другой сервер Proton проверку не пропустит")
+                    elif conflict == nova_profiles.CHECK_CONFLICT_SHARED_KEY:
+                        message = f"ключ занят подключением «{live_name}» — другой сервер может его не пустить"
+                    else:
+                        message = f"тот же ключ и сервер, что у «{live_name}» — проверка оборвала бы подключение"
+                    return {"ok": False, "ms": None, "_record": False, "skipped": True, "message": message}
+                return self._test_awg_profile_locked(record, wm, profile, payload, allow_personal)
+
+        def _test_awg_profile_locked(self, record, wm, profile, payload, allow_personal):
+            wireproxy = getattr(wm, "wireproxy_awg_path", "") or os.path.join(get_bin_dir(), "wireproxy-awg.exe")
+            if record.get("group") == nova_profiles.GROUP_PROTON:
+                # The conflict rule above already refused a check beside a live Proton tunnel; here a
+                # silent node is answered in seconds, and a live one is checked from the port it answered.
+                verdict = wm._preprobe_proton_profile(profile, log_skip=False)
+                if not verdict.get("ok"):
+                    if verdict.get("error") == "stopped":
+                        return {"ok": False, "ms": None, "message": "проверка прервана", "_record": False}
+                    return {"ok": False, "ms": None, "message": "узел не отвечает на рукопожатие"}
+                if verdict.get("source_port"):
+                    profile["listen_port"] = int(verdict["source_port"])
+                    payload, _using_personal = wm._render_awg_runtime_payload(
+                        profile, allow_personal_identity=allow_personal)
+                    if not payload:
+                        return {"ok": False, "ms": None, "message": "не удалось собрать конфигурацию"}
             port = _pick_free_loopback_port()
             payload = re.sub(r"(?m)^BindAddress = 127\.0\.0\.1:\d+$", f"BindAddress = 127.0.0.1:{port}", payload)
             base = get_base_dir()
@@ -5787,11 +5932,6 @@ try:
                 with contextlib.suppress(OSError):
                     os.remove(cfg_path)
 
-        @staticmethod
-        def _private_key_of(conf_text):
-            match = re.search(r"(?im)^\s*PrivateKey\s*=\s*(\S+)\s*$", str(conf_text or ""))
-            return match.group(1) if match else ""
-
         def _test_masque_profile(self, record):
             nova_go = self._nova_go_path()
             if not os.path.exists(nova_go):
@@ -5799,7 +5939,7 @@ try:
             wm = globals().get("warp_manager")
             if (wm is not None and getattr(wm, "active_backend", "") == "masque"
                     and getattr(wm, "masque_active_profile_name", "") == record.get("id")):
-                return {"ok": False, "ms": None, "_record": False,
+                return {"ok": False, "ms": None, "_record": False, "skipped": True,
                         "message": "профиль уже подключается — проверка оборвала бы подключение"}
             deadline = time.monotonic() + self.MASQUE_PROBE_TIMEOUT_SEC
             last_detail = ""
@@ -5963,7 +6103,13 @@ try:
                     self.log_func(f"[Profiles] Шаг выпуска «{step}» упал: {type(e).__name__}")
 
         def measure_proton_distances(self, force=False):
-            """TCP 443 connect time to every Proton node: the «nearest first» order of the queue."""
+            """TCP 443 connect time to every Proton node: the «nearest first» order of the queue.
+
+            Not a WireGuard handshake, on purpose (measured 2026-09-15): handshakes to fifty servers in a
+            row left the most-used nodes refusing the key for tens of minutes, and a finished handshake
+            takes the key over from a live Proton tunnel. Liveness comes from the pre-start handshake of
+            the one node being connected (WarpManager._preprobe_proton_profile).
+            """
             base = get_base_dir()
             records = nova_profiles.list_profiles(base)
             stats = {} if force else nova_profiles.load_stats(base)
@@ -13301,7 +13447,8 @@ try:
     # Что показывать индикатором DNS-AI и что уже сделано с правилами.
     # Пишется из потоков старта/настроек и читается индикатором главного окна.
     _nrpt_state = {
-        "system_dns_ai": False,   # системный резолвер - уже dns-ai.ru
+        "system_dns_ai": False,   # DNS машины уже идёт через DNS-AI, любым из режимов
+        "dns_ai_mode": "",        # каким именно: "native", "stub" или "" (не идёт)
         "rules_applied": False,   # правила Nova стоят
     }
 
@@ -13320,69 +13467,34 @@ try:
         """
         return _env_bool_global("NOVA_NRPT_CLEAN_ON_EXIT", True)
 
-    def _system_dns_servers():
-        """Адреса DNS, настроенные в системе. Читается из реестра, без процессов.
+    def dns_ai_system_mode():
+        """Как машина сейчас ходит в DNS: "native", "stub" или "" (не через DNS-AI).
 
-        PowerShell стоил бы 0.5-2 с на вызов (та же цена, что сделала фазу NRPT
-        самой долгой на старте), а состояние опрашивает ещё и индикатор. Правило
-        Windows: статический NameServer старше DhcpNameServer, и когда он задан,
-        используется именно он - поэтому здесь тот же приоритет.
+        Ответ даёт `nova_dns_ai`, и он шире прежнего. Адреса dns-ai.ru в
+        адаптере - это только режим «Native DNS support»; в режиме «Legacy DNS
+        перехват» (он по умолчанию там, где нет встроенного DoH-клиента, и
+        именно он стоит на машине владельца) в адаптере лежит 127.0.0.1, и
+        по самому адресу нельзя сказать, чей это резолвер - рядом живёт
+        127.0.0.53 от другой программы владельца. Поэтому там решает владелец
+        сокета :53. Замеры и подробности - в модуле; отдельным модулем это
+        сделано потому, что только так оно покрывается тестами (I15).
         """
         try:
-            import winreg as _winreg
+            return nova_dns_ai.detect_mode(NOVA_DNS_AI_SERVERS)
         except Exception:
-            return set()
-        servers = set()
-        for branch in ("Tcpip", "Tcpip6"):
-            key_path = "SYSTEM\\CurrentControlSet\\Services\\%s\\Parameters\\Interfaces" % branch
-            try:
-                root_key = _winreg.OpenKey(_winreg.HKEY_LOCAL_MACHINE, key_path)
-            except Exception:
-                continue
-            try:
-                index = 0
-                while True:
-                    try:
-                        interface_name = _winreg.EnumKey(root_key, index)
-                    except OSError:
-                        break
-                    except Exception:
-                        break
-                    index += 1
-                    static_value = ""
-                    dhcp_value = ""
-                    try:
-                        interface_key = _winreg.OpenKey(root_key, interface_name)
-                    except Exception:
-                        continue
-                    try:
-                        try:
-                            static_value = _winreg.QueryValueEx(interface_key, "NameServer")[0]
-                        except Exception:
-                            static_value = ""
-                        try:
-                            dhcp_value = _winreg.QueryValueEx(interface_key, "DhcpNameServer")[0]
-                        except Exception:
-                            dhcp_value = ""
-                    finally:
-                        with contextlib.suppress(Exception):
-                            interface_key.Close()
-                    raw = str(static_value or "").strip() or str(dhcp_value or "").strip()
-                    for token in re.split(r"[,;\s]+", raw):
-                        token = token.strip().strip("[]").lower()
-                        if token:
-                            servers.add(token)
-            finally:
-                with contextlib.suppress(Exception):
-                    root_key.Close()
-        return servers
+            return ""
 
-    def system_dns_uses_dns_ai():
-        """Системный DNS уже указывает на dns-ai.ru - значит подменять нечего."""
-        try:
-            return bool(_system_dns_servers() & set(NOVA_DNS_AI_SERVERS))
-        except Exception:
-            return False
+    def _remember_dns_ai_mode():
+        """Опросить систему и запомнить режим DNS-AI в состоянии NRPT.
+
+        Одно место на все три вызова (старт, смена настроек, индикатор): два
+        поля состояния должны меняться вместе, иначе индикатор и правила
+        разъезжаются.
+        """
+        mode = dns_ai_system_mode()
+        _nrpt_state["dns_ai_mode"] = mode
+        _nrpt_state["system_dns_ai"] = bool(mode)
+        return mode
 
     def _nrpt_existing_namespaces(log_func=None):
         """Namespace'ы уже поставленных правил Nova. None - опросить не вышло."""
@@ -13416,23 +13528,28 @@ try:
         процессом PowerShell. Отдельный powershell.exe на каждое правило стоил
         ~0.5 с на быстрой машине и 1-2 с на слабой, что добавляло к старту ~40 с.
 
-        Если системный DNS уже dns-ai.ru, правила не ставятся вовсе: NRPT увёл
-        бы эти имена с его канала (у пользователя это DoH) на обычный UDP к
-        запасному резолверу - то есть сделал бы хуже, чем без правил.
-        NOVA_NRPT_FORCE=1 ставит их всё равно.
+        Если DNS машины уже идёт через DNS-AI - любым из двух его режимов, -
+        правила не ставятся вовсе: NRPT увёл бы эти имена с шифрованного канала
+        на обычный UDP к запасному резолверу, то есть сделал бы хуже, чем без
+        правил. NOVA_NRPT_FORCE=1 ставит их всё равно.
         """
         with _nrpt_setup_lock:
             try:
-                dns_ai_system = system_dns_uses_dns_ai()
-                _nrpt_state["system_dns_ai"] = bool(dns_ai_system)
-                if dns_ai_system and not _env_bool_global("NOVA_NRPT_FORCE", False):
+                dns_ai_mode = _remember_dns_ai_mode()
+                if dns_ai_mode and not _env_bool_global("NOVA_NRPT_FORCE", False):
+                    # Режим назван в журнале: «адреса в адаптере» и «перехват на
+                    # 127.0.0.1» - разные машины, и по строке должно быть видно,
+                    # какую из них мы увидели.
+                    how = ("DNS-AI перехватывает запросы (127.0.0.1)"
+                           if dns_ai_mode == nova_dns_ai.MODE_STUB
+                           else "Системный DNS - dns-ai.ru")
                     existing = _nrpt_existing_namespaces(log_func=log_func)
                     if existing:
                         _remove_nrpt_dns_unblock_unlocked(log_func=log_func, silent=True)
                         if log_func:
-                            log_func("[NRPT] Системный DNS - dns-ai.ru, свои правила сняты.")
+                            log_func(f"[NRPT] {how}, свои правила сняты.")
                     elif log_func:
-                        log_func("[NRPT] Системный DNS - dns-ai.ru, правила не нужны.")
+                        log_func(f"[NRPT] {how}, правила не нужны.")
                     _nrpt_state["rules_applied"] = False
                     return True
 
@@ -13548,9 +13665,10 @@ try:
     def refresh_nrpt_for_system_dns(log_func=None):
         """Пересобрать решение после смены системного DNS.
 
-        Вызывается индикатором, когда dns-ai.ru появился в системных настройках
-        или исчез оттуда. Само решение принимает setup/remove - здесь только
-        выбор ветки, чтобы состояние правил догоняло настройки без перезапуска.
+        Вызывается индикатором, когда DNS-AI появился на машине или ушёл с
+        неё - в любом из двух своих режимов. Само решение принимает
+        setup/remove - здесь только выбор ветки, чтобы состояние правил
+        догоняло настройки без перезапуска.
         """
         try:
             settings = load_routing_settings()
@@ -13558,7 +13676,7 @@ try:
         except Exception:
             ai_unlock_enabled = True
         if not ai_unlock_enabled:
-            _nrpt_state["system_dns_ai"] = system_dns_uses_dns_ai()
+            _remember_dns_ai_mode()
             return
         setup_nrpt_dns_unblock(log_func=log_func)
 
@@ -16225,6 +16343,14 @@ try:
         "240.0.0.0/4",
     )
 
+    # Upstream winws (nfq/nfqws.c, DIVERT_NO_LOCALNETSv6_DST): loopback, Teredo, ULA, link-local, multicast.
+    WINWS_LOCAL_IPV6_BYPASS_CLAUSE = (
+        "(ipv6.DstAddr > ::1) and (ipv6.DstAddr < 2001::0 or ipv6.DstAddr >= 2001:1::0) and "
+        "(ipv6.DstAddr < fc00::0 or ipv6.DstAddr >= fe00::0) and "
+        "(ipv6.DstAddr < fe80::0 or ipv6.DstAddr >= fec0::0) and "
+        "(ipv6.DstAddr < ff00::0 or ipv6.DstAddr >= ffff::0)"
+    )
+
     def _winws_ipv4_not_in_net_clause(cidr):
         try:
             import ipaddress
@@ -16236,6 +16362,18 @@ try:
             return f"(ip.DstAddr < {net.network_address} or ip.DstAddr > {net.broadcast_address})"
         except:
             return ""
+
+    def render_local_bypass_clause():
+        """The local-traffic exclusion get_loopback_bypass_clause() appends, whatever the env switch says."""
+        ipv4_clauses = [
+            clause for clause in (_winws_ipv4_not_in_net_clause(cidr) for cidr in WINWS_LOCAL_IPV4_BYPASS_CIDRS)
+            if clause
+        ]
+        if not ipv4_clauses:
+            ipv4_clauses = ["(ip.DstAddr < 127.0.0.0 or ip.DstAddr > 127.255.255.255)"]
+        # WinDivert evaluates an ip.* test on an IPv6 packet as false, so IPv4 tests ANDed on their own kept
+        # every IPv6 flow away from winws (G66). Upstream winws ORs the two families the same way.
+        return f" and (({' and '.join(ipv4_clauses)}) or ({WINWS_LOCAL_IPV6_BYPASS_CLAUSE}))"
 
     def get_loopback_bypass_clause():
         """
@@ -16254,13 +16392,7 @@ try:
             use_ipv6 = str(os.environ.get("NOVA_WINWS_LOOPBACK_BYPASS_IPV6", "0")).strip().lower() in ("1", "true", "yes", "on")
         except:
             use_ipv6 = False
-        ipv4_clauses = [
-            clause for clause in (_winws_ipv4_not_in_net_clause(cidr) for cidr in WINWS_LOCAL_IPV4_BYPASS_CIDRS)
-            if clause
-        ]
-        if not ipv4_clauses:
-            ipv4_clauses = ["(ip.DstAddr < 127.0.0.0 or ip.DstAddr > 127.255.255.255)"]
-        clause = " and " + " and ".join(ipv4_clauses)
+        clause = render_local_bypass_clause()
         if use_ipv6:
             clause += " and !(ipv6.DstAddr == ::1)"
         return clause
@@ -23957,8 +24089,10 @@ try:
             _repair_lock.release()
 
     def start_nova_service(silent=False, restart_mode=False):
-        global awaiting_manual_connect
+        global awaiting_manual_connect, service_start_requested_at
         awaiting_manual_connect = False
+        if not restart_mode:
+            service_start_requested_at = time.monotonic()
         threading.Thread(target=_start_nova_service_impl, args=(silent, restart_mode), daemon=True).start()
 
     def sync_hard_domains_to_strategies(log_func=None):
@@ -25707,6 +25841,7 @@ try:
 
     def _start_nova_service_impl(silent=False, restart_mode=False):
         global warp_manager, pac_manager, opera_proxy_manager, telegram_relay_manager, novawfp_observer_manager, SERVICE_RUN_ID, state_lock
+        global service_start_requested_at
 
         # Increment run ID
         try:
@@ -25755,6 +25890,7 @@ try:
                 msg = "Не удалось загрузить необходимые компоненты!\nПроверьте интернет и повторите попытку."
                 if not silent:
                     root.after(0, lambda: messagebox.showerror("Ошибка", msg))
+                service_start_requested_at = 0.0
                 return
             
             # Show "STARTING" only after successful download
@@ -25987,6 +26123,7 @@ try:
             start_bg_services()
 
         def kernel_start_entry():
+            global service_start_requested_at
             try:
                 _start_nova_service_logic(silent, restart_mode)
             except Exception as e:
@@ -25999,6 +26136,11 @@ try:
                     safe_trace(f"[KernelStart] Fatal: {e}")
                 except:
                     pass
+            finally:
+                # No admin rights, no winws, an exception: the start ended before is_service_active, and
+                # a marker left behind would keep request_nova_start answering «still starting».
+                if not restart_mode and not is_service_active:
+                    service_start_requested_at = 0.0
 
         # 2. Kernel Start
         try:
@@ -26010,7 +26152,7 @@ try:
 
 
     def _start_nova_service_logic(silent=False, restart_mode=False): # Added restart_mode
-        global is_service_active, process, is_closing, _windivert_broken, is_restarting
+        global is_service_active, process, is_closing, _windivert_broken, is_restarting, service_start_requested_at
         global _windivert_unrecoverable_reason, _windivert_unrecoverable_detail
         global _windivert_registration_reset_attempted
         global has_connected_once
@@ -26204,6 +26346,7 @@ try:
             log_print(f"[Init] Адаптивная система: {visited_count} посещённых доменов, {evo_count} стратегий в эволюции, {ip_count} IP в истории")
 
         is_service_active = True
+        service_start_requested_at = 0.0
         try: restart_requested_event.clear()
         except: pass
         root.after(0, lambda: btn_toggle.config(text="ОТКЛЮЧИТЬ"))
@@ -26663,6 +26806,7 @@ try:
             changed = False
             try:
                 patterns = [
+                    render_local_bypass_clause(),
                     " and !(ip.DstAddr == 127.0.0.1)",
                     " and !(ipv6.DstAddr == ::1)",
                 ]
@@ -27270,6 +27414,7 @@ try:
 
     def stop_nova_service(silent=False, wait_for_cleanup=False, restart_mode=False):
         global is_service_active, process, is_closing, nova_service_status, SERVICES_RUNNING, SERVICE_RUN_ID, has_connected_once
+        global service_start_requested_at
         managed_opera_owned = False
         if not restart_mode:
             has_connected_once = False
@@ -27290,6 +27435,7 @@ try:
         # === НЕМЕДЛЕННОЕ обновление состояния ===
         if not restart_mode:
             is_service_active = False
+            service_start_requested_at = 0.0
             set_core_backend_health(False, "stopped")
             _degraded_core_recovery_scheduled[0] = False
             # FIX: Only set is_closing in on_closing() to allow background workers (like VPN monitor)
@@ -27526,6 +27672,14 @@ try:
              log_print("[Auto-Restart] Ядро перезапущено.")
         except: pass
 
+    # A start stamped this long ago and still not up is taken as failed, not as still starting.
+    NOVA_START_GRACE_SEC = 45.0
+
+    def nova_start_pending():
+        """A full start was requested moments ago and has not reached is_service_active yet. Any thread."""
+        return (not is_service_active and service_start_requested_at > 0
+                and time.monotonic() - service_start_requested_at < NOVA_START_GRACE_SEC)
+
     # === SPAM PROTECTION & SEQUENTIAL EXECUTION ===
     toggle_queue = queue.Queue()
     
@@ -27536,14 +27690,22 @@ try:
                 
                 # Check current state BEFORE action
                 is_running = (process is not None)
+                start_pending = nova_start_pending()
                 
-                if is_running:
+                if cmd == "start" and (is_running or is_service_active or start_pending):
+                    # request_nova_start(): Nova is up or on its way, and a start must never become a stop.
+                    pass
+                elif is_running:
                     # Request STOP
                     stop_nova_service()
                     # Wait for process to die (max 10s)
                     for _ in range(50):
                          if process is None: break
                          time.sleep(0.2)
+                elif start_pending:
+                    # A start is under way (autostart, «Подключить» in «Профили») and the button still reads
+                    # ПОДКЛЮЧИТЬ until is_service_active: starting again here ran the core twice.
+                    pass
                 else:
                     # Request START
                     # Increment Global Run ID to kill any zombie tasks from previous run
@@ -27580,6 +27742,21 @@ try:
             return 
             
         toggle_queue.put("toggle")
+
+    def request_nova_start():
+        """ПОДКЛЮЧИТЬ without its toggle, for callers that mean "connect": never stops Nova. Any thread.
+
+        "queued" -- a start is on the toggle queue; "running" -- Nova runs or is still starting;
+        "paused" -- a foreign VPN holds Nova (ПОДКЛЮЧИТЬ is disabled for the same reason); "closing".
+        """
+        if is_closing:
+            return "closing"
+        if is_vpn_active:
+            return "paused"
+        if process is not None or is_service_active or nova_start_pending():
+            return "running"
+        toggle_queue.put("start")
+        return "queued"
 
     def on_closing():
         global is_closing, process, is_service_active, nova_service_status, SERVICES_RUNNING, SERVICE_RUN_ID
@@ -30483,8 +30660,9 @@ try:
 
             def place_window(self, win):
                 # Called on every root <Configure> while the window is visible, so it sizes from
-                # the requested size and moves only when the target actually changed.
-                popup_w = int(win.winfo_reqwidth())
+                # the requested size and moves only when the target actually changed. The window
+                # stretches in width: the width the user dragged it to survives this and a hide.
+                popup_w = max(int(win.winfo_reqwidth()), int(win.winfo_width()))
                 popup_h = int(win.winfo_reqheight())
                 profiles_window_geom_ref["win"] = win
                 pos_x, pos_y = _compute_settings_popup_geometry(popup_w, popup_h, ref=profiles_window_geom_ref)
@@ -30524,8 +30702,20 @@ try:
                         return
                     wm = globals().get("warp_manager")
                     if wm is None or not _core_services_running():
-                        logger("[Profiles] Выбор сохранён, применится при подключении.")
-                        return
+                        # With Nova stopped this used to save the choice and connect nothing, right under
+                        # the window's «Подключение к профилю» notice. Start Nova the way ПОДКЛЮЧИТЬ does;
+                        # the start reads the choice saved above.
+                        started = request_nova_start()
+                        if started == "queued":
+                            logger(f"[Profiles] Nova не была подключена — подключаемся: {_describe_profile_selection(saved)}.")
+                            return
+                        if started == "paused":
+                            logger("[Profiles] Выбор сохранён: Nova на паузе, пока работает сторонний VPN.")
+                            return
+                        if started != "running" or wm is None or not getattr(wm, "_is_starting_now", False):
+                            logger("[Profiles] Выбор сохранён, применится при подключении.")
+                            return
+                        # Nova is still starting and its tunnel start has already read the previous choice.
                     wm.apply_selection_now(_describe_profile_selection(saved))
 
                 _start_profiles_thread(_worker, "NovaProfilesApply")
@@ -30722,8 +30912,9 @@ try:
 
         def apply_dns_ai_indicator_state(system_dns_ai, rules_applied, ai_unlock_enabled):
             try:
-                # Градиент - это факт о системе, а не о настройке: dns-ai.ru
-                # стоит резолвером прямо сейчас. Он остаётся верным и при
+                # Градиент - это факт о системе, а не о настройке: DNS
+                # машины идёт через DNS-AI прямо сейчас - неважно, адресами в
+                # адаптере или перехватом на 127.0.0.1. Он остаётся верным и при
                 # выключенной разблокировке ИИ, поэтому галка в настройках его
                 # не гасит. Серый - уже про работу самой Nova: подмену делает
                 # её каскад NRPT, а его без разблокировки не бывает.
@@ -30737,24 +30928,25 @@ try:
                 pass
 
         dns_ai_watch_state = {
-            "known": None,        # прошлый ответ «системный DNS — это dns-ai.ru»
+            "known": None,        # прошлый ответ «DNS машины идёт через DNS-AI»
             "shown": None,        # что уже нарисовано, чтобы не дёргать Tk впустую
             "next_check_ts": 0.0,
         }
 
         def _refresh_dns_ai_state():
-            """Опросить системный DNS и догнать им индикатор и правила NRPT.
+            """Опросить состояние DNS-AI и догнать им индикатор и правила NRPT.
 
             Раз в 10 секунд, а не каждый оборот: смена системного DNS — событие
-            редкое, а поток здесь общий с пробами портов. Чтение идёт из реестра
-            (`_system_dns_servers`), процессов не запускает.
+            редкое, а поток здесь общий с пробами портов. Читаются реестр и
+            таблицы сокетов (`nova_dns_ai`) — 7 мс на машине владельца, без
+            единого порождённого процесса.
             """
             now_ts = time.time()
             if now_ts < float(dns_ai_watch_state.get("next_check_ts") or 0.0):
                 return
             dns_ai_watch_state["next_check_ts"] = now_ts + 10.0
             try:
-                system_dns_ai = bool(system_dns_uses_dns_ai())
+                system_dns_ai = bool(_remember_dns_ai_mode())
             except:
                 return
             try:
@@ -30763,7 +30955,6 @@ try:
                 ai_unlock_enabled = True
             previous = dns_ai_watch_state.get("known")
             dns_ai_watch_state["known"] = system_dns_ai
-            _nrpt_state["system_dns_ai"] = system_dns_ai
             # Системный DNS переключили при живой Nova: решение по правилам надо
             # принять заново, иначе NRPT продолжит уводить эти имена с канала
             # dns-ai на запасной резолвер (или наоборот, оставит их без подмены).
@@ -30936,7 +31127,10 @@ try:
             threading.Thread(target=_worker, daemon=True).start()
 
         main_context_menu = tk.Menu(root, tearoff=0)
-        main_context_menu.add_command(label="Профили…", command=toggle_profiles_window_ui)
+        # Пункт «Профили…» снят по просьбе владельца: на главном экране уже есть
+        # кнопка «Профили», и второй вход в то же окно ничего не добавлял.
+        # toggle_profiles_window_ui никуда не делся - он же открывает окно с
+        # кнопки и из меню слота VPN, а возврат пункта сюда это одна строка.
         main_context_menu.add_command(label="Перезапустить Nova", command=restart_nova)
         # Пункт «Сообщить о заблокированном сайте…» снят по просьбе владельца.
         # Сам report_blocked_site оставлен намеренно: это единственный способ

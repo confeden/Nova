@@ -63,10 +63,13 @@ __all__ = [
     # selection / plans
     "load_selection", "save_selection", "normalize_selection", "resolve_effective_selection",
     "group_empty_message", "build_attempt_plan", "build_recovery_plan", "record_country", "proton_countries",
+    "handshake_probe_target", "proton_liveness",
     # stats
-    "load_stats", "record_outcome", "record_rtts",
+    "load_stats", "record_outcome", "record_rtts", "record_handshake_probes",
     # parsing / import
     "parse_awg_conf", "awg_identity_key", "validate_awg_conf", "awg_fingerprint",
+    "CLOUDFLARE_WARP_PEER_KEY", "CHECK_CONFLICT_SINGLE_SESSION", "CHECK_CONFLICT_SAME_PEER", "CHECK_CONFLICT_SHARED_KEY",
+    "live_check_conflict",
     "looks_like_masque_identity", "normalize_masque_identity", "masque_fingerprint",
     "parse_import_text", "safe_profile_name", "import_candidates", "delete_profile", "rename_profile",
     # migration
@@ -125,6 +128,13 @@ DEFAULT_RECOVERY_BUDGET = 4
 # Nodes die and come back between sessions; a queue that remembers every failure forever ends up
 # looping over the same few survivors.
 PROTON_FAILURE_MEMORY_SEC = 6 * 3600
+# A pre-start WireGuard handshake (nova_wg_probe) outranks everything else in the Proton queue while it
+# is this fresh: measured 2026-09-15, 36 of 50 issued nodes were silent on every UDP port while all
+# 50 answered TCP 443, and a node that connected yesterday was among the silent ones.
+PROTON_PROBE_MEMORY_SEC = 6 * 3600
+# A daily re-issue keeps and puts first the nodes this install connected to within this window.
+PROTON_ISSUE_MEMORY_SEC = 3 * 24 * 3600
+PROTON_UNKNOWN_DISTANCE_MS = 9999
 # «Авто» stops trying MASQUE after this many failures in a row, until the last failure is this old
 # (Nova Android MasqueStartPolicy.AUTO_FIRST_FAILURE_LIMIT). A MASQUE attempt costs tens of seconds
 # on a network that cuts it, and in «Авто» it is a guess, not the user's request -- a guess that must
@@ -543,6 +553,45 @@ def awg_identity_key(parsed, path_or_name=""):
     if address:
         return address
     return os.path.basename(str(path_or_name or ""))
+
+
+CLOUDFLARE_WARP_PEER_KEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+CHECK_CONFLICT_SINGLE_SESSION = "single_session"
+CHECK_CONFLICT_SAME_PEER = "same_peer"
+CHECK_CONFLICT_SHARED_KEY = "shared_key"
+
+
+def live_check_conflict(check_text, live_text, group=""):
+    """Why a check of `check_text` must not start beside the live AWG tunnel; "" when it may.
+
+    A check starts a second wireproxy. A PrivateKey other than the live one never touches the live
+    tunnel; a shared key depends on the server, measured with the live tunnel probed once a second:
+    * Cloudflare WARP (peer CLOUDFLARE_WARP_PEER_KEY) keeps both sessions of one key, even on the live
+      endpoint itself: live 19/19 during the check and 22/22 after, while the check carried data too.
+      Every WARPgen_NN shares one key, so refusing here left the group uncheckable while connected.
+    * Proton answers no handshake for a key connected to another of its servers (NL-FREE-237 alone 7/8,
+      beside NO-FREE-9 on the same key no handshake in 30 s, the live tunnel unharmed): the check could
+      only report a working server as dead.
+    * A plain WireGuard server moves the key to the newest endpoint, so a check against the live peer
+      would take the tunnel's traffic.
+    Any other server with the live key is unmeasured and may refuse like Proton — a Proton conf imported
+    into Custom is one — so it is skipped too rather than recorded as a failure.
+    """
+    check = parse_awg_conf(check_text)
+    check_key = _strip_inline_comment(check["interface"].get("privatekey", ""))
+    if not check_key:
+        return ""
+    live = parse_awg_conf(live_text)
+    if _strip_inline_comment(live["interface"].get("privatekey", "")) != check_key:
+        return ""
+    check_peer = _strip_inline_comment(check["peer"].get("publickey", ""))
+    if check_peer == CLOUDFLARE_WARP_PEER_KEY:
+        return ""
+    if group == GROUP_PROTON:
+        return CHECK_CONFLICT_SINGLE_SESSION
+    if check_peer and check_peer == _strip_inline_comment(live["peer"].get("publickey", "")):
+        return CHECK_CONFLICT_SAME_PEER
+    return CHECK_CONFLICT_SHARED_KEY
 
 
 def _sections(text):
@@ -1343,14 +1392,66 @@ def _stats_entry(stats, record):
     return entry if isinstance(entry, dict) else {}
 
 
-def _proton_order(records, stats, now=None):
-    """Proton connect queue by attempt outcomes, then distance (Nova Android G207 + ProtonLatency).
+def _proton_liveness_rank(entry, now):
+    """0: answered our handshake at its latest probe (and no start failed after that), or carried traffic
+    after a silent probe; 2: silent at a probe younger than PROTON_PROBE_MEMORY_SEC and nothing has worked
+    since; 1: never probed, the probe is too old to mean anything, or it answered and the tunnel then failed."""
+    probe_ok = _as_float(entry.get("hs_ok_at"), 0.0)
+    probe_fail = _as_float(entry.get("hs_fail_at"), 0.0)
+    latest = max(probe_ok, probe_fail)
+    if not latest or not 0 <= now - latest < PROTON_PROBE_MEMORY_SEC:
+        return 1
+    last_ok = _as_float(entry.get("last_ok_at"), 0.0)
+    if probe_ok >= probe_fail:
+        # A start that failed after the answer proves the handshake, not the data path: no lead for it.
+        last_fail = _as_float(entry.get("last_fail_at"), 0.0)
+        return 0 if probe_ok > last_fail or last_ok >= last_fail else 1
+    return 0 if last_ok > probe_fail else 2
 
+
+def proton_liveness(records, stats, now=None, memory=PROTON_ISSUE_MEMORY_SEC):
+    """`{entry_ip: ms, or None}` of the Proton profiles this install has evidence about, for a re-issue.
+
+    Evidence is this install's own: tunnels that carried traffic and pre-start handshakes (never a
+    probe run for its own sake). The latest piece younger than `memory` decides: a success gives the
+    node's distance (or 0 when unknown), a failure gives None. Nodes without evidence are left out.
+    """
+    from nova_latency import endpoint_host
+
+    now = time.time() if now is None else float(now)
+    stats = stats if isinstance(stats, dict) else {}
+    liveness = {}
+    for record in records or ():
+        if not isinstance(record, dict) or record.get("group") != GROUP_PROTON:
+            continue
+        host = endpoint_host(record.get("endpoint"))
+        entry = _stats_entry(stats, record)
+        if not host or not entry:
+            continue
+        good = max(_as_float(entry.get("last_ok_at"), 0.0), _as_float(entry.get("hs_ok_at"), 0.0))
+        bad = max(_as_float(entry.get("last_fail_at"), 0.0), _as_float(entry.get("hs_fail_at"), 0.0))
+        latest = max(good, bad)
+        if not latest or not 0 <= now - latest < memory:
+            continue
+        if good >= bad:
+            rtt = _as_int(entry.get("rtt_ms"), 0)
+            # A proven node with no measured distance still goes first, behind the measured ones.
+            liveness[host] = rtt if rtt > 0 else PROTON_UNKNOWN_DISTANCE_MS
+        else:
+            liveness.setdefault(host, None)
+    return liveness
+
+
+def _proton_order(records, stats, now=None):
+    """Proton connect queue: handshake liveness, then attempt outcomes, then distance.
+
+    First key -- the latest WireGuard handshake probe (`_proton_liveness_rank`): a node that answered
+    goes before an unprobed one, a node silent on every probed port goes last. Then Nova Android G207:
     0. nodes whose latest success is newer than their latest failure;
     1. untried nodes, and nodes whose failure is older than PROTON_FAILURE_MEMORY_SEC;
     2. recently failed nodes, the oldest failure first.
-    Inside a bucket the nearest node (TCP 443 rtt, `rtt_ms`) goes first; unmeasured ones after, and
-    lifetime failures break the remaining ties.
+    Inside a bucket the nearest node (`rtt_ms`: handshake time, or TCP 443 connect time when only
+    that was measured) goes first; unmeasured ones after, and lifetime failures break the remaining ties.
     """
     now = time.time() if now is None else float(now)
 
@@ -1365,7 +1466,8 @@ def _proton_order(records, stats, now=None):
             bucket, tiebreak = 2, last_fail
         else:
             bucket, tiebreak = 1, 0.0
-        return (bucket, tiebreak, rtt, _stats_failures(stats, record), natural_key(record["name"]))
+        return (_proton_liveness_rank(entry, now), bucket, tiebreak, rtt, _stats_failures(stats, record),
+                natural_key(record["name"]))
 
     return sorted(records, key=key)
 
@@ -1457,11 +1559,19 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
 
 
 def build_recovery_plan(plan, failed_id, budget=DEFAULT_RECOVERY_BUDGET):
-    """Next attempts after `failed_id` died: its identity-mates last, itself dropped, warp-cli excluded."""
+    """Next attempts after `failed_id` died: its identity-mates last, warp-cli excluded.
+
+    The failed profile itself is dropped -- except a Proton one, which goes first: a Proton tunnel
+    dies with its flow (the node's entry balances flows over servers, and a new local port reaches
+    the key again), the connect path probes the node before starting it, so a node that is really
+    gone costs a few seconds, and one that is fine comes back on the nearest server instead of a
+    farther one.
+    """
     entries = [a for a in (plan or []) if isinstance(a, dict) and isinstance(a.get("profile"), dict)
                and a.get("backend") != BACKEND_WARP_CLI]
     failed_id = str(failed_id or "")
-    failed = next((a["profile"] for a in entries if a["profile"].get("id") == failed_id), None)
+    failed_attempt = next((a for a in entries if a["profile"].get("id") == failed_id), None)
+    failed = failed_attempt["profile"] if failed_attempt else None
     identity = failed.get("identity") if failed else None
     others, mates = [], []
     for attempt in entries:
@@ -1471,7 +1581,21 @@ def build_recovery_plan(plan, failed_id, budget=DEFAULT_RECOVERY_BUDGET):
             mates.append(attempt)
         else:
             others.append(attempt)
-    return (others + mates)[:max(0, _as_int(budget, DEFAULT_RECOVERY_BUDGET))]
+    head = [failed_attempt] if failed is not None and failed.get("group") == GROUP_PROTON else []
+    return (head + others + mates)[:max(0, _as_int(budget, DEFAULT_RECOVERY_BUDGET))]
+
+
+def handshake_probe_target(record):
+    """The nova_wg_probe target of an AWG profile record (its key, server and cover), or None."""
+    if not isinstance(record, dict) or record.get("kind") != KIND_AWG or not record.get("path"):
+        return None
+    try:
+        data = _read_profile_bytes(record["path"])
+    except (OSError, ValueError):
+        return None
+    import nova_wg_probe  # lazy: listing and plans never need the crypto
+
+    return nova_wg_probe.target_from_parsed(parse_awg_conf(data.decode("utf-8", errors="ignore")))
 
 
 # --------------------------------------------------------------------------------------------
@@ -1494,9 +1618,12 @@ def _clean_stats_entry(entry):
         # Failures since the last success: the counters above are lifetime totals and cannot say
         # "failing right now", which is what the MASQUE lockout of «Авто» needs.
         "fail_streak": max(0, _as_int(entry.get("fail_streak"), 0)),
-        # Distance to the node's entry (TCP connect, ms); None = not measured or did not answer.
+        # Distance to the node's entry (handshake or TCP connect, ms); None = not measured or silent.
         "rtt_ms": _as_int(rtt_ms, None) if rtt_ms is not None else None,
         "rtt_at": _as_float(entry.get("rtt_at"), None),
+        # Latest WireGuard handshake probe that got an authenticated answer / got none (nova_wg_probe).
+        "hs_ok_at": _as_float(entry.get("hs_ok_at"), None),
+        "hs_fail_at": _as_float(entry.get("hs_fail_at"), None),
     }
 
 
@@ -1578,6 +1705,46 @@ def record_rtts(base_dir, measurements, now=None):
             entry = stats.get(profile_id) or _clean_stats_entry({})
             ms = _as_float(value, None)
             entry["rtt_ms"] = max(1, int(round(ms))) if ms is not None and ms >= 0 else None
+            entry["rtt_at"] = stamp
+            stats[profile_id] = entry
+        try:
+            _save_stats_locked(base_dir, stats)
+        except OSError:
+            return None
+    return len(items)
+
+
+def record_handshake_probes(base_dir, results, now=None):
+    """Store handshake probes `{profile_id: {"ok", "rtt_ms", "error"}}` in one write; the count, or None.
+
+    An answer sets `hs_ok_at` and the distance to the handshake time; silence sets `hs_fail_at` and
+    clears the distance, like `record_rtts`. A probe that never ran or saw no verdict (`error` "stopped",
+    "cookie", a bad key or endpoint, a local socket error "oserror-…", a prober crash "error-…") is not a
+    measurement of the node and is left out.
+    """
+    items = []
+    for pid, result in dict(results or {}).items():
+        pid = str(pid or "").strip()
+        if not pid or not isinstance(result, dict):
+            continue
+        error = str(result.get("error") or "")
+        if error in ("stopped", "bad-key", "bad-endpoint", "cookie") or error.startswith(("oserror-", "error-")):
+            continue
+        items.append((pid, result))
+    if not items:
+        return 0
+    stamp = round(float(time.time() if now is None else now), 3)
+    with _STATS_LOCK:
+        stats = load_stats(base_dir)
+        for profile_id, result in items:
+            entry = stats.get(profile_id) or _clean_stats_entry({})
+            ms = _as_float(result.get("rtt_ms"), None)
+            if result.get("ok"):
+                entry["hs_ok_at"] = stamp
+                entry["rtt_ms"] = max(1, int(round(ms))) if ms is not None and ms >= 0 else None
+            else:
+                entry["hs_fail_at"] = stamp
+                entry["rtt_ms"] = None
             entry["rtt_at"] = stamp
             stats[profile_id] = entry
         try:

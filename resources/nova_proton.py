@@ -435,16 +435,28 @@ def conf_filename(name):
     return (stem or "PROTON") + ".conf"
 
 
-def order_nodes(nodes):
+def _liveness_key(node, liveness):
+    """(rank, rtt) of a node by this install's evidence: 0 worked (nearest first), 1 unknown, 2 silent."""
+    if not isinstance(liveness, dict) or node.get("entry_ip") not in liveness:
+        return 1, 0
+    rtt = liveness.get(node.get("entry_ip"))
+    return (0, rtt) if isinstance(rtt, (int, float)) and not isinstance(rtt, bool) else (2, 0)
+
+
+def order_nodes(nodes, liveness=None):
     """Least-loaded first inside each country, then round-robin across countries.
 
     Countries follow the order of their least-loaded node, so the head of the set is the best
     node of every country rather than twenty NL nodes in a row. Duplicates by address+key and
-    by file name (case-insensitive: Windows) are dropped, the first one kept.
+    by file name (case-insensitive: Windows) are dropped, the first one kept. `liveness`
+    (`{entry_ip: ms, or None when silent}`, see nova_profiles.proton_liveness) ranks first: nodes
+    that carried this install's traffic, nearest first, then unknown ones, then silent ones -- so a
+    country with a proven node comes before a country without one, and a name shared by two
+    addresses keeps the one that worked.
     """
     ranked = sorted(
         (n for n in nodes if isinstance(n, dict)),
-        key=lambda n: (n.get("load", 100), n.get("score", float("inf"))),
+        key=lambda n: (_liveness_key(n, liveness), n.get("load", 100), n.get("score", float("inf"))),
     )
     buckets = {}
     seen_pairs = set()
@@ -469,18 +481,19 @@ def order_nodes(nodes):
     return ordered
 
 
-def plan_profiles(nodes, count=TARGET_COUNT, *, taken=()):
+def plan_profiles(nodes, count=TARGET_COUNT, *, taken=(), liveness=None):
     """Nodes -> [{"node", "port", "filename"}]: at most `count`, ports round-robin by index.
 
     One profile per node: file names come from the node name, so a second port on the same
     node would need a name the layout does not have. A node whose file name is in `taken`
     (case-insensitive; a file in the folder that this install did not write) is skipped and the
     next node fills its place, so a user's file is never overwritten and ports stay dense.
+    `liveness` is passed to `order_nodes`: live nodes are the first to get a place.
     """
     limit = max(0, int(count))
     blocked = {str(name).lower() for name in (taken or ())}
     plan = []
-    for node in order_nodes(nodes):
+    for node in order_nodes(nodes, liveness):
         if len(plan) >= limit:
             break
         filename = conf_filename(node.get("name"))
@@ -1419,6 +1432,7 @@ def _base_summary(group_dir):
         "reused": False,         # the existing set was kept as it is, nothing was written
         "warning": "",           # the run succeeded, but something the user may want to know failed
         "session_code": None,    # Proton Code of a failed session step the run survived (e.g. 9001)
+        "alive": None,           # proven nodes (this install's attempts) among the candidates; None: unknown
     }
 
 
@@ -1436,7 +1450,60 @@ def _record_failure(group_dir, now, message, code, emit, *, transport=False, rou
         emit(f"{LOG_PREFIX} отметка о неудачной попытке не записана: {_os_reason(exc)}")
 
 
-def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False, progress=None):
+_CONF_COMMENT_NAME = re.compile(r"^#\s*(?P<name>[^()\r\n]+?)\s*(?:\((?P<city>[^()\r\n]*)\))?\s*$")
+
+
+def _previous_set_nodes(group_dir, names, own_keys, known_nodes):
+    """Nodes of the previous set (this install's files) that the new node list does not carry.
+
+    Every run gets a session-bound subset, so a node that carried traffic yesterday is often simply
+    absent today, while it still takes our key (Android N30/N36). The caller keeps only the ones this
+    install's own attempts proved (`issue_profiles(liveness=...)`).
+    """
+    known = {(_text(n.get("entry_ip")), _text(n.get("peer_public_key"))) for n in known_nodes or ()
+             if isinstance(n, dict)}
+    carried = []
+    for name in names or ():
+        name = str(name or "")
+        if os.path.basename(name) != name or not name.lower().endswith(".conf"):
+            continue
+        path = os.path.join(group_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_CONF_PEEK_CHARS)
+        except OSError:
+            continue
+        if _conf_private_key(path) not in own_keys:
+            continue
+        peer_key = endpoint = label = city = ""
+        section = ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip().lower()
+                continue
+            if section != "peer":
+                continue
+            comment = _CONF_COMMENT_NAME.match(line) if line.startswith("#") else None
+            if comment and not label:
+                label, city = comment.group("name").strip(), (comment.group("city") or "").strip()
+            elif "=" in line and not line.startswith("#"):
+                key, value = (part.strip() for part in line.split("=", 1))
+                if key.lower() == "publickey":
+                    peer_key = value
+                elif key.lower() == "endpoint":
+                    endpoint = value
+        host = endpoint.rpartition(":")[0].strip("[]") if ":" in endpoint else ""
+        if not _valid_ip(host) or _decode_wg_key(peer_key) is None or (host, peer_key) in known:
+            continue
+        label = label or name[:-5]
+        country = label.split("-", 1)[0].upper() if "-" in label else "??"
+        known.add((host, peer_key))
+        carried.append(_make_node(label, country, city, host, peer_key, 100, float("inf")))
+    return carried
+
+
+def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False, progress=None, liveness=None):
     """Issue the Proton profile set into `profiles/AWG Proton/`. Never raises; returns a summary.
 
     A normal run keeps a complete set written with the live key and does not touch the network
@@ -1449,6 +1516,12 @@ def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False
     logicals win, the bundled list is the fallback -- but a stale complete set is kept rather than
     replaced by the bundled list. Only files carrying this install's key are replaced or removed.
     `progress(text)` may raise to cancel: the run then stops before touching any profile.
+    `liveness` (`nova_profiles.proton_liveness`: `{entry_ip: ms, or None when silent}`, built from
+    this install's own connect attempts, no network) decides who gets a place first: nodes that
+    carried traffic, then unknown ones, then silent ones -- and a proven node the new list lost is
+    kept. Nodes are deliberately not probed here: measured 2026-09-15, a burst of handshakes across
+    dozens of servers left the most-used nodes refusing the key for tens of minutes, and a finished
+    handshake takes the key over from a live tunnel (nova_wg_probe).
     """
     proxies = tuple(str(p).strip() for p in (proxies or ()) if str(p or "").strip())
     scrub = _Scrubber(proxies)
@@ -1460,7 +1533,7 @@ def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False
         emit(f"{LOG_PREFIX} {summary['error']} — второй не начинаю")
         return summary
     try:
-        _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress)
+        _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress, liveness)
     except _Cancelled:
         summary["cancelled"] = True
         summary["ok"] = False
@@ -1525,7 +1598,7 @@ def _source_text(source):
     return "живой список" if source == NODES_SOURCE_LIVE else "встроенный список"
 
 
-def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress):
+def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress, liveness=None):
     def step(text):
         emit(f"{LOG_PREFIX} {text}")
         if progress is not None:
@@ -1736,10 +1809,21 @@ def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, pro
         summary["route"] = client.last_route_label
         summary["relay_outdated"] = client.relay_outdated
 
+        if isinstance(liveness, dict) and liveness:
+            proven = {ip for ip, rtt in liveness.items() if rtt is not None}
+            kept = [n for n in _previous_set_nodes(group_dir, previous_names, own_keys, nodes)
+                    if n["entry_ip"] in proven]
+            nodes = list(nodes) + kept
+            summary["alive"] = sum(1 for n in nodes if n.get("entry_ip") in proven)
+            emit(f"{LOG_PREFIX} узлов, на которых эта установка уже подключалась: {summary['alive']} — идут первыми"
+                 + (f"; из прежнего набора сохранено тех, что пропали из нового списка: {len(kept)}" if kept else ""))
+        else:
+            liveness = None
+
         step("собираю профили")
         taken = _foreign_conf_names(group_dir, own_keys)
-        plan = plan_profiles(nodes, count, taken=taken)
-        blocked = sum(1 for n in order_nodes(nodes) if conf_filename(n.get("name")).lower() in taken)
+        plan = plan_profiles(nodes, count, taken=taken, liveness=liveness)
+        blocked = sum(1 for n in order_nodes(nodes, liveness) if conf_filename(n.get("name")).lower() in taken)
         if blocked:
             emit(f"{LOG_PREFIX} узлов пропущено: {blocked} — файл с таким именем уже лежит в папке "
                  "и записан не этой установкой")

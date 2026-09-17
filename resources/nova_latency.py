@@ -1,10 +1,15 @@
-"""Distance to VPN nodes by TCP connect time -- the order «ближайший первым» is built from it.
+"""Distance to VPN nodes by TCP connect time -- the fallback order «ближайший первым».
+
+The Proton queue is ordered by a WireGuard handshake now (nova_wg_probe): liveness and distance in
+one measurement. This module stays for the one case the handshake must not run -- a Proton tunnel
+is up, and a handshake with its key would take the key over.
 
 Ported from Nova Android `ProtonLatency.kt`, with its reasons:
 
-* the honest measurement would be a WireGuard handshake, but from Russia Proton answers it on
-  none of fifty nodes, so ranking fell back to the API's `Load` and the queue started on another
-  continent;
+* Android's handshake probe answered on none of fifty nodes, so ranking fell back to the API's
+  `Load`. That probe was broken, not the nodes: its initiation is pinned to a vector built under the
+  protocol name "ChaCha20Poly1305" where WireGuard uses "ChaChaPoly", and every server drops it in
+  silence. The corrected probe got answers from 14 of 50 nodes on the same day (2026-09-15);
 * a plain TCP connect to the node's entry address follows the same path, and Proton keeps OpenVPN
   TCP on 443 there: measured 61 ms to NO, 74 ms to NL, 150 ms to CA, 215 ms to US -- ordered
   exactly as geography predicts;

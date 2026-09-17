@@ -216,6 +216,36 @@ def apply_title_bar_theme(win, dark):
         return False
 
 
+def drop_maximize_box(win):
+    """Take the maximize button off a window resizable in width only (Windows).
+
+    Tk adds the button as soon as one dimension is resizable. Measured: a maximized «Профили» spans
+    the whole screen (2560 px) at its fixed height, and nova.pyw's placement then keeps that width
+    after a restore. Without WS_MAXIMIZEBOX a double click on the title bar does not maximize either.
+    """
+    if os.name != "nt":
+        return False
+    gwl_style, ws_maximizebox = -16, 0x00010000
+    # SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED: redraw the caption only.
+    swp_frame_only = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
+    try:
+        import ctypes
+
+        win.update_idletasks()
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(win.winfo_id())
+        if not hwnd:
+            return False
+        style = user32.GetWindowLongW(hwnd, gwl_style)
+        if style & ws_maximizebox:
+            user32.SetWindowLongW(hwnd, gwl_style, style & ~ws_maximizebox)
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, swp_frame_only)
+        return True
+    except (OSError, AttributeError, tk.TclError):
+        # Cosmetic only: the button stays and does what Windows does with it.
+        return False
+
+
 def set_pill_text(pill, text):
     """Change a pill's caption. PopupPillButton has no setter, but it is a Canvas with one text item."""
     setter = getattr(pill, "set_text", None)
@@ -258,13 +288,16 @@ def _num(value):
 
 def _normalize_test_result(result):
     if not isinstance(result, dict):
-        return {"ok": False, "ms": None, "message": "проверка вернула пустой ответ"}
+        return {"ok": False, "ms": None, "message": "проверка вернула пустой ответ", "skipped": False}
     ms = result.get("ms")
     try:
         ms = None if ms is None or isinstance(ms, bool) else max(0, int(round(float(ms))))
     except (TypeError, ValueError):
         ms = None
-    return {"ok": bool(result.get("ok")), "ms": ms, "message": str(result.get("message") or "").strip()}
+    # "skipped": the check did not run (it would cut the live tunnel or could not pass beside it),
+    # so it says nothing about the profile.
+    return {"ok": bool(result.get("ok")), "ms": ms, "message": str(result.get("message") or "").strip(),
+            "skipped": bool(result.get("skipped")) and not result.get("ok")}
 
 
 def format_outcome(stats_entry, test_result=None, testing=False):
@@ -842,9 +875,13 @@ class ProfilesWindow:
         self._logged_once = set()
         self._notice_at = 0.0
         self._notice_tone = "muted"
+        self._notice_text = ""  # full text: a wider window shows more of it
         self._fit_cache = {}
         self._last_snapshot_errors = ()
         self._title_bar_done = False
+        self._maximize_box_dropped = False
+        self._min_content_px = 0
+        self._outer_pad_px = 0
         self.win = None
         try:
             self._build()
@@ -861,8 +898,10 @@ class ProfilesWindow:
     # -- building ------------------------------------------------------------------------
 
     def _label(self, parent, tone="normal", font=None):
+        # width=1: a text never widens the window. Every label is packed to fill the row and its text is
+        # fitted to the row width (_fit), so the width comes from the pill rows, the list and the user.
         return tk.Label(parent, text="", anchor="w", justify="left", bg=self.theme["bg"],
-                        fg=self._tone_color(tone), font=font or self.font_text, bd=0, padx=0)
+                        fg=self._tone_color(tone), font=font or self.font_text, bd=0, padx=0, width=1)
 
     def _measure(self, font, text):
         return int(self.root.tk.call("font", "measure", font, text))
@@ -895,7 +934,8 @@ class ProfilesWindow:
         self.win = win
         self._win_path = str(win)
         win.title("Профили")
-        win.resizable(False, False)
+        # Wider only: rows and notices are long (endpoint, outcome, warnings), the height is set by the list.
+        win.resizable(True, False)
         win.configure(bg=t["bg"], bd=1, highlightthickness=1, highlightbackground=t["border"])
         self._call_ctx_quiet("apply_window_icon", win)
         win.protocol("WM_DELETE_WINDOW", self.hide)
@@ -982,13 +1022,17 @@ class ProfilesWindow:
         self.notice_label.pack(side="left", fill="x", expand=True)
 
         win.update_idletasks()
-        self._content_px = max(tabs_row.winfo_reqwidth(), actions.winfo_reqwidth(), body.winfo_reqwidth(),
-                               mode_row.winfo_reqwidth(), 360)
-        self._tor_value_px = max(120, self._content_px - self._tor_caption_width)
-        self._notice_px = max(120, self._content_px - self.close_pill.winfo_reqwidth() - 10)
-        self.tor_hint.configure(wraplength=self._content_px,
-                                text="Tor включается только для группы «Браузеры»: остальные приложения идут "
+        content_px = max(tabs_row.winfo_reqwidth(), actions.winfo_reqwidth(), body.winfo_reqwidth(),
+                         mode_row.winfo_reqwidth(), 360)
+        self.tor_hint.configure(text="Tor включается только для группы «Браузеры»: остальные приложения идут "
                                      "прежним путём.")
+        self._apply_content_width(content_px)
+        # The built width is the narrowest one: pills and the list never get cut off.
+        self._min_content_px = content_px
+        self._outer_pad_px = 2 * int(outer.cget("padx"))
+        frame_px = win.winfo_reqwidth() - (outer.winfo_reqwidth() - self._outer_pad_px)
+        win.minsize(content_px + frame_px, 1)
+        outer.bind("<Configure>", self._on_outer_configure, add="+")
         space = max(1, self._measure(self.font_text, " "))
         self._marker_pad = " " * max(1, round(self._measure(self.font_text, "● ") / space))
         self.select_tab(self.current_tab if self.current_tab in dict(TABS) else GROUP_CLOUDFLARE)
@@ -1041,6 +1085,21 @@ class ProfilesWindow:
         self.tor_hint.pack(fill="x", pady=(8, 0))
         panel.update_idletasks()
         self._tor_caption_width = caption.winfo_reqwidth()
+
+    def _apply_content_width(self, content_px):
+        self._content_px = content_px
+        self._tor_value_px = max(120, content_px - self._tor_caption_width)
+        self._notice_px = max(120, content_px - self.close_pill.winfo_reqwidth() - 10)
+        self.tor_hint.configure(wraplength=content_px)
+
+    def _on_outer_configure(self, event):
+        # `outer` fills the window, so its width follows a drag of the window's edge: refit every text.
+        content_px = max(self._min_content_px, int(event.width) - self._outer_pad_px)
+        if content_px == self._content_px or not self.alive():
+            return
+        self._apply_content_width(content_px)
+        self._set_label(self.notice_label, self._notice_text, self._notice_tone, max_px=self._notice_px)
+        self._render_all()
 
     # -- small helpers -------------------------------------------------------------------
 
@@ -1100,6 +1159,7 @@ class ProfilesWindow:
     def _notice(self, text, tone="muted"):
         self._notice_at = time.monotonic()
         self._notice_tone = tone
+        self._notice_text = str(text or "")
         if self.alive():
             self._set_label(self.notice_label, text, tone, max_px=self._notice_px)
 
@@ -1224,6 +1284,8 @@ class ProfilesWindow:
         if not self._title_bar_done:
             # The DWM frame exists only once the toplevel has been mapped (same as nova.pyw's log window).
             self._title_bar_done = apply_title_bar_theme(self.win, self.dark)
+        if not self._maximize_box_dropped:
+            self._maximize_box_dropped = drop_maximize_box(self.win)
         self._raise()
         self._schedule_tick()
 
@@ -1325,6 +1387,7 @@ class ProfilesWindow:
         self._expire_tests()
         if self._notice_tone != "fail" and self._notice_at and time.monotonic() - self._notice_at > NOTICE_TTL_S:
             self._notice_at = 0.0
+            self._notice_text = ""
             self._set_label(self.notice_label, "", "muted", max_px=self._notice_px)
         self._schedule_tick()
 
@@ -1762,8 +1825,15 @@ class ProfilesWindow:
             return
         self._tests.pop(token.profile_id, None)
         normalized = _normalize_test_result(result)
-        self._test_results[token.profile_id] = (normalized, time.time())
         name = token.profile_id.partition("/")[2] or token.profile_id
+        if normalized["skipped"]:
+            # Not a verdict: the row keeps the profile's last real outcome.
+            reason = f" — {normalized['message']}" if normalized["message"] else ""
+            self._notice(f"«{name}»: не проверен{reason}", "warn")
+            self._render_all()
+            self.refresh_now()
+            return
+        self._test_results[token.profile_id] = (normalized, time.time())
         if normalized["ok"]:
             ms = f" {normalized['ms']} мс" if normalized["ms"] is not None else ""
             self._notice(f"«{name}»: ок{ms}", "ok")
