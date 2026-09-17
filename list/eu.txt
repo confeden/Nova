@@ -1,4 +1,4 @@
-# version: 1.39
+# version: 1.39.1
 4pda.to
 4pda.ws
 agent-router.org
@@ -46,10 +46,11 @@ imgur.com
 intel.com
 invideo.io
 jestkii.com
+kaspersky.com
+kaspersky.ru
+kaspersky.se
 kilo.ai
-kinozal.tv
 kodikplayer.com
-lh3.googleusercontent.com
 lpsg.com
 meta.ai
 microchip.com
@@ -58,6 +59,7 @@ mozilla.org
 msys2.org
 mtraf.io
 netflix.com
+ngc.nvidia.com
 nitter.net
 notebooklm.google.com
 ntc.party

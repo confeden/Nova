@@ -1,3 +1,5 @@
-# version: 1.39
+# version: 1.39.1
 # user WARP override domains
 pornolab.net
+kinozal.me
+kinozal.guru

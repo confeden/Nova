@@ -1,4 +1,4 @@
-# version: 1.39
+# version: 1.39.1
 1337x.to
 1e100cdn.net
 7tv.app
@@ -21,7 +21,6 @@ arkoselabs.com
 arm.com
 arrow.com
 aspose.app
-avatars.githubusercontent.com
 awswaf.com
 azure.com
 b-cdn.net
@@ -31,6 +30,7 @@ benchgecko.ai
 bestrandoms.com
 booktracker.org
 bootstrapcdn.com
+br.de
 breakingcopyright.com
 brevo.com
 buildwithfern.com
@@ -81,6 +81,7 @@ emp.bbc.co.uk
 engagement.ai
 etoneya.su
 evolution-x.org
+excalidraw.com
 ext-twitch.tv
 facebook.com
 farnell.com
@@ -101,6 +102,7 @@ funpay.com
 g2g.com
 ggpht.com
 github.com
+githubusercontent.com
 glbgpt.com
 godaddy.com
 goentri.com
@@ -120,6 +122,7 @@ hexed.it
 hls.ttvnw.net
 hlsloader.com
 ibb.co
+iditena.org
 instagram.com
 ip-tracker.org
 iplogger.org
@@ -130,7 +133,9 @@ jnn-pa.googleapis.com
 killedbygoogle.com
 kinobox.tv
 kinohub.vip
+kinozal.tv
 laozhang.ai
+lh3.googleusercontent.com
 litellm.ai
 live-video.net
 live.com
@@ -170,8 +175,6 @@ nova.app
 nova.net
 nowpayments.io
 ntfy.sh
-nvidia.com
-objects.githubusercontent.com
 obmen.one
 obsproject.com
 ohi-s.com
@@ -195,13 +198,11 @@ proxyliberty.com
 proxynova.com
 puter.chat
 puter.site
-raw.githubusercontent.com
 recaptcha.net
 receive-sms.io
 redav.online
 redditspace.com
 redgifs.com
-release-assets.githubusercontent.com
 rezka.ag
 romexsoftware.com
 rottentomatoes.com

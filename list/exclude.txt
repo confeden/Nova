@@ -1,4 +1,4 @@
-# version: 1.39
+# version: 1.39.1
 1c-bitrix.ru
 akamaihd.net
 apptracer.ru
