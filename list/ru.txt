@@ -33,6 +33,7 @@ bootstrapcdn.com
 br.de
 breakingcopyright.com
 brevo.com
+bspuhose.com
 buildwithfern.com
 cdn.bsky.app
 cdn.intergient.com
@@ -72,6 +73,7 @@ discord.com
 discord.gg
 discordapp.com
 discourse-cdn.com
+dnsleaktest.org
 dropboxstatic.com
 dw.com
 ecosyste.ms
