@@ -685,6 +685,16 @@ def restart_nova():
                 log_func(f"[Restart] Ошибка перезапуска: {e}")
             except:
                 print(f"Restart failed: {e}")
+            # Сервисы уже остановлены, а новой копии нет: без этого надпись
+            # «ПЕРЕЗАПУСК» оставалась бы навсегда при кнопке «ПОДКЛЮЧИТЬ».
+            try:
+                _root = globals().get('root')
+                _status = globals().get('status_label')
+                if _root and _status:
+                    _fail = globals().get('COLOR_TEXT_FAIL', "#FF4444")
+                    _root.after(0, lambda: _status.config(text="ОСТАНОВЛЕНО", fg=_fail))
+            except:
+                pass
         finally:
             try:
                 restart_nova._in_progress = False
@@ -2638,12 +2648,13 @@ try:
         PROTON_PREPROBE_ATTEMPTS = 5
         PROTON_PREPROBE_TIMEOUT_SEC = 1.5
 
-        def _preprobe_proton_profile(self, profile, log_skip=True):
+        def _preprobe_proton_profile(self, profile, log_skip=True, should_stop=None):
             """Handshake a Proton node from a few local ports; the nova_wg_probe result.
 
             An answer is recorded as the node's liveness and distance; silence as a silent probe. When the
             probe cannot be built (no key or endpoint in the file) or cannot be sent (a local socket error)
-            the result says ok with no port: the start then goes on exactly as before.
+            the result says ok with no port: the start then goes on exactly as before. Besides Nova's exit,
+            `should_stop` ends it between attempts ("stopped"): a check gives its key up to a waiting start.
             """
             target = nova_profiles.handshake_probe_target(profile)
             if target is None:
@@ -2652,7 +2663,8 @@ try:
             result = nova_wg_probe.probe_endpoint(
                 target["private_key"], target["peer_public_key"], target["host"], target["port"],
                 cover=target["cover"], attempts=self.PROTON_PREPROBE_ATTEMPTS,
-                timeout=self.PROTON_PREPROBE_TIMEOUT_SEC, should_stop=lambda: is_closing,
+                timeout=self.PROTON_PREPROBE_TIMEOUT_SEC,
+                should_stop=lambda: is_closing or (callable(should_stop) and bool(should_stop())),
             )
             if result.get("error") in ("stopped", "cookie"):
                 # Not a verdict about the node: a stop, or a server under load that wants a cookie round,
@@ -2681,9 +2693,17 @@ try:
 
         def _start_awg_proxy_backend(self, profile, allow_personal_identity=True):
             if isinstance(profile, dict) and str(profile.get("group") or "") == nova_profiles.GROUP_PROTON:
-                # A «Проверить» of this key waits, and decides its conflict only after the helper is up.
+                # A «Проверить» of this key that holds it, or gets it while this start waits, gives it up at once;
+                # one clicked after the start took the key waits, and decides its conflict after the helper is up.
                 target = nova_profiles.handshake_probe_target(profile)
-                with _wg_identity_lock(target["private_key"] if target else ""):
+                waiting_since = time.monotonic()
+                with _wg_identity_start(target["private_key"] if target else ""):
+                    waited = time.monotonic() - waiting_since
+                    if waited >= 1.0:
+                        profile_id = str(profile.get("id") or profile.get("name") or "")
+                        name = nova_profiles.split_profile_id(profile_id)[1] or profile_id
+                        self.log_func(f"[RU] [AWG] {name}: ключ держала проверка профиля или другой запуск — "
+                                      f"подключение ждало {waited:.1f} с.")
                     return self._launch_awg_proxy_backend(profile, allow_personal_identity)
             return self._launch_awg_proxy_backend(profile, allow_personal_identity)
 
@@ -5516,7 +5536,12 @@ try:
         return events
 
     _wg_identity_locks = {}
+    # Starts waiting for a key's lock, by the lock's digest; a check gives that key up to any of them.
+    _wg_identity_starts_waiting = {}
     _wg_identity_locks_guard = threading.Lock()
+
+    def _wg_identity_digest(identity):
+        return hashlib.sha256(str(identity or "").encode("utf-8")).hexdigest()[:16] if identity else ""
 
     def _wg_identity_lock(identity):
         """The one lock of a WireGuard key: a Proton start and a profile check never overlap on it.
@@ -5525,12 +5550,44 @@ try:
         handshake takes the key over from the other server ~15 s later; on Cloudflare a live tunnel plus two
         new sessions dropped one of the new ones after its first handshake. Re-entrant: a start may retry itself.
         """
-        digest = hashlib.sha256(str(identity or "").encode("utf-8")).hexdigest()[:16] if identity else ""
+        digest = _wg_identity_digest(identity)
         with _wg_identity_locks_guard:
             lock = _wg_identity_locks.get(digest)
             if lock is None:
                 lock = _wg_identity_locks[digest] = threading.RLock()
             return lock
+
+    @contextlib.contextmanager
+    def _wg_identity_start(identity):
+        """Hold a key's lock for a start, ahead of every «Проверить» of that key.
+
+        A check holds the key up to ~25 s (handshake probe 7.7 s, helper 14 s, its stop 3 s) and the lock goes
+        to its waiters in arrival order (3.14: 300 runs of 300), so a Proton start or recovery waited behind
+        every check clicked before it: five left RU without a tunnel for ~2 min (review before 1.39.1). While
+        this start waits, a check that holds the key or gets it gives it up (`_wg_identity_start_waiting`).
+        Once the start holds the key it no longer counts: a check clicked meanwhile waits and then runs.
+        """
+        digest = _wg_identity_digest(identity)
+        lock = _wg_identity_lock(identity)
+        with _wg_identity_locks_guard:
+            _wg_identity_starts_waiting[digest] = _wg_identity_starts_waiting.get(digest, 0) + 1
+        try:
+            lock.acquire()
+        finally:
+            with _wg_identity_locks_guard:
+                left = _wg_identity_starts_waiting.pop(digest, 1) - 1
+                if left > 0:
+                    _wg_identity_starts_waiting[digest] = left
+        try:
+            yield lock
+        finally:
+            lock.release()
+
+    def _wg_identity_start_waiting(identity):
+        """True while a start waits for this key's lock: a check then gives the key up instead of going on."""
+        digest = _wg_identity_digest(identity)
+        with _wg_identity_locks_guard:
+            return _wg_identity_starts_waiting.get(digest, 0) > 0
 
     def _pick_free_loopback_port():
         """A free 127.0.0.1 port chosen by the OS (never one of Nova's fixed ports)."""
@@ -5838,6 +5895,23 @@ try:
             elapsed = int((time.monotonic() - started) * 1000)
             return {"ok": ok, "ms": elapsed if ok else None}
 
+        def _probe_socks_port_until(self, port, should_stop):
+            """`_probe_socks_port` on a worker; None as soon as `should_stop()` fires.
+
+            A probe through a helper whose traffic does not flow runs its whole budget (8 s), too long for a start
+            waiting on the key. Abandoned, it ends when the caller stops the helper: its connection goes with it.
+            """
+            box = {}
+            worker = threading.Thread(target=lambda: box.update(result=self._probe_socks_port(port)),
+                                      daemon=True, name="NovaProfileProbe")
+            worker.start()
+            while True:
+                worker.join(0.25)
+                if not worker.is_alive():
+                    return box.get("result") or {"ok": False, "ms": None}
+                if should_stop():
+                    return None
+
         def _test_awg_profile(self, record, wm):
             wireproxy = getattr(wm, "wireproxy_awg_path", "") if wm else ""
             wireproxy = wireproxy or os.path.join(get_bin_dir(), "wireproxy-awg.exe")
@@ -5850,7 +5924,10 @@ try:
                 return {"ok": False, "ms": None, "message": "не удалось собрать конфигурацию"}
             identity = str((nova_profiles.parse_awg_conf(payload).get("interface") or {}).get("privatekey") or "")
             with _wg_identity_lock(identity):
-                # Decided under the lock: a Proton start or another check may have taken this key while we waited.
+                # Decided under the lock: a Proton start or another check may have taken this key while we waited,
+                # and a start waiting for it now goes first -- RU may have no tunnel until that start runs.
+                if _wg_identity_start_waiting(identity):
+                    return self._yielded_key_result()
                 live_cfg = getattr(wm, "awg_runtime_config_path", "") if getattr(wm, "active_backend", "") == "awg" else ""
                 live_text = ""
                 if live_cfg:
@@ -5869,16 +5946,26 @@ try:
                     else:
                         message = f"тот же ключ и сервер, что у «{live_name}» — проверка оборвала бы подключение"
                     return {"ok": False, "ms": None, "_record": False, "skipped": True, "message": message}
-                return self._test_awg_profile_locked(record, wm, profile, payload, allow_personal)
+                return self._test_awg_profile_locked(record, wm, profile, payload, allow_personal,
+                                                     should_yield=lambda: _wg_identity_start_waiting(identity))
 
-        def _test_awg_profile_locked(self, record, wm, profile, payload, allow_personal):
+        def _yielded_key_result(self):
+            # Not a verdict: the row keeps the profile's last real outcome.
+            return {"ok": False, "ms": None, "_record": False, "skipped": True,
+                    "message": "ключ нужен подключению, проверка уступила ему"}
+
+        def _test_awg_profile_locked(self, record, wm, profile, payload, allow_personal, should_yield=None):
+            if not callable(should_yield):
+                should_yield = lambda: False
             wireproxy = getattr(wm, "wireproxy_awg_path", "") or os.path.join(get_bin_dir(), "wireproxy-awg.exe")
             if record.get("group") == nova_profiles.GROUP_PROTON:
                 # The conflict rule above already refused a check beside a live Proton tunnel; here a
                 # silent node is answered in seconds, and a live one is checked from the port it answered.
-                verdict = wm._preprobe_proton_profile(profile, log_skip=False)
+                verdict = wm._preprobe_proton_profile(profile, log_skip=False, should_stop=should_yield)
                 if not verdict.get("ok"):
                     if verdict.get("error") == "stopped":
+                        if should_yield():
+                            return self._yielded_key_result()
                         return {"ok": False, "ms": None, "message": "проверка прервана", "_record": False}
                     return {"ok": False, "ms": None, "message": "узел не отвечает на рукопожатие"}
                 if verdict.get("source_port"):
@@ -5887,6 +5974,9 @@ try:
                         profile, allow_personal_identity=allow_personal)
                     if not payload:
                         return {"ok": False, "ms": None, "message": "не удалось собрать конфигурацию"}
+            if should_yield():
+                # A start began waiting while the node answered: no new session of the key for a check now.
+                return self._yielded_key_result()
             port = _pick_free_loopback_port()
             payload = re.sub(r"(?m)^BindAddress = 127\.0\.0\.1:\d+$", f"BindAddress = 127.0.0.1:{port}", payload)
             base = get_base_dir()
@@ -5908,15 +5998,27 @@ try:
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
+
+                def cut_short():
+                    return is_closing or should_yield()
+
                 deadline = time.monotonic() + self.TEST_AWG_DEADLINE_SEC
-                while time.monotonic() < deadline and not is_closing:
+                while time.monotonic() < deadline and not cut_short():
                     if proc.poll() is not None:
                         return {"ok": False, "ms": None, "message": "wireproxy завершился — конфигурация не принята"}
                     if is_local_port_open_quick(port, timeout=0.25):
-                        probe = self._probe_socks_port(port)
+                        probe = self._probe_socks_port_until(port, cut_short)
+                        if probe is None:
+                            continue
                         if probe["ok"]:
                             return {"ok": True, "ms": probe["ms"], "message": "работает"}
                     time.sleep(0.5)
+                if should_yield():
+                    # The helper stops in `finally`, before the caller lets the key go.
+                    return self._yielded_key_result()
+                if is_closing:
+                    # Cut short by Nova's exit: recorded as «трафик не пошёл» before.
+                    return {"ok": False, "ms": None, "message": "проверка прервана", "_record": False}
                 return {"ok": False, "ms": None, "message": "трафик не пошёл"}
             finally:
                 if proc is not None:
@@ -30895,6 +30997,12 @@ try:
                 safe_trace(f"[UI] indicator pill update failed: {e}")
                 
             try:
+                # Перезапуск Nova: старая копия ещё несколько секунд гасит
+                # сервисы, этот опрос видит упавшие туннели и переписывал
+                # «ПЕРЕЗАПУСК» на «ПОДКЛЮЧЕНИЕ». Подключаться будет новая копия,
+                # а надпись здесь принадлежит остановке — не трогаем её.
+                if getattr(restart_nova, "_in_progress", False):
+                    return
                 both_ok = bool(warp_ok and opera_ok)
                 if both_ok:
                     global has_connected_once
@@ -30905,7 +31013,13 @@ try:
                     # враньём: никто не подключается и не собирается.
                     if globals().get("awaiting_manual_connect", False):
                         status_label.config(text="ГОТОВ К ЗАПУСКУ", fg="#cccccc")
-                    elif not globals().get("has_connected_once", False):
+                    # Остановка сбрасывает has_connected_once, поэтому без этой
+                    # проверки «ОСТАНОВЛЕНО» и «ПАУЗА (VPN)» через пару секунд
+                    # тоже сменялись на «ПОДКЛЮЧЕНИЕ», хотя запуска нет.
+                    elif not globals().get("has_connected_once", False) and (
+                        globals().get("is_service_active", False)
+                        or globals().get("service_start_requested_at", 0.0)
+                    ):
                         status_label.config(text="ПОДКЛЮЧЕНИЕ", fg=COLOR_TEXT_WARNING)
             except:
                 pass
