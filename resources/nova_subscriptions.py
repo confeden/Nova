@@ -46,7 +46,8 @@ __all__ = [
     "DEFAULT_USER_AGENT", "MAX_BODY_BYTES", "MAX_NODES", "DEFAULT_SOURCES",
     "KIND_AUTO", "KIND_VLESS", "KIND_AWG",
     "DEFAULT_KEEP", "MAX_TOTAL_VLESS",
-    "subscriptions_path", "load", "save", "add", "remove", "set_enabled", "find",
+    "subscriptions_path", "load", "save", "add", "remove", "set_enabled", "set_interval",
+    "set_keep", "merge_saved", "find", "github_file_parts",
     "normalize_record", "due", "mirror_urls", "fetch", "FetchResult", "plan_sync", "refresh",
 ]
 
@@ -132,7 +133,11 @@ DEFAULT_SOURCES = (
 # written by an older Nova be corrected on load instead of being trusted.
 _SHAPE = 2
 
-_LOCK = threading.Lock()
+# Re-entrant, and every read-modify-write of the registry is held across both halves. Two writers
+# are ordinary here: the owner edits a subscription in the «Профили» window while the periodic
+# sweep is half-way through downloading the others, and the sweep used to save the whole registry
+# from the snapshot it started with -- which silently dropped a subscription added meanwhile.
+_LOCK = threading.RLock()
 _ID_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -287,32 +292,84 @@ def find(records, sub_id):
     return None
 
 
-def add(base_dir, url, name="", kind=KIND_AUTO, interval_hours=DEFAULT_INTERVAL_HOURS):
+def add(base_dir, url, name="", kind=KIND_AUTO, interval_hours=DEFAULT_INTERVAL_HOURS,
+        keep=DEFAULT_KEEP):
     """Register a subscription. An already-registered URL is returned unchanged, not duplicated."""
-    records = load(base_dir)
-    candidate = normalize_record({"url": url, "name": name, "kind": kind,
-                                  "interval_hours": interval_hours})
-    if candidate is None:
-        return None, records
-    for record in records:
-        if record["url"].lower() == candidate["url"].lower():
-            return record, records
-    records.append(candidate)
-    return candidate, save(base_dir, records)
+    # `shape` is stated: without it `normalize_record` reads a brand-new record as one written by
+    # an older Nova and resets `keep` to the default, so the quota the caller asked for was lost.
+    candidate = normalize_record({"url": url, "name": name, "kind": kind, "shape": _SHAPE,
+                                  "interval_hours": interval_hours, "keep": keep})
+    with _LOCK:
+        records = load(base_dir)
+        if candidate is None:
+            return None, records
+        for record in records:
+            if record["url"].lower() == candidate["url"].lower():
+                return record, records
+        # Two lists of one repository share a host and a file name, so the id is built from the
+        # whole path -- and a collision would still lose one of them silently. Make it unique.
+        taken = {r["id"] for r in records}
+        if candidate["id"] in taken:
+            for suffix in range(2, 100):
+                nominee = "%s-%d" % (candidate["id"][:76], suffix)
+                if nominee not in taken:
+                    candidate["id"] = nominee
+                    break
+        records.append(candidate)
+        return candidate, save(base_dir, records)
 
 
 def remove(base_dir, sub_id):
-    records = [r for r in load(base_dir) if r.get("id") != sub_id]
-    return save(base_dir, records)
+    with _LOCK:
+        return save(base_dir, [r for r in load(base_dir) if r.get("id") != sub_id])
+
+
+def _mutate(base_dir, sub_id, field, value):
+    with _LOCK:
+        records = load(base_dir)
+        record = find(records, sub_id)
+        if record is None:
+            return records
+        record[field] = value
+        return save(base_dir, records)
 
 
 def set_enabled(base_dir, sub_id, enabled):
-    records = load(base_dir)
-    record = find(records, sub_id)
-    if record is None:
-        return records
-    record["enabled"] = bool(enabled)
-    return save(base_dir, records)
+    return _mutate(base_dir, sub_id, "enabled", bool(enabled))
+
+
+def set_interval(base_dir, sub_id, hours):
+    """How often this subscription is re-downloaded, clamped to the registry's own bounds.
+
+    The clamp is `normalize_record`'s, so a value out of range is corrected rather than refused:
+    the window asks the owner for a number and a typo must not lose the edit.
+    """
+    return _mutate(base_dir, sub_id, "interval_hours",
+                   max(MIN_INTERVAL_HOURS, min(MAX_INTERVAL_HOURS, _as_int(hours, DEFAULT_INTERVAL_HOURS))))
+
+
+def set_keep(base_dir, sub_id, keep):
+    """How many profiles this subscription may hold on disk (its own quota, G87)."""
+    return _mutate(base_dir, sub_id, "keep", max(1, min(MAX_NODES, _as_int(keep, DEFAULT_KEEP))))
+
+
+def merge_saved(base_dir, updates):
+    """Write back only the rows in `updates` (by id), keeping every row added meanwhile.
+
+    What a sweep must use instead of `save(base_dir, its_own_snapshot)`: a download loop runs for
+    seconds to minutes, and saving the list it started with would undo an «Добавить»/«Удалить» the
+    owner did in that window. Rows whose id is gone from the registry are dropped rather than
+    resurrected — the owner removed them on purpose.
+    """
+    by_id = {}
+    for record in updates or []:
+        fresh = normalize_record(record)
+        if fresh is not None:
+            by_id[fresh["id"]] = fresh
+    with _LOCK:
+        current = load(base_dir)
+        merged = [by_id.get(record["id"], record) for record in current]
+        return save(base_dir, merged)
 
 
 def due(records, now=None, grace_sec=0.0):
@@ -340,6 +397,22 @@ def due(records, now=None, grace_sec=0.0):
 
 
 _GITHUB_RAW_RE = re.compile(r"(?i)^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
+# The same file as a mirror serves it. A subscription is usually pasted from a chat or a README, so
+# the link the owner has is as likely to be a mirror as the canonical one -- and a record that
+# arrives as `raw.githack.com/...` deserves the same ladder as one that arrives as
+# `raw.githubusercontent.com/...`, not a single name with no fallback.
+_GITHACK_RE = re.compile(r"(?i)^https?://(?:raw|rawcdn)\.githack\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
+_JSDELIVR_RE = re.compile(r"(?i)^https?://cdn\.jsdelivr\.net/gh/([^/@]+)/([^/@]+)@([^/]+)/(.+)$")
+
+
+def github_file_parts(url):
+    """(user, repo, ref, path) for a GitHub file under any of its known names; None otherwise."""
+    text = str(url or "").strip()
+    for pattern in (_GITHUB_RAW_RE, _GITHACK_RE, _JSDELIVR_RE):
+        match = pattern.match(text)
+        if match:
+            return match.groups()
+    return None
 
 
 def mirror_urls(url):
@@ -360,16 +433,30 @@ def mirror_urls(url):
     url = str(url or "").strip()
     if not url:
         return ()
-    match = _GITHUB_RAW_RE.match(url)
-    if not match:
+    parts = github_file_parts(url)
+    if not parts:
         return (url,)
-    user, repo, ref, path = match.groups()
+    user, repo, ref, path = parts
     quoted = quote(path, safe="/._-~")
-    return (
+    # The measured order, not the order the owner happened to paste: `raw.githubusercontent.com` is
+    # unreachable from here without a bypass (G48), so putting a pasted raw link first would cost
+    # three TCP timeouts before the mirror that works. A pasted githack link is already first.
+    # Whichever name the owner registered is used verbatim in its own slot, so a path that was
+    # already percent-encoded is not encoded a second time.
+    names = [
         "https://raw.githack.com/%s/%s/%s/%s" % (user, repo, ref, quoted),
-        url,
+        "https://raw.githubusercontent.com/%s/%s/%s/%s" % (user, repo, ref, quoted),
         "https://cdn.jsdelivr.net/gh/%s/%s@%s/%s" % (user, repo, ref, quoted),
-    )
+    ]
+    lowered = [name.lower() for name in names]
+    if url.lower() in lowered:
+        names[lowered.index(url.lower())] = url
+    else:
+        # An exotic spelling of the same file (`rawcdn.githack.com`, a different encoding of the
+        # path). It is tried, because it is what the owner registered, but last: the three above
+        # are the ones that were measured.
+        names.append(url)
+    return tuple(names)
 
 
 class FetchResult(object):

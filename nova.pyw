@@ -2230,6 +2230,237 @@ try:
             self.last_plan_reason = str(effective.get("reason") or "")
             return plan, effective
 
+        # «Auto» on an imported group (the VLESS/Custom entry of the slot menu, and «Подключить»
+        # with no row selected). Measured 2026-09-20 on the owner's list of 147 public nodes: 145
+        # answered a ping in 3.4 s, and **25 of the 30 nearest carried real traffic through the
+        # shipped helper**, while a dead node costs the full VLESS_READY_TIMEOUT_SEC to find out.
+        # So the order is worth a second of measurement before the walk, not after it.
+        IMPORTED_AUTO_PROBE_LIMIT = 50
+        # The whole pre-walk sweep, never longer: 50 hosts at 12 workers took 3.4 s there, and this
+        # is time the owner spends staring at «Подключение…».
+        IMPORTED_AUTO_PROBE_BUDGET_SEC = 12.0
+        # A figure this young is reused instead of re-measured, so a reconnect is instant.
+        IMPORTED_AUTO_PROBE_FRESH_SEC = 600.0
+        # After the tunnel is up: the rest of the group, so every row has a number for next time.
+        IMPORTED_AUTO_SWEEP_LIMIT = 400
+        _imported_sweep_lock = threading.Lock()
+        _imported_sweep_generation = -1
+
+        @staticmethod
+        def _split_endpoint_host_port(endpoint):
+            """«host:port» / «[v6]:port» -> (host, port or 0). ("", 0) when there is no endpoint."""
+            text = str(endpoint or "").strip()
+            if not text:
+                return "", 0
+            if text.startswith("["):
+                host, _sep, tail = text[1:].partition("]")
+                port = tail.lstrip(":")
+            else:
+                host, _sep, port = text.rpartition(":")
+                if not host:
+                    host, port = text, ""
+            try:
+                port_number = int(port)
+            except (TypeError, ValueError):
+                port_number = 0
+            return host.strip(), (port_number if 0 < port_number < 65536 else 0)
+
+        def _latency_target_of(self, record):
+            """`(host, ports)` for nova_ping, or None when the record names no endpoint.
+
+            A VLESS node is probed on its own port — that is the port its traffic uses, so it is
+            the honest question — and anything else falls back to 443, which covers Proton and
+            MASQUE and says nothing about a UDP-only WARP endpoint (which ICMP answers instead).
+            """
+            host, port = self._split_endpoint_host_port(record.get("endpoint"))
+            if not host:
+                return None
+            if record.get("kind") == nova_profiles.KIND_VLESS and port:
+                return (host, (port,))
+            return (host, (443,))
+
+        def _order_imported_group_by_latency(self, plan, effective, generation):
+            """Reorder an imported group's attempts by what answers fastest, right now.
+
+            Only for a group choice on VLESS or Custom: they hold nodes Nova cannot vouch for, they
+            are long (a subscription brings hundreds), and the recorded order alone cannot tell a
+            node that died an hour ago from one that is merely untried. What it does not do is
+            overrule experience — a node this install connected through in the last day keeps its
+            place at the head, because "it carried traffic" beats "it answers a ping".
+
+            Failure of the measurement is not failure of the connect: the plan comes back unchanged.
+            """
+            mode = str(effective.get("mode") or "")
+            group = str(effective.get("group") or "")
+            if mode != nova_profiles.MODE_GROUP or group not in (nova_profiles.GROUP_VLESS,
+                                                                 nova_profiles.GROUP_CUSTOM):
+                return plan
+            attempts = [a for a in plan if isinstance(a.get("profile"), dict)]
+            others = [a for a in plan if not isinstance(a.get("profile"), dict)]
+            if len(attempts) < 2:
+                return plan
+            head = attempts[:self.IMPORTED_AUTO_PROBE_LIMIT]
+            tail = attempts[self.IMPORTED_AUTO_PROBE_LIMIT:]
+            base = get_base_dir()
+            try:
+                stats = nova_profiles.load_stats(base)
+            except Exception:
+                stats = {}
+            now = time.time()
+            known = {}
+            targets = {}
+            for attempt in head:
+                record = attempt["profile"]
+                profile_id = str(record.get("id") or "")
+                entry = stats.get(profile_id) if isinstance(stats, dict) else None
+                entry = entry if isinstance(entry, dict) else {}
+                rtt_at = float(entry.get("rtt_at") or 0.0)
+                if rtt_at and 0 <= now - rtt_at < self.IMPORTED_AUTO_PROBE_FRESH_SEC:
+                    known[profile_id] = entry.get("rtt_ms")
+                    continue
+                target = self._latency_target_of(record)
+                if target is not None:
+                    targets[profile_id] = target
+            measured = {}
+            if targets:
+                deadline = time.monotonic() + self.IMPORTED_AUTO_PROBE_BUDGET_SEC
+
+                def should_stop():
+                    return (is_closing or time.monotonic() > deadline
+                            or self._selection_generation != generation)
+
+                # Which nodes the sweep actually reached. `probe_hosts` answers for every key it was
+                # given, and an abandoned one comes back empty — indistinguishable from a node that
+                # was asked and stayed silent. Recording that would clear a good number and push a
+                # live node to the back of the queue for the next ten minutes, because the deadline
+                # passed, not because the node is dead.
+                attempted = set()
+
+                def note_started(event, keys, _result=None):
+                    if event == "start":
+                        attempted.update(keys)
+
+                started = time.time()
+                try:
+                    results = nova_ping.probe_hosts(targets, max_workers=12, pace_sec=0.03,
+                                                    timeout_ms=1500, should_stop=should_stop,
+                                                    progress=note_started)
+                    measured = {pid: result.ms for pid, result in results.items()
+                                if pid in attempted}
+                    with contextlib.suppress(Exception):
+                        nova_profiles.record_rtts(base, measured)
+                except Exception as e:
+                    self.log_func(f"[Profiles] Замер узлов «{group}» не удался: {type(e).__name__}")
+                    return plan
+                if self._selection_generation != generation or is_closing:
+                    return plan
+                answered = sum(1 for ms in measured.values() if ms is not None)
+                self.log_func(f"[Profiles] «{group}» (Auto): промерено {len(measured)} "
+                              f"{'узел' if len(measured) == 1 else 'узлов'} за "
+                              f"{time.time() - started:.1f} с, ответили {answered}.")
+            known.update({pid: ms for pid, ms in measured.items()})
+
+            def proven(record):
+                entry = stats.get(str(record.get("id") or "")) if isinstance(stats, dict) else None
+                entry = entry if isinstance(entry, dict) else {}
+                ok_at = float(entry.get("last_ok_at") or 0.0)
+                fail_at = float(entry.get("last_fail_at") or 0.0)
+                return bool(ok_at) and ok_at >= fail_at and (now - ok_at) < nova_profiles.VLESS_MEMORY_SEC
+
+            lead, fast, unmeasurable, silent = [], [], [], []
+            for attempt in head:
+                record = attempt["profile"]
+                profile_id = str(record.get("id") or "")
+                if proven(record):
+                    lead.append(attempt)
+                elif known.get(profile_id) is not None:
+                    fast.append(attempt)
+                elif profile_id in known:
+                    silent.append(attempt)  # measured and did not answer: worse than untried
+                else:
+                    # Nothing is known about it: no endpoint to measure, or the sweep ran out of
+                    # time before reaching it. It keeps the place the queue gave it, ahead of the
+                    # nodes that were never part of this pass at all.
+                    unmeasurable.append(attempt)
+            fast.sort(key=lambda a: int(known.get(str(a["profile"].get("id") or "")) or 0))
+            if fast:
+                first = fast[0]["profile"]
+                self.log_func(f"[Profiles] «{group}» (Auto): начинаем с "
+                              f"{first.get('name') or first.get('id')} — "
+                              f"{int(known.get(str(first.get('id') or '')) or 0)} мс.")
+            return lead + fast + unmeasurable + tail + silent + others
+
+        def _sweep_imported_group_after_connect(self, effective, generation):
+            """Measure the rest of the group once its tunnel is up, so every row has a number.
+
+            Owner's request 2026-09-20: after the connection happens, check the others, "so the
+            latency of each is visible for the future". It is the same cheap probe the window uses
+            — one ICMP echo, a TCP connect where ICMP is filtered, no keys and no handshakes (N26)
+            — paced so it is a trickle beside a tunnel that has just come up. The numbers go into
+            profile-stats.json, which is what the connect queue and the «Профили» window both read.
+            """
+            group = str(effective.get("group") or "")
+            if (str(effective.get("mode") or "") != nova_profiles.MODE_GROUP
+                    or group not in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM)):
+                return False
+            with self._imported_sweep_lock:
+                if self._imported_sweep_generation == generation:
+                    return False  # already swept for this choice
+                self._imported_sweep_generation = generation
+
+            def _worker():
+                time.sleep(3.0)  # let the tunnel settle; nothing here is urgent
+                if is_closing or self._selection_generation != generation:
+                    return
+                base = get_base_dir()
+                try:
+                    records = [r for r in nova_profiles.list_profiles(base)
+                               if r.get("group") == group and r.get("valid", True)]
+                    stats = nova_profiles.load_stats(base)
+                except Exception:
+                    return
+                now = time.time()
+                targets = {}
+                for record in records[:self.IMPORTED_AUTO_SWEEP_LIMIT]:
+                    profile_id = str(record.get("id") or "")
+                    entry = stats.get(profile_id) if isinstance(stats, dict) else None
+                    entry = entry if isinstance(entry, dict) else {}
+                    rtt_at = float(entry.get("rtt_at") or 0.0)
+                    if rtt_at and 0 <= now - rtt_at < self.IMPORTED_AUTO_PROBE_FRESH_SEC:
+                        continue
+                    target = self._latency_target_of(record)
+                    if target is not None:
+                        targets[profile_id] = target
+                if not targets:
+                    return
+                attempted = set()
+
+                def note_started(event, keys, _result=None):
+                    if event == "start":
+                        attempted.update(keys)
+
+                try:
+                    results = nova_ping.probe_hosts(
+                        targets, max_workers=6, pace_sec=0.12, timeout_ms=1500,
+                        should_stop=lambda: is_closing or self._selection_generation != generation,
+                        progress=note_started)
+                    # Only what was really asked: this sweep is abandoned whenever the owner
+                    # switches profile, and the nodes it never got to are not silent nodes.
+                    measured = {pid: result.ms for pid, result in results.items()
+                                if pid in attempted}
+                    nova_profiles.record_rtts(base, measured)
+                except Exception as e:
+                    if IS_DEBUG_MODE:
+                        self.log_func(f"[Profiles] Фоновый замер «{group}» не удался: {type(e).__name__}")
+                    return
+                answered = sum(1 for ms in measured.values() if ms is not None)
+                self.log_func(f"[Profiles] «{group}»: промерены остальные узлы — "
+                              f"{answered} из {len(measured)} отвечают. Задержка каждого видна "
+                              "в окне «Профили».")
+
+            threading.Thread(target=_worker, daemon=True, name="NovaImportedSweep").start()
+            return True
+
         def _get_ordered_awg_profiles(self):
             # Kept for callers of the pre-profiles API: the AWG attempts of the current plan.
             try:
@@ -3176,6 +3407,12 @@ try:
                     )
                     return "explicit-failed"
 
+            # An imported group is walked from the fastest node that answers, not from the file
+            # order: a dead stranger node costs the full readiness budget to discover.
+            plan = self._order_imported_group_by_latency(plan, effective, generation)
+            profile_attempts = [a for a in plan if isinstance(a.get("profile"), dict)]
+            if _interrupted():
+                return _interrupted_outcome()
             self.log_func(f"[Profiles] Режим: {self._describe_plan_mode(effective)}; попыток: {len(profile_attempts)}")
             target = str(effective.get("profile_id") or "") if mode == nova_profiles.MODE_PROFILE else str(effective.get("group") or "")
 
@@ -3224,6 +3461,7 @@ try:
                     else:
                         self.log_func(f"[Profiles] VLESS профиль: {profile_name}.")
                     if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
+                        self._sweep_imported_group_after_connect(effective, generation)
                         return "connected"
                 else:
                     awg_idx += 1
@@ -3238,6 +3476,7 @@ try:
                         self.log_func(f"[RU] [Diag] AWG профиль: {profile_name}.")
                     if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
                         self.log_func(f"[RU] [Diag] AWG профиль сработал: {profile_name}.")
+                        self._sweep_imported_group_after_connect(effective, generation)
                         return "connected"
                 time.sleep(0.4)
 
@@ -6417,7 +6656,10 @@ try:
                     elif outcome == "failed":
                         failed += 1
                 try:
-                    nova_subscriptions.save(base, list(by_id.values()))
+                    # Merged, not written whole: a sweep runs for as long as the downloads take,
+                    # and saving the list it started with would undo an «Добавить» or «Удалить»
+                    # the owner did in the «Подписки» tab meanwhile.
+                    nova_subscriptions.merge_saved(base, list(by_id.values()))
                 except Exception as e:
                     self.log_func(f"[Подписки] Реестр не сохранён: {type(e).__name__}")
                 if failed and not updated:
@@ -6431,7 +6673,7 @@ try:
 
             return self._run("subs", _work, wait, "NovaProfilesSubs")
 
-        def measure_latency(self, targets, done_cb=None):
+        def measure_latency(self, targets, done_cb=None, progress_cb=None):
             """Cheap reachability of many profiles at once, off the Tk thread.
 
             Not a job kind: it runs while the owner looks at the window, several times a minute in
@@ -6448,7 +6690,12 @@ try:
             def _worker():
                 measured = {}
                 try:
-                    results = nova_ping.probe_hosts(targets, max_workers=6, pace_sec=0.12)
+                    # `progress` is what lets the window mark the rows it is measuring right now;
+                    # `should_stop` ends the sweep when Nova is closing instead of holding the
+                    # shutdown for the rest of a few hundred paced probes.
+                    results = nova_ping.probe_hosts(targets, max_workers=6, pace_sec=0.12,
+                                                    should_stop=lambda: is_closing,
+                                                    progress=progress_cb)
                     measured = {pid: (result.ms, result.method) for pid, result in results.items()}
                     with contextlib.suppress(Exception):
                         nova_profiles.record_rtts(get_base_dir(), {pid: ms for pid, (ms, _m) in measured.items()})
@@ -32077,7 +32324,10 @@ try:
                 rows = list(info.get("rows") or [])
                 sub = tk.Menu(menu, **_vpn_menu_options())
                 sub.add_radiobutton(
-                    label="Любой профиль группы", variable=var, value=f"{imported_kind}:",
+                    # «Auto», not «Любой профиль группы»: Nova measures the head of the group and
+                    # starts with the node that answered fastest, then measures the rest once the
+                    # tunnel is up (WarpManager._order_imported_group_by_latency).
+                    label="Auto", variable=var, value=f"{imported_kind}:",
                     command=lambda k=imported_kind: _run_ui_worker(
                         _apply_primary_vpn_choice, "NovaPrimaryVpnSwitch", k, "", "меню", ""),
                 )
@@ -32360,21 +32610,6 @@ try:
                     "secondary_up": bool(state.get("up")),
                 }
 
-            def apply_secondary_profile(self, group, profile_id=""):
-                """«В резерв» in «Профили»: hand the reserve slot an imported profile or its group.
-
-                A different file and a different apply path from the primary selection: the reserve
-                lives in routing_settings.json and is applied by its own controller, so this must not
-                go through apply_selection_now, which would tear down the primary instead.
-                """
-                group = str(group or "").strip()
-                profile_id = str(profile_id or "").strip()
-                if not group:
-                    return
-                _run_ui_worker(_apply_secondary_vpn_choice, "NovaSecondaryVpnFromProfiles",
-                               nova_vpn_slots.SECONDARY_PROFILE, None, None, "Профили",
-                               group, profile_id)
-
             def apply_selection(self, sel):
                 selection = dict(sel or {})
 
@@ -32420,8 +32655,8 @@ try:
             def refresh_subscriptions(self):
                 get_profile_jobs().refresh_subscriptions(force=True)
 
-            def measure_latency(self, targets, done_cb):
-                get_profile_jobs().measure_latency(targets, done_cb)
+            def measure_latency(self, targets, done_cb, progress_cb=None):
+                get_profile_jobs().measure_latency(targets, done_cb, progress_cb)
 
             def test_profile(self, profile_id, done_cb):
                 get_profile_jobs().test_profile(profile_id, done_cb)

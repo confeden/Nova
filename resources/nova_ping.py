@@ -255,7 +255,7 @@ def probe_host(host, tcp_ports=DEFAULT_TCP_PORTS, timeout_ms=DEFAULT_TIMEOUT_MS,
 
 
 def probe_hosts(targets, timeout_ms=DEFAULT_TIMEOUT_MS, max_workers=MAX_WORKERS,
-                should_stop=None, probe=None, pace_sec=0.0, sleep=None):
+                should_stop=None, probe=None, pace_sec=0.0, sleep=None, progress=None):
     """`{key: host}` or `{key: (host, ports)}` -> `{key: Result}`; one host is measured once.
 
     Bounded on purpose. `max_workers` is 8 rather than `nova_latency`'s 16 because this runs while
@@ -266,6 +266,12 @@ def probe_hosts(targets, timeout_ms=DEFAULT_TIMEOUT_MS, max_workers=MAX_WORKERS,
     `should_stop()` is checked when a worker picks its host up (not at submit time: everything is
     queued at once, so a check there could never stop anything); abandoned hosts come back as an
     empty `Result`. The window closing is what calls it.
+
+    `progress(event, keys, result)` is called on a worker thread as each host enters and leaves the
+    probe — `event` is "start" (`result` None) or "done" — so a window can say which rows it is
+    measuring *right now* instead of showing nothing until the whole sweep is over. `keys` are all
+    the caller's keys that share the host, because one host is measured once for all of them. It is
+    advisory: an exception from it is swallowed rather than allowed to lose a measurement.
     """
     items = []
     for key, value in dict(targets or {}).items():
@@ -277,9 +283,21 @@ def probe_hosts(targets, timeout_ms=DEFAULT_TIMEOUT_MS, max_workers=MAX_WORKERS,
         items.append((key, host, ports))
 
     plan = {}
-    for _key, host, ports in items:
-        if host and host not in plan:
+    keys_by_host = {}
+    for key, host, ports in items:
+        if not host:
+            continue
+        if host not in plan:
             plan[host] = ports
+        keys_by_host.setdefault(host, []).append(key)
+
+    def announce(event, host, result=None):
+        if not callable(progress):
+            return
+        try:
+            progress(event, tuple(keys_by_host.get(host, ())), result)
+        except Exception:
+            pass  # a window that cannot draw must not cost the measurement
 
     measured = {}
     if plan:
@@ -289,16 +307,25 @@ def probe_hosts(targets, timeout_ms=DEFAULT_TIMEOUT_MS, max_workers=MAX_WORKERS,
         workers = max(1, min(int(max_workers), len(plan)))
 
         def measure(host, ports):
-            if callable(should_stop) and should_stop():
-                return Result(None, "")
-            if pace_sec > 0:
-                # Serialised: the gap is between *starts*, so `workers` probes are in flight at most
-                # and they enter one at a time.
-                with gate:
-                    if callable(should_stop) and should_stop():
-                        return Result(None, "")
-                    napper(float(pace_sec))
-            return probe_fn(host, ports, timeout_ms)
+            # "done" is announced in `finally`, for every host that was ever submitted: a sweep that
+            # is abandoned half-way (the window closed, the deadline passed) or one whose probe
+            # raises must not leave a row marked "being measured" for ever.
+            result = Result(None, "")
+            try:
+                if callable(should_stop) and should_stop():
+                    return result
+                if pace_sec > 0:
+                    # Serialised: the gap is between *starts*, so `workers` probes are in flight at
+                    # most and they enter one at a time.
+                    with gate:
+                        if callable(should_stop) and should_stop():
+                            return result
+                        napper(float(pace_sec))
+                announce("start", host)
+                result = probe_fn(host, ports, timeout_ms)
+                return result
+            finally:
+                announce("done", host, result)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                                                    thread_name_prefix="NovaPing") as pool:

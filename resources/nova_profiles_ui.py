@@ -31,6 +31,7 @@ Import never changes the selection (I1 is about explicit choices; an import is n
 Candidates carry private keys in `text`: nothing here logs a candidate or a record whole.
 """
 
+import inspect
 import os
 import queue
 import sys
@@ -42,10 +43,11 @@ from tkinter import filedialog, messagebox, simpledialog
 __all__ = [
     "open_profiles_window", "toggle_profiles_window", "close_profiles_window", "get_profiles_window",
     "ProfilesWindow", "ImportPreview", "FallbackPillButton", "ThemedScrollbar",
-    "TABS", "TAB_TOR", "ACTION_LABELS", "TAB_ACTION_ROWS", "TOR_ENTRIES", "IMPORT_FILETYPES",
-    "DEFAULT_THEME", "merge_theme", "is_dark_theme", "set_pill_text",
+    "TABS", "TAB_TOR", "TAB_SUBS", "ACTION_LABELS", "TAB_ACTION_ROWS", "TOR_ENTRIES",
+    "IMPORT_FILETYPES", "DEFAULT_THEME", "merge_theme", "is_dark_theme", "set_pill_text",
     "format_outcome", "format_row_text", "format_selection_text", "format_runtime_text",
     "format_job_line", "format_tor_status", "format_list_header", "classify_import_candidates",
+    "format_subscription_row", "format_subs_header", "SUBS_INTERVAL_CHOICES",
 ]
 
 # Group names are fixed by the design contract (nova_profiles.GROUP_*); repeated here so the
@@ -64,23 +66,34 @@ KIND_VLESS = "vless"
 # Groups whose profiles the user brought in, so renaming them is theirs to do.
 IMPORTED_GROUPS = (GROUP_CUSTOM, GROUP_VLESS)
 TAB_TOR = "tor"
+# The subscriptions tab: URLs that hand out profiles, and how often each is re-downloaded. It has
+# no profile list of its own -- what it brings lands in VLESS and «Custom AWG» -- so it reuses the
+# list panel with rows of its own.
+TAB_SUBS = "subscriptions"
 TABS = (
     (GROUP_CLOUDFLARE, "AWG Cloudflare"),
     (GROUP_PROTON, "AWG Proton"),
     (GROUP_MASQUE, "MASQUE"),
     (GROUP_VLESS, "VLESS"),
-    (GROUP_CUSTOM, "Custom"),
+    # The group's folder, its id prefix and everything stored under it stay "Custom"; only the
+    # caption says what is in it, because «Custom» alone told the owner nothing.
+    (GROUP_CUSTOM, "Custom AWG"),
+    (TAB_SUBS, "Подписки"),
     (TAB_TOR, "Tor"),
 )
 
 ACTION_LABELS = {
     "connect": "Подключить",
     "connect_group": "Подключить группу",
-    "secondary": "В резерв",
     "test": "Проверить",
     "test_list": "Проверить список",
     "refresh_profiles": "Обновить профили",
     "folder": "Папка",
+    "sub_add": "Добавить…",
+    "sub_interval": "Период…",
+    "sub_toggle": "Вкл/выкл",
+    "sub_refresh": "Обновить сейчас",
+    "sub_delete": "Удалить",
     "generate_warp": "Сгенерировать свои",
     "issue_proton": "Выпустить профили",
     "register_masque": "Зарегистрировать",
@@ -102,20 +115,20 @@ TOR_DISCONNECT_LABEL = "Отключить Tor"
 # Подключить / Проверить / Проверить список / Обновить профили / Папка. What each of them means is
 # the tab's business — «Обновить профили» issues on Cloudflare, Proton and MASQUE, and downloads
 # the subscriptions on VLESS and Custom — but where the owner clicks does not move between tabs.
-# The second row holds what only some tabs have: the group connect, the imports, rename and delete.
-# Tor keeps a row of its own: it has no profile list, so four of the five would do nothing there.
+# The second row holds what only some tabs have: the imports, rename and delete.
+#
+# «Подключить группу» and «В резерв» were removed on the owner's word 2026-09-20 ("unclear
+# buttons"), not because the two things went away: the group connect is what «Подключить» does when
+# no row is selected, and the reserve slot is chosen from its own pill menu on the main window,
+# which lists the same groups and nodes.
 _MAIN_ROW = ("connect", "test", "test_list", "refresh_profiles", "folder")
 TAB_ACTION_ROWS = {
-    GROUP_CLOUDFLARE: (_MAIN_ROW, ("connect_group",)),
-    GROUP_PROTON: (_MAIN_ROW, ("connect_group",)),
+    GROUP_CLOUDFLARE: (_MAIN_ROW,),
+    GROUP_PROTON: (_MAIN_ROW,),
     GROUP_MASQUE: (_MAIN_ROW, ("delete",)),
-    # «В резерв» only on the imported tabs: the reserve slot runs a second helper of its own, and
-    # Nova will not put its own issued identity in both slots at once (two live sessions of one
-    # WireGuard key break one of them).
-    GROUP_VLESS: (_MAIN_ROW, ("connect_group", "secondary", "import_file", "import_clipboard",
-                              "rename", "delete")),
-    GROUP_CUSTOM: (_MAIN_ROW, ("connect_group", "secondary", "import_file", "import_clipboard",
-                               "rename", "delete")),
+    GROUP_VLESS: (_MAIN_ROW, ("import_file", "import_clipboard", "rename", "delete")),
+    GROUP_CUSTOM: (_MAIN_ROW, ("import_file", "import_clipboard", "rename", "delete")),
+    TAB_SUBS: (("sub_add", "sub_interval", "sub_toggle", "sub_refresh", "sub_delete"),),
     TAB_TOR: (("tor_toggle", "tor_new_identity", "tor_refresh_bridges"),),
 }
 
@@ -143,7 +156,8 @@ TOR_DEFAULT_HTTP_PORT = 1378
 # profiles come from subscriptions, and `_on_refresh_profiles` sends them there instead.
 JOB_KIND_BY_GROUP = {GROUP_CLOUDFLARE: "warp", GROUP_PROTON: "proton", GROUP_MASQUE: "masque"}
 # Which job line a tab shows. Subscriptions feed both import groups, so both watch «subs».
-JOB_LINE_BY_GROUP = dict(JOB_KIND_BY_GROUP, **{GROUP_VLESS: "subs", GROUP_CUSTOM: "subs"})
+JOB_LINE_BY_GROUP = dict(JOB_KIND_BY_GROUP,
+                         **{GROUP_VLESS: "subs", GROUP_CUSTOM: "subs", TAB_SUBS: "subs"})
 _JOB_NOUNS = {"warp": "Генерация WARP", "proton": "Выпуск Proton", "masque": "Регистрация MASQUE",
               "subs": "Обновление подписок"}
 
@@ -306,6 +320,20 @@ LATENCY_PACE_S = 0.12
 # looking at right now. The rows are already in connect order (nova_profiles._vless_order), so the
 # first N are the ones that matter — and what was left out is said in the log rather than implied.
 LATENCY_SWEEP_LIMIT = 80
+# «Проверить список» is an explicit request, so it covers a whole imported group (a subscription
+# brings a couple of hundred nodes) instead of the cap that keeps the automatic on-open sweep
+# cheap. At the pace below that is a trickle of about half a minute, not a burst.
+LATENCY_LIST_LIMIT = 400
+# Repeated from nova_subscriptions (the window is built before a worker has imported it).
+DEFAULT_SUB_INTERVAL_HOURS = 12
+SUB_MAX_INTERVAL_HOURS = 24 * 7
+# A subscription the owner adds by hand is the one they want whole, so its own quota is the size of
+# a real list rather than the conservative share the four shipped sources divide between them.
+SUB_DEFAULT_KEEP = 300
+# How often the window takes the sweep's progress and redraws the rows. Six probes land per pace
+# interval and each redraw rebuilds the whole listbox, so the events are coalesced into ~7 frames
+# a second rather than drawn one by one.
+LATENCY_POLL_MS = 150
 # Ports a TCP connect falls back to when ICMP is filtered, per profile kind. A VLESS node is probed
 # on its own port, which is the port its traffic uses; a WireGuard endpoint is UDP, so 443 is a
 # stand-in for "is this host reachable at all" (Proton keeps OpenVPN TCP there).
@@ -366,14 +394,21 @@ def format_latency(measurement):
         return "", "normal"
 
 
-def format_outcome(stats_entry, test_result=None, testing=False, latency=None):
+def format_outcome(stats_entry, test_result=None, testing=False, latency=None, probing=False):
     """Last outcome of a profile -> (text, tone): «ок 12 мс» / «сбой» / «не проверялся».
 
     A background latency figure never replaces a verdict — a check that ran is what the owner asked
     for — but it does replace «не проверялся», which tells them nothing at all.
+
+    `testing` is a real «Проверить» (a tunnel is being started through this profile); `probing` is
+    the cheap sweep of «Проверить список» passing over this row right now. Both say so in the row,
+    because a list of two hundred that changes nothing for eight seconds looks broken — the owner
+    asked to see which rows are being measured at this moment.
     """
     if testing:
         return "проверка…", "muted"
+    if probing:
+        return "замеряем…", "warn"
     entry = stats_entry if isinstance(stats_entry, dict) else {}
     ok_at = _num(entry.get("last_ok_at"))
     fail_at = _num(entry.get("last_fail_at"))
@@ -463,6 +498,95 @@ def format_list_header(group, records, loaded=True):
     return text
 
 
+# What «Период…» offers, in hours. Twelve is the default and the owner's request: lists change
+# slowly and a conditional GET that finds nothing costs 0 bytes (measured: 304 on every source), so
+# the interval is chosen for freshness, not for traffic.
+SUBS_INTERVAL_CHOICES = (1, 3, 6, 12, 24, 48, 168)
+
+
+def _age_text(stamp, now=None):
+    """«5 мин назад» / «3 ч назад» / «вчера»; "" when there is no stamp."""
+    stamp = _num(stamp)
+    if stamp <= 0:
+        return ""
+    delta = max(0.0, (time.time() if now is None else float(now)) - stamp)
+    if delta < 90:
+        return "только что"
+    minutes = int(delta // 60)
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    hours = int(delta // 3600)
+    if hours < 24:
+        return f"{hours} ч назад"
+    days = int(delta // 86400)
+    return "вчера" if days == 1 else f"{days} {_plural(days, 'день', 'дня', 'дней')} назад"
+
+
+def _subs_kind_word(kind):
+    return {"vless": "VLESS", "awg": "AWG"}.get(str(kind or "").lower(), "авто")
+
+
+def format_subscription_row(record, now=None, pad="   ", refreshing=False):
+    """One row of the «Подписки» tab -> (text, tone).
+
+    The URL is deliberately not in the row. A subscription link is a credential often enough
+    (`.../link/<secret>`, `?token=<secret>`) that the folder «Папка» opens must never carry one in
+    a file name (G89); a window the owner screenshots is the same exposure. The row says where it
+    goes — host and file — and the whole link is one «Период…» away for anyone who needs it.
+    """
+    entry = record if isinstance(record, dict) else {}
+    name = str(entry.get("name") or "").strip()
+    url = str(entry.get("url") or "")
+    host, _sep, tail = url.partition("://")[2].partition("/")
+    title = name or host or str(entry.get("id") or "подписка")
+    enabled = bool(entry.get("enabled", True))
+    interval = _as_hours(entry.get("interval_hours"))
+    count = max(0, int(_num(entry.get("node_count"))))
+    parts = [title, host or "?"]
+    if not enabled:
+        parts.append("выключена")
+    else:
+        parts.append(f"каждые {interval} ч")
+    parts.append(f"{count} {_plural(count, 'профиль', 'профиля', 'профилей')}")
+    parts.append(_subs_kind_word(entry.get("kind")))
+    if refreshing:
+        parts.append("обновляется…")
+        tone = "warn"
+    else:
+        status = str(entry.get("last_status") or "").strip()
+        when = _age_text(entry.get("last_checked_at"), now)
+        if status:
+            parts.append(status + (f" · {when}" if when else ""))
+        elif when:
+            parts.append(when)
+        else:
+            parts.append("ещё не загружалась")
+        streak = int(_num(entry.get("fail_streak")))
+        tone = "fail" if streak else ("muted" if not enabled else "normal")
+    return pad + "  ·  ".join(str(p) for p in parts if str(p)), tone
+
+
+def _as_hours(value):
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 12
+
+
+def format_subs_header(records, loaded=True):
+    if not loaded:
+        return "Загрузка подписок…"
+    total = len(records or [])
+    if not total:
+        return "Подписок нет — «Добавить…» и вставьте ссылку на список VLESS или AWG"
+    on = sum(1 for r in records if r.get("enabled", True))
+    nodes = sum(max(0, int(_num(r.get("node_count")))) for r in records)
+    text = f"Подписки: {total}, включено {on}"
+    if nodes:
+        text += f" · профилей {nodes}"
+    return text
+
+
 def format_selection_text(effective, selection=None):
     eff = effective if isinstance(effective, dict) else {}
     sel = selection if isinstance(selection, dict) else {}
@@ -480,7 +604,8 @@ def format_selection_text(effective, selection=None):
             return f"Профиль «{name}» удалён — используется группа «{group}»"
         text = f"Группа «{group}»: Nova перебирает только её профили"
     else:
-        text = "Авто: Nova сама выбирает профиль из всех групп, кроме Custom"
+        # Both imported groups are out of «Авто» (D25), and the line used to name only one of them.
+        text = "Авто: Nova сама выбирает профиль из своих групп; VLESS и Custom AWG — только вручную"
     if reason:
         text += f" — {reason}"
     return text
@@ -658,6 +783,21 @@ def _load_profiles_module():
     except ImportError as exc:
         return None, f"Модуль профилей недоступен: {exc}"
     return nova_profiles, ""
+
+
+def _load_subs_module():
+    try:
+        import nova_subscriptions
+    except ImportError as exc:
+        return None, f"Модуль подписок недоступен: {exc}"
+    return nova_subscriptions, ""
+
+
+def _require_subs_module():
+    module, error = _load_subs_module()
+    if module is None:
+        raise RuntimeError(error)
+    return module
 
 
 def _require_profiles_module():
@@ -940,7 +1080,8 @@ class ProfilesWindow:
         self._snapshot = {"started_at": 0.0, "loaded": False, "profiles": [], "stats": {},
                           "selection": {"version": 1, "mode": "auto"},
                           "effective": {"mode": "auto", "group": "", "profile_id": "", "reason": ""},
-                          "runtime": {}, "jobs": {}, "tor": None, "errors": []}
+                          "runtime": {}, "jobs": {}, "tor": None, "errors": [],
+                          "subs": [], "subs_loaded": False}
         self._optimistic_selection = None  # (selection, set_at)
         self._selected_ids = {}
         self._reveal_ids = {}
@@ -952,6 +1093,15 @@ class ProfilesWindow:
         self._latency = {}
         self._latency_running = False
         self._latency_at = 0.0
+        # The rows the sweep has in flight right now, the queue their events arrive on, and the
+        # poll that draws them. A queue of their own, not the window's result queue: `_drain`
+        # counts one in-flight worker per item it takes, so a few hundred progress events would
+        # spend the counter that keeps a «Проверить» result moving, and the drain loop would stop
+        # rescheduling itself. The poll runs only while a sweep is in flight and coalesces the
+        # events — a redraw per event rebuilds the whole listbox ~16 times a second.
+        self._latency_active = set()
+        self._latency_events = queue.Queue()
+        self._latency_poll_after_id = None
         self._job_started = {}
         self._tor_entry = None  # an entry pill the user clicked in this window
         self._tor_optimistic = None  # (expected state_key, set_at wall clock, set_at monotonic)
@@ -1046,20 +1196,12 @@ class ProfilesWindow:
             pill.pack(side="left", padx=(0 if index == 0 else 4, 0))
             self.tab_pills[key] = pill
 
-        mode_row = tk.Frame(outer, bg=t["bg"])
-        mode_row.pack(fill="x", pady=(8, 0))
-        tk.Label(mode_row, text="Режим", width=10, anchor="w", bg=t["bg"], fg=t["text"],
-                 font=self.font_text).pack(side="left")
-        self.mode_pills = {}
-        for index, (mode, caption, command) in enumerate((
-                ("auto", "Авто", self._on_auto),
-                ("group", "Группа", self._on_connect_group),
-                ("profile", "Профиль", self._on_connect))):
-            pill = self._make_pill(mode_row, caption, command)
-            pill.pack(side="left", padx=(0 if index == 0 else 4, 0))
-            self.mode_pills[mode] = pill
+        # The «Режим: Авто / Группа / Профиль» row was removed on the owner's word 2026-09-20
+        # ("superfluous information"): it named the same thing three times — the pills, the line
+        # under them and the main window's own VPN pill — and two of its three buttons duplicated
+        # «Подключить». What remains is the one line that says what is actually in use.
         self.selection_label = self._label(outer, tone="muted")
-        self.selection_label.pack(fill="x", pady=(5, 0))
+        self.selection_label.pack(fill="x", pady=(8, 0))
         self.runtime_label = self._label(outer)
         self.runtime_label.pack(fill="x", pady=(1, 0))
 
@@ -1108,7 +1250,7 @@ class ProfilesWindow:
 
         win.update_idletasks()
         content_px = max(tabs_row.winfo_reqwidth(), actions.winfo_reqwidth(), body.winfo_reqwidth(),
-                         mode_row.winfo_reqwidth(), 360)
+                         360)
         self.tor_hint.configure(text="Tor включается только для группы «Браузеры»: остальные приложения идут "
                                      "прежним путём.")
         self._apply_content_width(content_px)
@@ -1427,8 +1569,10 @@ class ProfilesWindow:
         self._closed = True
         self._cancel_after(self._tick_after_id)
         self._cancel_after(self._drain_after_id)
+        self._cancel_after(self._latency_poll_after_id)
         self._tick_after_id = None
         self._drain_after_id = None
+        self._latency_poll_after_id = None
         ref = getattr(self.root, _REGISTRY_ATTR, None)
         if isinstance(ref, dict) and ref.get("view") is self:
             ref["view"] = None
@@ -1507,7 +1651,8 @@ class ProfilesWindow:
         snap = {"started_at": started, "loaded": True, "profiles": [], "stats": {},
                 "selection": {"version": 1, "mode": "auto"},
                 "effective": {"mode": "auto", "group": "", "profile_id": "", "reason": ""},
-                "runtime": {}, "jobs": {}, "tor": None, "errors": []}
+                "runtime": {}, "jobs": {}, "tor": None, "errors": [],
+                "subs": [], "subs_loaded": False}
         # The getters run next to the file work, each on its own thread (see _StatusCall).
         calls = []
         for name, key, default in _STATUS_GETTERS:
@@ -1525,6 +1670,17 @@ class ProfilesWindow:
                 snap["effective"] = module.resolve_effective_selection(snap["selection"], snap["profiles"])
             except Exception as exc:
                 snap["errors"].append(f"Не удалось прочитать профили: {_error_text(exc)}")
+        subs_module, subs_error = _load_subs_module()
+        if subs_module is None:
+            # Not an error line in the window: a build without the module simply has no such tab,
+            # and the tab itself says so when it is opened.
+            self._log_once(subs_error)
+        else:
+            try:
+                snap["subs"] = subs_module.load(self.base_dir)
+                snap["subs_loaded"] = True
+            except Exception as exc:
+                snap["errors"].append(f"Не удалось прочитать подписки: {_error_text(exc)}")
         for call, key, default, (done, outcome, call_started) in calls:
             remaining = call_started + STATUS_GETTER_TIMEOUT_S - time.monotonic()
             if done.wait(max(0.0, remaining)):
@@ -1594,13 +1750,14 @@ class ProfilesWindow:
         if not self.alive():
             return
         selection, effective = self._selection_pair()
-        for mode, pill in self.mode_pills.items():
-            pill.set_selected(mode == effective.get("mode"))
         self._set_label(self.selection_label, format_selection_text(effective, selection), "muted")
         text, tone = format_runtime_text(self._snapshot.get("runtime"))
         self._set_label(self.runtime_label, text, "ok" if tone == "ok" else "normal")
         if self.current_tab == TAB_TOR:
             self._render_tor()
+        elif self.current_tab == TAB_SUBS:
+            self._render_subs()
+            self._render_job_line()
         else:
             self._render_list()
             self._render_job_line()
@@ -1633,14 +1790,20 @@ class ProfilesWindow:
         rows = []
         for record in records:
             pid = record.get("id")
+            probing = pid in self._latency_active
             outcome, outcome_tone = format_outcome(stats.get(pid), self._test_results.get(pid),
-                                                   pid in self._tests, self._latency.get(pid))
+                                                   pid in self._tests, self._latency_of(pid, stats),
+                                                   probing=probing)
             live = bool(live_id) and pid == live_id
             reserve = bool(reserve_id) and pid == reserve_id
             text = format_row_text(record, live=live, outcome=outcome, pad=self._marker_pad,
                                    is_fatal=is_fatal, reserve=reserve)
             if not record.get("valid", True):
                 tone = "fail"
+            elif probing:
+                # The row being measured right now: the owner asked to see which ones those are,
+                # and the sweep passes over a few hundred rows one screenful at a time.
+                tone = "warn"
             elif live and connected:
                 tone = "ok"
             elif reserve:
@@ -1650,17 +1813,60 @@ class ProfilesWindow:
             else:
                 tone = "normal"
             rows.append((pid, text, tone))
-        signature = (group, tuple(rows))
+        self._fill_listbox(group, rows)
+
+    def _latency_of(self, profile_id, stats):
+        """This window's own measurement of a profile, or the one Nova recorded while connecting.
+
+        Nova measures a VLESS group before it walks it (the «Auto» choice) and sweeps the rest once
+        the tunnel is up, writing `rtt_ms` into profile-stats.json. Without this the window would
+        show «не проверялся» for rows Nova had just measured, and the owner would have no way to
+        see the latency the connect order was built from.
+        """
+        known = self._latency.get(profile_id)
+        if known is not None:
+            return known
+        entry = stats.get(profile_id) if isinstance(stats, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        ms = entry.get("rtt_ms")
+        at = _num(entry.get("rtt_at"))
+        if at <= 0:
+            return None  # never measured; `rtt_ms` None *with* a stamp means "did not answer"
+        try:
+            ms = None if ms is None else int(ms)
+        except (TypeError, ValueError):
+            return None
+        return (ms, "", at)
+
+    def _render_subs(self):
+        """The «Подписки» tab, in the same listbox the profile tabs use."""
+        records = list(self._snapshot.get("subs") or [])
+        loaded = bool(self._snapshot.get("subs_loaded"))
+        self._set_label(self.list_header, format_subs_header(records, loaded))
+        running = bool((self._snapshot.get("jobs") or {}).get("subs", {}).get("running"))
+        now = time.time()
+        rows = []
+        for record in records:
+            sub_id = str(record.get("id") or "")
+            text, tone = format_subscription_row(record, now=now, pad=self._marker_pad,
+                                                 refreshing=running and record.get("enabled", True))
+            rows.append((sub_id, text, tone))
+        self._fill_listbox(TAB_SUBS, rows)
+
+    def _fill_listbox(self, key, rows):
+        """Draw `[(row_id, text, tone)]`, keeping the scroll position and the selection."""
+        signature = (key, tuple(rows))
         lb = self.listbox
-        wanted = self._selected_ids.get(group)
+        wanted = self._selected_ids.get(key)
         if signature != self._row_signature:
-            same_group = bool(self._row_signature) and self._row_signature[0] == group
-            top = lb.yview()[0] if rows and same_group else 0.0
+            same = bool(self._row_signature) and self._row_signature[0] == key
+            top = lb.yview()[0] if rows and same else 0.0
             lb.delete(0, "end")
-            for index, (_pid, text, tone) in enumerate(rows):
+            for index, (_row_id, text, tone) in enumerate(rows):
                 lb.insert("end", text)
                 lb.itemconfigure(index, fg=self._tone_color(tone))
-            self._row_ids = [pid for pid, _text, _tone in rows]
+            self._row_ids = [row_id for row_id, _text, _tone in rows]
             self._row_signature = signature
             if rows:
                 lb.yview_moveto(top)
@@ -1669,8 +1875,21 @@ class ProfilesWindow:
             if tuple(lb.curselection()) != (index,):
                 lb.selection_clear(0, "end")
                 lb.selection_set(index)
-            if self._reveal_ids.pop(group, None) == wanted:
+            if self._reveal_ids.pop(key, None) == wanted:
                 lb.see(index)
+
+    def _selected_sub(self):
+        """The subscription record the row selection points at, or None."""
+        if self.current_tab != TAB_SUBS:
+            return None
+        selection = self.listbox.curselection()
+        if not selection or selection[0] >= len(self._row_ids):
+            return None
+        wanted = self._row_ids[selection[0]]
+        for record in self._snapshot.get("subs") or []:
+            if str(record.get("id") or "") == wanted:
+                return record
+        return None
 
     def _render_job_line(self):
         kind = JOB_LINE_BY_GROUP.get(self.current_tab)
@@ -1746,6 +1965,9 @@ class ProfilesWindow:
         if tab == TAB_TOR:
             self.tor_panel.tkraise()
         else:
+            # The subscriptions tab borrows the list panel: its rows are subscriptions, not
+            # profiles, and `_row_ids` then holds subscription ids — every reader of it goes
+            # through `_selected_sub`/`_selected_record`, which check the tab first.
             self.list_panel.tkraise()
             self._row_signature = None
             self._reveal_ids[tab] = self._selected_ids.get(tab)
@@ -1815,7 +2037,11 @@ class ProfilesWindow:
             "reissue_masque": lambda: self._on_job("masque", force=True),
             "delete": self._on_delete,
             "rename": self._on_rename,
-            "secondary": self._on_make_secondary,
+            "sub_add": self._on_sub_add,
+            "sub_interval": self._on_sub_interval,
+            "sub_toggle": self._on_sub_toggle,
+            "sub_refresh": self._on_sub_refresh,
+            "sub_delete": self._on_sub_delete,
             "import_file": self._on_import_file,
             "import_clipboard": self._on_import_clipboard,
             "tor_toggle": self._on_tor_toggle,
@@ -1860,9 +2086,6 @@ class ProfilesWindow:
         self.refresh_now()
         return True
 
-    def _on_auto(self):
-        self._apply_selection({"version": 1, "mode": "auto"}, "Режим «Авто»: Nova сама выбирает профиль")
-
     def _on_connect_group(self):
         group = self.current_tab
         if group not in PROFILE_GROUPS:
@@ -1874,47 +2097,25 @@ class ProfilesWindow:
             # nothing will arrive unless the user imports it or a subscription brings it.
             self._notice(f"В группе «{group}» нет профилей — сначала импортируйте их", "warn")
             return
-        self._apply_selection({"version": 1, "mode": "group", "group": group},
-                              f"Подключение к группе «{group}»: другие группы не используются")
-
-    def _on_make_secondary(self):
-        """Put the selected profile — or the whole group — into the reserve VPN slot.
-
-        A node is pinned when one is selected and the group is taken otherwise, because the two mean
-        different things: a pinned node is retried as itself (I1), a group walks to its next node
-        when the one it is on stops carrying traffic. That is the same difference «Подключить» and
-        «Подключить группу» make for the primary, expressed in one button because the second row is
-        already the widest thing in this window.
-        """
-        group = self.current_tab
-        if group not in IMPORTED_GROUPS:
-            self._notice(f"В резерв можно поставить только профили групп "
-                         f"{' и '.join(chr(171) + g + chr(187) for g in IMPORTED_GROUPS)}", "warn")
-            return
-        record = self._selected_record()
-        profile_id = str(record.get("id") or "") if isinstance(record, dict) else ""
-        if record is not None and not record.get("valid", True):
-            self._notice("Профиль с ошибками — в резерв его ставить нечем", "fail")
-            return
-        if not profile_id:
-            valid = [r for r in self._records_for(group) if r.get("valid", True)]
-            if not valid and self._snapshot.get("loaded"):
-                self._notice(f"В группе «{group}» нет профилей — сначала импортируйте их", "warn")
-                return
-        if not self._call_ctx("apply_secondary_profile", group, profile_id,
-                              error_prefix="Резерв не изменён"):
-            return
-        if profile_id:
-            name = profile_id.partition("/")[2] or profile_id
-            self._notice(f"Резервный VPN: «{name}». Основной остаётся прежним.", "ok")
-        else:
-            self._notice(f"Резервный VPN: группа «{group}» — при потере связи берётся следующий узел.", "ok")
-        self.refresh_now()
+        note = (f"Группа «{group}» (Auto): Nova промерит первые узлы и начнёт с самого быстрого"
+                if group in IMPORTED_GROUPS
+                else f"Подключение к группе «{group}»: другие группы не используются")
+        self._apply_selection({"version": 1, "mode": "group", "group": group}, note)
 
     def _on_connect(self):
+        """«Подключить»: the selected node, or the whole group when no row is selected.
+
+        The group connect used to be a button of its own («Подключить группу»), removed on the
+        owner's word as unclear. It is not lost: clicking «Подключить» with nothing selected means
+        "use this group", which is what the group pill menu on the main window calls «Auto» — Nova
+        measures the head of the queue and starts with the node that answered fastest.
+        """
         record = self._selected_record()
         if record is None:
-            self._notice("Выберите профиль в списке", "warn")
+            if self.current_tab in PROFILE_GROUPS:
+                self._on_connect_group()
+            else:
+                self._notice("Выберите профиль в списке", "warn")
             return
         if not record.get("valid", True):
             self._notice(f"Профиль «{record.get('name')}» с ошибками: {self._first_issue(record)}", "fail")
@@ -2028,6 +2229,166 @@ class ProfilesWindow:
 
         self._run_async("NovaProfilesFolder", work, done)
 
+    # -- subscriptions -------------------------------------------------------------------
+
+    def _subs_write(self, what, work, notice):
+        """Run a registry edit on a worker, then re-read the window. `work(module)` -> anything."""
+        def run():
+            return work(_require_subs_module())
+
+        def done(_result, error):
+            if error is not None:
+                self._report_error(what, error)
+                return
+            self._notice(notice, "ok")
+            self.refresh_now()
+
+        self._run_async("NovaProfilesSubsEdit", run, done)
+
+    def _on_sub_add(self):
+        """«Добавить…»: a URL, then how often to re-download it.
+
+        The kind (VLESS or AWG) is not asked: the body decides it, which is the whole point — the
+        same link shape hands out `vless://` lines, wg-quick blocks and Amnezia `vpn://` keys, and
+        making the owner classify their own link is making them guess.
+        """
+        url = self._ask_string("Новая подписка",
+                               "Ссылка на подписку (http/https).\n\nПодойдёт список vless://, "
+                               "конфиги WireGuard/AmneziaWG или ссылка панели — Nova сама "
+                               "разберёт содержимое.")
+        if not url:
+            return
+        url = url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            self._notice("Ссылка должна начинаться с http:// или https://", "warn")
+            return
+        name = (self._ask_string("Новая подписка",
+                                 "Название (необязательно) — как показывать её в списке:") or "").strip()
+        hours = self._ask_interval(DEFAULT_SUB_INTERVAL_HOURS)
+        if hours is None:
+            return
+        base = self.base_dir
+
+        def run():
+            module = _require_subs_module()
+            record, _records = module.add(base, url, name=name, interval_hours=hours,
+                                          keep=SUB_DEFAULT_KEEP)
+            if record is None:
+                raise ValueError("ссылка не похожа на адрес подписки")
+            return record
+
+        def done(record, error):
+            if error is not None:
+                self._report_error("Подписка не добавлена", error)
+                return
+            record = record if isinstance(record, dict) else {}
+            title = str(record.get("name") or record.get("id") or "подписка")
+            self._selected_ids[TAB_SUBS] = str(record.get("id") or "")
+            self._reveal_ids[TAB_SUBS] = self._selected_ids[TAB_SUBS]
+            self._notice(f"Подписка «{title}» добавлена — загружаем профили…", "ok")
+            self.refresh_now()
+            # Downloading it at once is the point of adding it: a list that arrives in twelve hours
+            # is not an answer to "I have just added this".
+            self._call_ctx_quiet("refresh_subscriptions")
+
+        self._run_async("NovaProfilesSubsAdd", run, done)
+
+    def _on_sub_interval(self):
+        record = self._selected_sub()
+        if record is None:
+            self._notice("Выберите подписку в списке", "warn")
+            return
+        hours = self._ask_interval(_num(record.get("interval_hours")) or DEFAULT_SUB_INTERVAL_HOURS,
+                                   url=str(record.get("url") or ""))
+        if hours is None:
+            return
+        sub_id = str(record.get("id") or "")
+        title = str(record.get("name") or sub_id)
+        base = self.base_dir
+        self._subs_write("Период не изменён", lambda m: m.set_interval(base, sub_id, hours),
+                         f"«{title}»: обновление каждые {hours} ч")
+
+    def _on_sub_toggle(self):
+        record = self._selected_sub()
+        if record is None:
+            self._notice("Выберите подписку в списке", "warn")
+            return
+        sub_id = str(record.get("id") or "")
+        title = str(record.get("name") or sub_id)
+        wanted = not bool(record.get("enabled", True))
+        base = self.base_dir
+        word = "включена" if wanted else "выключена"
+        self._subs_write("Подписка не изменена", lambda m: m.set_enabled(base, sub_id, wanted),
+                         f"«{title}»: {word}")
+
+    def _on_sub_delete(self):
+        record = self._selected_sub()
+        if record is None:
+            self._notice("Выберите подписку в списке", "warn")
+            return
+        sub_id = str(record.get("id") or "")
+        title = str(record.get("name") or sub_id)
+        count = int(_num(record.get("node_count")))
+        question = (f"Удалить подписку «{title}»?\n\n"
+                    "Уже скачанные из неё профили останутся на месте — их можно удалить "
+                    "на вкладке группы.")
+        if count:
+            question += (f"\n\nСейчас она даёт {count} "
+                         f"{_plural(count, 'профиль', 'профиля', 'профилей')}.")
+        try:
+            if not messagebox.askyesno("Подписки", question, parent=self.win):
+                return
+        except Exception:
+            return
+        base = self.base_dir
+        self._subs_write("Подписка не удалена", lambda m: m.remove(base, sub_id),
+                         f"Подписка «{title}» удалена")
+
+    def _on_sub_refresh(self):
+        if not callable(getattr(self.ctx, "refresh_subscriptions", None)):
+            self._notice("Обновление подписок недоступно в этой сборке Nova", "warn")
+            return
+        jobs = self._snapshot.get("jobs") or {}
+        if (jobs.get("subs") or {}).get("running"):
+            self._notice("Обновление подписок уже идёт", "muted")
+            return
+        if self._call_ctx("refresh_subscriptions", error_prefix="Не удалось обновить подписки"):
+            self._job_started["subs"] = time.time()
+            self._notice("Обновляем подписки…", "muted")
+            self._render_job_line()
+
+    def _ask_string(self, title, prompt, initial=""):
+        try:
+            return simpledialog.askstring(title, prompt, parent=self.win, initialvalue=initial)
+        except Exception as exc:
+            self._report_error("Не удалось открыть диалог", exc)
+            return None
+
+    def _ask_interval(self, current, url=""):
+        """Hours between refreshes; None when the owner cancelled or typed something else."""
+        try:
+            current = max(1, int(current or DEFAULT_SUB_INTERVAL_HOURS))
+        except (TypeError, ValueError):
+            current = DEFAULT_SUB_INTERVAL_HOURS
+        choices = ", ".join(str(h) for h in SUBS_INTERVAL_CHOICES)
+        prompt = ("Как часто обновлять подписку, в часах?\n\n"
+                  f"Обычные значения: {choices}. По умолчанию 12: списки меняются медленно, "
+                  "а запрос, который не нашёл изменений, не скачивает ничего.")
+        if url:
+            prompt += f"\n\nСсылка: {url}"
+        answer = self._ask_string("Период обновления", prompt, initial=str(current))
+        if answer is None:
+            return None
+        try:
+            hours = int(str(answer).strip())
+        except (TypeError, ValueError):
+            self._notice("Период — это число часов", "warn")
+            return None
+        if hours < 1:
+            self._notice("Период не может быть меньше часа", "warn")
+            return None
+        return min(hours, SUB_MAX_INTERVAL_HOURS)
+
     def _latency_targets(self, records, force=False):
         """`{profile_id: (host, ports)}` for the records worth measuring right now."""
         now = time.time()
@@ -2054,7 +2415,7 @@ class ProfilesWindow:
             targets[pid] = (host, ports)
         return targets
 
-    def _start_latency_sweep(self, records, reason="", force=False):
+    def _start_latency_sweep(self, records, reason="", force=False, limit=LATENCY_SWEEP_LIMIT):
         """Measure the given records in the background. Returns how many were sent to be measured."""
         fn = getattr(self.ctx, "measure_latency", None)
         if not callable(fn) or self._latency_running:
@@ -2063,10 +2424,10 @@ class ProfilesWindow:
         if not targets:
             return 0
         skipped = 0
-        if len(targets) > LATENCY_SWEEP_LIMIT:
+        if len(targets) > limit:
             keep = [str(r.get("id") or "") for r in records][:len(records)]
             order = {pid: index for index, pid in enumerate(keep)}
-            chosen = sorted(targets, key=lambda pid: order.get(pid, len(order)))[:LATENCY_SWEEP_LIMIT]
+            chosen = sorted(targets, key=lambda pid: order.get(pid, len(order)))[:limit]
             skipped = len(targets) - len(chosen)
             targets = {pid: targets[pid] for pid in chosen}
         view = self
@@ -2076,24 +2437,97 @@ class ProfilesWindow:
             # May run on any thread: the result travels through the same queue as a «Проверить».
             results.put((lambda value, _err: view._on_latency_done(value), measured, None))
 
+        events = self._latency_events
+
+        def progress_cb(event, keys, result=None):
+            # Also any thread, several times a second. Nothing here may touch Tk — a queue the Tk
+            # thread polls is the only hand-off that works from here (the same rule as the results
+            # queue: a worker calling root.after raises «main thread is not in main loop»).
+            events.put((str(event or ""), tuple(str(k) for k in keys or ()),
+                        getattr(result, "ms", None), str(getattr(result, "method", "") or "")))
+
         self._latency_running = True
         self._inflight += 1
         try:
-            fn(dict(targets), done_cb)
+            self._call_measure_latency(fn, dict(targets), done_cb, progress_cb)
         except Exception as exc:
             self._latency_running = False
             self._inflight = max(0, self._inflight - 1)
             self._report_error("Замер задержки не запустился", exc)
             return 0
         self._ensure_drain()
+        self._schedule_latency_poll()
         if reason or skipped:
             tail = f"; остальные {skipped} не мерились — предел одного прохода" if skipped else ""
             self._log(f"[Profiles] Замер задержки ({reason or 'окно'}): {len(targets)} "
                       f"{_plural(len(targets), 'профиль', 'профиля', 'профилей')}{tail}.")
         return len(targets)
 
+    @staticmethod
+    def _call_measure_latency(fn, targets, done_cb, progress_cb):
+        """Call the ctx getter, with the progress callback only when it takes one.
+
+        An older nova.pyw (or a test double) has the two-argument signature, and the window has to
+        keep working there — without the row highlight, which is the only thing that is lost. The
+        signature is asked for rather than a TypeError caught: a TypeError raised *inside* a
+        three-argument implementation would otherwise start the whole sweep a second time.
+        """
+        takes_progress = True
+        try:
+            takes_progress = len(inspect.signature(fn).parameters) >= 3
+        except (TypeError, ValueError):
+            pass  # a callable whose signature cannot be read: assume the current contract
+        if takes_progress:
+            return fn(targets, done_cb, progress_cb)
+        return fn(targets, done_cb)
+
+    def _schedule_latency_poll(self):
+        if self._latency_poll_after_id is not None or self._closed:
+            return
+        try:
+            self._latency_poll_after_id = self.root.after(LATENCY_POLL_MS, self._poll_latency_events)
+        except tk.TclError:
+            self._latency_poll_after_id = None
+
+    def _poll_latency_events(self):
+        """Tk thread: take everything the sweep has reported since the last turn and draw it once."""
+        self._latency_poll_after_id = None
+        if not self.alive():
+            return
+        changed = False
+        while True:
+            try:
+                event, keys, ms, method = self._latency_events.get_nowait()
+            except queue.Empty:
+                break
+            except ValueError:  # a payload of another shape: drop it rather than stop the poll
+                continue
+            changed = True
+            if event == "start":
+                self._latency_active.update(keys)
+                continue
+            self._latency_active.difference_update(keys)
+            if ms is None and not method:
+                continue  # abandoned: nothing was measured, so nothing is recorded
+            try:
+                value = int(ms) if ms is not None else None
+            except (TypeError, ValueError):
+                value = None
+            now = time.time()
+            for key in keys:
+                self._latency[key] = (value, method, now)
+        if self._latency_running:
+            self._schedule_latency_poll()
+        elif self._latency_active:
+            # The sweep is over and something never reported its end: the rows must not stay marked.
+            self._latency_active.clear()
+            changed = True
+        if changed and self.current_tab in PROFILE_GROUPS:
+            self._render_list()
+
     def _on_latency_done(self, measured):
         self._latency_running = False
+        self._latency_active.clear()
         self._latency_at = time.time()
         if not isinstance(measured, dict):
             self._render_all()
@@ -2139,9 +2573,15 @@ class ProfilesWindow:
         if not callable(getattr(self.ctx, "measure_latency", None)):
             self._notice("Проверка списка недоступна в этой сборке Nova", "warn")
             return
-        started = self._start_latency_sweep(records, reason="список")
+        started = self._start_latency_sweep(records, reason="список", force=True,
+                                            limit=LATENCY_LIST_LIMIT)
         if started:
-            self._notice(f"Проверяем {started} {_plural(started, 'профиль', 'профиля', 'профилей')}…", "muted")
+            self._notice(f"Проверяем {started} {_plural(started, 'профиль', 'профиля', 'профилей')}… "
+                         "— строка, которую меряем сейчас, подсвечена", "muted")
+        elif self._latency_running:
+            self._notice("Проверка списка уже идёт", "muted")
+        else:
+            self._notice("Свежие замеры уже есть — проверять нечего", "muted")
 
     def _on_refresh_profiles(self):
         """«Обновить профили»: whatever brings fresh profiles into this tab.

@@ -146,7 +146,9 @@ PRIMARY_MENU_LABELS = {
     PRIMARY_CF_MASQUE: "Cloudflare MASQUE",
     PRIMARY_PROTON: "Proton",
     PRIMARY_VLESS: "VLESS",
-    PRIMARY_CUSTOM: "Свои профили",
+    # The same words as the tab in «Профили» (owner's request 2026-09-20): one group, one name.
+    # The folder on disk and every stored id stay "Custom" — only what is shown changed.
+    PRIMARY_CUSTOM: "Custom AWG",
 }
 PRIMARY_PILL_LABELS = {
     PRIMARY_AUTO: "Авто",
