@@ -2,7 +2,7 @@ import os
 import re
 from pathlib import Path
 
-CURRENT_VERSION = "1.39.1"
+CURRENT_VERSION = "1.40"
 WINWS_FILENAME = "winws.exe"
 # Обновления берутся прямо из релизов основного репозитория, а не из отдельного
 # version.json. Одно место вместо двух: релиз опубликован — обновление доступно,

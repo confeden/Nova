@@ -1,4 +1,4 @@
-# version: 1.39.1
+# version: 1.40
 1337x.to
 1e100cdn.net
 7tv.app
@@ -59,6 +59,7 @@ cloudflarestatus.com
 cloudflarestorage.com
 cloudflarestream.com
 cloudfront.net
+code.claude.com
 coinbase.com
 comicbook.com
 cryptocloud.plus
@@ -96,10 +97,12 @@ fineshare.com
 flagcdn.com
 flixster.com
 fontawesome.com
+forms.gle
 frankerfacez.com
 freebuff.com
 fsdn.com
 fubgun.com
+funcpa.ru
 funpay.com
 g2g.com
 ggpht.com
@@ -132,12 +135,14 @@ island-of-pleasure.site
 issuehunt.io
 jabber.fr
 jnn-pa.googleapis.com
+jsdelivr.net
 killedbygoogle.com
 kinobox.tv
 kinohub.vip
 kinozal.tv
 laozhang.ai
 lh3.googleusercontent.com
+links.email.claude.com
 litellm.ai
 live-video.net
 live.com
@@ -155,6 +160,7 @@ meet.google.com
 meshworld.in
 microsoft.com
 minimax.io
+mintcdn.com
 mktoweb.com
 mmcdn.com
 mobi-films.com
@@ -263,6 +269,7 @@ twimg.com
 twitch.tv
 twitchcdn.net
 twitter.com
+typeform.com
 unpkg.com
 userscript.zone
 vecpea.com
@@ -274,6 +281,7 @@ vultrusercontent.com
 warp.dev
 warp.plus
 weblate.org
+website-files.com
 websiteplanet.com
 whatsapp.com
 whatsapp.net

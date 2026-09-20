@@ -1,5 +1,5 @@
 {
-    "version": "1.39.1",
+    "version": "1.40",
     "strategies": [
         {
             "name": "masque-zt-autottl",

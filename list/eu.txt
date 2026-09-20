@@ -1,4 +1,4 @@
-# version: 1.39.1
+# version: 1.40
 4pda.to
 4pda.ws
 agent-router.org
@@ -12,6 +12,7 @@ cdn.cookielaw.org
 cdnbunny.org
 cerebras.ai
 chatgpt.com
+claude.com
 codegpt.co
 collaborator.pro
 copilot.microsoft.com
@@ -42,6 +43,7 @@ gql.twitch.tv
 grizzlysms.com
 grok.com
 hex-rays.com
+hsforms.com
 imgur.com
 intel.com
 invideo.io
@@ -63,6 +65,8 @@ netflix.com
 ngc.nvidia.com
 nitter.net
 notebooklm.google.com
+notion.com
+notion.so
 ntc.party
 nxp.com
 oaistatic.com
@@ -110,3 +114,4 @@ tiger-sms.com
 usher.ttvnw.net
 x.ai
 xdaforums.com
+zhizhin.xyz

@@ -1,4 +1,4 @@
-# version: 1.39.1
+# version: 1.40
 1c-bitrix.ru
 akamaihd.net
 apptracer.ru
@@ -12,6 +12,7 @@ cdn-tinkoff.ru
 cdnflow.ru
 cdnwb.ru
 chrome.cloudflare-dns.com
+cikrf.ru
 cloud.ru
 cloudcode-pa.googleapis.com
 cloudflare-dns.com
