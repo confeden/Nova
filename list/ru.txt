@@ -130,11 +130,13 @@ ibb.co
 iditena.org
 instagram.com
 ip-tracker.org
+argotunnel.com
 iplogger.org
 island-of-pleasure.site
 issuehunt.io
 jabber.fr
 jnn-pa.googleapis.com
+trycloudflare.com
 jsdelivr.net
 killedbygoogle.com
 kinobox.tv
