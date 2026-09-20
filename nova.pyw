@@ -2383,12 +2383,24 @@ try:
                     # nodes that were never part of this pass at all.
                     unmeasurable.append(attempt)
             fast.sort(key=lambda a: int(known.get(str(a["profile"].get("id") or "")) or 0))
-            if fast:
-                first = fast[0]["profile"]
+            order = lead + fast + unmeasurable + tail + silent + others
+            # The node the walk will really start with, and why — not "the fastest one measured",
+            # which is a different node whenever something connected in the last day (seen live:
+            # the line named a 60 ms node while the walk began with the one that had carried
+            # traffic, which is the intended order and looked like a defect in the log).
+            head_attempt = next((a for a in order if isinstance(a.get("profile"), dict)), None)
+            if head_attempt is not None:
+                first = head_attempt["profile"]
+                rtt = known.get(str(first.get("id") or ""))
+                if head_attempt in lead:
+                    why = "работал недавно"
+                elif rtt is not None:
+                    why = f"быстрее всех, {int(rtt)} мс"
+                else:
+                    why = "первый в очереди группы"
                 self.log_func(f"[Profiles] «{group}» (Auto): начинаем с "
-                              f"{first.get('name') or first.get('id')} — "
-                              f"{int(known.get(str(first.get('id') or '')) or 0)} мс.")
-            return lead + fast + unmeasurable + tail + silent + others
+                              f"{first.get('name') or first.get('id')} — {why}.")
+            return order
 
         def _sweep_imported_group_after_connect(self, effective, generation):
             """Measure the rest of the group once its tunnel is up, so every row has a number.
