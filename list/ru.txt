@@ -1,4 +1,4 @@
-# version: 1.40
+# version: 1.40.1
 1337x.to
 1e100cdn.net
 7tv.app
@@ -17,6 +17,7 @@ announcekit.app
 anydesk.com
 archive.org
 arena.ai
+argotunnel.com
 arkoselabs.com
 arm.com
 arrow.com
@@ -130,13 +131,11 @@ ibb.co
 iditena.org
 instagram.com
 ip-tracker.org
-argotunnel.com
 iplogger.org
 island-of-pleasure.site
 issuehunt.io
 jabber.fr
 jnn-pa.googleapis.com
-trycloudflare.com
 jsdelivr.net
 killedbygoogle.com
 kinobox.tv
@@ -261,6 +260,7 @@ timeanddate.com
 topdns.com
 torrindex.net
 trustpilot.net
+trycloudflare.com
 tuta.com
 tuta.io
 tutamail.com

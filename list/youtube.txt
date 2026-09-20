@@ -1,4 +1,4 @@
-# version: 1.40
+# version: 1.40.1
 googlevideo.com
 jnn-pa.googleapis.com
 wide-youtube.l.google.com
