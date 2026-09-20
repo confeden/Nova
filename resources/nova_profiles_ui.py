@@ -53,13 +53,22 @@ __all__ = [
 GROUP_CLOUDFLARE = "AWG Cloudflare"
 GROUP_PROTON = "AWG Proton"
 GROUP_MASQUE = "MASQUE"
+GROUP_VLESS = "VLESS"
 GROUP_CUSTOM = "Custom"
-PROFILE_GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_MASQUE, GROUP_CUSTOM)
+PROFILE_GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_MASQUE, GROUP_VLESS, GROUP_CUSTOM)
+# Profile kinds, likewise repeated (nova_profiles.KIND_*): the file's own type, not its folder,
+# decides which helper starts it and therefore which group an import lands in.
+KIND_AWG = "awg"
+KIND_MASQUE = "masque"
+KIND_VLESS = "vless"
+# Groups whose profiles the user brought in, so renaming them is theirs to do.
+IMPORTED_GROUPS = (GROUP_CUSTOM, GROUP_VLESS)
 TAB_TOR = "tor"
 TABS = (
     (GROUP_CLOUDFLARE, "AWG Cloudflare"),
     (GROUP_PROTON, "AWG Proton"),
     (GROUP_MASQUE, "MASQUE"),
+    (GROUP_VLESS, "VLESS"),
     (GROUP_CUSTOM, "Custom"),
     (TAB_TOR, "Tor"),
 )
@@ -67,7 +76,10 @@ TABS = (
 ACTION_LABELS = {
     "connect": "Подключить",
     "connect_group": "Подключить группу",
+    "secondary": "В резерв",
     "test": "Проверить",
+    "test_list": "Проверить список",
+    "refresh_profiles": "Обновить профили",
     "folder": "Папка",
     "generate_warp": "Сгенерировать свои",
     "issue_proton": "Выпустить профили",
@@ -86,15 +98,27 @@ ACTION_LABELS = {
 TOR_CONNECT_LABEL = "Подключить Tor"
 TOR_DISCONNECT_LABEL = "Отключить Tor"
 
-# Rows of action pills per tab: connecting first, managing files second.
+# The first row is the same five actions on every profile tab (owner's request 2026-09-20):
+# Подключить / Проверить / Проверить список / Обновить профили / Папка. What each of them means is
+# the tab's business — «Обновить профили» issues on Cloudflare, Proton and MASQUE, and downloads
+# the subscriptions on VLESS and Custom — but where the owner clicks does not move between tabs.
+# The second row holds what only some tabs have: the group connect, the imports, rename and delete.
+# Tor keeps a row of its own: it has no profile list, so four of the five would do nothing there.
+_MAIN_ROW = ("connect", "test", "test_list", "refresh_profiles", "folder")
 TAB_ACTION_ROWS = {
-    GROUP_CLOUDFLARE: (("connect", "connect_group", "test"), ("generate_warp", "reissue_warp", "folder")),
-    GROUP_PROTON: (("connect", "connect_group", "test"), ("issue_proton", "reissue_proton", "folder")),
-    GROUP_MASQUE: (("connect", "test"), ("register_masque", "reissue_masque", "delete")),
-    GROUP_CUSTOM: (("connect", "connect_group", "test"),
-                   ("import_file", "import_clipboard", "rename", "delete", "folder")),
+    GROUP_CLOUDFLARE: (_MAIN_ROW, ("connect_group",)),
+    GROUP_PROTON: (_MAIN_ROW, ("connect_group",)),
+    GROUP_MASQUE: (_MAIN_ROW, ("delete",)),
+    # «В резерв» only on the imported tabs: the reserve slot runs a second helper of its own, and
+    # Nova will not put its own issued identity in both slots at once (two live sessions of one
+    # WireGuard key break one of them).
+    GROUP_VLESS: (_MAIN_ROW, ("connect_group", "secondary", "import_file", "import_clipboard",
+                              "rename", "delete")),
+    GROUP_CUSTOM: (_MAIN_ROW, ("connect_group", "secondary", "import_file", "import_clipboard",
+                               "rename", "delete")),
     TAB_TOR: (("tor_toggle", "tor_new_identity", "tor_refresh_bridges"),),
 }
+
 
 TOR_ENTRIES = (
     ("auto", "Auto"),
@@ -115,8 +139,13 @@ _TOR_BRIDGE_ORDER = ("webtunnel", "obfs4", "snowflake", "meek_lite", "vanilla")
 TOR_DEFAULT_SOCKS_PORT = 1375
 TOR_DEFAULT_HTTP_PORT = 1378
 
+# The group whose «Обновить профили» runs an issue job. VLESS and Custom are not here: their
+# profiles come from subscriptions, and `_on_refresh_profiles` sends them there instead.
 JOB_KIND_BY_GROUP = {GROUP_CLOUDFLARE: "warp", GROUP_PROTON: "proton", GROUP_MASQUE: "masque"}
-_JOB_NOUNS = {"warp": "Генерация WARP", "proton": "Выпуск Proton", "masque": "Регистрация MASQUE"}
+# Which job line a tab shows. Subscriptions feed both import groups, so both watch «subs».
+JOB_LINE_BY_GROUP = dict(JOB_KIND_BY_GROUP, **{GROUP_VLESS: "subs", GROUP_CUSTOM: "subs"})
+_JOB_NOUNS = {"warp": "Генерация WARP", "proton": "Выпуск Proton", "masque": "Регистрация MASQUE",
+              "subs": "Обновление подписок"}
 
 IMPORT_FILETYPES = [("Профили", "*.conf *.json *.txt"), ("Все файлы", "*.*")]
 IMPORT_MAX_FILES = 64
@@ -265,6 +294,24 @@ def set_pill_text(pill, text):
 # Pure formatting (no Tk; unit-tested directly)
 
 
+# How long a latency figure is worth showing and worth not re-measuring. Short enough that the
+# number in front of the owner is about the network they have now, long enough that flipping between
+# tabs does not re-measure anything.
+LATENCY_FRESH_S = 180.0
+# The pause between the starts of two probes in a background sweep. At 0.12 s a group of fifty is a
+# trickle spread over six seconds instead of a burst — the window must not be felt while it is open.
+LATENCY_PACE_S = 0.12
+# How many rows one sweep measures. A VLESS group filled from four public subscriptions can hold
+# several hundred, and measuring them all would take a minute of trickle for a list the owner is
+# looking at right now. The rows are already in connect order (nova_profiles._vless_order), so the
+# first N are the ones that matter — and what was left out is said in the log rather than implied.
+LATENCY_SWEEP_LIMIT = 80
+# Ports a TCP connect falls back to when ICMP is filtered, per profile kind. A VLESS node is probed
+# on its own port, which is the port its traffic uses; a WireGuard endpoint is UDP, so 443 is a
+# stand-in for "is this host reachable at all" (Proton keeps OpenVPN TCP there).
+LATENCY_FALLBACK_PORTS = (443,)
+
+
 def _plural(count, one, few, many):
     n = abs(int(count)) % 100
     if 11 <= n <= 19:
@@ -300,8 +347,31 @@ def _normalize_test_result(result):
             "skipped": bool(result.get("skipped")) and not result.get("ok")}
 
 
-def format_outcome(stats_entry, test_result=None, testing=False):
-    """Last outcome of a profile -> (text, tone): «ок 12 мс» / «сбой» / «не проверялся»."""
+def format_latency(measurement):
+    """A background measurement -> the short text beside a row, or "" when there is none.
+
+    The number is deliberately not called «ок»: it says the host answered a ping or a TCP connect,
+    which is not the same as "a tunnel through it carries traffic" — of sixty reachable public VLESS
+    nodes measured on 2026-09-20, four carried anything. «—» is the honest word for a host that did
+    not answer at all: that one really is out.
+    """
+    if not isinstance(measurement, (tuple, list)) or not measurement:
+        return "", "normal"
+    ms = measurement[0]
+    if ms is None:
+        return "не отвечает", "muted"
+    try:
+        return f"{int(ms)} мс", "normal"
+    except (TypeError, ValueError):
+        return "", "normal"
+
+
+def format_outcome(stats_entry, test_result=None, testing=False, latency=None):
+    """Last outcome of a profile -> (text, tone): «ок 12 мс» / «сбой» / «не проверялся».
+
+    A background latency figure never replaces a verdict — a check that ran is what the owner asked
+    for — but it does replace «не проверялся», which tells them nothing at all.
+    """
     if testing:
         return "проверка…", "muted"
     entry = stats_entry if isinstance(stats_entry, dict) else {}
@@ -315,7 +385,8 @@ def format_outcome(stats_entry, test_result=None, testing=False):
                 return (f"ок {result['ms']} мс" if result["ms"] is not None else "ок"), "ok"
             return "сбой", "muted"
     if ok_at <= 0 and fail_at <= 0:
-        return "не проверялся", "normal"
+        text, tone = format_latency(latency)
+        return (text or "не проверялся"), tone
     if ok_at >= fail_at:
         last_ms = entry.get("last_ms")
         if last_ms is not None and not isinstance(last_ms, bool):
@@ -324,7 +395,10 @@ def format_outcome(stats_entry, test_result=None, testing=False):
             except (TypeError, ValueError):
                 pass
         return "ок", "ok"
-    return "сбой", "muted"
+    # It failed last time. The ping still matters: «сбой» on a host that does not answer at all is a
+    # different problem from «сбой» on one that pings in 40 ms.
+    text, _tone = format_latency(latency)
+    return (f"сбой · {text}" if text else "сбой"), "muted"
 
 
 def _issue_split(record, is_fatal=None):
@@ -337,9 +411,14 @@ def _issue_split(record, is_fatal=None):
     return fatal, warnings
 
 
-def format_row_text(record, *, live=False, outcome="не проверялся", pad="   ", is_fatal=None):
-    """One listbox row: «● name  ·  endpoint  ·  outcome» (no monospace alignment)."""
-    marker = "● " if live else pad
+def format_row_text(record, *, live=False, outcome="не проверялся", pad="   ", is_fatal=None,
+                    reserve=False):
+    """One listbox row: «● name  ·  endpoint  ·  outcome» (no monospace alignment).
+
+    `●` is the profile carrying the primary tunnel, `◆` the one serving the reserve slot. One
+    profile is never both: the two slots are separate helpers on separate ports.
+    """
+    marker = "● " if live else ("◆ " if reserve else pad)
     parts = [str(record.get("name") or record.get("id") or "")]
     endpoint = str(record.get("endpoint") or "").strip()
     if endpoint and endpoint != parts[0]:
@@ -363,6 +442,7 @@ def format_list_header(group, records, loaded=True):
             GROUP_CLOUDFLARE: "нажмите «Сгенерировать свои»",
             GROUP_PROTON: "нажмите «Выпустить профили»",
             GROUP_MASQUE: "нажмите «Зарегистрировать»",
+            GROUP_VLESS: "нажмите «Обновить профили» или вставьте ссылку vless:// из буфера",
             GROUP_CUSTOM: "импортируйте файл или вставьте конфиг из буфера",
         }
         return f"В группе «{group}» пока нет профилей — {hints.get(group, 'добавьте профиль')}"
@@ -406,7 +486,8 @@ def format_selection_text(effective, selection=None):
     return text
 
 
-_BACKEND_NAMES = {"awg": "AWG", "masque": "MASQUE", "cloudflare": "WARP", "warp-cli": "WARP"}
+_BACKEND_NAMES = {"awg": "AWG", "masque": "MASQUE", "vless": "VLESS",
+                  "cloudflare": "WARP", "warp-cli": "WARP"}
 
 
 def format_runtime_text(runtime):
@@ -867,6 +948,10 @@ class ProfilesWindow:
         self._row_signature = None
         self._tests = {}
         self._test_results = {}
+        # {profile_id: (ms or None, method, measured_at)} from the background latency sweep.
+        self._latency = {}
+        self._latency_running = False
+        self._latency_at = 0.0
         self._job_started = {}
         self._tor_entry = None  # an entry pill the user clicked in this window
         self._tor_optimistic = None  # (expected state_key, set_at wall clock, set_at monotonic)
@@ -1288,6 +1373,10 @@ class ProfilesWindow:
             self._maximize_box_dropped = drop_maximize_box(self.win)
         self._raise()
         self._schedule_tick()
+        # Opening the window is the moment the owner wants to know which profile is worth choosing,
+        # so the figures are measured then rather than on a timer nobody is watching. `force=False`
+        # keeps a figure measured in the last few minutes, so re-opening costs nothing.
+        self._sweep_current_tab()
 
     def hide(self):
         if self._preview is not None:
@@ -1528,23 +1617,34 @@ class ProfilesWindow:
         runtime = self._snapshot.get("runtime") or {}
         return str(runtime.get("profile_id") or ""), bool(runtime.get("connected"))
 
+    def _reserve_profile_id(self):
+        """The profile serving the reserve slot right now, "" when the reserve is Opera or Tor."""
+        runtime = self._snapshot.get("runtime") or {}
+        return str(runtime.get("secondary_profile") or "")
+
     def _render_list(self):
         group = self.current_tab
         records = self._records_for(group)
         self._set_label(self.list_header, format_list_header(group, records, self._snapshot.get("loaded")))
         live_id, connected = self._live_profile_id()
+        reserve_id = self._reserve_profile_id()
         stats = self._snapshot.get("stats") or {}
         is_fatal = self._is_fatal_fn()
         rows = []
         for record in records:
             pid = record.get("id")
-            outcome, outcome_tone = format_outcome(stats.get(pid), self._test_results.get(pid), pid in self._tests)
+            outcome, outcome_tone = format_outcome(stats.get(pid), self._test_results.get(pid),
+                                                   pid in self._tests, self._latency.get(pid))
             live = bool(live_id) and pid == live_id
-            text = format_row_text(record, live=live, outcome=outcome, pad=self._marker_pad, is_fatal=is_fatal)
+            reserve = bool(reserve_id) and pid == reserve_id
+            text = format_row_text(record, live=live, outcome=outcome, pad=self._marker_pad,
+                                   is_fatal=is_fatal, reserve=reserve)
             if not record.get("valid", True):
                 tone = "fail"
             elif live and connected:
                 tone = "ok"
+            elif reserve:
+                tone = "ok" if self._snapshot.get("runtime", {}).get("secondary_up") else "muted"
             elif outcome_tone == "muted" or live:
                 tone = "muted"
             else:
@@ -1573,7 +1673,7 @@ class ProfilesWindow:
                 lb.see(index)
 
     def _render_job_line(self):
-        kind = JOB_KIND_BY_GROUP.get(self.current_tab)
+        kind = JOB_LINE_BY_GROUP.get(self.current_tab)
         if not kind:
             self._set_label(self.job_label, "", "muted")
             return
@@ -1651,6 +1751,15 @@ class ProfilesWindow:
             self._reveal_ids[tab] = self._selected_ids.get(tab)
         self.action_frames[tab].tkraise()
         self._render_all()
+        self._sweep_current_tab()
+
+    def _sweep_current_tab(self):
+        """Measure the visible group in the background, unless its figures are still fresh."""
+        if self.current_tab not in PROFILE_GROUPS:
+            return
+        records = self._records_for(self.current_tab)
+        if records:
+            self._start_latency_sweep(records)
 
     def _on_list_select(self, _event=None):
         selection = self.listbox.curselection()
@@ -1695,6 +1804,8 @@ class ProfilesWindow:
             "connect": self._on_connect,
             "connect_group": self._on_connect_group,
             "test": self._on_test,
+            "test_list": self._on_test_list,
+            "refresh_profiles": self._on_refresh_profiles,
             "folder": self._on_folder,
             "generate_warp": lambda: self._on_job("warp"),
             "issue_proton": lambda: self._on_job("proton"),
@@ -1704,6 +1815,7 @@ class ProfilesWindow:
             "reissue_masque": lambda: self._on_job("masque", force=True),
             "delete": self._on_delete,
             "rename": self._on_rename,
+            "secondary": self._on_make_secondary,
             "import_file": self._on_import_file,
             "import_clipboard": self._on_import_clipboard,
             "tor_toggle": self._on_tor_toggle,
@@ -1757,11 +1869,47 @@ class ProfilesWindow:
             self._notice("Откройте вкладку группы профилей, чтобы выбрать группу", "warn")
             return
         valid = [r for r in self._records_for(group) if r.get("valid", True)]
-        if group == GROUP_CUSTOM and not valid and self._snapshot.get("loaded"):
-            self._notice("В группе «Custom» нет профилей — сначала импортируйте их", "warn")
+        if group in IMPORTED_GROUPS and not valid and self._snapshot.get("loaded"):
+            # The issued groups fill themselves when they are chosen empty; an imported one cannot —
+            # nothing will arrive unless the user imports it or a subscription brings it.
+            self._notice(f"В группе «{group}» нет профилей — сначала импортируйте их", "warn")
             return
         self._apply_selection({"version": 1, "mode": "group", "group": group},
                               f"Подключение к группе «{group}»: другие группы не используются")
+
+    def _on_make_secondary(self):
+        """Put the selected profile — or the whole group — into the reserve VPN slot.
+
+        A node is pinned when one is selected and the group is taken otherwise, because the two mean
+        different things: a pinned node is retried as itself (I1), a group walks to its next node
+        when the one it is on stops carrying traffic. That is the same difference «Подключить» and
+        «Подключить группу» make for the primary, expressed in one button because the second row is
+        already the widest thing in this window.
+        """
+        group = self.current_tab
+        if group not in IMPORTED_GROUPS:
+            self._notice(f"В резерв можно поставить только профили групп "
+                         f"{' и '.join(chr(171) + g + chr(187) for g in IMPORTED_GROUPS)}", "warn")
+            return
+        record = self._selected_record()
+        profile_id = str(record.get("id") or "") if isinstance(record, dict) else ""
+        if record is not None and not record.get("valid", True):
+            self._notice("Профиль с ошибками — в резерв его ставить нечем", "fail")
+            return
+        if not profile_id:
+            valid = [r for r in self._records_for(group) if r.get("valid", True)]
+            if not valid and self._snapshot.get("loaded"):
+                self._notice(f"В группе «{group}» нет профилей — сначала импортируйте их", "warn")
+                return
+        if not self._call_ctx("apply_secondary_profile", group, profile_id,
+                              error_prefix="Резерв не изменён"):
+            return
+        if profile_id:
+            name = profile_id.partition("/")[2] or profile_id
+            self._notice(f"Резервный VPN: «{name}». Основной остаётся прежним.", "ok")
+        else:
+            self._notice(f"Резервный VPN: группа «{group}» — при потере связи берётся следующий узел.", "ok")
+        self.refresh_now()
 
     def _on_connect(self):
         record = self._selected_record()
@@ -1880,6 +2028,147 @@ class ProfilesWindow:
 
         self._run_async("NovaProfilesFolder", work, done)
 
+    def _latency_targets(self, records, force=False):
+        """`{profile_id: (host, ports)}` for the records worth measuring right now."""
+        now = time.time()
+        targets = {}
+        for record in records or []:
+            pid = str(record.get("id") or "")
+            endpoint = str(record.get("endpoint") or "").strip()
+            if not pid or not endpoint:
+                continue
+            if not force:
+                known = self._latency.get(pid)
+                if known is not None and (now - known[2]) < LATENCY_FRESH_S:
+                    continue
+            host, _sep, port = endpoint.rpartition(":")
+            if endpoint.startswith("["):
+                host, _sep, port = endpoint[1:].partition("]")
+                port = port.lstrip(":")
+            if not host:
+                host, port = endpoint, ""
+            ports = LATENCY_FALLBACK_PORTS
+            if record.get("kind") == "vless" and port.isdigit():
+                # The node's own port is the one its traffic uses, so it is also the honest probe.
+                ports = (int(port),)
+            targets[pid] = (host, ports)
+        return targets
+
+    def _start_latency_sweep(self, records, reason="", force=False):
+        """Measure the given records in the background. Returns how many were sent to be measured."""
+        fn = getattr(self.ctx, "measure_latency", None)
+        if not callable(fn) or self._latency_running:
+            return 0
+        targets = self._latency_targets(records, force=force)
+        if not targets:
+            return 0
+        skipped = 0
+        if len(targets) > LATENCY_SWEEP_LIMIT:
+            keep = [str(r.get("id") or "") for r in records][:len(records)]
+            order = {pid: index for index, pid in enumerate(keep)}
+            chosen = sorted(targets, key=lambda pid: order.get(pid, len(order)))[:LATENCY_SWEEP_LIMIT]
+            skipped = len(targets) - len(chosen)
+            targets = {pid: targets[pid] for pid in chosen}
+        view = self
+        results = self._results
+
+        def done_cb(measured=None):
+            # May run on any thread: the result travels through the same queue as a «Проверить».
+            results.put((lambda value, _err: view._on_latency_done(value), measured, None))
+
+        self._latency_running = True
+        self._inflight += 1
+        try:
+            fn(dict(targets), done_cb)
+        except Exception as exc:
+            self._latency_running = False
+            self._inflight = max(0, self._inflight - 1)
+            self._report_error("Замер задержки не запустился", exc)
+            return 0
+        self._ensure_drain()
+        if reason or skipped:
+            tail = f"; остальные {skipped} не мерились — предел одного прохода" if skipped else ""
+            self._log(f"[Profiles] Замер задержки ({reason or 'окно'}): {len(targets)} "
+                      f"{_plural(len(targets), 'профиль', 'профиля', 'профилей')}{tail}.")
+        return len(targets)
+
+    def _on_latency_done(self, measured):
+        self._latency_running = False
+        self._latency_at = time.time()
+        if not isinstance(measured, dict):
+            self._render_all()
+            return
+        now = time.time()
+        reachable = 0
+        for pid, value in measured.items():
+            ms, method = (None, "")
+            if isinstance(value, (tuple, list)) and value:
+                ms = value[0]
+                method = str(value[1]) if len(value) > 1 else ""
+            elif isinstance(value, (int, float)):
+                ms = value
+            try:
+                ms = int(ms) if ms is not None else None
+            except (TypeError, ValueError):
+                ms = None
+            self._latency[str(pid)] = (ms, method, now)
+            if ms is not None:
+                reachable += 1
+        if measured:
+            self._notice(f"Отвечают {reachable} из {len(measured)}", "ok" if reachable else "warn")
+        self._render_all()
+
+    def _on_test_list(self):
+        """«Проверить список»: measure every profile of the tab, cheaply.
+
+        Deliberately not «run «Проверить» on each row». A real check starts a tunnel and holds the
+        profile's WireGuard key for up to ~25 s; fifty of them in a row would take twenty minutes
+        and, worse, hammer one key — the nodes probed hardest stop answering it for 25 minutes and
+        a finished handshake takes a live Proton tunnel over (G71, G72, N26). What this does is the
+        latency sweep: one ICMP echo, a TCP connect if that is filtered, no keys and no handshakes.
+        It says which nodes are reachable and how far they are, which is what ordering a list of a
+        few hundred needs; «Проверить» stays the way to prove one of them carries traffic.
+        """
+        group = self.current_tab
+        if group not in PROFILE_GROUPS:
+            return
+        records = self._records_for(group)
+        if not records:
+            self._notice(f"В группе «{group}» нет профилей", "warn")
+            return
+        if not callable(getattr(self.ctx, "measure_latency", None)):
+            self._notice("Проверка списка недоступна в этой сборке Nova", "warn")
+            return
+        started = self._start_latency_sweep(records, reason="список")
+        if started:
+            self._notice(f"Проверяем {started} {_plural(started, 'профиль', 'профиля', 'профилей')}…", "muted")
+
+    def _on_refresh_profiles(self):
+        """«Обновить профили»: whatever brings fresh profiles into this tab.
+
+        On the issuing groups it is the issue job when the group is empty and a **re-issue** when it
+        is not — which is the point of the button. Proton hands out a different subset of its free
+        nodes every time it is asked, and a set issued weeks ago is largely dead by now: the owner
+        reported connections failing on stale nodes, and re-issuing is the cure, not a last resort.
+        A re-issue still asks its question first (`_confirm_reissue`), and it does not cut the live
+        tunnel.
+
+        On VLESS and Custom the fresh profiles come from the subscriptions, so it downloads those.
+        """
+        group = self.current_tab
+        kind = JOB_KIND_BY_GROUP.get(group)
+        if kind:
+            self._on_job(kind, force=bool(self._records_for(group)))
+            return
+        if group in (GROUP_VLESS, GROUP_CUSTOM):
+            if not callable(getattr(self.ctx, "refresh_subscriptions", None)):
+                self._notice("Обновление подписок недоступно в этой сборке Nova", "warn")
+                return
+            if self._call_ctx("refresh_subscriptions", error_prefix="Не удалось обновить подписки"):
+                self._notice("Обновляем подписки…", "muted")
+            return
+        self._notice("Для этой вкладки обновление не предусмотрено", "muted")
+
     _REISSUE_QUESTIONS = {
         "warp": "Перевыпустить свои профили WARP?\n\nБудет зарегистрировано новое устройство Cloudflare "
                 "и найдены новые точки входа; прежние свои профили WARP заменятся.",
@@ -1975,8 +2264,9 @@ class ProfilesWindow:
         if record is None:
             self._notice("Выберите профиль в списке", "warn")
             return
-        if record.get("group") != GROUP_CUSTOM:
-            self._notice(f"Переименовать можно только профили группы «{GROUP_CUSTOM}»", "warn")
+        if record.get("group") not in IMPORTED_GROUPS:
+            groups = " и ".join(f"«{g}»" for g in IMPORTED_GROUPS)
+            self._notice(f"Переименовать можно только профили групп {groups}", "warn")
             return
         pid = str(record.get("id"))
         old_name = str(record.get("name") or "")
@@ -2005,8 +2295,11 @@ class ProfilesWindow:
                 return
             new_id = str(new_id or "")
             if new_id:
-                self._selected_ids[GROUP_CUSTOM] = new_id
-                self._reveal_ids[GROUP_CUSTOM] = new_id
+                # The renamed profile's own group, not «Custom»: renaming a VLESS node used to move
+                # the cursor on the Custom tab, where the node is not.
+                target = str(record.get("group") or "") or new_id.partition("/")[0] or GROUP_CUSTOM
+                self._selected_ids[target] = new_id
+                self._reveal_ids[target] = new_id
             final = new_id.partition("/")[2] or new_name
             self._test_results.pop(pid, None)
             self._notice(f"Профиль переименован: «{old_name}» → «{final}»", "ok")
@@ -2129,15 +2422,25 @@ class ProfilesWindow:
                 first = (invalid[0].get("issues") or ["ошибка"])[0]
                 parts.append(f"с ошибками {len(invalid)} ({first})")
             self._notice("Импорт: " + ", ".join(parts), "fail" if invalid and not imported else "ok")
-            self._log(f"[Profiles] Импорт в «{GROUP_CUSTOM}»: новых {len(imported)}, уже были {len(duplicates)}, "
+            # The group is read from the id: a vless:// link lands in «VLESS» and a wg-quick block in
+            # «Custom», and one import can do both. Saying «Импорт в Custom» would then be a lie and
+            # the window would switch to the tab the profiles are not in.
+            groups = []
+            for row in imported:
+                group = str(row.get("id") or "").partition("/")[0]
+                if group and group not in groups:
+                    groups.append(group)
+            where = ", ".join("«%s»" % g for g in groups) or f"«{GROUP_CUSTOM}»"
+            self._log(f"[Profiles] Импорт в {where}: новых {len(imported)}, уже были {len(duplicates)}, "
                       f"с ошибками {len(invalid)}.")
             if imported:
                 first_id = str(imported[0].get("id") or "")
+                target = first_id.partition("/")[0] or GROUP_CUSTOM
                 if first_id:
-                    self._selected_ids[GROUP_CUSTOM] = first_id
-                    self._reveal_ids[GROUP_CUSTOM] = first_id
-                if self.current_tab != GROUP_CUSTOM:
-                    self.select_tab(GROUP_CUSTOM)
+                    self._selected_ids[target] = first_id
+                    self._reveal_ids[target] = first_id
+                if self.current_tab != target:
+                    self.select_tab(target)
             self.refresh_now()
 
         self._run_async("NovaProfilesImport", work, done)
@@ -2221,7 +2524,17 @@ class ImportPreview:
         new = sum(1 for r in self.rows if r["status"] == "new")
         tk.Label(outer, text=f"Найдено профилей: {total} · новых: {new}", font=view.font_title, bg=t["bg"],
                  fg=t["text"], anchor="w").pack(fill="x")
-        tk.Label(outer, text=f"Отмеченные попадут в группу «{GROUP_CUSTOM}». Режим подключения не меняется.",
+        # The group follows the kind, not the button: a vless:// link goes to «VLESS» and a
+        # wg-quick block to «Custom», and one paste can carry both.
+        groups = []
+        for row in self.rows:
+            candidate = row.get("candidate") if isinstance(row, dict) else None
+            group = GROUP_VLESS if (candidate or {}).get("kind") == KIND_VLESS else GROUP_CUSTOM
+            if group not in groups:
+                groups.append(group)
+        where = " и ".join(f"«{g}»" for g in groups) or f"«{GROUP_CUSTOM}»"
+        tk.Label(outer, text=f"Отмеченные попадут в {'группы' if len(groups) > 1 else 'группу'} {where}. "
+                             "Режим подключения не меняется.",
                  font=view.font_text, bg=t["bg"], fg=t["muted"], anchor="w").pack(fill="x", pady=(2, 6))
 
         box = tk.Frame(outer, bg=t["panel"], highlightthickness=1, highlightbackground=t["border"], bd=0)

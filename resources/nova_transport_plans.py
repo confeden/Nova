@@ -149,14 +149,20 @@ def build_public_tcp_upstream_attempts(
     opera_timeout=1.0,
     secondary=None,
 ):
-    """`secondary` = {"kind": "opera"|"tor", "ready": bool, "http_port": int} names the reserve slot.
+    """`secondary` = {"kind", "ready", "http_port"} names the reserve slot.
 
-    With Tor as the reserve the `opera-http` attempt points at Tor's HTTP CONNECT port instead of
-    Opera; the label stays, because every ordering rule knows the secondary slot by it.
+    `kind` is `opera`, `tor` or `profile` (an imported profile Nova runs itself). Opera is the one
+    this function probes; the other two are managed elsewhere and arrive with their own `ready` and
+    their own port. The label stays `opera-http` for all three, because every ordering rule knows
+    the secondary slot by it — `egress` is what says which tenant it really is.
     """
     attempts = []
     secondary = secondary if isinstance(secondary, dict) else None
-    secondary_is_tor = bool(secondary) and str(secondary.get("kind") or "").strip().lower() == "tor"
+    secondary_kind = str((secondary or {}).get("kind") or "").strip().lower()
+    secondary_is_tor = secondary_kind == "tor"
+    # Anything that is not Opera is a tenant with its own port and its own liveness: its attempt is
+    # built from what the caller passed, never probed here.
+    secondary_is_managed = bool(secondary) and secondary_kind in ("tor", "profile")
 
     try:
         if warp_manager is not None:
@@ -182,21 +188,24 @@ def build_public_tcp_upstream_attempts(
     except:
         pass
 
-    if secondary_is_tor:
+    if secondary_is_managed:
         if secondary.get("ready"):
+            # Tor builds a circuit before CONNECT answers (seconds); an own profile dials its node
+            # abroad per flow, which is slower than Opera's local hop and faster than Tor.
+            default_port = 1378 if secondary_is_tor else 1380
+            floor = 10.0 if secondary_is_tor else 6.0
             attempts.append(
                 {
                     "kind": "http",
                     "host": "127.0.0.1",
-                    "port": int(secondary.get("http_port") or 1378),
+                    "port": int(secondary.get("http_port") or default_port),
                     "label": "opera-http",
-                    "egress": "tor",
-                    # Tor builds a circuit before CONNECT answers.
-                    "timeout": max(float(opera_timeout), 10.0),
+                    "egress": secondary_kind,
+                    "timeout": max(float(opera_timeout), floor),
                 }
             )
     try:
-        if opera_proxy_manager is not None and not secondary_is_tor:
+        if opera_proxy_manager is not None and not secondary_is_managed:
             port_open = False
             proxy_ok = False
             try:

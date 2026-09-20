@@ -162,6 +162,9 @@ RESTART_WINDOW_S = 30 * 60.0
 
 AUTO_MEMORY_FRESH_S = 30 * 60
 BRIDGES_FRESH_S = 24 * 3600
+# How long a failed collection is left alone. One hour, not one day: the usual reason is that the
+# network is down or the sources are blocked right now, and both change.
+BRIDGES_FAIL_BACKOFF_S = 3600
 KEEP_LIMIT = 40
 
 LYREBIRD_LOG_CAP = 512 * 1024
@@ -650,18 +653,32 @@ def load_builtin_bridges(tor_dir):
 # --------------------------------------------------------------------------------------
 
 def load_bridge_store(path):
-    """-> {"bridges", "updated_at" (ms), "source", "last_error"}; empty when missing/corrupt.
+    """-> {"bridges", "updated_at" (ms), "source", "last_error", "readable"}; empty when missing.
 
     Every stored line is parsed again: the file is outside our control once written,
     and G174 must hold for whatever is in it.
+
+    `readable` is False only when the file exists and could not be **opened** -- a lock, an
+    antivirus scan, a sharing violation. That is not the same as "there are no bridges", and the
+    difference costs the whole list: the failed-collection branch of `_refresh_store` writes the
+    snapshot it was given straight back, so an empty snapshot from a momentary OSError erased a
+    good file and left the install with no bridges at all. A file that opens and parses to
+    nonsense is a different thing -- it really is corrupt, and replacing it is right.
     """
-    snapshot = {"bridges": [], "updated_at": 0, "source": "", "last_error": ""}
+    snapshot = {"bridges": [], "updated_at": 0, "attempted_at": 0, "source": "", "last_error": "",
+                "readable": True}
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except FileNotFoundError:
         return snapshot
-    except (OSError, ValueError):
+    except OSError as exc:
+        # The reason is named: "не открылся" alone leaves whoever reads the report guessing
+        # between a lock, an antivirus and a permission problem.
+        snapshot["last_error"] = "файл мостов не открылся: {}".format(type(exc).__name__)
+        snapshot["readable"] = False
+        return snapshot
+    except ValueError:
         snapshot["last_error"] = "файл мостов повреждён"
         return snapshot
     if not isinstance(data, dict):
@@ -675,19 +692,28 @@ def load_bridge_store(path):
             continue
         seen.add(bridge["id"])
         snapshot["bridges"].append(bridge)
-    try:
-        snapshot["updated_at"] = int(data.get("updated_at") or 0)
-    except (TypeError, ValueError):
-        snapshot["updated_at"] = 0
+    for key in ("updated_at", "attempted_at"):
+        try:
+            snapshot[key] = int(data.get(key) or 0)
+        except (TypeError, ValueError):
+            snapshot[key] = 0
     snapshot["source"] = str(data.get("source") or "")
     snapshot["last_error"] = str(data.get("last_error") or "")
     return snapshot
 
 
 def save_bridge_store(path, snapshot):
+    if snapshot.get("readable") is False:
+        # The caller is about to write back what it could not read. Refusing here rather than in
+        # every caller keeps the rule in one place: a snapshot that never held the file's contents
+        # may not replace them.
+        raise OSError("список мостов не читался — перезаписывать его нечем")
     payload = {
         "version": 1,
         "updated_at": int(snapshot.get("updated_at") or 0),
+        # When the last collection was attempted, whether or not it produced anything. Kept apart
+        # from `updated_at`, which answers "how old is this list".
+        "attempted_at": int(snapshot.get("attempted_at") or 0),
         "source": str(snapshot.get("source") or ""),
         "last_error": str(snapshot.get("last_error") or ""),
         "bridges": [
@@ -704,6 +730,24 @@ def bridge_store_is_fresh(snapshot, now=None):
         return False
     age_ms = _now_ms(now) - int(snapshot.get("updated_at") or 0)
     return 0 <= age_ms < BRIDGES_FRESH_S * 1000
+
+
+def bridge_collection_backing_off(snapshot, now=None):
+    """True while a failed collection should be left alone.
+
+    A failed run deliberately keeps the previous `updated_at`, so the list stays due and the next
+    trigger collects again. That is right for one retry and wrong as a policy: the background
+    issuance pipeline pokes every 30 minutes for as long as Nova runs, and a full collection is
+    minutes of fetching and probing. On a network where the bridge sources are simply unreachable
+    -- which is the network Tor is wanted on -- that became a permanent background load with
+    nothing to show for it. A separate stamp is kept for the attempt, so a failure backs off
+    without making the list look fresh.
+    """
+    attempted = int((snapshot or {}).get("attempted_at") or 0)
+    if attempted <= 0 or not (snapshot or {}).get("last_error"):
+        return False
+    age_ms = _now_ms(now) - attempted
+    return 0 <= age_ms < BRIDGES_FAIL_BACKOFF_S * 1000
 
 
 def read_auto_progress(path, now=None):
@@ -2460,11 +2504,22 @@ class TorManager:
             return load_bridge_store(self.bridges_path)
         try:
             snapshot = load_bridge_store(self.bridges_path)
+            if snapshot.get("readable") is False:
+                # Collecting now would end in the failure branch writing an empty list over a file
+                # that is very likely fine and merely busy.
+                self._log("список мостов сейчас не читается — сбор отложен ({}).".format(reason))
+                return snapshot
             if not force and bridge_store_is_fresh(snapshot):
                 age_min = (_now_ms() - snapshot["updated_at"]) // 60000
                 self._log("список мостов свежий ({} шт., {} мин) — повторный сбор не нужен ({}).".format(
                     len(snapshot["bridges"]), age_min, reason))
                 return snapshot
+            if not force and bridge_collection_backing_off(snapshot):
+                left_min = (BRIDGES_FAIL_BACKOFF_S * 1000 - (_now_ms() - snapshot["attempted_at"])) // 60000
+                self._log("прошлый сбор мостов не удался ({}) — следующая попытка через {} мин ({}).".format(
+                    snapshot["last_error"] or "без причины", max(1, left_min), reason))
+                return snapshot
+            snapshot["attempted_at"] = _now_ms()
             with self._state_lock:
                 self._state["refreshing_bridges"] = True
             self._log("собираем мосты ({}).".format(reason))
@@ -2480,8 +2535,10 @@ class TorManager:
                 return snapshot
             self._last_collection_at = time.monotonic()
             if result["bridges"]:
+                # `attempted_at` travels with the success too: it is the stamp that says when the
+                # collector last went out, and a fresh list must not leave a stale attempt behind.
                 snapshot = {"bridges": result["bridges"], "updated_at": _now_ms(),
-                            "source": result["source"], "last_error": ""}
+                            "attempted_at": _now_ms(), "source": result["source"], "last_error": ""}
                 try:
                     save_bridge_store(self.bridges_path, snapshot)
                     stored = "сохранили {}".format(len(result["bridges"]))

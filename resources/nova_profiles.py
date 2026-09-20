@@ -37,12 +37,15 @@ import zlib
 
 __all__ = [
     # layout constants
-    "PROFILES_DIRNAME", "GROUP_CLOUDFLARE", "GROUP_PROTON", "GROUP_MASQUE", "GROUP_CUSTOM", "GROUPS",
+    "PROFILES_DIRNAME", "GROUP_CLOUDFLARE", "GROUP_PROTON", "GROUP_MASQUE", "GROUP_VLESS",
+    "GROUP_CUSTOM", "GROUPS",
     "RUNTIME_DIRNAME", "RELAY_KEY_FILENAME", "LEGACY_AWG_DIRNAME", "SELECTION_FILENAME", "STATS_FILENAME",
     "GENERATED_WARP_PREFIX", "BUNDLED_WARP_PREFIX",
     "TEMP_DIRNAME", "CF_WS_KEY_FILENAME", "LEGACY_AWG_STATE_FILENAME", "PRIVATE_FILENAMES",
-    "MODE_AUTO", "MODE_GROUP", "MODE_PROFILE", "BACKEND_AWG", "BACKEND_MASQUE", "BACKEND_WARP_CLI",
-    "ORIGIN_BUNDLED", "ORIGIN_GENERATED", "ORIGIN_IMPORTED", "KIND_AWG", "KIND_MASQUE",
+    "MODE_AUTO", "MODE_GROUP", "MODE_PROFILE", "BACKEND_AWG", "BACKEND_MASQUE", "BACKEND_VLESS",
+    "BACKEND_WARP_CLI",
+    "ORIGIN_BUNDLED", "ORIGIN_GENERATED", "ORIGIN_IMPORTED", "ORIGIN_SUBSCRIPTION",
+    "KIND_AWG", "KIND_MASQUE", "KIND_VLESS",
     "AUTO_GENERATED_LEAD_LIMIT", "AUTO_PROTON_LIMIT", "MASQUE_DEFAULT_PORTS",
     "WARNING_AWG3", "is_fatal_issue",
     "ISSUE_NO_INTERFACE", "ISSUE_NO_PEER", "ISSUE_NO_PRIVATE_KEY", "ISSUE_BAD_PRIVATE_KEY",
@@ -50,7 +53,8 @@ __all__ = [
     "ISSUE_NO_ADDRESS", "ISSUE_MASQUE_NOT_JSON", "ISSUE_MASQUE_NOT_IDENTITY", "ISSUE_MASQUE_NO_PRIVATE_KEY",
     "ISSUE_MASQUE_BAD_PRIVATE_KEY", "ISSUE_MASQUE_NO_PUB_KEY", "ISSUE_MASQUE_BAD_PUB_KEY",
     "ISSUE_MASQUE_NO_ENDPOINT", "ISSUE_MASQUE_NO_TUNNEL_ADDRESS", "ISSUE_AMNEZIA_UNREADABLE",
-    "ISSUE_TEXT_TOO_LARGE", "ISSUE_UNKNOWN_KIND",
+    "ISSUE_TEXT_TOO_LARGE", "ISSUE_UNKNOWN_KIND", "ISSUE_VLESS_NOT_JSON", "ISSUE_VLESS_NO_URI",
+    "ISSUE_VLESS_BAD_URI", "ISSUE_VLESS_UNUSABLE",
     "ISSUE_FILE_BOM", "ISSUE_FILE_UTF16", "ISSUE_MASQUE_BAD_IPV4", "ISSUE_MASQUE_BAD_IPV6",
     "ISSUE_MASQUE_BAD_FIELD_TYPE",
     "REASON_PROFILE_DELETED", "REASON_GROUP_EMPTY", "REASON_UNKNOWN_GROUP", "REASON_PROFILE_INVALID",
@@ -63,7 +67,7 @@ __all__ = [
     # selection / plans
     "load_selection", "save_selection", "normalize_selection", "resolve_effective_selection",
     "group_empty_message", "build_attempt_plan", "build_recovery_plan", "record_country", "proton_countries",
-    "handshake_probe_target", "proton_liveness",
+    "handshake_probe_target", "proton_liveness", "VLESS_MEMORY_SEC",
     # stats
     "load_stats", "record_outcome", "record_rtts", "record_handshake_probes",
     # parsing / import
@@ -71,6 +75,7 @@ __all__ = [
     "CLOUDFLARE_WARP_PEER_KEY", "CHECK_CONFLICT_SINGLE_SESSION", "CHECK_CONFLICT_SAME_PEER", "CHECK_CONFLICT_SHARED_KEY",
     "live_check_conflict",
     "looks_like_masque_identity", "normalize_masque_identity", "masque_fingerprint",
+    "vless_available", "parse_vless_profile", "vless_profile_payload", "vless_node_of_record",
     "parse_import_text", "safe_profile_name", "import_candidates", "delete_profile", "rename_profile",
     # migration
     "migrate_legacy_layout",
@@ -83,8 +88,13 @@ PROFILES_DIRNAME = "profiles"
 GROUP_CLOUDFLARE = "AWG Cloudflare"
 GROUP_PROTON = "AWG Proton"
 GROUP_MASQUE = "MASQUE"
+# VLESS nodes (imported links and subscriptions). Its own group rather than Custom, although the
+# owner's rule is that every import lands in Custom: a Custom profile is started as a WireGuard
+# config by wireproxy, and a VLESS node needs a different helper entirely (bin/nova-xray.exe). One
+# folder per backend is what keeps "choose this profile" from meaning "start the wrong program".
+GROUP_VLESS = "VLESS"
 GROUP_CUSTOM = "Custom"
-GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_MASQUE, GROUP_CUSTOM)
+GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_MASQUE, GROUP_VLESS, GROUP_CUSTOM)
 RUNTIME_DIRNAME = ".runtime"
 RELAY_KEY_FILENAME = "opera_relay.key"
 LEGACY_AWG_DIRNAME = "awg"
@@ -99,7 +109,11 @@ LEGACY_AWG_STATE_FILENAME = "awg-profile-state.json"
 # Private material that sits next to profiles but is not a profile itself. warp_native_profile.json
 # is nova.pyw's personal overlay identity (moved out of temp/); it has private_key and would
 # otherwise pass for a MASQUE identity.
-PRIVATE_FILENAMES = ("warp_identity.json", "proton_account.json", "proton_nodes.json", "warp_native_profile.json")
+# subscriptions.json sits in `profiles/` root rather than in a group, so the listing does not reach
+# it today -- it is named here because its URLs can carry a token, and the day the scan widens is
+# not the day to remember that.
+PRIVATE_FILENAMES = ("warp_identity.json", "proton_account.json", "proton_nodes.json",
+                     "warp_native_profile.json", "subscriptions.json")
 # Folders where Nova keeps its own non-profile JSON: an unrelated JSON there is not listed. In
 # MASQUE and Custom every JSON is a profile, broken or not, so it stays visible and deletable.
 _NON_PROFILE_JSON_GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON)
@@ -112,14 +126,17 @@ _MODES = (MODE_AUTO, MODE_GROUP, MODE_PROFILE)
 
 BACKEND_AWG = "awg"
 BACKEND_MASQUE = "masque"
+BACKEND_VLESS = "vless"
 BACKEND_WARP_CLI = "warp-cli"
 
 ORIGIN_BUNDLED = "bundled"
 ORIGIN_GENERATED = "generated"
 ORIGIN_IMPORTED = "imported"
+ORIGIN_SUBSCRIPTION = "subscription"
 
 KIND_AWG = "awg"
 KIND_MASQUE = "masque"
+KIND_VLESS = "vless"
 
 AUTO_GENERATED_LEAD_LIMIT = 12
 AUTO_PROTON_LIMIT = 10
@@ -157,6 +174,11 @@ _BUNDLED_NAME_RE = re.compile(r"(?i)WARPv[0-9A-Za-z_-]*")
 _GENERATED_WARP_NAME_RE = re.compile(r"(?i)WARPgen_[0-9]+")
 _GENERATED_PROTON_NAME_RE = re.compile(r"(?i)[A-Z]{2,3}-FREE-[0-9]+")
 _RUNTIME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# A vless link runs to the end of its line, not to the first space: `#`, `{`, `}` and
+# spaces are all legal inside it -- the fragment holds the node name ("Test NL", flags and
+# all) and `extra=` holds JSON. Cutting at whitespace truncated exactly those names. A
+# second link on the same line ends the first, so a pasted pair is two candidates.
+VLESS_URI_RE = re.compile(r"(?i)vless://(?:(?!vless://)[^\r\n])+")
 
 # --------------------------------------------------------------------------------------------
 # Issue texts (user-visible, Russian)
@@ -196,6 +218,12 @@ ISSUE_AMNEZIA_UNREADABLE = (
 )
 ISSUE_TEXT_TOO_LARGE = "Текст слишком большой для импорта"
 ISSUE_UNKNOWN_KIND = "Неизвестный вид профиля"
+
+ISSUE_VLESS_NOT_JSON = "Файл не разбирается как JSON"
+ISSUE_VLESS_NO_URI = "В файле нет ссылки vless://"
+ISSUE_VLESS_BAD_URI = "Ссылка vless:// не разбирается"
+# Followed by ": <reason>" from nova_vless.validate.
+ISSUE_VLESS_UNUSABLE = "Узел VLESS не заработает"
 
 _WARNING_ISSUES = frozenset({WARNING_AWG3})
 
@@ -949,6 +977,61 @@ _FILE_CACHE = {}
 _FILE_CACHE_LOCK = threading.Lock()
 
 
+# nova_vless is imported softly: a helper module missing from an installed build must not take the
+# whole profile list down with it. Inno.py's RESOURCE_ROOT_FILES skips an unlisted file in silence
+# (G30), and that class of defect has reached users before -- here it degrades to "VLESS profiles
+# are listed as unreadable" instead of "the «Профили» window does not open".
+try:
+    import nova_vless as _nova_vless
+except ImportError:  # pragma: no cover - only in a build that failed to ship the module
+    _nova_vless = None
+
+
+def vless_available():
+    """True when this build can read VLESS profiles at all (resources/nova_vless.py shipped)."""
+    return _nova_vless is not None
+
+
+def parse_vless_profile(obj):
+    """A profile file's parsed JSON -> (node, issues). `node` is None when there is nothing usable."""
+    if _nova_vless is None:
+        return None, [ISSUE_VLESS_NOT_JSON]
+    if not isinstance(obj, dict):
+        return None, [ISSUE_VLESS_NOT_JSON]
+    uri = obj.get("uri") or obj.get("link") or ""
+    if not str(uri).strip():
+        return None, [ISSUE_VLESS_NO_URI]
+    node = _nova_vless.parse_uri(uri)
+    if node is None:
+        return None, [ISSUE_VLESS_BAD_URI]
+    reason = _nova_vless.validate(node)
+    return node, ([f"{ISSUE_VLESS_UNUSABLE}: {reason}"] if reason else [])
+
+
+def vless_profile_payload(node, *, source=ORIGIN_IMPORTED, subscription=""):
+    """The bytes written to `profiles/VLESS/<name>.json` for one node."""
+    payload = node.to_dict()
+    payload["source"] = str(source or ORIGIN_IMPORTED)
+    if subscription:
+        payload["subscription"] = str(subscription)
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def vless_node_of_record(record):
+    """The `VlessNode` behind a listed record, or None when it is not a readable VLESS profile."""
+    if _nova_vless is None or not isinstance(record, dict):
+        return None
+    if record.get("kind") != KIND_VLESS or not record.get("path"):
+        return None
+    try:
+        data = _read_profile_bytes(record["path"])
+        obj = _loads_strict_json(_meant_text(data))
+    except (OSError, ValueError):
+        return None
+    node, _issues = parse_vless_profile(obj)
+    return node
+
+
 def _is_ignored_filename(name):
     low = name.lower()
     return name.startswith(".") or low.endswith(_IGNORED_SUFFIXES) or low in PRIVATE_FILENAMES
@@ -965,6 +1048,10 @@ def _origin_for(group, name, masque_source=""):
         return ORIGIN_GENERATED if _GENERATED_PROTON_NAME_RE.fullmatch(name) else ORIGIN_IMPORTED
     if group == GROUP_MASQUE:
         return ORIGIN_IMPORTED if str(masque_source or "").lower().startswith("import") else ORIGIN_GENERATED
+    if group == GROUP_VLESS:
+        # A node that came from a subscription is shown apart from one the owner pasted, because
+        # only the first is the subscription's to remove on the next refresh.
+        return ORIGIN_SUBSCRIPTION if str(masque_source or "") == ORIGIN_SUBSCRIPTION else ORIGIN_IMPORTED
     return ORIGIN_IMPORTED
 
 
@@ -994,6 +1081,35 @@ def _conf_file_info(path):
     }
 
 
+def _looks_like_vless_profile(obj):
+    """A profile file written by `vless_profile_payload`, or anything else carrying a vless link."""
+    if not isinstance(obj, dict):
+        return False
+    if str(obj.get("type") or "").strip().lower() == "vless":
+        return True
+    return bool(str(obj.get("uri") or "").strip().lower().startswith("vless://"))
+
+
+def _vless_file_info(path, obj, encoding_issue):
+    node, issues = parse_vless_profile(obj)
+    if encoding_issue:
+        issues = [encoding_issue] + issues
+    source = ""
+    if isinstance(obj, dict):
+        source = str(obj.get("source") or "")
+    return {
+        "kind": KIND_VLESS,
+        # The identity is the node's, not the file's: the same node under two names is one node,
+        # which is what makes a subscription refresh a diff rather than a replacement.
+        "identity": node.identity if node is not None else path,
+        "endpoint": node.endpoint if node is not None else "",
+        "valid": node is not None and not any(is_fatal_issue(issue) for issue in issues),
+        "issues": issues,
+        "fingerprint": node.identity if node is not None else "",
+        "masque_source": source,
+    }
+
+
 def _json_file_info(path, group):
     data = _read_profile_bytes(path)
     try:
@@ -1001,6 +1117,21 @@ def _json_file_info(path, group):
     except ValueError:
         obj = None
     encoding_issue = _file_encoding_issue(data)
+    # The file's own `type` decides, not the folder: a VLESS profile dropped into Custom is still a
+    # VLESS profile, and starting it as a WireGuard config would fail with an unreadable message.
+    if _looks_like_vless_profile(obj):
+        return _vless_file_info(path, obj, encoding_issue)
+    if group == GROUP_VLESS:
+        return {
+            "kind": KIND_VLESS,
+            "identity": path,
+            "endpoint": "",
+            "valid": False,
+            "issues": ([encoding_issue] if encoding_issue else [])
+            + [ISSUE_VLESS_NOT_JSON if obj is None else ISSUE_VLESS_NO_URI],
+            "fingerprint": "",
+            "masque_source": "",
+        }
     if not looks_like_masque_identity(obj):
         if group in _NON_PROFILE_JSON_GROUPS:
             return None  # Nova's own non-profile JSON can sit in the AWG folders
@@ -1044,8 +1175,12 @@ def _file_info(path, st, ext, group):
         except (OSError, ValueError) as exc:
             reason = getattr(exc, "strerror", None) or str(exc)
             # Not cached: a file that is being written right now is re-read next time.
+            if ext != ".json":
+                fallback_kind = KIND_AWG
+            else:
+                fallback_kind = KIND_VLESS if group == GROUP_VLESS else KIND_MASQUE
             return {
-                "kind": KIND_MASQUE if ext == ".json" else KIND_AWG,
+                "kind": fallback_kind,
                 "identity": path,
                 "endpoint": "",
                 "valid": False,
@@ -1287,8 +1422,11 @@ def resolve_effective_selection(sel, profiles):
 # Attempt plans
 
 
+_BACKEND_BY_KIND = {KIND_MASQUE: BACKEND_MASQUE, KIND_VLESS: BACKEND_VLESS}
+
+
 def _attempt(record):
-    backend = BACKEND_MASQUE if record.get("kind") == KIND_MASQUE else BACKEND_AWG
+    backend = _BACKEND_BY_KIND.get(record.get("kind"), BACKEND_AWG)
     return {"backend": backend, "profile": record}
 
 
@@ -1322,13 +1460,38 @@ def _stats_failures(stats, record):
     return _as_int(entry.get("fail"), 0) if isinstance(entry, dict) else 0
 
 
+def _endpoint_is_name(record):
+    """True when the profile's Endpoint is a host name rather than an address literal.
+
+    Three of the shipped seeds point at `engage.cloudflareclient.com` instead of an address. A name
+    has to be resolved before the tunnel can even be attempted, and when that resolution is the
+    thing being blocked the attempt does not fail fast — Nova Android measured one such first
+    attempt at **83 seconds instead of 6** and moved its name-addressed profiles to the tail for
+    exactly this reason. The connect budget here is 10 s per profile, so three of them at the head
+    of the very first pass is half a minute before anything that can work is tried.
+    """
+    host = _split_endpoint(str((record or {}).get("endpoint") or ""))
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host[0])
+    except ValueError:
+        return True
+    return False
+
+
 def _identity_round_robin(records, preferred_id=""):
     """nova.pyw `_get_ordered_awg_profiles`: one profile per identity per pass, preferred first.
 
-    The pre-sort is by lowercased name, as nova.pyw did (not natural order): it decides both
-    the bucket order and the draw order inside a bucket, so it must not change.
+    Inside that, a profile whose Endpoint is a name goes behind the literals of its own identity
+    (see `_endpoint_is_name`). Everything else about the order is unchanged: the pre-sort is by
+    lowercased name, as nova.pyw did (not natural order), and it decides both the bucket order and
+    the draw order inside a bucket.
     """
-    ordered_input = sorted(records, key=lambda r: str(r.get("name", "")).lower())
+    ordered_input = sorted(
+        records,
+        key=lambda r: (_endpoint_is_name(r), str(r.get("name", "")).lower()),
+    )
     buckets = {}
     for record in ordered_input:
         buckets.setdefault(record.get("identity"), []).append(record)
@@ -1472,6 +1635,48 @@ def _proton_order(records, stats, now=None):
     return sorted(records, key=key)
 
 
+# A node that has not been reached in this long is no longer evidence of anything: public VLESS
+# nodes are rented, moved and filtered constantly.
+VLESS_MEMORY_SEC = 24 * 3600
+
+
+def _vless_order(records, stats, now=None):
+    """The order «Подключить группу» walks a VLESS group in.
+
+    Public free nodes are mostly dead — measured 2026-09-20 over the largest Russian-reachable
+    aggregator: 55 % of nodes answered TCP at all and **4 of 60 of those carried real traffic**.
+    Walking such a list in name order would try dozens of corpses before the first live node, so
+    what this install has actually reached decides: a node that worked recently first, then the
+    ones that answered a latency probe (nearest first), then the never-tried, and the ones that
+    failed since their last success last of all. Evidence older than a day is ignored rather than
+    trusted, because a node that worked yesterday is a coin toss today.
+    """
+    now = time.time() if now is None else float(now)
+
+    def key(record):
+        entry = _stats_entry(stats, record)
+        last_ok = _as_float(entry.get("last_ok_at"), 0.0)
+        last_fail = _as_float(entry.get("last_fail_at"), 0.0)
+        fresh_ok = last_ok and 0 <= now - last_ok < VLESS_MEMORY_SEC and last_ok >= last_fail
+        rtt = entry.get("rtt_ms")
+        rtt_at = _as_float(entry.get("rtt_at"), 0.0)
+        fresh_rtt = rtt is not None and rtt_at and 0 <= now - rtt_at < VLESS_MEMORY_SEC
+        if fresh_ok:
+            bucket = 0
+        elif fresh_rtt:
+            bucket = 1
+        elif not last_fail:
+            bucket = 2
+        else:
+            bucket = 3
+        distance = int(rtt) if fresh_rtt else PROTON_UNKNOWN_DISTANCE_MS
+        # Inside a bucket: nearest first, then the least recently failed, then by name so the order
+        # is stable between runs and the window does not reshuffle under the owner's hand.
+        return (bucket, distance, last_fail, natural_key(record["name"]))
+
+    return sorted(records, key=key)
+
+
 def _masque_locked_out(record, stats, now):
     """True while «Авто» should not guess this MASQUE profile (see AUTO_MASQUE_FAILURE_LIMIT)."""
     entry = _stats_entry(stats, record)
@@ -1491,7 +1696,7 @@ def _contains_preferred(records, preferred_id):
 
 
 def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, stats=None, now=None):
-    """Ordered attempts for a connect: `[{"backend": "awg"|"masque"|"warp-cli", "profile": record|None}]`.
+    """Ordered attempts: `[{"backend": "awg"|"masque"|"vless"|"warp-cli", "profile": record|None}]`.
 
     Own profiles -- issued for this install (generated WARP, Proton, MASQUE) -- always go before the
     shared seeds everyone got with the installer (owner's rule: switch to personal profiles whenever
@@ -1503,7 +1708,10 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
     auto:    own Cloudflare (healthy, by rtt, <=12) -> MASQUE (skipped after repeated failures)
              -> Proton (<=10, connect queue) -> shared Cloudflare seeds (identity round-robin)
              -> own Cloudflare that failed -> warp-cli. The segment holding an own `preferred_id`
-             moves to the front. Custom is never part of auto.
+             moves to the front. Custom and VLESS are never part of auto: both hold profiles whose
+             quality Nova cannot vouch for -- a Custom conf is the owner's, a VLESS node is a
+             stranger's -- and a dead one in the automatic ladder would cost every connect its
+             timeout. They are reached by choosing the group or the profile.
     group:   that group only, never warp-cli; own profiles before seeds; Proton by the connect
              queue, narrowed to `country` when the selection names one.
     profile: exactly that profile.
@@ -1535,6 +1743,8 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
             country = effective.get("country", "")
             group_members = [r for r in members(group) if not country or record_country(r) == country]
             ordered = _front(_proton_order(group_members, stats, now), preferred)
+        elif group == GROUP_VLESS:
+            ordered = _front(_vless_order(members(group), stats, now), preferred)
         else:
             ordered = _front(_stats_order(members(group), stats), preferred)
         return [_attempt(r) for r in ordered]
@@ -1581,7 +1791,13 @@ def build_recovery_plan(plan, failed_id, budget=DEFAULT_RECOVERY_BUDGET):
             mates.append(attempt)
         else:
             others.append(attempt)
-    head = [failed_attempt] if failed is not None and failed.get("group") == GROUP_PROTON else []
+    # The failed profile goes first when it is Proton (the reason is in the docstring) and when it
+    # is the only candidate there is. An explicit group of one used to get an empty recovery plan:
+    # the tunnel died, the watchdog had nothing to try, and the choice stayed dead until something
+    # else triggered a start. Retrying the one profile is not a great answer, but it is the only
+    # one, and a tunnel dies for reasons a restart often clears.
+    alone = failed is not None and not others and not mates
+    head = [failed_attempt] if failed is not None and (failed.get("group") == GROUP_PROTON or alone) else []
     return (head + others + mates)[:max(0, _as_int(budget, DEFAULT_RECOVERY_BUDGET))]
 
 
@@ -1831,6 +2047,32 @@ def _invalid_candidate(name, issues, kind=KIND_AWG):
             "ok": False, "fingerprint": ""}
 
 
+def _vless_candidate(uri, stem=""):
+    """One `vless://` link -> an import candidate of kind VLESS.
+
+    The name comes from the link's own `#remark` when it has one, because that is what the owner
+    reads in the window; a subscription's remarks carry the country and the provider. It falls
+    back to `host:port`, never to the source file's name — a list of 300 nodes would otherwise
+    import as 300 profiles all called the same thing.
+    """
+    if _nova_vless is None:
+        return _invalid_candidate(stem or "VLESS", [ISSUE_VLESS_BAD_URI], kind=KIND_VLESS)
+    node = _nova_vless.parse_uri(uri)
+    if node is None:
+        return _invalid_candidate(stem or "VLESS", [ISSUE_VLESS_BAD_URI], kind=KIND_VLESS)
+    reason = _nova_vless.validate(node)
+    issues = ["{}: {}".format(ISSUE_VLESS_UNUSABLE, reason)] if reason else []
+    return {
+        "kind": KIND_VLESS,
+        "name": _nova_vless.safe_profile_name(node) or stem or node.endpoint,
+        "text": vless_profile_payload(node).decode("utf-8"),
+        "endpoint": node.endpoint,
+        "issues": issues,
+        "ok": not issues,
+        "fingerprint": node.identity,
+    }
+
+
 def _masque_candidate(obj, name=""):
     identity, issues = normalize_masque_identity(obj)
     source = "import-usque" if "id" in obj and "device_id" not in obj else "import-android"
@@ -1997,6 +2239,13 @@ def parse_import_text(text, source_name=""):
 
     found = []
     consumed = []
+    # vless:// is scanned first: its query may carry JSON (an `extra=` parameter does) and the
+    # MASQUE scan below would otherwise eat half the link starting at that brace.
+    for match in re.finditer(VLESS_URI_RE, text):
+        # Trailing quotes and brackets come from links pasted out of JSON, HTML or a chat message.
+        link = match.group(0).rstrip().rstrip("\"'<>),;")
+        found.append((match.start(), _vless_candidate(link, stem)))
+        consumed.append((match.start(), match.start() + len(link)))
     for match in re.finditer(r"(?i)vpn://[A-Za-z0-9_\-+/=]*", text):
         found.append((match.start(), _amnezia_candidate(match.group(0), stem)))
         consumed.append((match.start(), match.end()))
@@ -2089,20 +2338,36 @@ def _write_new_file(folder, base_name, ext, data):
     raise OSError(f"слишком много профилей с именем «{base_name}»")
 
 
-def import_candidates(base_dir, candidates):
-    """Write accepted candidates to `profiles/Custom/`; never touches the selection.
+def import_candidates(base_dir, candidates, *, source=ORIGIN_IMPORTED, subscription=""):
+    """Write accepted candidates to their group; never touches the selection.
+
+    AWG and MASQUE land in `profiles/Custom/` as before; VLESS lands in `profiles/VLESS/`, because
+    the folder is what decides which helper a chosen profile starts.
+
+    `source`/`subscription` stamp the written VLESS files, so a later subscription refresh can tell
+    the nodes it owns from the ones the owner pasted by hand.
 
     Each candidate is re-validated from its `text` (the preview may have edited the name).
     Returns `[{"name","status":"imported"|"duplicate"|"invalid","id","issues"}]`; a duplicate is
     the same fingerprint as any existing profile in any group, or an earlier candidate.
     """
     results = []
-    folder = os.path.join(profiles_dir(base_dir), GROUP_CUSTOM)
-    try:
-        os.makedirs(folder, exist_ok=True)
-    except OSError as exc:
-        issue = f"Не удалось создать папку {GROUP_CUSTOM}: {exc.strerror or exc}"
-        return [{"name": str((c or {}).get("name") or ""), "status": "invalid", "id": "", "issues": [issue]}
+    folders = {}
+
+    def folder_for(group):
+        """The group's folder, created on demand; on failure the message takes its place."""
+        if group not in folders:
+            path = os.path.join(profiles_dir(base_dir), group)
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as exc:
+                path = f"Не удалось создать папку {group}: {exc.strerror or exc}"
+            folders[group] = path
+        return folders[group]
+
+    probe = folder_for(GROUP_CUSTOM)
+    if not os.path.isdir(probe):
+        return [{"name": str((c or {}).get("name") or ""), "status": "invalid", "id": "", "issues": [probe]}
                 for c in candidates or []]
     known = {}
     for record in list_profiles(base_dir):
@@ -2114,6 +2379,7 @@ def import_candidates(base_dir, candidates):
         kind = candidate.get("kind")
         name = str(candidate.get("name") or "")
         text = _coerce_text(candidate.get("text"))
+        group = GROUP_CUSTOM
         if kind == KIND_AWG and text.strip():
             fresh = _conf_candidate(text, name=name)
             ext = ".conf"
@@ -2127,6 +2393,18 @@ def import_candidates(base_dir, candidates):
                 continue
             fresh = _masque_candidate(obj, name=name)
             ext = ".json"
+        elif kind == KIND_VLESS and text.strip():
+            try:
+                obj = _loads_strict_json(text)
+            except ValueError:
+                obj = None
+            link = str((obj or {}).get("uri") or "") or text
+            fresh = _vless_candidate(link, stem=name)
+            if name:
+                # The preview may have renamed it; the link keeps its own remark either way.
+                fresh = dict(fresh, name=name)
+            ext = ".json"
+            group = GROUP_VLESS
         else:
             issues = list(candidate.get("issues") or []) or [ISSUE_UNKNOWN_KIND]
             results.append({"name": name, "status": "invalid", "id": "", "issues": issues})
@@ -2140,13 +2418,22 @@ def import_candidates(base_dir, candidates):
                             "issues": fresh["issues"]})
             continue
         safe = safe_profile_name(fresh["name"]) or safe_profile_name(fresh["endpoint"]) or "Профиль"
+        folder = folder_for(group)
+        if not os.path.isdir(folder):
+            results.append({"name": fresh["name"], "status": "invalid", "id": "", "issues": [folder]})
+            continue
+        payload = fresh["text"].encode("utf-8")
+        if kind == KIND_VLESS and source != ORIGIN_IMPORTED and _nova_vless is not None:
+            node = _nova_vless.parse_uri(link)
+            if node is not None:
+                payload = vless_profile_payload(node, source=source, subscription=subscription)
         try:
-            _path, stem = _write_new_file(folder, safe, ext, fresh["text"].encode("utf-8"))
+            _path, stem = _write_new_file(folder, safe, ext, payload)
         except OSError as exc:
             issue = f"Не удалось записать файл: {exc.strerror or exc}"
             results.append({"name": fresh["name"], "status": "invalid", "id": "", "issues": [issue]})
             continue
-        profile_id = make_profile_id(GROUP_CUSTOM, stem)
+        profile_id = make_profile_id(group, stem)
         known[fresh["fingerprint"]] = profile_id
         results.append({"name": stem, "status": "imported", "id": profile_id, "issues": fresh["issues"]})
     return results
@@ -2281,8 +2568,15 @@ def _rename_masque_files(record, target):
         _release_masque_lock(lock, source)
 
 
+RENAMABLE_GROUPS = (GROUP_CUSTOM, GROUP_VLESS)
+
+
 def rename_profile(base_dir, profile_id, new_name):
-    """Rename a Custom profile; returns the new id. Raises ValueError (Russian) or OSError.
+    """Rename an imported profile; returns the new id. Raises ValueError (Russian) or OSError.
+
+    Imported means Custom or VLESS: both hold files the user brought in, and both offer the button
+    in «Профили». The issued groups do not — a Cloudflare, Proton or MASQUE name is what the issuing
+    code recognises its own profiles by.
 
     A MASQUE profile takes nova-go's `.pending` / `.pending.<unix>.bak` along (an interrupted
     enroll resumes under the new name) and is refused while nova-go holds its lock.
@@ -2290,8 +2584,9 @@ def rename_profile(base_dir, profile_id, new_name):
     record = _find_record(base_dir, profile_id)
     if record is None:
         raise ValueError(f"Профиль «{profile_id}» не найден")
-    if record["group"] != GROUP_CUSTOM:
-        raise ValueError(f"Переименовать можно только профили группы «{GROUP_CUSTOM}»")
+    if record["group"] not in RENAMABLE_GROUPS:
+        groups = " и ".join(f"«{g}»" for g in RENAMABLE_GROUPS)
+        raise ValueError(f"Переименовать можно только профили групп {groups}")
     safe = safe_profile_name(new_name)
     if not safe:
         raise ValueError("Пустое имя профиля")
@@ -2313,7 +2608,7 @@ def rename_profile(base_dir, profile_id, new_name):
         _rename_masque_files(record, target)
     else:
         os.rename(record["path"], target)
-    new_id = make_profile_id(GROUP_CUSTOM, safe)
+    new_id = make_profile_id(record["group"], safe)
     _move_stats_entry(base_dir, record["id"], new_id)
     _remove_quietly(runtime_config_path(base_dir, record["id"]))
     selection = load_selection(base_dir)

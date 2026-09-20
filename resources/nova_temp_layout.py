@@ -72,6 +72,16 @@ ENTRIES = (
       "лог помощника, выполняющего рукопожатия TLS"),
     E("nova-go-masque.log", "log", "nova-go.exe (masque socks)", "человек/агент",
       "лог MASQUE-помощника: события NOVA_MASQUE и ошибки. Усекается на каждом запуске"),
+    E("nova-xray.log", "log", "nova-xray.exe", "человек/агент",
+      "лог помощника VLESS: что ядро Xray сделало с соединением. Имя узла в строках есть, "
+      "ключа пользователя нет — он только в profiles/.runtime", needle='"nova-xray.log"'),
+    E("nova-xray-secondary.log", "log", "nova-xray.exe (резервный слот)", "человек/агент",
+      "то же для профиля VLESS, занявшего слот дополнительного VPN (порты 1379/1380). "
+      "Отдельный файл, потому что два экземпляра пишут одновременно",
+      needle='"nova-xray-secondary.log"'),
+    E("wireproxy-secondary.log", "log", "wireproxy-awg.exe (резервный слот)", "человек/агент",
+      "то же для своего профиля AWG в слоте дополнительного VPN",
+      needle='"wireproxy-secondary.log"'),
 
     # --- состояние: влияет на поведение ----------------------------------
     E("checker_state.json", "state", "nova.pyw", "nova.pyw",
@@ -140,10 +150,16 @@ ENTRIES = (
     # проблеме (I19). Они живут в profiles/.runtime.
     E("masque-ready.json", "runtime", "nova-go.exe (masque socks)", "nova.pyw",
       "сигнал готовности MASQUE: транспорт, точка входа, SNI. Без ключей"),
+    E("vless-ready.json", "runtime", "nova-xray.exe", "nova.pyw",
+      "сигнал готовности VLESS: pid помощника и версия Xray. Без ключей и без адреса узла"),
+    E("vless-ready-secondary.json", "runtime", "nova-xray.exe (резервный слот)", "nova.pyw",
+      "то же для экземпляра, обслуживающего дополнительный VPN. Своё имя нужно затем, "
+      "что помощник удаляет файл готовности и на старте, и на остановке",
+      needle='"vless-ready-secondary.json"'),
     E("vpn-egress.json", "runtime", "nova.pyw (nova_vpn_slots.py)", "tcp_proxy.py, tgrelay/transport.py",
       "что сейчас основной и дополнительный VPN: вид, подпись, поднят ли, страна выхода основного "
-      "и порты дополнительного (Opera 1371 или Tor 1378). По стране решается, пускать ли список EU "
-      "через основной. Без адресов"),
+      "и порты дополнительного (Opera 1371, Tor 1375/1378 или свой профиль 1379/1380). По стране "
+      "решается, пускать ли список EU через основной. Без адресов"),
     E("tor/", "runtime", "nova_tor.py", "nova-tor.exe, nova-lyrebird.exe",
       "Tor: torrc, pt_state/, tor.log, tor.stdout.log, lyrebird.log, tor.pid, control_port, "
       "bridges.json (только публичные строки мостов), auto_entry.txt. "

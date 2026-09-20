@@ -304,6 +304,9 @@ import nova_exit_probe
 import nova_latency
 import nova_issuance
 import nova_wg_probe
+import nova_vless
+import nova_subscriptions
+import nova_ping
 import nova_boot_timeline as boot_timeline
 import nova_win_routes
 import nova_dns_ai
@@ -1851,7 +1854,7 @@ try:
         SERVICE_NAME = "CloudflareWARP"
         # Backends served by a helper process of ours on the SOCKS port (payload probe,
         # profile recovery, stop by handle). "cloudflare" is the warp-cli path.
-        USERSPACE_BACKENDS = ("awg", "masque")
+        USERSPACE_BACKENDS = ("awg", "masque", "vless")
         MASQUE_READY_TIMEOUT_SEC = 150.0
         # In «Авто» MASQUE is a guess among several transports, not the user's request: a network
         # that cuts it must not hold the whole start for 150 s (P19 cost exactly that). The helper is
@@ -1859,6 +1862,11 @@ try:
         MASQUE_AUTO_READY_TIMEOUT_SEC = 30.0
         # Payload probe budget on the MASQUE backend (see _test_awg_backend_ready).
         MASQUE_PROBE_BUDGET_SEC = 10.0
+        # Payload probe budget on the VLESS backend. Xray dials the node on every new SOCKS flow --
+        # a TLS/REALITY handshake to a stranger's server abroad, not the local hop wireproxy has
+        # already built. The start path already grants 12 s (VLESS_READY_TIMEOUT_SEC) for the same
+        # reason; a 4 s watchdog probe on the same tunnel would call a slow-but-alive node dead.
+        VLESS_PROBE_BUDGET_SEC = 8.0
         MASQUE_ENROLL_FRESH_SEC = 300.0
         # nova-go masque exit codes (nova-go/masque/cli.go) -> the reason shown in the log.
         MASQUE_EXIT_REASONS = {
@@ -2029,6 +2037,7 @@ try:
             self.warp_svc_path = os.path.join(self.bin_dir, "warp-svc.exe")
             self.wireproxy_awg_path = os.path.join(self.bin_dir, "wireproxy-awg.exe")
             self.nova_go_path = os.path.join(self.bin_dir, "nova-go.exe")
+            self.nova_xray_path = os.path.join(self.bin_dir, "nova-xray.exe")
             self.temp_dir = os.path.join(get_base_dir(), "temp")
             self.warp_connect_profile_path = os.path.join(self.temp_dir, "warp-connect-profile.json")
             self.warp_bootstrap_profiles_path = os.path.join(get_base_dir(), "strat", WARP_STRATEGIES_FILENAME)
@@ -2056,11 +2065,25 @@ try:
             self.masque_active_profile_name = ""
             self.masque_ready_path = os.path.join(self.temp_dir, "masque-ready.json")
             self.masque_log_path = os.path.join(self.temp_dir, "nova-go-masque.log")
+            # VLESS (bin/nova-xray.exe) is the third helper on the same port and the same contract:
+            # it serves SOCKS5 on 1370 and is judged ready by a probe through it, exactly like the
+            # other two. The rendered Xray configuration carries the node's user id, so it goes
+            # under profiles/.runtime/ with the wireproxy configs, never into temp/ (I19).
+            self.vless_process = None
+            self.vless_log_handle = None
+            self.vless_active_profile_name = ""
+            self.vless_runtime_config_path = ""
+            self.vless_ready_path = os.path.join(self.temp_dir, "vless-ready.json")
+            self.vless_log_path = os.path.join(self.temp_dir, "nova-xray.log")
             # Full profile id ("AWG Cloudflare/WARPv1_11") of the backend that carries traffic.
             self.active_profile_id = ""
             self.last_plan_reason = ""
             self._selection_restart_lock = threading.Lock()
             self._selection_restart_pending = False
+            # The selection generation whose group has already been refreshed after a total failure.
+            # One fresh set per choice: a re-issue is a new anonymous Proton account, and a loop of
+            # them is exactly what their anti-abuse counts.
+            self._refreshed_generation = -1
             # Bumped by apply_selection_now(): a start or recovery walking the previous
             # plan stops at its next attempt instead of finishing a choice the user replaced.
             self._selection_generation = 0
@@ -2318,7 +2341,13 @@ try:
             except:
                 return False
 
-        def _render_awg_runtime_payload(self, profile, allow_personal_identity=True):
+        def _render_awg_runtime_payload(self, profile, allow_personal_identity=True,
+                                        socks_port=None, http_port=0):
+            """The wireproxy config text for a profile.
+
+            `socks_port` defaults to the primary's own port; the reserve slot passes its own, plus an
+            `http_port` so the slot's HTTP CONNECT consumers reach the same tunnel.
+            """
             profile_path = str(profile.get("path", "") or "").strip()
             if not profile_path or not os.path.exists(profile_path):
                 return "", False
@@ -2391,9 +2420,20 @@ try:
             lines.extend([
                 "",
                 "[Socks5]",
-                f"BindAddress = 127.0.0.1:{int(self.port)}",
+                f"BindAddress = 127.0.0.1:{int(socks_port or self.port)}",
                 "",
             ])
+            if http_port:
+                # wireproxy serves HTTP CONNECT from the same tunnel as SOCKS5 (verified against the
+                # shipped wireproxy-awg.exe on 2026-09-20: both listeners bind). The primary needs
+                # only SOCKS5 -- the PAC and every helper dial it that way -- but the reserve slot is
+                # consumed through one HTTP CONNECT port under the label `opera-http`, so a profile
+                # serving that slot has to offer both.
+                lines.extend([
+                    "[http]",
+                    f"BindAddress = 127.0.0.1:{int(http_port)}",
+                    "",
+                ])
             return "\n".join(lines), using_personal_identity
 
         def _write_awg_runtime_config(self, profile, allow_personal_identity=True):
@@ -2429,9 +2469,58 @@ try:
                 return []
 
         def _kill_awg_proxy_orphans(self):
+            """Kill stray wireproxy helpers — but never a check's own.
+
+            This used to be `taskkill /IM wireproxy-awg.exe /T`, which takes every wireproxy on the
+            machine. «Проверить» runs one of its own on a free loopback port, so any start or
+            recovery that swept the orphans while a check was in flight recorded a perfectly good
+            profile as «сбой». «Проверить список» makes that the normal case rather than a race,
+            because it keeps checks running for as long as the sweep lasts.
+
+            By pid, therefore, with the checks' pids held out. A pid that has already exited is
+            simply not in the list, and `taskkill` is given only what is there.
+
+            nova-xray.exe is swept the same way. It holds the same port 1370 when a VLESS profile is
+            the primary, and nothing else frees it: it has no orphan sweep of its own, only its
+            --parent-pid watchdog, which polls every 2 s and does nothing at all if the parent pid
+            was reused. The protected set covers the reserve slot's helper as well as the checks'
+            (`_note_awg_check_pid`), so a secondary-slot tunnel on 1379/1380 is never reaped here.
+            """
+            listing = ""
+            for image in ("wireproxy-awg.exe", "nova-xray.exe"):
+                try:
+                    listing += subprocess.run(
+                        ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        creationflags=subprocess.CREATE_NO_WINDOW, timeout=4,
+                    ).stdout or ""
+                except:
+                    pass
+            # Read after the listing, never before it: a helper that registered itself while
+            # tasklist was running would otherwise be in the list and not in the exemption.
+            protected = _awg_check_pids()
+            targets = []
+            for line in listing.splitlines():
+                parts = [field.strip().strip('"') for field in line.split('","')]
+                if len(parts) < 2:
+                    continue
+                try:
+                    pid = int(parts[1])
+                except (TypeError, ValueError):
+                    continue
+                if pid and pid not in protected and pid not in targets:
+                    targets.append(pid)
+            if not targets:
+                # Nothing to kill, or tasklist said nothing we could read. Not falling back to
+                # /IM on purpose: killing the checks is the defect this exists to avoid.
+                return
+            command = ["taskkill", "/F"]
+            for pid in targets:
+                command += ["/PID", str(pid)]
+            command.append("/T")
             try:
                 subprocess.run(
-                    ["taskkill", "/F", "/IM", "wireproxy-awg.exe", "/T"],
+                    command,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
@@ -2490,16 +2579,37 @@ try:
                         os.remove(self.masque_ready_path)
             except:
                 pass
+            vless_stopped = False
+            try:
+                # By handle only, like the MASQUE helper: another nova-xray.exe may be a check of a
+                # different profile running beside the live tunnel on its own port.
+                vless_proc = getattr(self, "vless_process", None)
+                if vless_proc:
+                    try:
+                        if vless_proc.poll() is None:
+                            vless_stopped = True
+                            vless_proc.terminate()
+                            try:
+                                vless_proc.wait(timeout=4)
+                            except:
+                                vless_proc.kill()
+                                vless_proc.wait(timeout=3)
+                    except:
+                        pass
+                    with contextlib.suppress(Exception):
+                        os.remove(self.vless_ready_path)
+            except:
+                pass
             if force_orphans:
                 self._kill_awg_proxy_orphans()
                 try:
                     self._wait_local_port_closed(self.port, timeout=3.0)
                 except:
                     pass
-            elif masque_stopped:
+            elif masque_stopped or vless_stopped:
                 with contextlib.suppress(Exception):
                     self._wait_local_port_closed(self.port, timeout=3.0)
-            for handle_attr in ("awg_log_handle", "masque_log_handle"):
+            for handle_attr in ("awg_log_handle", "masque_log_handle", "vless_log_handle"):
                 try:
                     handle = getattr(self, handle_attr, None)
                     if handle:
@@ -2517,13 +2627,24 @@ try:
             self.awg_log_handle = None
             self.masque_process = None
             self.masque_log_handle = None
+            self.vless_process = None
+            self.vless_log_handle = None
             if reset_backend:
                 if self.active_backend in self.USERSPACE_BACKENDS:
                     self.active_backend = "cloudflare"
                 self.awg_active_profile_name = ""
                 self.masque_active_profile_name = ""
+                self.vless_active_profile_name = ""
                 self.active_profile_id = ""
                 self.awg_runtime_config_path = ""
+                # The rendered Xray configuration carries the node's user id, so it is deleted with
+                # the tunnel rather than left in profiles/.runtime until the next start of the same
+                # profile overwrites it (I19: anything written beside a key is treated as published).
+                stale_vless_config = str(getattr(self, "vless_runtime_config_path", "") or "")
+                if stale_vless_config:
+                    with contextlib.suppress(Exception):
+                        os.remove(stale_vless_config)
+                self.vless_runtime_config_path = ""
                 if self.active_backend not in self.USERSPACE_BACKENDS:
                     self.is_connected = False
 
@@ -2594,6 +2715,12 @@ try:
                 # passes: the likely cause of P19's 150 s of «проба не прошла» and of false «трафик
                 # умер» on a working MASQUE tunnel.
                 budget = max(budget, self.MASQUE_PROBE_BUDGET_SEC)
+            elif getattr(self, "active_backend", "") == "vless":
+                # Xray dials the node on every new SOCKS flow -- a TLS/REALITY handshake to a
+                # stranger's server abroad, not the local hop wireproxy has already built. The start
+                # path grants 12 s for the same reason; a 4 s watchdog probe on the same tunnel
+                # would read a slow-but-alive node as «трафик умер».
+                budget = max(budget, self.VLESS_PROBE_BUDGET_SEC)
 
             try:
                 if _env_bool_global("NOVA_WARP_PROBE_LEGACY_CURL", False):
@@ -2740,10 +2867,17 @@ try:
                     pass
                 time.sleep(0.5)
 
-                existing_deadline = time.time() + 2.5
+                # Whatever the stop above left behind is only ours to adopt if it is serving this
+                # very profile. `reset_backend=False` keeps the name, so the comparison is possible;
+                # without it a Proton node that was never dialled could be recorded as a success
+                # because some other helper — or a leftover from a previous Nova — held the port.
+                wanted_name = str(profile.get("name", "") or "").strip()
+                already_serving = wanted_name and wanted_name == str(
+                    getattr(self, "awg_active_profile_name", "") or "").strip()
+                existing_deadline = time.time() + (2.5 if already_serving else 0.0)
                 while time.time() < existing_deadline:
                     if self._is_awg_backend_healthy(timeout=1.5):
-                        self.awg_active_profile_name = str(profile.get("name", "") or "").strip()
+                        self.awg_active_profile_name = wanted_name
                         self.active_backend = "awg"
                         self.last_bootstrap_transport = "awg_proxy"
                         self.is_connected = True
@@ -2866,6 +3000,8 @@ try:
         def _profile_backend_binary_present(self, backend):
             if backend == nova_profiles.BACKEND_MASQUE:
                 return os.path.exists(self.nova_go_path)
+            if backend == nova_profiles.BACKEND_VLESS:
+                return os.path.exists(self.nova_xray_path)
             return os.path.exists(self.wireproxy_awg_path)
 
         def _run_profile_attempt(self, attempt, abort_generation=None, explicit=True):
@@ -2880,6 +3016,8 @@ try:
             started = time.monotonic()
             if backend == nova_profiles.BACKEND_MASQUE:
                 ok = bool(self._start_masque_backend(profile, abort_generation=abort_generation, explicit=explicit))
+            elif backend == nova_profiles.BACKEND_VLESS:
+                ok = bool(self._start_vless_backend(profile, abort_generation=abort_generation, explicit=explicit))
             else:
                 ok = bool(self._start_awg_proxy_backend(profile))
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -2900,13 +3038,77 @@ try:
                     nova_warp_generator.note_outcome(base, nova_profiles.split_profile_id(profile_id)[1], ok)
             return ok
 
-        def _try_start_profile_plan(self, my_run_id, prepared=None):
+        def _refresh_group_after_total_failure(self, group, generation):
+            """Every profile of an explicitly chosen group failed: fetch a fresh set, once.
+
+            Returns True when something new may have arrived and the plan is worth walking again.
+
+            Which groups and why:
+
+            * **Proton** hands out a session-bound subset of its free nodes, and a set issued a day
+              ago is largely dead — measured 2026-09-15, 14 of 50 issued nodes answered UDP at all.
+              A re-issue is one API call, 3.9 s, and gives a different subset. Its own cooldown
+              after a failed run still applies (`nova_proton.should_issue`), because `force` here
+              means "the user is waiting", not "ignore the anti-abuse rules".
+            * **VLESS** profiles come from subscriptions, which are refreshed by the same backfill
+              and so by the same stalled clock; and public nodes rot faster than anything else here
+              (4 of 60 reachable ones carried traffic, measured 2026-09-20).
+
+            Cloudflare and MASQUE are not here: their profiles are this install's own identity, they
+            do not expire between connects, and re-registering a device on every failed connect
+            would be a device-registration loop.
+            """
+            if generation != self._selection_generation or is_closing:
+                return False
+            if self._refreshed_generation == generation:
+                return False
+            if group not in (nova_profiles.GROUP_PROTON, nova_profiles.GROUP_VLESS):
+                return False
+            jobs = get_profile_jobs()
+            if jobs is None:
+                return False
+            self._refreshed_generation = generation
+            before = self._group_signature(group)
+            try:
+                if group == nova_profiles.GROUP_PROTON:
+                    self.log_func("[Profiles] Ни один узел Proton не ответил — запрашиваем свежий набор…")
+                    jobs.issue_proton(force=True, wait=True)
+                else:
+                    self.log_func("[Profiles] Ни один узел VLESS не ответил — обновляем подписки…")
+                    jobs.refresh_subscriptions(force=True, wait=True)
+            except Exception as e:
+                self.log_func(f"[Profiles] Обновление группы «{group}» не удалось: {type(e).__name__}")
+                return False
+            if self._group_signature(group) == before:
+                # Nothing new arrived — a cooldown, a network that is down, a subscription that has
+                # not changed. Walking the same dead set again would only double the wait.
+                self.log_func(f"[Profiles] Свежих профилей «{group}» не появилось.")
+                return False
+            return True
+
+        def _group_signature(self, group):
+            """The set of profile ids in a group: what tells a real refresh from a no-op."""
+            try:
+                return frozenset(
+                    r["id"] for r in nova_profiles.list_profiles(get_base_dir())
+                    if r.get("group") == group and r.get("valid")
+                )
+            except Exception:
+                return frozenset()
+
+        def _try_start_profile_plan(self, my_run_id, prepared=None, skip_ids=()):
             """Walk the attempt plan of the persisted selection.
 
             Returns "connected"; "fallback" (auto: go on with warp-cli); "explicit-failed"
             (group/profile: stop, an explicit choice is never substituted, I1); or "aborted"
             (apply_selection_now replaced the selection while the plan was walked).
+
+            `skip_ids` are profiles this connect has already tried and seen fail. It is what the
+            second walk after a fresh set is for: the point of the retry is the profiles that were
+            not there a moment ago, and starting the same dead ones again would double the wait the
+            owner is sitting through.
             """
+            skip_ids = {str(pid) for pid in (skip_ids or ())}
             generation = self._selection_generation
             if prepared is None:
                 try:
@@ -2926,6 +3128,10 @@ try:
                     return "aborted"
                 return "explicit-failed" if explicit else "fallback"
 
+            if skip_ids:
+                plan = [a for a in plan
+                        if not (isinstance(a.get("profile"), dict)
+                                and str(a["profile"].get("id") or "") in skip_ids)]
             profile_attempts = [a for a in plan if isinstance(a.get("profile"), dict)]
             if explicit and not profile_attempts:
                 group = str(effective.get("group") or "")
@@ -2943,6 +3149,9 @@ try:
                         nova_profiles.GROUP_PROTON: lambda: jobs.issue_proton(force=False, wait=True),
                         nova_profiles.GROUP_MASQUE: lambda: jobs.register_masque(wait=True),
                         nova_profiles.GROUP_CLOUDFLARE: lambda: jobs.generate_warp(force=False, wait=True),
+                        # Its profiles come from subscriptions, so "the group is empty" means
+                        # "nothing has been downloaded yet", not "nothing has been issued yet".
+                        nova_profiles.GROUP_VLESS: lambda: jobs.refresh_subscriptions(force=True, wait=True),
                     }.get(group)
                 if issue_job is not None and not _interrupted():
                     self.log_func(f"[Profiles] В группе «{group}» нет профилей — выпускаем…")
@@ -2970,11 +3179,14 @@ try:
             self.log_func(f"[Profiles] Режим: {self._describe_plan_mode(effective)}; попыток: {len(profile_attempts)}")
             target = str(effective.get("profile_id") or "") if mode == nova_profiles.MODE_PROFILE else str(effective.get("group") or "")
 
-            awg_total = sum(1 for a in profile_attempts if a.get("backend") != nova_profiles.BACKEND_MASQUE)
-            masque_total = len(profile_attempts) - awg_total
+            masque_total = sum(1 for a in profile_attempts if a.get("backend") == nova_profiles.BACKEND_MASQUE)
+            vless_total = sum(1 for a in profile_attempts if a.get("backend") == nova_profiles.BACKEND_VLESS)
+            awg_total = len(profile_attempts) - masque_total - vless_total
             awg_idx = 0
             masque_idx = 0
+            vless_idx = 0
             missing_logged = set()
+            tried_ids = set(skip_ids)
             for attempt in plan:
                 if _interrupted():
                     return _interrupted_outcome()
@@ -2986,6 +3198,7 @@ try:
                 if not isinstance(profile, dict):
                     continue
                 profile_name = str(profile.get("name") or profile.get("id") or "")
+                tried_ids.add(str(profile.get("id") or ""))
                 if backend == nova_profiles.BACKEND_MASQUE:
                     masque_idx += 1
                     if not self._profile_backend_binary_present(backend):
@@ -2999,6 +3212,19 @@ try:
                         self.log_func(f"[Profiles] MASQUE профиль: {profile_name}.")
                     if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
                         return "connected"
+                elif backend == nova_profiles.BACKEND_VLESS:
+                    vless_idx += 1
+                    if not self._profile_backend_binary_present(backend):
+                        if backend not in missing_logged:
+                            missing_logged.add(backend)
+                            self.log_func("[RU] [Diag] VLESS пропущен: nova-xray.exe не найден.")
+                        continue
+                    if vless_total > 1:
+                        self.log_func(f"[Profiles] VLESS профиль {vless_idx}/{vless_total}: {profile_name}.")
+                    else:
+                        self.log_func(f"[Profiles] VLESS профиль: {profile_name}.")
+                    if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
+                        return "connected"
                 else:
                     awg_idx += 1
                     if not self._profile_backend_binary_present(backend):
@@ -3010,7 +3236,7 @@ try:
                         self.log_func(f"[RU] [Diag] AWG профиль {awg_idx}/{awg_total}: {profile_name}.")
                     else:
                         self.log_func(f"[RU] [Diag] AWG профиль: {profile_name}.")
-                    if self._run_profile_attempt(attempt, abort_generation=generation):
+                    if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
                         self.log_func(f"[RU] [Diag] AWG профиль сработал: {profile_name}.")
                         return "connected"
                 time.sleep(0.4)
@@ -3018,6 +3244,13 @@ try:
             if _interrupted():
                 return _interrupted_outcome()
             if explicit:
+                group = str(effective.get("group") or "") if mode == nova_profiles.MODE_GROUP else ""
+                if group and self._refresh_group_after_total_failure(group, generation):
+                    if _interrupted():
+                        return _interrupted_outcome()
+                    # One more walk, over what arrived and nothing else. `_refreshed_generation`
+                    # makes this the last one for this choice, so the recursion is two deep at most.
+                    return self._try_start_profile_plan(my_run_id, skip_ids=tried_ids)
                 self.log_func(f"[Profiles] Ни один профиль «{target}» не подключился.")
                 return "explicit-failed"
             return "fallback"
@@ -3053,6 +3286,7 @@ try:
                 getattr(self, "active_profile_id", "")
                 or getattr(self, "awg_active_profile_name", "")
                 or getattr(self, "masque_active_profile_name", "")
+                or getattr(self, "vless_active_profile_name", "")
                 or ""
             ).strip()
             generation = self._selection_generation
@@ -3092,6 +3326,46 @@ try:
             if self._selection_generation != generation:
                 self.last_recovery_outcome = "busy"
                 return False
+            # Every profile the recovery had was walked. Not `tried >= len(profile_attempts)`: the
+            # candidate list drops the profile that just died and is truncated to the budget, so that
+            # comparison could never be true for a group of two or more -- the very case this exists
+            # for. The group also has to be small enough that the budget could cover it, or a
+            # 200-node VLESS group would ask for a refresh after touching four of them.
+            if (explicit and mode == nova_profiles.MODE_GROUP and profile_attempts
+                    and len(profile_attempts) <= self.AWG_RECOVERY_PROFILE_BUDGET
+                    and tried >= len(candidates)):
+                # The whole group was walked, not just the recovery budget, and none of it carried
+                # traffic. That is the same state the start walker calls a total failure, and the
+                # same answer applies: ask the group for a fresh set once. Without this a VLESS
+                # group whose nodes all died mid-session sat in the 60-900 s pause with the same
+                # dead list until something else triggered a start -- and for a group that IS the
+                # VPN, nothing else does (the backfill only runs while a slot is up).
+                group = str(effective.get("group") or "")
+                if group and self._refresh_group_after_total_failure(group, generation):
+                    if is_closing or self._selection_generation != generation:
+                        self.last_recovery_outcome = "busy"
+                        return False
+                    try:
+                        fresh_plan, _fresh_effective = self._get_attempt_plan()
+                    except Exception:
+                        fresh_plan = []
+                    walked = {str(a["profile"].get("id") or "") for a in candidates
+                              if isinstance(a.get("profile"), dict)}
+                    walked.add(current_id)
+                    fresh = [a for a in fresh_plan
+                             if isinstance(a.get("profile"), dict)
+                             and a.get("backend") != nova_profiles.BACKEND_WARP_CLI
+                             and str(a["profile"].get("id") or "") not in walked]
+                    for attempt in fresh[:self.AWG_RECOVERY_PROFILE_BUDGET]:
+                        if is_closing or self._selection_generation != generation:
+                            self.last_recovery_outcome = "busy"
+                            return False
+                        tried += 1
+                        if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
+                            self._awg_recovery_fail_streak = 0
+                            self._awg_recovery_block_until = 0.0
+                            self.last_recovery_outcome = "restored"
+                            return True
             streak = int(getattr(self, "_awg_recovery_fail_streak", 0) or 0) + 1
             self._awg_recovery_fail_streak = streak
             pause = min(
@@ -3260,6 +3534,155 @@ try:
             self.log_func(f"[RU] [MASQUE] Профиль {profile_id}: обновить ключ не удалось (код {exit_code}).")
             return False
 
+        # A VLESS node is a stranger's server: most public ones are dead. Measured 2026-09-20 over
+        # the largest Russian-reachable aggregator, 55 % of nodes answered TCP and 4 of 60 of those
+        # carried traffic. So the readiness budget is short on purpose — walking to the next node
+        # fast is worth far more here than waiting out a node that will not answer.
+        VLESS_READY_TIMEOUT_SEC = 12.0
+
+        def _render_vless_runtime_config(self, profile):
+            """Write the Xray configuration for a profile; returns its path, or "" on failure.
+
+            It goes to `profiles/.runtime/` rather than `temp/` because it carries the node's user
+            id, which is a credential, and `temp/` is what gets attached to a problem report (I19).
+            """
+            try:
+                node = nova_profiles.vless_node_of_record(profile)
+                if node is None:
+                    return ""
+                reason = nova_vless.validate(node)
+                if reason:
+                    self.log_func(f"[RU] [VLESS] Профиль {profile.get('name') or ''}: {reason}.")
+                    return ""
+                config = nova_vless.build_xray_config(node, int(self.port))
+                # Xray's own log has to be asked for in the configuration: the helper cannot
+                # redirect it afterwards, because the logger captured stderr at its own start.
+                config["log"] = {"loglevel": "warning", "error": self.vless_log_path.replace("\\", "/")}
+                path = nova_profiles.runtime_config_path(get_base_dir(), str(profile.get("id") or ""))
+                path = os.path.splitext(path)[0] + ".json"
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                payload = json.dumps(config, ensure_ascii=False).encode("utf-8")
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, path)
+                return path
+            except Exception as e:
+                # Not debug-only: without this line a profile that never got a configuration written
+                # looks exactly like a node that did not answer, and the stats record it as the
+                # node's failure. The reason is local, and the log has to say so.
+                self.log_func(f"[RU] [VLESS] Не удалось подготовить конфигурацию: {type(e).__name__}: {e}")
+                return ""
+
+        def _start_vless_backend(self, profile, abort_generation=None, explicit=True):
+            """VLESS profile -> `nova-xray run` on the shared SOCKS port (the AWG contract).
+
+            `explicit` is the same flag MASQUE takes and means the same thing: the user named this
+            group or this node, so the node is worth the full readiness budget. A walk that merely
+            guessed gets half of it — a guess that costs 12 s per dead stranger node would make the
+            whole ladder unusable. Nothing guesses VLESS today (D25 keeps it out of «Авто»), so the
+            short branch exists for the day something does.
+            """
+            profile = profile if isinstance(profile, dict) else {}
+            profile_id = str(profile.get("id") or profile.get("name") or "vless").strip()
+            previous_config = str(getattr(self, "vless_runtime_config_path", "") or "")
+            try:
+                if not os.path.exists(self.nova_xray_path):
+                    self.log_func("[RU] [Diag] VLESS пропущен: nova-xray.exe не найден.")
+                    return False
+                config_path = self._render_vless_runtime_config(profile)
+                if not config_path:
+                    return False
+                if previous_config and previous_config != config_path:
+                    # The previous node's rendered config carries its user id; it is of no use once
+                    # we are starting another one (I19).
+                    with contextlib.suppress(Exception):
+                        os.remove(previous_config)
+
+                self._stop_awg_proxy_process(reset_backend=False)
+                try:
+                    self.run_warp_cli("disconnect", timeout=4)
+                except:
+                    pass
+                try:
+                    self._run_sc("stop", self.SERVICE_NAME, timeout=8)
+                except:
+                    pass
+                time.sleep(0.3)
+
+                if self.is_port_open(self.port):
+                    self.log_func(f"[RU] [VLESS] Порт {self.port} занят. Очищаем старый экземпляр...")
+                    self._kill_awg_proxy_orphans()
+                    self._wait_local_port_closed(self.port, timeout=4.0)
+                    if self.is_port_open(self.port):
+                        self.log_func(f"[RU] [VLESS] Порт {self.port} всё ещё занят. Пропускаем профиль {profile_id}.")
+                        # The config is already on disk and carries the node's user id, and the reset
+                        # below only deletes the path recorded on the manager -- which is still the
+                        # previous profile's, because this one has not been spawned yet (I19).
+                        with contextlib.suppress(Exception):
+                            os.remove(config_path)
+                        self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
+                        return False
+
+                with contextlib.suppress(OSError):
+                    os.remove(self.vless_ready_path)
+                os.makedirs(self.temp_dir, exist_ok=True)
+                cmd = [
+                    self.nova_xray_path, "run",
+                    "--config", config_path,
+                    "--ready-file", self.vless_ready_path,
+                    "--parent-pid", str(os.getpid()),
+                ]
+                self.vless_process = subprocess.Popen(
+                    cmd,
+                    cwd=get_base_dir(),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                self.vless_active_profile_name = profile_id
+                self.vless_runtime_config_path = config_path
+                self.active_backend = "vless"
+                self.last_bootstrap_transport = "vless_proxy"
+
+                ready_budget = self.VLESS_READY_TIMEOUT_SEC if explicit else self.VLESS_READY_TIMEOUT_SEC / 2.0
+                deadline = time.time() + ready_budget
+                while time.time() < deadline:
+                    if is_closing:
+                        return False
+                    if abort_generation is not None and self._selection_generation != abort_generation:
+                        return False
+                    proc = self.vless_process
+                    if proc is None:
+                        return False
+                    exit_code = proc.poll()
+                    if exit_code is not None:
+                        # Xray refuses a configuration it cannot build; its own reason is in the log.
+                        self.log_func(f"[RU] [VLESS] Профиль {profile_id}: помощник завершился с кодом {exit_code}.")
+                        return False
+                    # The port opens the moment the inbound binds, before anything is proven, so the
+                    # probe through it is the only readiness that means "traffic passes".
+                    if self.is_port_open(self.port) and self._test_awg_backend_ready(self.port, timeout=4):
+                        self.is_connected = True
+                        self.mark_bootstrap(True)
+                        self._remember_successful_awg_profile(profile_id)
+                        endpoint = str(profile.get("endpoint") or "?")
+                        self.log_func(f"[RU] [Diag] VLESS профиль сработал: {profile_id} ({endpoint}).")
+                        return True
+                    time.sleep(0.4)
+                self.log_func(
+                    f"[RU] [VLESS] Профиль {profile_id} не поднялся: трафик не пошёл за "
+                    f"{int(ready_budget)} с."
+                )
+            except Exception as e:
+                if IS_DEBUG_MODE:
+                    self.log_func(f"[RU] [VLESS] Ошибка запуска профиля {profile_id}: {e}")
+            self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
+            return False
+
         def _start_masque_backend(self, profile, abort_generation=None, explicit=True):
             """MASQUE identity -> `nova-go masque socks` on the shared SOCKS port (the AWG contract)."""
             profile = profile if isinstance(profile, dict) else {}
@@ -3349,6 +3772,7 @@ try:
                 while True:
                     self._selection_restart_pending = False
                     self._selection_generation += 1
+                    self._refreshed_generation = -1
                     wait_started = time.time()
                     waited_logged = False
                     long_wait_logged = False
@@ -3413,7 +3837,8 @@ try:
             """
             backend = str(getattr(self, "active_backend", "") or "")
             profile_id = str(getattr(self, "active_profile_id", "") or getattr(self, "awg_active_profile_name", "")
-                             or getattr(self, "masque_active_profile_name", "") or "")
+                             or getattr(self, "masque_active_profile_name", "")
+                             or getattr(self, "vless_active_profile_name", "") or "")
             connected = bool(getattr(self, "is_connected", False))
             choice = self.get_primary_choice()
             return nova_vpn_slots.primary_indicator_label(backend, profile_id, connected, choice.get("kind"))
@@ -4457,6 +4882,15 @@ try:
                     kind = "MASQUE"
                     helper_name = getattr(self, "masque_active_profile_name", "")
                     helper_attr = "masque_process"
+                elif backend == "vless":
+                    # Without this branch a live VLESS tunnel was judged by awg_process, which is
+                    # always None while xray runs: one failed 1.6 s probe returned «Disconnected
+                    # (AWG)» and cleared is_connected, and the watchdog then took the
+                    # flag_disconnected path, which has no streak threshold and no false-alarm
+                    # hardening. VLESS rotated away from a marginal channel that AWG would hold.
+                    kind = "VLESS"
+                    helper_name = getattr(self, "vless_active_profile_name", "")
+                    helper_attr = "vless_process"
                 else:
                     kind = "AWG"
                     helper_name = self.awg_active_profile_name
@@ -5480,6 +5914,29 @@ try:
             self.is_connected = False
 
 
+    # Pids of the wireproxy helpers the «Проверить» checks are running right now. A start or a
+    # recovery sweeping the orphans must not take them: they are on their own loopback ports and
+    # have nothing to do with port 1370.
+    _awg_check_pids_lock = threading.Lock()
+    _awg_check_pids_set = set()
+
+    def _awg_check_pids():
+        with _awg_check_pids_lock:
+            return set(_awg_check_pids_set)
+
+    def _note_awg_check_pid(pid, running):
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0:
+            return
+        with _awg_check_pids_lock:
+            if running:
+                _awg_check_pids_set.add(pid)
+            else:
+                _awg_check_pids_set.discard(pid)
+
     def _profiles_log(message):
         logger = globals().get("log_print")
         try:
@@ -5602,7 +6059,11 @@ try:
         refresh worker can read it every 1.5 s without touching Tk or waiting on a job.
         """
 
-        KINDS = ("warp", "proton", "masque")
+        KINDS = ("warp", "proton", "masque", "subs")
+        # A subscription refresh that finds nothing new is a conditional GET answered with 304 and
+        # zero bytes (measured on both shipped sources), so this budget is about a list that really
+        # changed: 1.97 MB parsed into a few thousand nodes.
+        SUBS_TIMEOUT_SEC = 180
         BACKFILL_INTERVAL_SEC = 1800.0
         BACKFILL_SETTLE_SEC = 30.0
         MASQUE_REGISTER_TIMEOUT_SEC = 150
@@ -5912,6 +6373,96 @@ try:
                 if should_stop():
                     return None
 
+        def refresh_subscriptions(self, force=False, wait=False, only_due=False):
+            """Download the registered subscriptions and apply them to profiles/.
+
+            `only_due` is the background sweep: it takes the ones whose interval has come round.
+            Without it every enabled subscription is taken, which is what the button means.
+            """
+            def _work():
+                base = get_base_dir()
+                try:
+                    records = nova_subscriptions.load(base)
+                except Exception as e:
+                    return False, f"реестр подписок не прочитан: {type(e).__name__}"
+                wanted = nova_subscriptions.due(records) if only_due else [
+                    r for r in records if r.get("enabled", True)]
+                if not wanted:
+                    return True, "нечего обновлять"
+                proxies = []
+                try:
+                    # Nova's own egresses: raw.githubusercontent.com is blocked from Russia, and the
+                    # tunnel Nova already holds is the natural way to reach the list.
+                    if is_local_port_open_quick(1371):
+                        proxies.append("http://127.0.0.1:1371")
+                except Exception:
+                    pass
+                updated = failed = 0
+                by_id = {r.get("id"): r for r in records}
+                for record in wanted:
+                    if is_closing:
+                        break
+                    self._set("subs", message=f"«{record.get('name') or record.get('id')}»…")
+                    try:
+                        outcome, fresh, _stats = nova_subscriptions.refresh(
+                            base, record, proxies=proxies, log=self.log_func)
+                    except Exception as e:
+                        failed += 1
+                        self.log_func(f"[Подписки] «{record.get('name') or record.get('id')}» упала: {type(e).__name__}")
+                        continue
+                    if fresh is not None:
+                        by_id[fresh.get("id")] = fresh
+                    if outcome == "updated":
+                        updated += 1
+                    elif outcome == "failed":
+                        failed += 1
+                try:
+                    nova_subscriptions.save(base, list(by_id.values()))
+                except Exception as e:
+                    self.log_func(f"[Подписки] Реестр не сохранён: {type(e).__name__}")
+                if failed and not updated:
+                    return False, f"не загрузились: {failed}"
+                parts = []
+                if updated:
+                    parts.append(f"обновлено {updated}")
+                if failed:
+                    parts.append(f"не загрузились {failed}")
+                return True, ", ".join(parts) or "без изменений"
+
+            return self._run("subs", _work, wait, "NovaProfilesSubs")
+
+        def measure_latency(self, targets, done_cb=None):
+            """Cheap reachability of many profiles at once, off the Tk thread.
+
+            Not a job kind: it runs while the owner looks at the window, several times a minute in
+            the worst case, and a single-flight state entry would make the second sweep look like a
+            failure. It is paced instead — `nova_ping` puts a gap between the starts — so fifty
+            rows are a trickle rather than a burst.
+
+            The numbers also go into profile-stats.json: the connect queue orders a VLESS group by
+            them (`nova_profiles._vless_order`), which is what turns a list of a few hundred public
+            nodes into something worth walking.
+            """
+            targets = {str(k): v for k, v in dict(targets or {}).items()}
+
+            def _worker():
+                measured = {}
+                try:
+                    results = nova_ping.probe_hosts(targets, max_workers=6, pace_sec=0.12)
+                    measured = {pid: (result.ms, result.method) for pid, result in results.items()}
+                    with contextlib.suppress(Exception):
+                        nova_profiles.record_rtts(get_base_dir(), {pid: ms for pid, (ms, _m) in measured.items()})
+                except Exception as e:
+                    if IS_DEBUG_MODE:
+                        self.log_func(f"[Profiles] Замер задержки не удался: {type(e).__name__}: {e}")
+                finally:
+                    if callable(done_cb):
+                        with contextlib.suppress(Exception):
+                            done_cb(measured)
+
+            _start_profiles_thread(_worker, "NovaProfilesPing")
+            return True
+
         def _test_awg_profile(self, record, wm):
             wireproxy = getattr(wm, "wireproxy_awg_path", "") if wm else ""
             wireproxy = wireproxy or os.path.join(get_bin_dir(), "wireproxy-awg.exe")
@@ -5998,6 +6549,9 @@ try:
                     stderr=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
+                # Held out of the orphan sweep for as long as this check runs: a start or recovery
+                # meanwhile used to take it down by image name and record a working profile as «сбой».
+                _note_awg_check_pid(proc.pid, True)
 
                 def cut_short():
                     return is_closing or should_yield()
@@ -6022,6 +6576,7 @@ try:
                 return {"ok": False, "ms": None, "message": "трафик не пошёл"}
             finally:
                 if proc is not None:
+                    _note_awg_check_pid(proc.pid, False)
                     # By handle: the live wireproxy of the same image must survive the check.
                     with contextlib.suppress(Exception):
                         if proc.poll() is None:
@@ -6166,6 +6721,9 @@ try:
             if tm is not None:
                 with contextlib.suppress(Exception):
                     bridges_fresh = bool(nova_tor.bridge_store_is_fresh(nova_tor.load_bridge_store(tm.bridges_path)))
+            subscriptions_due = 0
+            with contextlib.suppress(Exception):
+                subscriptions_due = len(nova_subscriptions.due(nova_subscriptions.load(base)))
             steps = nova_issuance.plan_backfill(
                 records=records,
                 warp_state=nova_warp_generator.load_state(base),
@@ -6175,6 +6733,7 @@ try:
                 masque_failed_at=self._masque_failed_at,
                 now=time.time(),
                 proxies=_api_proxies(),
+                subscriptions_due=subscriptions_due,
             )
             if not os.path.exists(self._nova_go_path()):
                 steps = [s for s in steps if s[0] not in (nova_issuance.STEP_WARP, nova_issuance.STEP_MASQUE)]
@@ -6195,12 +6754,20 @@ try:
                             self._drop_older_masque_profiles(get_base_dir(), self._newest_masque_profile_id())
                     elif step == nova_issuance.STEP_PROTON:
                         self.issue_proton(force=force, wait=True)
+                    elif step == nova_issuance.STEP_PROTON_FRESH:
+                        # Forced on purpose: every ordinary guard says the set is fresh, and every
+                        # one of them is looking at the clock rather than at the nodes.
+                        self.issue_proton(force=True, wait=True)
                     elif step == nova_issuance.STEP_PROTON_RTT:
                         self.measure_proton_distances(force=force)
                     elif step == nova_issuance.STEP_TOR_BRIDGES:
                         tm = get_tor_manager()
                         if tm is not None:
                             tm.refresh_bridges(force=force, wait=True)
+                    elif step == nova_issuance.STEP_SUBSCRIPTIONS:
+                        # only_due unless this is a manual «Перевыпустить»: the background pass must
+                        # respect each subscription's own interval and its failure backoff.
+                        self.refresh_subscriptions(force=force, wait=True, only_due=not force)
                 except Exception as e:
                     self.log_func(f"[Profiles] Шаг выпуска «{step}» упал: {type(e).__name__}")
 
@@ -6304,15 +6871,610 @@ try:
 
     # ============================================================================================
     # Two VPN slots (resources/nova_vpn_slots.py). The primary is WarpManager on 1370; the secondary
-    # is Opera (1371) or Tor (1375/1378), kept up by SecondaryVpnController. VpnSlotsRuntime measures
-    # the primary's exit country and publishes temp/vpn-egress.json for the helper processes.
+    # is Opera (1371), Tor (1375/1378) or an imported profile of the user's own (1379/1380), kept up
+    # by SecondaryVpnController. VpnSlotsRuntime measures the primary's exit country and publishes
+    # temp/vpn-egress.json for the helper processes.
+
+    class SecondaryProfileRunner:
+        """An imported profile (VLESS node or own .conf) served as the reserve VPN.
+
+        The primary owns port 1370 and one helper process; this owns 1379 (SOCKS5) and 1380 (HTTP
+        CONNECT) and a second helper process of its own. Two ports because the reserve has two kinds
+        of consumer: browsers take the SOCKS5 token out of the PAC, while tcp_proxy.py, the Telegram
+        relay and the app transport plans all dial one HTTP CONNECT port under the frozen label
+        `opera-http`. Giving the helper both means no consumer has to learn a new attempt kind.
+
+        Which profile is decided by the planner the primary already uses
+        (`nova_profiles.build_attempt_plan`), so the rules are the same ones and stay in one place:
+        a named group walks the group in the group's own order, a pinned node is retried as itself
+        and never rotated away from (I1), and the outcome of every attempt lands in the same
+        `profile-stats.json` that orders the group next time.
+
+        What it must not do: share a WireGuard key with the live primary. Two sessions of one key at
+        once break one of them (measured 2026-09-15, G71/G73), so a profile whose identity is the
+        primary's is skipped here rather than started and silently broken.
+        """
+
+        SOCKS_PORT = nova_vpn_slots.SECONDARY_PROFILE_SOCKS_PORT
+        HTTP_PORT = nova_vpn_slots.SECONDARY_PROFILE_HTTP_PORT
+        # Same budget the primary grants a VLESS node: 55 % of public nodes answer TCP and few of
+        # those carry traffic, so walking on fast is worth more than waiting out a dead one.
+        READY_TIMEOUT_SEC = 12.0
+        PROBE_BUDGET_SEC = 6.0
+        # The reserve is not probed on every watchdog pass. Each probe is a real request through the
+        # tunnel, and for a VLESS node that means a fresh TLS/REALITY handshake to a stranger's
+        # server: at the watchdog's 3 s cadence that is 20 handshakes a minute on somebody else's
+        # node, which is how a node stops answering us at all (G72).
+        HEALTH_CACHE_SEC = 12.0
+        # How long the reserve may stay silent before its slot walks to the next profile. Longer than
+        # the primary's, because nothing is riding on the reserve at that moment except the EU list.
+        DEAD_GRACE_SEC = 45.0
+        # Profiles tried in one walk. The same reasoning as AWG_RECOVERY_PROFILE_BUDGET: an unbounded
+        # walk over a 200-node VLESS group would spend twenty minutes starting dead helpers.
+        WALK_BUDGET = 4
+        # After a walk that found nothing, the slot waits before walking again.
+        WALK_PAUSE_SEC = 300.0
+
+        def __init__(self, log_func=None):
+            self.log_func = log_func or _profiles_log
+            self._lock = threading.RLock()
+            self._walk_lock = threading.Lock()
+            self._running = False
+            self._process = None
+            self._log_handle = None
+            self._config_path = ""
+            self._profile_id = ""
+            self._profile_group = ""
+            self._profile_identity = ""
+            self._backend = ""
+            self._choice = {"group": "", "profile": ""}
+            self._plan = []
+            self._index = -1
+            self._tried_ids = set()
+            self._next_walk_at = 0.0
+            self._health = (0.0, False)
+            self._health_running = False
+            self._country = ""
+            self._country_for = ""
+            self._walking = False
+            self._collision_logged = ""
+            base = get_base_dir()
+            self._ready_path = os.path.join(base, "temp", "vless-ready-secondary.json")
+            self._xray_log_path = os.path.join(base, "temp", "nova-xray-secondary.log")
+            self._wireproxy_log_path = os.path.join(base, "temp", "wireproxy-secondary.log")
+
+        # -- queries -------------------------------------------------------------------------
+
+        def is_up(self):
+            """The cached verdict. Cheap enough for the PAC and the state file to ask every tick.
+
+            It is not only the cached bool: this is what the PAC and `temp/vpn-egress.json` read, and
+            unlike `usable()` nothing here refreshes the cache. A helper that exited, or a verdict
+            nothing has refreshed for a whole cache window, must read as down rather than keep the
+            reserve in every routing chain.
+            """
+            with self._lock:
+                if not self._running or self._process is None:
+                    return False
+                stamp, verdict = self._health
+                if not verdict:
+                    return False
+                if time.time() - stamp > self.HEALTH_CACHE_SEC * 2:
+                    return False
+                proc = self._process
+            try:
+                return proc.poll() is None
+            except Exception:
+                return False
+
+        def label(self):
+            with self._lock:
+                name = str(self._profile_id or "").partition("/")[2] or self._profile_group
+            name = str(name or "").strip()
+            if not name:
+                return nova_vpn_slots.secondary_indicator_label(nova_vpn_slots.SECONDARY_PROFILE)
+            return nova_vpn_slots.secondary_indicator_label(nova_vpn_slots.SECONDARY_PROFILE, name[:12])
+
+        def country(self):
+            with self._lock:
+                return self._country
+
+        def status(self):
+            with self._lock:
+                return {
+                    "running": self._running,
+                    "profile": self._profile_id,
+                    "group": self._profile_group,
+                    "backend": self._backend,
+                    "up": bool(self._health[1]),
+                    "country": self._country,
+                }
+
+        def usable(self, now):
+            """Liveness for the watchdog: the cached verdict, refreshed off-thread when it is stale."""
+            with self._lock:
+                if not self._running:
+                    return False
+                proc = self._process
+                if proc is None or proc.poll() is not None:
+                    return False
+                stamp, verdict = self._health
+                stale = (now - stamp) >= self.HEALTH_CACHE_SEC
+                if stale and not self._health_running:
+                    self._health_running = True
+                    start_probe = True
+                else:
+                    start_probe = False
+            if start_probe:
+                try:
+                    threading.Thread(target=self._refresh_health, daemon=True,
+                                     name="NovaSecondaryProfileProbe").start()
+                except Exception:
+                    # A thread that never started would otherwise leave _health_running set and the
+                    # reserve would keep answering with a verdict nothing refreshes.
+                    with self._lock:
+                        self._health_running = False
+            return bool(verdict)
+
+        def _refresh_health(self):
+            with self._lock:
+                probed_for = self._profile_id
+                identity = self._profile_identity
+            ok = False
+            try:
+                if is_local_port_open_quick(self.SOCKS_PORT, timeout=0.5):
+                    ok = bool(probe_socks5_payload(self.SOCKS_PORT, budget=self.PROBE_BUDGET_SEC))
+            except Exception:
+                ok = False
+            if ok and identity and identity == self._primary_identity():
+                # The primary moved onto this key while the reserve was already on it. Two live
+                # sessions of one key break one of them (G71/G73), and the primary is the one that
+                # must keep working: report the reserve down so its slot walks to another node.
+                if self._collision_logged != probed_for:
+                    self._collision_logged = probed_for
+                    self.log_func(f"[VPN] Дополнительный VPN: ключ профиля {probed_for} занял основной VPN — "
+                                  "уступаем и берём другой узел.")
+                ok = False
+            with self._lock:
+                self._health_running = False
+                if self._profile_id != probed_for or not self._running:
+                    # The tunnel was replaced while this probe ran: its verdict is about a helper
+                    # that no longer serves the slot, and writing it would flap the new one.
+                    return
+                self._health = (time.time(), ok)
+            if ok:
+                self._maybe_measure_country()
+
+        # -- control -------------------------------------------------------------------------
+
+        def apply(self, choice, still_current):
+            """Bring the reserve up for `choice` ({"group", "profile"}). Runs on a worker thread."""
+            group = str((choice or {}).get("group") or "").strip()
+            profile = str((choice or {}).get("profile") or "").strip()
+            with self._lock:
+                same = (self._running and self._profile_id
+                        and (profile == self._profile_id or (not profile and self._profile_group == group)))
+                self._running = True
+                if {"group": group, "profile": profile} != self._choice:
+                    self._tried_ids = set()
+                self._choice = {"group": group, "profile": profile}
+                self._next_walk_at = 0.0
+            if same and self.is_up():
+                self.log_func(f"[VPN] Дополнительный VPN: профиль {self._profile_id} уже работает.")
+                return True
+            # A user choice waits for a walk already in flight instead of being dropped: `advance`
+            # may be mid-start when the menu is clicked, and skipping the click would leave the slot
+            # on the profile the user just replaced.
+            return self._walk(0, "выбор", still_current, wait=True)
+
+        def advance(self, reason, still_current):
+            """The reserve stopped carrying traffic: take the next profile of the choice."""
+            return self._walk(-1, reason, still_current)
+
+        def stop(self):
+            with self._lock:
+                self._running = False
+                self._index = -1
+                self._plan = []
+                self._tried_ids = set()
+                self._health = (0.0, False)
+                self._country = ""
+                self._country_for = ""
+            self._stop_process()
+
+        # -- the walk ------------------------------------------------------------------------
+
+        def _build_plan(self, choice):
+            base = get_base_dir()
+            group = str((choice or {}).get("group") or "").strip()
+            profile = str((choice or {}).get("profile") or "").strip()
+            if profile:
+                sel = {"version": 1, "mode": nova_profiles.MODE_PROFILE, "group": group, "profile": profile}
+            elif group:
+                sel = {"version": 1, "mode": nova_profiles.MODE_GROUP, "group": group}
+            else:
+                return []
+            try:
+                records = nova_profiles.list_profiles(base)
+                stats = nova_profiles.load_stats(base)
+            except Exception:
+                return []
+            try:
+                plan = nova_profiles.build_attempt_plan(records, sel, stats=stats)
+            except Exception:
+                return []
+            return [a for a in plan
+                    if isinstance(a, dict) and isinstance(a.get("profile"), dict)
+                    and a.get("backend") != nova_profiles.BACKEND_WARP_CLI]
+
+        def _primary_identity(self):
+            """The WireGuard identity the primary tunnel is using right now, "" when it uses none."""
+            wm = globals().get("warp_manager")
+            if wm is None or str(getattr(wm, "active_backend", "") or "") != "awg":
+                return ""
+            live = str(getattr(wm, "active_profile_id", "") or getattr(wm, "awg_active_profile_name", "") or "")
+            if not live:
+                return ""
+            try:
+                for record in nova_profiles.list_profiles(get_base_dir()):
+                    if str(record.get("id") or "") == live:
+                        return str(record.get("identity") or "")
+            except Exception:
+                return ""
+            return ""
+
+        def _walk(self, start_at, reason, still_current, wait=False):
+            """Try the profiles of the choice until one carries traffic.
+
+            `start_at` is 0 for a fresh choice (forget what was tried) and -1 to continue from where
+            the last walk stopped. Continuing is by profile id, never by index: every attempt writes
+            its outcome, and an outcome reorders the group's own connect order, so the entry at
+            index+1 of the NEXT plan is a different profile -- possibly the one that just failed.
+            """
+            if not self._walk_lock.acquire(blocking=bool(wait), timeout=90.0 if wait else -1):
+                # Another walk is in flight; it will land on something or set the pause itself.
+                return False
+            try:
+                with self._lock:
+                    if not self._running:
+                        return False
+                    choice = dict(self._choice)
+                    now = time.time()
+                    if start_at != 0 and self._next_walk_at and now < self._next_walk_at:
+                        return False
+                    if start_at == 0:
+                        self._tried_ids = set()
+                    tried_ids = set(self._tried_ids)
+                    self._walking = True
+                plan = self._build_plan(choice)
+                with self._lock:
+                    self._plan = plan
+                if not plan:
+                    # The helper goes down with the plan. Leaving it up would keep the slot serving a
+                    # profile the choice no longer contains -- a deleted node, an emptied group --
+                    # for the rest of the session, because nothing else stops it.
+                    self.log_func("[VPN] Дополнительный VPN: в выбранной группе нет пригодных профилей.")
+                    self._stop_process()
+                    with self._lock:
+                        self._profile_id = ""
+                        self._profile_group = ""
+                        self._profile_identity = ""
+                        self._next_walk_at = time.time() + self.WALK_PAUSE_SEC
+                    return False
+                ids = [str((a.get("profile") or {}).get("id") or "") for a in plan]
+                if tried_ids.issuperset(i for i in ids if i):
+                    # The whole choice has been walked since the last fresh start: begin again, which
+                    # for a pinned profile means retrying it -- the only candidate there is.
+                    tried_ids = set()
+                    with self._lock:
+                        self._tried_ids = set()
+                tried = 0
+                for index, attempt in enumerate(plan):
+                    if is_closing or not still_current() or tried >= self.WALK_BUDGET:
+                        break
+                    record = attempt["profile"]
+                    profile_id = str(record.get("id") or "")
+                    if profile_id in tried_ids:
+                        continue
+                    # Re-read per attempt, not once per walk: a walk can run four starts of ~25 s
+                    # each, and the primary may move onto a key in that time. A stale snapshot would
+                    # let the reserve take a key the primary now holds (G71/G73).
+                    primary_identity = self._primary_identity()
+                    identity = str(record.get("identity") or "")
+                    if identity and primary_identity and identity == primary_identity:
+                        # Two live sessions of one WireGuard key break one of them (G71/G73). The
+                        # primary is the one that must keep working, so the reserve steps aside.
+                        if self._collision_logged != profile_id:
+                            self._collision_logged = profile_id
+                            self.log_func(
+                                f"[VPN] Дополнительный VPN: профиль {profile_id} пропущен — "
+                                "его ключ занят основным VPN.")
+                        continue
+                    tried += 1
+                    with self._lock:
+                        self._index = index
+                        self._tried_ids.add(profile_id)
+                        tried_ids.add(profile_id)
+                    if self._start_one(attempt, reason, still_current):
+                        return True
+                if still_current() and not is_closing:
+                    with self._lock:
+                        self._next_walk_at = time.time() + self.WALK_PAUSE_SEC
+                    self.log_func(
+                        f"[VPN] Дополнительный VPN: испробовано профилей {tried} из {len(plan)}, "
+                        f"трафик не пошёл ни на одном. Пауза {int(self.WALK_PAUSE_SEC / 60)} мин.")
+                return False
+            finally:
+                with self._lock:
+                    self._walking = False
+                self._walk_lock.release()
+
+        def _start_one(self, attempt, reason, still_current):
+            record = attempt.get("profile") or {}
+            backend = str(attempt.get("backend") or nova_profiles.BACKEND_AWG)
+            profile_id = str(record.get("id") or record.get("name") or "").strip()
+            self._stop_process()
+            if not still_current() or is_closing:
+                return False
+            if is_local_port_open_quick(self.SOCKS_PORT, timeout=0.4):
+                # Someone still holds our port: our own previous helper mid-exit, or a leftover.
+                for _ in range(16):
+                    time.sleep(0.25)
+                    if not is_local_port_open_quick(self.SOCKS_PORT, timeout=0.25):
+                        break
+                else:
+                    self.log_func(f"[VPN] Дополнительный VPN: порт {self.SOCKS_PORT} занят — профиль {profile_id} пропущен.")
+                    return False
+            started = time.monotonic()
+            ok = False
+            try:
+                if backend == nova_profiles.BACKEND_VLESS:
+                    ok = self._start_vless(record, profile_id, still_current)
+                elif backend == nova_profiles.BACKEND_AWG:
+                    ok = self._start_awg(record, profile_id, still_current)
+                else:
+                    # MASQUE has no second-listener story: nova-go masque serves one SOCKS port and
+                    # takes it from the command line, not from a config we render. Left out on
+                    # purpose rather than half-supported.
+                    self.log_func(f"[VPN] Дополнительный VPN: {profile_id} — такой профиль в резерв пока нельзя.")
+                    return False
+            except Exception as e:
+                safe_trace(f"[VPN] secondary profile start failed: {e}")
+                ok = False
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            interrupted = is_closing or not still_current()
+            if not (interrupted and not ok):
+                with contextlib.suppress(Exception):
+                    nova_profiles.record_outcome(get_base_dir(), profile_id, ok, elapsed_ms if ok else None)
+            if ok:
+                with self._lock:
+                    self._profile_id = profile_id
+                    self._profile_group = str(record.get("group") or "")
+                    self._profile_identity = str(record.get("identity") or "")
+                    self._backend = backend
+                    self._health = (time.time(), True)
+                    self._country = ""
+                    self._country_for = ""
+                    self._collision_logged = ""
+                endpoint = str(record.get("endpoint") or "")
+                suffix = f" ({endpoint})" if endpoint else ""
+                self.log_func(f"[VPN] Дополнительный VPN: профиль {profile_id}{suffix} работает — {reason}.")
+                with contextlib.suppress(Exception):
+                    nova_vpn_slots.remember_secondary(
+                        get_base_dir(), nova_vpn_slots.SECONDARY_PROFILE, profile=profile_id)
+                threading.Thread(target=self._maybe_measure_country, daemon=True,
+                                 name="NovaSecondaryProfileExit").start()
+            else:
+                self._stop_process()
+            return ok
+
+        def _runtime_path(self, profile_id, extension):
+            base = get_base_dir()
+            path = nova_profiles.runtime_config_path(base, profile_id)
+            folder, name = os.path.split(path)
+            return os.path.join(folder, "secondary-" + os.path.splitext(name)[0] + extension)
+
+        def _start_awg(self, record, profile_id, still_current):
+            wm = globals().get("warp_manager")
+            if wm is None:
+                return False
+            wireproxy = str(getattr(wm, "wireproxy_awg_path", "") or "")
+            if not wireproxy or not os.path.exists(wireproxy):
+                self.log_func("[VPN] Дополнительный VPN: wireproxy-awg.exe не найден.")
+                return False
+            # The personal Cloudflare identity belongs to the primary; the reserve uses the file as
+            # it was imported, which for a Custom profile is the only identity it has anyway.
+            payload, _personal = wm._render_awg_runtime_payload(
+                record, allow_personal_identity=False,
+                socks_port=self.SOCKS_PORT, http_port=self.HTTP_PORT)
+            if not payload:
+                return False
+            cfg_path = self._runtime_path(profile_id, ".conf")
+            os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+            with open(cfg_path, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+            if not still_current() or is_closing:
+                # The file carries the profile's private key (I19): it never outlives the attempt
+                # that wrote it, not even when the attempt is abandoned before the spawn.
+                with contextlib.suppress(Exception):
+                    os.remove(cfg_path)
+                return False
+            identity = str(record.get("identity") or "")
+            # The key is held only while the helper comes up, exactly as the primary holds it: long
+            # enough that two starts of one key never interleave, short enough that a reserve does
+            # not block every primary start for the rest of the session.
+            lock_ctx = _wg_identity_start(identity) if identity else contextlib.nullcontext()
+            with lock_ctx:
+                if not still_current() or is_closing:
+                    with contextlib.suppress(Exception):
+                        os.remove(cfg_path)
+                    return False
+                handle = None
+                with contextlib.suppress(Exception):
+                    handle = open(self._wireproxy_log_path, "w", encoding="utf-8", errors="replace")
+                proc = subprocess.Popen(
+                    [wireproxy, "-c", cfg_path],
+                    cwd=get_base_dir(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=handle or subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT if handle else subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                # Held out of the primary's orphan sweep, which kills by image name.
+                _note_awg_check_pid(proc.pid, True)
+                with self._lock:
+                    self._process = proc
+                    self._log_handle = handle
+                    self._config_path = cfg_path
+                return self._await_ready(proc, profile_id, still_current)
+
+        def _start_vless(self, record, profile_id, still_current):
+            wm = globals().get("warp_manager")
+            xray = str(getattr(wm, "nova_xray_path", "") or "") if wm is not None else ""
+            if not xray or not os.path.exists(xray):
+                self.log_func("[VPN] Дополнительный VPN: nova-xray.exe не найден.")
+                return False
+            node = nova_profiles.vless_node_of_record(record)
+            if node is None or nova_vless.validate(node):
+                return False
+            config = nova_vless.build_xray_config(node, self.SOCKS_PORT, http_port=self.HTTP_PORT)
+            config["log"] = {"loglevel": "warning", "error": self._xray_log_path.replace("\\", "/")}
+            cfg_path = self._runtime_path(profile_id, ".json")
+            os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+            tmp = cfg_path + ".tmp"
+            with open(tmp, "wb") as handle:
+                handle.write(json.dumps(config, ensure_ascii=False).encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, cfg_path)
+            if not still_current() or is_closing:
+                # The rendered Xray configuration carries the node's user id (I19).
+                with contextlib.suppress(Exception):
+                    os.remove(cfg_path)
+                return False
+            with contextlib.suppress(OSError):
+                os.remove(self._ready_path)
+            proc = subprocess.Popen(
+                [xray, "run", "--config", cfg_path,
+                 "--ready-file", self._ready_path, "--parent-pid", str(os.getpid())],
+                cwd=get_base_dir(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            _note_awg_check_pid(proc.pid, True)
+            with self._lock:
+                self._process = proc
+                self._log_handle = None
+                self._config_path = cfg_path
+            return self._await_ready(proc, profile_id, still_current)
+
+        def _await_ready(self, proc, profile_id, still_current):
+            deadline = time.time() + self.READY_TIMEOUT_SEC
+            while time.time() < deadline:
+                if is_closing or not still_current():
+                    return False
+                if proc.poll() is not None:
+                    self.log_func(f"[VPN] Дополнительный VPN: помощник профиля {profile_id} "
+                                  f"завершился с кодом {proc.returncode}.")
+                    return False
+                if is_local_port_open_quick(self.SOCKS_PORT, timeout=0.3):
+                    # The port opens when the listener binds, before anything is proven; the payload
+                    # probe through it is what says traffic passes (O5).
+                    if probe_socks5_payload(self.SOCKS_PORT, budget=self.PROBE_BUDGET_SEC):
+                        if not is_local_port_open_quick(self.HTTP_PORT, timeout=0.3):
+                            # Both listeners or neither: the slot is consumed through the HTTP
+                            # CONNECT port by tcp_proxy.py, the Telegram relay and the app transport
+                            # plans, so a reserve whose SOCKS works and whose 1380 never bound would
+                            # report itself up and fail every one of them.
+                            self.log_func(f"[VPN] Дополнительный VPN: профиль {profile_id} поднял SOCKS, "
+                                          f"но порт {self.HTTP_PORT} не открылся — берём другой узел.")
+                            return False
+                        return True
+                time.sleep(0.4)
+            return False
+
+        def _stop_process(self):
+            with self._lock:
+                proc = self._process
+                handle = self._log_handle
+                config_path = self._config_path
+                self._process = None
+                self._log_handle = None
+                self._config_path = ""
+                self._health = (0.0, False)
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    _note_awg_check_pid(proc.pid, False)
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=4)
+                        except Exception:
+                            proc.kill()
+                            proc.wait(timeout=3)
+                except Exception:
+                    pass
+                with contextlib.suppress(Exception):
+                    os.remove(self._ready_path)
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    handle.flush()
+                with contextlib.suppress(Exception):
+                    handle.close()
+            if config_path:
+                # The rendered config carries a private key or a node's user id (I19).
+                with contextlib.suppress(Exception):
+                    os.remove(config_path)
+
+        def _maybe_measure_country(self):
+            """Where the reserve comes out, measured once per profile. Nothing routes on it yet.
+
+            Opera and Tor are known to exit abroad; a profile the user imported is not, and the EU
+            list rides the reserve unconditionally (D21). Saying so in the log is what lets the owner
+            see that their reserve exits in Russia, which no other part of Nova would reveal.
+            """
+            with self._lock:
+                if not self._running:
+                    return
+                profile_id = self._profile_id
+                if not profile_id or self._country_for == profile_id:
+                    return
+                self._country_for = profile_id
+            country = ""
+            try:
+                result = nova_exit_probe.probe_exit_country("socks5", self.SOCKS_PORT, budget=12.0)
+                country = nova_vpn_slots.normalize_country(result.get("country"))
+            except Exception:
+                country = ""
+            if not country:
+                with self._lock:
+                    if self._country_for == profile_id:
+                        self._country_for = ""
+                return
+            with self._lock:
+                if self._profile_id != profile_id:
+                    return
+                self._country = country
+            if country == nova_vpn_slots.HOME_COUNTRY:
+                self.log_func(f"[VPN] Дополнительный VPN выходит в {country}: список EU идёт через него, "
+                              "а значит из России. Выберите другой профиль, если это важно.")
+            else:
+                self.log_func(f"[VPN] Дополнительный VPN выходит в {country}.")
 
     class SecondaryVpnController:
-        """Keeps the secondary VPN slot served: Opera (EU/US) or Tor (an entry), one at a time.
+        """Keeps the secondary VPN slot served: Opera (EU/US), Tor (an entry) or an imported profile
+        of the user's own, one at a time.
 
         A named choice is retried as itself and never replaced (Nova Android I1). «Авто» starts with
         the reserve that carried traffic last, then Opera, then Tor; while it sits on Tor it tries
-        Opera again now and then, because Tor is the slow reserve, not a destination.
+        Opera again now and then, because Tor is the slow reserve, not a destination. An imported
+        profile is a named choice only and never joins that ring (D25): Nova cannot vouch for those
+        nodes. Its own failover — walk to the next node of the group when the tunnel dies — happens
+        one level down, in SecondaryProfileRunner, the way Opera's EU->US fallback happens inside
+        Opera's own controller.
         """
 
         # Opera restarts itself (EU direct -> EU over WARP -> US in «Авто»); «Авто» moves on to Tor
@@ -6332,6 +7494,9 @@ try:
             self.kind = nova_vpn_slots.SECONDARY_OPERA
             self.region = "EU"
             self.entry = nova_vpn_slots.TOR_ENTRY_AUTO
+            self.profile_choice = {"group": "", "profile": ""}
+            self._profile_runner = None
+            self._profile_dead_since = 0.0
             self._attempts = []
             self._index = 0
             self._attempt_started = 0.0
@@ -6364,9 +7529,32 @@ try:
             with self._lock:
                 return self.running and self.kind == nova_vpn_slots.SECONDARY_TOR
 
+        def profile_runner(self, create=True):
+            with self._lock:
+                if self._profile_runner is None and create:
+                    self._profile_runner = SecondaryProfileRunner(log_func=self.log_func)
+                return self._profile_runner
+
+        def profile_usable(self, now):
+            """Liveness of an imported-profile reserve, for the watchdog. False for any other kind."""
+            if self.kind != nova_vpn_slots.SECONDARY_PROFILE:
+                return False
+            runner = self.profile_runner(create=False)
+            return bool(runner is not None and runner.usable(now))
+
+        def secondary_country(self):
+            """Measured exit country of the reserve, "" when nothing measured it (Opera, Tor)."""
+            runner = self.profile_runner(create=False)
+            if runner is None or self.kind != nova_vpn_slots.SECONDARY_PROFILE:
+                return ""
+            return runner.country()
+
         def is_up(self):
             if self.kind == nova_vpn_slots.SECONDARY_TOR:
                 return tor_route_ready()
+            if self.kind == nova_vpn_slots.SECONDARY_PROFILE:
+                runner = self.profile_runner(create=False)
+                return bool(runner is not None and runner.is_up())
             opm = globals().get("opera_proxy_manager")
             try:
                 return bool(opm is not None and opm.is_tunnel_ready_cached(max_age=8.0))
@@ -6376,6 +7564,11 @@ try:
         def label(self):
             if self.kind == nova_vpn_slots.SECONDARY_TOR:
                 return nova_vpn_slots.secondary_indicator_label(nova_vpn_slots.SECONDARY_TOR)
+            if self.kind == nova_vpn_slots.SECONDARY_PROFILE:
+                runner = self.profile_runner(create=False)
+                if runner is not None:
+                    return runner.label()
+                return nova_vpn_slots.secondary_indicator_label(nova_vpn_slots.SECONDARY_PROFILE)
             opm = globals().get("opera_proxy_manager")
             runtime = ""
             try:
@@ -6386,13 +7579,18 @@ try:
 
         def status(self):
             with self._lock:
-                return {
+                state = {
                     "running": self.running,
                     "mode": self.mode,
                     "kind": self.kind,
                     "region": self.region,
                     "entry": self.entry,
+                    "profile": dict(self.profile_choice),
                 }
+            runner = self.profile_runner(create=False)
+            if runner is not None:
+                state["profile_runtime"] = runner.status()
+            return state
 
         # -- control ----------------------------------------------------------------------------
 
@@ -6409,6 +7607,8 @@ try:
                 self.running = True
                 self._run_id = globals().get("SERVICE_RUN_ID")
                 self.mode = choice["mode"]
+                self.profile_choice = {"group": choice.get("profile_group", ""),
+                                       "profile": choice.get("profile", "")}
                 self._attempts = nova_vpn_slots.secondary_attempts(choice, last)
                 self._index = 0
                 self._reset_trial()
@@ -6426,16 +7626,25 @@ try:
             with self._lock:
                 choice = nova_vpn_slots.secondary_choice(load_routing_settings())
                 current = {"kind": self.kind, "region": self.region, "entry": self.entry}
+                previous_profile = dict(self.profile_choice)
                 self.mode = choice["mode"]
+                self.profile_choice = {"group": choice.get("profile_group", ""),
+                                       "profile": choice.get("profile", "")}
                 self._attempts = nova_vpn_slots.secondary_attempts(choice, current)
                 self._index = 0
                 self._reset_trial()
                 self._generation += 1
                 generation = self._generation
                 attempt = self._attempts[0]
-                same = (attempt[0] == self.kind
-                        and (attempt[1] == self.region if attempt[0] == nova_vpn_slots.SECONDARY_OPERA
-                             else attempt[1] == self.entry))
+                if attempt[0] == nova_vpn_slots.SECONDARY_PROFILE:
+                    # The reserve is "the same" only when it is the same choice, not the same kind:
+                    # switching from one imported group to another must really switch.
+                    same = (self.kind == nova_vpn_slots.SECONDARY_PROFILE
+                            and previous_profile == self.profile_choice)
+                else:
+                    same = (attempt[0] == self.kind
+                            and (attempt[1] == self.region if attempt[0] == nova_vpn_slots.SECONDARY_OPERA
+                                 else attempt[1] == self.entry))
             opm = globals().get("opera_proxy_manager")
             if same and attempt[0] == nova_vpn_slots.SECONDARY_OPERA:
                 # Opera's own failover may be on US while the slot still says EU: «Авто» allowed that.
@@ -6457,6 +7666,11 @@ try:
                 self._generation += 1
                 self._reset_trial()
                 self._remembered_key = None
+                self._profile_dead_since = 0.0
+                runner = self._profile_runner
+            if runner is not None:
+                with contextlib.suppress(Exception):
+                    runner.stop()
 
         def _reset_trial(self):
             self._trial_started = 0.0
@@ -6499,13 +7713,33 @@ try:
                         # Opera serves the slot again: a pending return-to-Opera trial is moot, and a
                         # stale one would freeze _last_good and walk a working Opera back to Tor.
                         self._reset_trial()
-                    else:
+                    elif kind == nova_vpn_slots.SECONDARY_TOR:
                         self.entry = nova_vpn_slots.normalize_tor_entry(value)
+                    else:
+                        self._reset_trial()
                     self._attempt_started = time.time()
                     self._last_good = 0.0
                     self._remembered_key = None
+                    self._profile_dead_since = 0.0
+                if kind != nova_vpn_slots.SECONDARY_PROFILE:
+                    # Whatever the slot moves to, the reserve profile's own helper goes down with it:
+                    # the slot is single-occupancy, and its ports must be free for the next tenant.
+                    runner = self.profile_runner(create=False)
+                    if runner is not None:
+                        with contextlib.suppress(Exception):
+                            runner.stop()
                 try:
-                    if kind == nova_vpn_slots.SECONDARY_OPERA:
+                    if kind == nova_vpn_slots.SECONDARY_PROFILE:
+                        choice = dict(self.profile_choice)
+                        target = choice.get("profile") or choice.get("group") or "?"
+                        self.log_func(f"[VPN] Дополнительный VPN: свой профиль ({target}) — {reason}.")
+                        self._stop_tor_unless_needed()
+                        if opm is not None:
+                            with contextlib.suppress(Exception):
+                                opm.stop()
+                        if self._still_current(generation):
+                            self.profile_runner().apply(choice, lambda g=generation: self._still_current(g))
+                    elif kind == nova_vpn_slots.SECONDARY_OPERA:
                         region = self.region
                         auto_note = (" — при сбое допускается US"
                                      if self.mode == nova_vpn_slots.SECONDARY_AUTO and region == "EU" else "")
@@ -6564,16 +7798,40 @@ try:
             except Exception as e:
                 safe_trace(f"[VPN] PAC refresh after the secondary switch failed: {e}")
 
-        def tick(self, now, opera_usable, tor_ready):
+        def tick(self, now, opera_usable, tor_ready, profile_usable=False):
             """Watchdog pass (every ~3 s): remember what works, and let «Авто» walk on failures."""
             with self._lock:
                 if not self.running or self._activating:
                     return
                 kind = self.kind
-                up = bool(tor_ready) if kind == nova_vpn_slots.SECONDARY_TOR else bool(opera_usable)
+                if kind == nova_vpn_slots.SECONDARY_TOR:
+                    up = bool(tor_ready)
+                elif kind == nova_vpn_slots.SECONDARY_PROFILE:
+                    up = bool(profile_usable)
+                else:
+                    up = bool(opera_usable)
                 if up and not self._trial_started:
                     self._last_good = now
                 self._remember_if_new(up)
+                if kind == nova_vpn_slots.SECONDARY_PROFILE:
+                    # A named reserve is never replaced by another kind (I1). What it does when its
+                    # tunnel dies is walk to the next profile of its own group -- the same answer the
+                    # primary gives, and the reason the choice may be a group and not only one node.
+                    if up:
+                        self._profile_dead_since = 0.0
+                        return
+                    if not self._profile_dead_since:
+                        self._profile_dead_since = now
+                        return
+                    if now - self._profile_dead_since < SecondaryProfileRunner.DEAD_GRACE_SEC:
+                        return
+                    self._profile_dead_since = now
+                    generation = self._generation
+                    runner = self.profile_runner()
+                    threading.Thread(
+                        target=self._advance_profile, args=(runner, generation),
+                        daemon=True, name="NovaSecondaryProfileWalk").start()
+                    return
                 if self.mode != nova_vpn_slots.SECONDARY_AUTO:
                     return
                 generation = self._generation
@@ -6643,8 +7901,28 @@ try:
             self._generation += 1
             self._activate_async(self._generation, attempt, why)
 
+        def _advance_profile(self, runner, generation):
+            """Walk the reserve profile's group on a worker: a start blocks for seconds.
+
+            The PAC is rebuilt only when the walk actually landed on something. A walk that found
+            another one in flight, or that is inside its pause, changes nothing — and rebuilding the
+            PAC there costs a full list re-read plus an `INTERNET_OPTION_SETTINGS_CHANGED` broadcast
+            that makes every WinINET application re-read the proxy, every 45 s, for as long as the
+            reserve cannot come up.
+            """
+            moved = False
+            with contextlib.suppress(Exception):
+                moved = bool(runner.advance("предыдущий профиль замолчал",
+                                            lambda g=generation: self._still_current(g)))
+            if moved:
+                self._refresh_pac()
+
         def _remember_if_new(self, up):
             if not up:
+                return
+            if self.kind == nova_vpn_slots.SECONDARY_PROFILE:
+                # The runner records the node that actually carried traffic, with its id; there is
+                # nothing this level knows that it does not.
                 return
             if self.kind == nova_vpn_slots.SECONDARY_TOR:
                 entry = self.entry
@@ -6776,6 +8054,8 @@ try:
             backend = str(backend or "")
             if backend == "masque":
                 return nova_vpn_slots.PRIMARY_CF_MASQUE
+            if backend == "vless":
+                return nova_vpn_slots.PRIMARY_VLESS
             if backend == "awg":
                 group = str(profile_id or "").partition("/")[0]
                 return nova_vpn_slots.primary_kind_of_group(group) or nova_vpn_slots.PRIMARY_CF_AWG
@@ -6815,6 +8095,9 @@ try:
             secondary_label = ""
             with contextlib.suppress(Exception):
                 secondary_label = ctl.label() if ctl is not None else "EU"
+            secondary_country = ""
+            with contextlib.suppress(Exception):
+                secondary_country = ctl.secondary_country() if ctl is not None else ""
             if route_secondary is not None:
                 secondary_up = bool(active and route_secondary)
             else:
@@ -6823,7 +8106,7 @@ try:
             state = nova_vpn_slots.make_egress_state(
                 primary_up=primary_up, primary_kind=primary_kind, primary_label=primary_label,
                 primary_country=country, secondary_up=secondary_up, secondary_kind=secondary_kind,
-                secondary_label=secondary_label, now=now,
+                secondary_label=secondary_label, secondary_country=secondary_country, now=now,
             )
             core = json.dumps({k: v for k, v in state.items() if k != "updated_at"}, sort_keys=True)
             if core != self._last_state_core or now - self._last_write_at >= self.HEARTBEAT_SEC:
@@ -6942,6 +8225,7 @@ try:
             self.registry_backup = {}
             self._last_route_signature = None
             self._last_eu_route_state = None
+            self._last_youtube_route_state = None
             self._last_proxy_diag_state = None
             self._winhttp_backup_dump = None
             self._winhttp_proxy_applied = False
@@ -7143,6 +8427,11 @@ try:
                 discord_domains = get_discord_runtime_domains()
                 telegram_domains = get_telegram_runtime_domains()
                 whatsapp_domains = self._load_domain_list(os.path.join(base, "list", "whatsapp.txt"))
+                # YouTube has a route of its own (youtube_route below): the winws hostlist plus the
+                # names that must share googlevideo's exit (D22).
+                youtube_domains = set(sanitize_youtube_domain_list(
+                    self._load_domain_list(os.path.join(base, "list", "youtube.txt"))))
+                youtube_domains.update(nova_vpn_slots.YOUTUBE_ROUTE_FOLLOWERS)
                 telegram_ips = self._load_ip_list(os.path.join(base, "ip", "telegram.txt"))
                 user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_ru.txt"))
                 user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_eu.txt"))
@@ -7197,12 +8486,19 @@ try:
                     else nova_vpn_slots.SECONDARY_OPERA
                 )
                 secondary_is_tor = secondary_kind == nova_vpn_slots.SECONDARY_TOR
+                secondary_is_profile = secondary_kind == nova_vpn_slots.SECONDARY_PROFILE
                 if opera_override is not None:
                     opera_active = bool(opera_override)
                     opera_port_open = opera_active
                     opera_proxy_ok = opera_active
                 elif secondary_is_tor:
                     opera_active = bool(tor_route_ready())
+                    opera_port_open = opera_active
+                    opera_proxy_ok = opera_active
+                elif secondary_is_profile:
+                    # The runner's cached verdict, not a fresh probe: probing a stranger's node from
+                    # here too would double the handshakes it sees and disagree with the watchdog.
+                    opera_active = bool(secondary_ctl is not None and secondary_ctl.is_up())
                     opera_port_open = opera_active
                     opera_proxy_ok = opera_active
                 else:
@@ -7292,10 +8588,13 @@ try:
                     if mode == "direct":
                         return "DIRECT"
                     return default_route
-                # Keep WinHTTP in sync with actual 1371 health (optional).
+                # Keep WinHTTP in sync with actual 1371 health (optional). The system-wide WinHTTP
+                # proxy names one host:port and that port is Opera's; a reserve on Tor or on an own
+                # profile leaves it alone, as Tor already did — those clients then go direct, which
+                # is what they did before this slot existed.
                 if self._sync_winhttp_proxy:
                     try:
-                        if opera_active and not secondary_is_tor:
+                        if opera_active and not secondary_is_tor and not secondary_is_profile:
                             if not self._winhttp_proxy_applied:
                                 self._apply_winhttp_proxy()
                         else:
@@ -7333,6 +8632,24 @@ try:
                     ru_route_parts.append(secondary_route)
                 ru_route_parts.append(last_resort)
                 ru_route = "; ".join(ru_route_parts)
+
+                # YouTube: RU-list order while the primary exits abroad. With a Russian (or not yet
+                # measured) exit the primary reaches Google from inside the DPI, which drops YouTube
+                # ClientHellos per flow -- 10 s stalls on a third of new connections (G81) -- so the
+                # secondary goes first and the primary stays behind it as a fallback. Not with Tor as
+                # the secondary: video over Tor is too slow, YouTube stays primary-first (D23).
+                # Only browsers on «Auto» get this: «Осн.»/«Доп.» build a full-mode PAC whose single
+                # route is returned before any list is consulted.
+                youtube_slots = nova_vpn_slots.youtube_route_slots(
+                    bool(warp_active and primary_foreign), secondary_kind)
+                youtube_route = nova_vpn_slots.route_chain(
+                    youtube_slots,
+                    primary_up=warp_active,
+                    secondary_up=secondary_active,
+                    primary_tokens=primary_route,
+                    secondary_tokens=secondary_route,
+                    last_resort=last_resort,
+                )
 
                 # Browser Discord traffic also uses plain PAC fallbacks.
                 # App Discord traffic is routed separately from browser PAC.
@@ -7395,6 +8712,7 @@ try:
                 telegram_js = "{" + ",".join(f'"{d}":1' for d in sorted(telegram_domains)) + "}"
                 telegram_ips_js = json.dumps(telegram_ips)
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in sorted(whatsapp_domains)) + "}"
+                youtube_js = "{" + ",".join(f'"{d}":1' for d in sorted(youtube_domains)) + "}"
 
                 # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
                 # kill-switch: DNS для них уже развязан правилами, а blackhole
@@ -7494,6 +8812,7 @@ try:
     var telegram = {telegram_js};
     var telegram_ips = {telegram_ips_js};
     var whatsapp = {whatsapp_js};
+    var youtube = {youtube_js};
     var user_ru_ips = {user_ru_ips_js};
     var user_eu_ips = {user_eu_ips_js};
     var ru_ips = {ru_ips_js};
@@ -7641,6 +8960,7 @@ try:
     if (matchDomain(user_eu, host)) return "{eu_route}";
     if (matchDomain(exclude, host)) return "DIRECT";
 {app_domain_priority}{ai_unlock_guard}    if (matchDomain(eu, host)) return "{eu_route}";
+    if (matchDomain(youtube, host)) return "{youtube_route}";
     if (matchDomain(ru, host)) return "{ru_route}";
     if (matchDomain(discord, host)) return "{discord_route}";
     if (matchDomain(telegram, host)) return "{telegram_route}";
@@ -7695,7 +9015,7 @@ try:
                     system_refreshed = True
 
                 # Log routing states only when they change.
-                secondary_name = "Tor" if secondary_is_tor else "Opera"
+                secondary_name = "Tor" if secondary_is_tor else ("свой профиль" if secondary_is_profile else "Opera")
                 eu_route_state = eu_route
                 if eu_route_state != self._last_eu_route_state:
                     self._last_eu_route_state = eu_route_state
@@ -7718,6 +9038,23 @@ try:
                     else:
                         ru_note = "оба VPN недоступны"
                     self.log_func(f"[PAC] RU маршрут: {ru_route} ({ru_note})")
+
+                if youtube_route != self._last_youtube_route_state:
+                    self._last_youtube_route_state = youtube_route
+                    if not warp_active and not secondary_active:
+                        yt_note = "оба VPN недоступны"
+                    elif youtube_slots[0] == "secondary":
+                        yt_note = (
+                            f"выход основного VPN не за рубежом, первым {secondary_name}"
+                            if secondary_active else "дополнительный VPN недоступен, через основной"
+                        )
+                    elif not warp_active:
+                        yt_note = f"основной недоступен, через {secondary_name}"
+                    elif primary_foreign:
+                        yt_note = "основной VPN выходит за рубежом, он первым"
+                    else:
+                        yt_note = f"дополнительный VPN — {secondary_name}, первым основной"
+                    self.log_func(f"[PAC] YouTube маршрут: {youtube_route} ({yt_note})")
 
                 # Trigger refresh if statuses changed
                 status_signature = (bool(warp_active), bool(opera_active), secondary_kind, bool(primary_foreign))
@@ -9468,14 +10805,18 @@ try:
                     "timeout": 1.6,
                 }
             ctl = globals().get("secondary_vpn_controller")
-            tor_secondary = bool(
-                ctl is not None and ctl.running and ctl.serving_kind() == nova_vpn_slots.SECONDARY_TOR
-            )
+            secondary_kind = ""
+            if ctl is not None and ctl.running:
+                with contextlib.suppress(Exception):
+                    secondary_kind = str(ctl.serving_kind() or "")
+            # Opera is the only tenant whose port this manager knows; Tor and an own profile have
+            # their own, and nova_vpn_slots is the one place that maps a kind to them.
+            managed_secondary = secondary_kind in (nova_vpn_slots.SECONDARY_TOR,
+                                                   nova_vpn_slots.SECONDARY_PROFILE)
             try:
-                if tor_secondary:
-                    # Tor serves the secondary slot: its HTTP CONNECT port, with Tor's longer timeout.
+                if managed_secondary:
                     attempt = nova_vpn_slots.secondary_http_attempt(
-                        {"secondary": {"kind": nova_vpn_slots.SECONDARY_TOR}}, timeout=2.2)
+                        {"secondary": {"kind": secondary_kind}}, timeout=2.2)
                     attempt.pop("first_byte_timeout", None)
                     attempts_by_label["opera-http"] = attempt
                 else:
@@ -9573,8 +10914,8 @@ try:
                         return True
                     active_backend = getattr(wm, "active_backend", "")
                     if active_backend in getattr(wm, "USERSPACE_BACKENDS", ("awg",)):
-                        # AWG or MASQUE helper still coming up on the shared SOCKS port.
-                        for helper_attr in ("awg_process", "masque_process"):
+                        # AWG, MASQUE or VLESS helper still coming up on the shared SOCKS port.
+                        for helper_attr in ("awg_process", "masque_process", "vless_process"):
                             helper_proc = getattr(wm, helper_attr, None)
                             if helper_proc and helper_proc.poll() is None:
                                 return True
@@ -12778,9 +14119,14 @@ try:
     DEFAULT_ROUTING_SETTINGS = {
         "version": CURRENT_VERSION,
         "opera_region": "EU",
-        # Which reserve runs next to the primary VPN: auto | opera | tor (nova_vpn_slots). The
-        # Opera region stays in opera_region above and the Tor entry in the top-level "tor" block.
+        # Which reserve runs next to the primary VPN: auto | opera | tor | profile
+        # (nova_vpn_slots). The Opera region stays in opera_region above, the Tor entry in the
+        # top-level "tor" block and the reserve profile in "secondary_profile" below — each tenant's
+        # payload beside the block, not inside it, which is how the first two already worked.
         "secondary": {"mode": "auto"},
+        # Which imported profile serves the reserve when the mode is "profile": a group name alone
+        # means any profile of it, in the group's own order; a profile id pins one node.
+        "secondary_profile": {"group": "", "profile": ""},
         "routes": {
             "browser": "auto",
             # Auto, not WARP: the relay picks its own egress per connection now,
@@ -12865,13 +14211,14 @@ try:
 
     # Ключи верхнего уровня, за которые эта функция отвечает. Всё остальное она
     # обязана пронести через себя нетронутым — см. ниже.
-    _OWNED_ROUTING_KEYS = ("version", "opera_region", "secondary", "routes", "system")
+    _OWNED_ROUTING_KEYS = ("version", "opera_region", "secondary", "secondary_profile", "routes", "system")
 
     def normalize_routing_settings(data):
         normalized = {
             "version": CURRENT_VERSION,
             "opera_region": DEFAULT_ROUTING_SETTINGS["opera_region"],
             "secondary": dict(DEFAULT_ROUTING_SETTINGS["secondary"]),
+            "secondary_profile": dict(DEFAULT_ROUTING_SETTINGS["secondary_profile"]),
             "routes": dict(DEFAULT_ROUTING_SETTINGS["routes"]),
             "system": dict(DEFAULT_ROUTING_SETTINGS["system"]),
         }
@@ -12894,6 +14241,8 @@ try:
                 normalized["opera_region"],
             )
             normalized["secondary"] = nova_vpn_slots.normalize_secondary_block(data.get("secondary"))
+            normalized["secondary_profile"] = nova_vpn_slots.normalize_secondary_profile_block(
+                data.get("secondary_profile"))
             routes = data.get("routes") or {}
             if isinstance(routes, dict):
                 for route_key in ROUTING_GROUP_KEYS:
@@ -13104,7 +14453,7 @@ try:
         return _opera_region_to_country(get_routing_opera_region(settings))
 
     def get_secondary_vpn_choice(settings=None):
-        """{"mode": auto|opera|tor, "opera_region": EU|US, "tor_entry": ...} from the routing settings."""
+        """{"mode": auto|opera|tor|profile, "opera_region", "tor_entry", "profile_group", "profile"}."""
         payload = settings if isinstance(settings, dict) else load_routing_settings()
         return nova_vpn_slots.secondary_choice(payload)
 
@@ -25316,6 +26665,11 @@ try:
                         and secondary_ctl.running
                         and secondary_ctl.serving_kind() == nova_vpn_slots.SECONDARY_TOR
                     )
+                    secondary_is_profile = bool(
+                        secondary_ctl is not None
+                        and secondary_ctl.running
+                        and secondary_ctl.serving_kind() == nova_vpn_slots.SECONDARY_PROFILE
+                    )
                     opera_port = int(getattr(opera_proxy_manager, "port", 1371))
                     opera_proc = getattr(opera_proxy_manager, "process", None)
                     opera_proc_dead = bool(opera_proc and opera_proc.poll() is not None)
@@ -25550,12 +26904,27 @@ try:
                     # The secondary slot's verdict: Opera's health, or Tor's readiness when Tor serves it.
                     # «Авто» walks between the two in tick(); the PAC below follows whichever serves.
                     tor_ready_now = bool(tor_route_ready())
+                    # An own profile in the reserve is probed by its runner, on its own cadence: a
+                    # payload probe every 3 s would be a fresh TLS/REALITY handshake to a stranger's
+                    # node twenty times a minute, which is how a node stops answering us (G72).
+                    profile_ready_now = False
+                    if secondary_is_profile and secondary_ctl is not None:
+                        try:
+                            profile_ready_now = bool(secondary_ctl.profile_usable(now))
+                        except Exception:
+                            profile_ready_now = False
                     if secondary_ctl is not None:
                         try:
-                            secondary_ctl.tick(now, opera_usable=bool(opera_usable), tor_ready=tor_ready_now)
+                            secondary_ctl.tick(now, opera_usable=bool(opera_usable), tor_ready=tor_ready_now,
+                                               profile_usable=profile_ready_now)
                         except Exception as e:
                             safe_trace(f"[VPN] secondary slot tick error: {e}")
-                    secondary_usable = tor_ready_now if secondary_is_tor else bool(opera_usable)
+                    if secondary_is_tor:
+                        secondary_usable = tor_ready_now
+                    elif secondary_is_profile:
+                        secondary_usable = profile_ready_now
+                    else:
+                        secondary_usable = bool(opera_usable)
 
                     # Rebuild PAC when 1371 or 1370 availability changes, so EU and RU routing is always fresh.
                     if warp_manager:
@@ -25573,9 +26942,9 @@ try:
                     # изменении. Правило и замер, из которого взяты пороги,
                     # живут в `resources/nova_route_flap.py`.
                     try:
-                        # Opera's damper only: Tor readiness does not ripple, and Opera's counters
-                        # say nothing about Tor.
-                        if not secondary_is_tor and hold_route(
+                        # Opera's damper only: Tor readiness and a reserve profile's do not ripple,
+                        # and Opera's counters say nothing about either.
+                        if not secondary_is_tor and not secondary_is_profile and hold_route(
                             OPERA_HOLD,
                             bool(last_opera_port_state),
                             now,
@@ -28043,7 +29412,7 @@ try:
             _kill_singbox_processes_best_effort()
 
             for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "wireproxy-awg.exe", "warp-svc.exe", "warp-cli.exe",
-                              "nova-go.exe", "nova-tor.exe", "nova-lyrebird.exe",
+                              "nova-go.exe", "nova-xray.exe", "nova-tor.exe", "nova-lyrebird.exe",
                               "opera-proxy.windows-amd64.exe", "opera-proxy.exe", "opera-proxy*",
                               TLS_TERMINATOR_FILENAME, *_novawfp_service_image_names()]:
                 try:
@@ -29792,9 +31161,14 @@ try:
             # Tor can. A change that cannot affect the running reserve restarts nothing.
             secondary_changed = (
                 prev_secondary["mode"] != new_secondary["mode"]
-                or (opera_changed and new_secondary["mode"] != nova_vpn_slots.SECONDARY_TOR)
+                or (opera_changed and new_secondary["mode"] not in (nova_vpn_slots.SECONDARY_TOR,
+                                                                    nova_vpn_slots.SECONDARY_PROFILE))
                 or (prev_secondary["tor_entry"] != new_secondary["tor_entry"]
-                    and new_secondary["mode"] != nova_vpn_slots.SECONDARY_OPERA)
+                    and new_secondary["mode"] not in (nova_vpn_slots.SECONDARY_OPERA,
+                                                      nova_vpn_slots.SECONDARY_PROFILE))
+                or (new_secondary["mode"] == nova_vpn_slots.SECONDARY_PROFILE
+                    and (prev_secondary.get("profile_group") != new_secondary.get("profile_group")
+                         or prev_secondary.get("profile") != new_secondary.get("profile")))
             )
 
             prev_sys = previous.get("system") or {}
@@ -29814,6 +31188,9 @@ try:
                         nova_vpn_slots.SECONDARY_AUTO: "Авто",
                         nova_vpn_slots.SECONDARY_OPERA: f"Opera {new_secondary['opera_region']}",
                         nova_vpn_slots.SECONDARY_TOR: f"Tor ({new_secondary['tor_entry']})",
+                        nova_vpn_slots.SECONDARY_PROFILE: (
+                            "свой профиль: "
+                            + (new_secondary.get("profile") or new_secondary.get("profile_group") or "не выбран")),
                     }
                     logger(f"[VPN] Дополнительный VPN: выбран «{labels.get(new_secondary['mode'], new_secondary['mode'])}».")
                     ctl.apply_now("выбор изменён в настройках")
@@ -30182,12 +31559,16 @@ try:
                 ).pack(side="left")
                 slot_pill_frame = tk.Frame(slot_row, bg=SETTINGS_THEME["bg"])
                 slot_pill_frame.pack(side="right", fill="x", expand=True)
+                # Six primary kinds and five secondary ones no longer fit at the width four did.
+                # The pills shrink instead of the window growing: the widest row in this window is
+                # the browser one (five pills at 62), and 62 x 6 would widen every other row with it.
+                pill_width = 62 if len(row_items) <= 4 else 52
                 for index, (item_key, item_label) in enumerate(row_items):
                     btn = PopupPillButton(
                         slot_pill_frame,
                         item_label,
                         command=lambda k=item_key, setter=row_setter: setter(k),
-                        width=62,
+                        width=pill_width,
                         height=26,
                     )
                     btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
@@ -30354,10 +31735,19 @@ try:
                 system_settings["vpn_autoconnect"] = bool(vpn_autoconnect_state.get("enabled", True))
                 secondary_mode, secondary_region = nova_vpn_slots.secondary_choice_for_pill(
                     secondary_state.get("value"), get_secondary_vpn_choice(latest_settings))
+                secondary_profile_block = nova_vpn_slots.normalize_secondary_profile_block(
+                    latest_settings.get(nova_vpn_slots.SECONDARY_PROFILE_KEY))
+                if secondary_mode == nova_vpn_slots.SECONDARY_PROFILE and not secondary_profile_block["group"]:
+                    # The row's «Свой» pill names a kind, not a profile: the node or the group is
+                    # chosen in «Профили» or in the slot menu. Pressed with nothing chosen yet, it
+                    # takes the first imported group that has profiles, so the pill does something
+                    # instead of handing the slot an empty choice.
+                    secondary_profile_block = {"group": _default_reserve_profile_group(), "profile": ""}
                 payload = {
                     "version": CURRENT_VERSION,
                     "opera_region": secondary_region,
                     "secondary": {"mode": secondary_mode},
+                    nova_vpn_slots.SECONDARY_PROFILE_KEY: secondary_profile_block,
                     "routes": {key: current_modes.get(key, DEFAULT_ROUTING_SETTINGS["routes"].get(key, "auto")) for key, _label in routing_group_rows},
                     "system": system_settings,
                 }
@@ -30488,10 +31878,14 @@ try:
 
         # -- the two VPN slots from the UI (settings rows and the indicator menus) -----------------
 
-        def _apply_primary_vpn_choice(kind, country="", source="меню"):
-            """Save the primary slot choice and switch at once when the core runs. Worker thread only."""
+        def _apply_primary_vpn_choice(kind, country="", source="меню", profile=""):
+            """Save the primary slot choice and switch at once when the core runs. Worker thread only.
+
+            `profile` pins one node of that kind's group — how an imported VLESS or Custom profile is
+            chosen from the slot menu, instead of only from «Профили».
+            """
             logger = globals().get("log_print", print)
-            selection = nova_vpn_slots.selection_for_primary(kind, country)
+            selection = nova_vpn_slots.selection_for_primary(kind, country, profile)
             try:
                 saved_selection = nova_profiles.save_selection(get_base_dir(), selection)
             except OSError as e:
@@ -30500,6 +31894,8 @@ try:
             name = nova_vpn_slots.PRIMARY_MENU_LABELS.get(kind, kind)
             if saved_selection.get("country"):
                 name = f"{name} {saved_selection['country']}"
+            elif saved_selection.get("profile"):
+                name = f"{name}: {nova_profiles.split_profile_id(saved_selection['profile'])[1]}"
             wm = globals().get("warp_manager")
             if wm is not None:
                 wm._primary_choice_cache = None
@@ -30510,13 +31906,37 @@ try:
             wm.apply_selection_now(_describe_profile_selection(saved_selection))
             return True
 
-        def _apply_secondary_vpn_choice(mode, region=None, entry=None, source="меню"):
-            """Save the secondary slot choice through apply_routing_settings_live. Worker thread only."""
+        def _default_reserve_profile_group():
+            """The imported group a bare «Свой» falls back to: VLESS first, then Custom.
+
+            VLESS first because that group refills itself from subscriptions, so it is the one that
+            still has candidates a week later; Custom holds only what the owner put there by hand.
+            Returns "" when neither has a usable profile -- the runner then says so in the log.
+            """
+            try:
+                records = nova_profiles.list_profiles(get_base_dir())
+            except Exception:
+                return nova_profiles.GROUP_VLESS
+            for group in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM):
+                if any(r.get("group") == group and r.get("valid") for r in records):
+                    return group
+            return nova_profiles.GROUP_VLESS
+
+        def _apply_secondary_vpn_choice(mode, region=None, entry=None, source="меню",
+                                        profile_group=None, profile_id=None):
+            """Save the secondary slot choice through apply_routing_settings_live. Worker thread only.
+
+            `profile_group` / `profile_id` name the imported profile that serves the reserve when the
+            mode is `profile`: a group alone means any node of it, an id pins one.
+            """
             logger = globals().get("log_print", print)
             try:
                 settings = load_routing_settings()
                 payload = dict(settings)
                 payload["secondary"] = {"mode": nova_vpn_slots.normalize_secondary_mode(mode)}
+                if profile_group is not None or profile_id is not None:
+                    payload[nova_vpn_slots.SECONDARY_PROFILE_KEY] = nova_vpn_slots.normalize_secondary_profile_block(
+                        {"group": profile_group or "", "profile": profile_id or ""})
                 if region:
                     payload["opera_region"] = nova_vpn_slots.normalize_opera_region(region)
                 if entry is not None:
@@ -30535,16 +31955,65 @@ try:
                 logger(f"[VPN] Не удалось применить дополнительный VPN ({source}): {e}")
                 return False
 
+        # How many imported nodes a slot menu lists. A VLESS group can hold thousands after a
+        # subscription refresh, and a Tk menu of thousands is not a menu; these are the ones Nova
+        # itself would try first, in the group's own connect order, and «Профили» has the rest.
+        IMPORTED_MENU_LIMIT = 12
+
+        def _imported_profile_menu_data(base, limit=IMPORTED_MENU_LIMIT, chosen_ids=()):
+            """{group: {"rows": [(id, name), ...], "total": n}} for the imported groups.
+
+            The order is the group's own connect order (`build_attempt_plan`), so the first entries
+            are the nodes that worked last and the nearest ones — the same ranking the automatic
+            walk uses, shown to the user instead of being hidden behind it.
+            """
+            out = {}
+            wanted = {str(x or "") for x in (chosen_ids or ())}
+            try:
+                records = nova_profiles.list_profiles(base)
+                stats = nova_profiles.load_stats(base)
+            except Exception:
+                return out
+            for group in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM):
+                chosen = next((x for x in wanted if x.partition("/")[0] == group), "")
+                sel = {"version": 1, "mode": nova_profiles.MODE_GROUP, "group": group}
+                try:
+                    plan = nova_profiles.build_attempt_plan(records, sel, stats=stats)
+                except Exception:
+                    plan = []
+                rows = []
+                for attempt in plan:
+                    record = attempt.get("profile") if isinstance(attempt, dict) else None
+                    if not isinstance(record, dict) or not record.get("id"):
+                        continue
+                    rows.append((str(record["id"]), str(record.get("name") or record["id"])))
+                shown = rows[:max(0, int(limit))]
+                if chosen:
+                    # The chosen node has to be in the menu even when the ranking puts it past the
+                    # cap, or the menu shows no selection at all and the user cannot see what is on.
+                    ids = {pid for pid, _name in shown}
+                    for row in rows:
+                        if row[0] == chosen and row[0] not in ids:
+                            shown.append(row)
+                            break
+                out[group] = {"rows": shown, "total": len(rows)}
+            return out
+
         def _gather_vpn_menu_data():
             """Everything a quick-switch menu shows, read off the Tk thread."""
             base = get_base_dir()
             data = {"primary": {"kind": nova_vpn_slots.PRIMARY_AUTO, "country": "", "profile": ""},
-                    "countries": [], "secondary": get_secondary_vpn_choice(), "reissue_busy": False}
+                    "countries": [], "secondary": get_secondary_vpn_choice(), "reissue_busy": False,
+                    "imported": {}}
             with contextlib.suppress(Exception):
                 data["primary"] = nova_vpn_slots.primary_choice_from_selection(nova_profiles.load_selection(base))
             with contextlib.suppress(Exception):
                 data["countries"] = nova_vpn_slots.order_countries(
                     nova_profiles.proton_countries(nova_profiles.list_profiles(base)))
+            with contextlib.suppress(Exception):
+                data["imported"] = _imported_profile_menu_data(
+                    base, chosen_ids=(data["primary"].get("profile") or "",
+                                      data["secondary"].get("profile") or ""))
             jobs = globals().get("profile_jobs")
             with contextlib.suppress(Exception):
                 data["reissue_busy"] = bool(jobs is not None and jobs._pipeline_lock.locked())
@@ -30568,7 +32037,12 @@ try:
         def _show_primary_vpn_menu(data, x_root, y_root):
             primary = data.get("primary") or {}
             kind = primary.get("kind") or nova_vpn_slots.PRIMARY_AUTO
-            current = f"{kind}:{primary.get('country') or ''}" if kind == nova_vpn_slots.PRIMARY_PROTON else kind
+            if kind == nova_vpn_slots.PRIMARY_PROTON:
+                current = f"{kind}:{primary.get('country') or ''}"
+            elif kind in nova_vpn_slots.PRIMARY_IMPORTED_CHOICES:
+                current = f"{kind}:{primary.get('profile') or ''}"
+            else:
+                current = kind
             var = tk.StringVar(value=current)
             menu = tk.Menu(root, **_vpn_menu_options())
             menu.add_command(label="Основной VPN", state="disabled")
@@ -30596,7 +32070,33 @@ try:
             if not countries:
                 proton_menu.add_command(label="Профилей Proton ещё нет — выпустятся сами", state="disabled")
             menu.add_cascade(label=nova_vpn_slots.PRIMARY_MENU_LABELS[nova_vpn_slots.PRIMARY_PROTON], menu=proton_menu)
-            if primary.get("profile"):
+            imported = data.get("imported") or {}
+            for group_name, imported_kind in ((nova_profiles.GROUP_VLESS, nova_vpn_slots.PRIMARY_VLESS),
+                                              (nova_profiles.GROUP_CUSTOM, nova_vpn_slots.PRIMARY_CUSTOM)):
+                info = imported.get(group_name) or {}
+                rows = list(info.get("rows") or [])
+                sub = tk.Menu(menu, **_vpn_menu_options())
+                sub.add_radiobutton(
+                    label="Любой профиль группы", variable=var, value=f"{imported_kind}:",
+                    command=lambda k=imported_kind: _run_ui_worker(
+                        _apply_primary_vpn_choice, "NovaPrimaryVpnSwitch", k, "", "меню", ""),
+                )
+                if rows:
+                    sub.add_separator()
+                for profile_id, profile_name in rows:
+                    sub.add_radiobutton(
+                        label=profile_name[:44], variable=var, value=f"{imported_kind}:{profile_id}",
+                        command=lambda k=imported_kind, pid=profile_id: _run_ui_worker(
+                            _apply_primary_vpn_choice, "NovaPrimaryVpnSwitch", k, "", "меню", pid),
+                    )
+                if not rows:
+                    sub.add_command(label="Профилей нет — импортируйте их в «Профили»", state="disabled")
+                elif int(info.get("total") or 0) > len(rows):
+                    sub.add_separator()
+                    sub.add_command(label=f"…ещё {int(info['total']) - len(rows)} — в окне «Профили»",
+                                    state="disabled")
+                menu.add_cascade(label=nova_vpn_slots.PRIMARY_MENU_LABELS[imported_kind], menu=sub)
+            if primary.get("profile") and kind not in nova_vpn_slots.PRIMARY_IMPORTED_CHOICES:
                 menu.add_separator()
                 menu.add_radiobutton(label=f"Профиль «{nova_profiles.split_profile_id(primary['profile'])[1]}»",
                                      variable=var, value=current, state="disabled")
@@ -30617,6 +32117,8 @@ try:
                 current = f"opera:{choice.get('opera_region') or 'EU'}"
             elif mode == nova_vpn_slots.SECONDARY_TOR:
                 current = f"tor:{choice.get('tor_entry') or 'auto'}"
+            elif mode == nova_vpn_slots.SECONDARY_PROFILE:
+                current = f"profile:{choice.get('profile') or choice.get('profile_group') or ''}"
             else:
                 current = "auto"
             var = tk.StringVar(value=current)
@@ -30642,6 +32144,41 @@ try:
                                                                nova_vpn_slots.SECONDARY_TOR, None, e, "меню"),
                 )
             menu.add_cascade(label="Tor", menu=tor_menu)
+            imported = data.get("imported") or {}
+            own_menu = tk.Menu(menu, **_vpn_menu_options())
+            has_any = False
+            for group_name in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM):
+                info = imported.get(group_name) or {}
+                rows = list(info.get("rows") or [])
+                if rows:
+                    has_any = True
+                # The group entry is offered even with an empty listing: a group the reserve is
+                # serving right now must still be selectable, or a subscription that momentarily
+                # returns nothing makes the running choice disappear from its own menu.
+                own_menu.add_radiobutton(
+                    label=f"Любой из «{group_name}»", variable=var, value=f"profile:{group_name}",
+                    command=lambda g=group_name: _run_ui_worker(
+                        _apply_secondary_vpn_choice, "NovaSecondaryVpnChoice",
+                        nova_vpn_slots.SECONDARY_PROFILE, None, None, "меню", g, ""),
+                )
+                for profile_id, profile_name in rows:
+                    own_menu.add_radiobutton(
+                        label=f"  {profile_name[:42]}", variable=var, value=f"profile:{profile_id}",
+                        command=lambda g=group_name, pid=profile_id: _run_ui_worker(
+                            _apply_secondary_vpn_choice, "NovaSecondaryVpnChoice",
+                            nova_vpn_slots.SECONDARY_PROFILE, None, None, "меню", g, pid),
+                    )
+                if not rows:
+                    own_menu.add_command(label="  профилей пока нет", state="disabled")
+                own_menu.add_separator()
+            if has_any:
+                own_menu.add_command(label="Резерв идёт по группе так же, как основной VPN:",
+                                     state="disabled")
+                own_menu.add_command(label="узел замолчал — берётся следующий.", state="disabled")
+            else:
+                own_menu.add_command(label="Импортируйте профиль в «Профили»", state="disabled")
+            menu.add_cascade(label=nova_vpn_slots.SECONDARY_MENU_LABELS[nova_vpn_slots.SECONDARY_PROFILE],
+                             menu=own_menu)
             menu.add_separator()
             menu.add_command(label="Обновить мосты Tor",
                              command=lambda: _run_ui_worker(_refresh_tor_bridges_now, "NovaTorBridges"))
@@ -30790,7 +32327,53 @@ try:
                     "profile_id": str(getattr(wm, "active_profile_id", "") or ""),
                     "connected": connected,
                     "label": wm.get_vpn_label(),
+                    **self._secondary_slot_status(),
                 }
+
+            @staticmethod
+            def _secondary_slot_status():
+                """Which profile, if any, serves the reserve slot — for the «◆» marker in the list.
+
+                Read off the controller in memory, not off disk: this runs inside a status getter the
+                window polls every 1.5 s and caps at 3 s.
+                """
+                idle = {"secondary_kind": "", "secondary_profile": "", "secondary_up": False}
+                ctl = globals().get("secondary_vpn_controller")
+                if ctl is None or not getattr(ctl, "running", False):
+                    return idle
+                kind = ""
+                with contextlib.suppress(Exception):
+                    kind = str(ctl.serving_kind() or "")
+                if kind != nova_vpn_slots.SECONDARY_PROFILE:
+                    return dict(idle, secondary_kind=kind)
+                runner = None
+                with contextlib.suppress(Exception):
+                    runner = ctl.profile_runner(create=False)
+                if runner is None:
+                    return dict(idle, secondary_kind=kind)
+                state = {}
+                with contextlib.suppress(Exception):
+                    state = runner.status() or {}
+                return {
+                    "secondary_kind": kind,
+                    "secondary_profile": str(state.get("profile") or ""),
+                    "secondary_up": bool(state.get("up")),
+                }
+
+            def apply_secondary_profile(self, group, profile_id=""):
+                """«В резерв» in «Профили»: hand the reserve slot an imported profile or its group.
+
+                A different file and a different apply path from the primary selection: the reserve
+                lives in routing_settings.json and is applied by its own controller, so this must not
+                go through apply_selection_now, which would tear down the primary instead.
+                """
+                group = str(group or "").strip()
+                profile_id = str(profile_id or "").strip()
+                if not group:
+                    return
+                _run_ui_worker(_apply_secondary_vpn_choice, "NovaSecondaryVpnFromProfiles",
+                               nova_vpn_slots.SECONDARY_PROFILE, None, None, "Профили",
+                               group, profile_id)
 
             def apply_selection(self, sel):
                 selection = dict(sel or {})
@@ -30834,6 +32417,12 @@ try:
             def reissue_personal(self):
                 get_profile_jobs().reissue_personal()
 
+            def refresh_subscriptions(self):
+                get_profile_jobs().refresh_subscriptions(force=True)
+
+            def measure_latency(self, targets, done_cb):
+                get_profile_jobs().measure_latency(targets, done_cb)
+
             def test_profile(self, profile_id, done_cb):
                 get_profile_jobs().test_profile(profile_id, done_cb)
 
@@ -30851,7 +32440,20 @@ try:
 
             def tor_status(self):
                 tm = get_tor_manager()
-                return tm.status() if tm is not None else None
+                if tm is None:
+                    return None
+                status = dict(tm.status() or {})
+                # The two keys nova_profiles_ui's contract asks for on top of TorManager.status().
+                # Neither was ever supplied, and both matter: without `entry_setting` the window
+                # cannot see the entry the owner saved — TorManager reports "auto" until its first
+                # start — so «Подключить Tor» sent "auto" and the worker then persisted it over
+                # their choice. Without `route_active` a stopped Tor whose browser route is still
+                # "tor" offers «Подключить» and no way back to «Авто».
+                with contextlib.suppress(Exception):
+                    status["entry_setting"] = str(get_tor_entry_mode() or "")
+                with contextlib.suppress(Exception):
+                    status["route_active"] = get_routing_group_mode("browser") == "tor"
+                return status
 
             def tor_connect(self, entry):
                 _start_profiles_thread(_route_browsers_through_tor_worker, "NovaTorConnect", True, entry)

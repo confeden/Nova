@@ -131,7 +131,7 @@ _default_egress_cache = None
 
 
 def _default_secondary_attempt() -> Dict[str, object]:
-    """The secondary slot as the helper processes see it: Opera's 1371 or Tor's CONNECT port.
+    """The secondary slot as the helper processes see it: Opera, Tor or an own profile.
 
     Only the provider-less path lands here (the out-of-process helpers); nova.pyw hands the
     in-process relay its own provider. The state file is nova.pyw's, see nova_vpn_slots.
@@ -149,8 +149,10 @@ def _default_secondary_attempt() -> Dict[str, object]:
             _default_egress_cache = nova_vpn_slots.EgressStateCache(
                 os.path.join(root, "temp", nova_vpn_slots.EGRESS_STATE_FILENAME))
         attempt = nova_vpn_slots.secondary_http_attempt(_default_egress_cache.get())
-        if attempt.get("egress") != "tor":
-            # Opera keeps the caller's own timeout, as this default always did; Tor needs its longer one.
+        if str(attempt.get("egress") or "") not in ("tor", "profile"):
+            # Opera keeps the caller's own timeout, as this default always did. Tor and an own
+            # profile need the longer ones nova_vpn_slots computed: Tor builds a circuit before
+            # CONNECT answers, an own profile dials its node abroad on every flow.
             attempt.pop("timeout", None)
             attempt.pop("first_byte_timeout", None)
         return attempt

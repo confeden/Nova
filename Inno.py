@@ -71,7 +71,7 @@ RESOURCE_DIRS = ("bin",)
 # the build if anything else got there anyway.
 PROFILES_DIRNAME = "profiles"
 LEGACY_AWG_DIRNAME = "awg"
-PROFILE_GROUP_DIRS = ("MASQUE", "Custom", "AWG Proton", "AWG Cloudflare")
+PROFILE_GROUP_DIRS = ("MASQUE", "Custom", "AWG Proton", "AWG Cloudflare", "VLESS")
 PROFILES_SHIP_WHITELIST = (
     "AWG Cloudflare/WARPv*.conf",    # shared seed pool, refreshed by name on upgrade
     "AWG Proton/proton_nodes.json",  # public starter node list
@@ -101,6 +101,13 @@ TOR_OPTIONAL_FILES = ("geoip", "geoip6", "pt_config.json")
 NOVA_GO_FILENAME = "nova-go.exe"
 NOVA_GO_SOURCE_DIR = "nova-go"
 NOVA_GO_PACKAGE = "./cmd/nova-go"
+# The Xray helper is a module of its own, not a package of nova-go: Xray-core pulls a quic-go that
+# does not agree with the one MASQUE is built on (Nova Android paid for that lesson first). Same
+# toolchain, same flags, same reproducibility argument -- a second binary, and a large one: ~32 MB
+# stripped against nova-go's 14 MB, which is what a full VLESS/REALITY/XHTTP stack costs.
+NOVA_XRAY_FILENAME = "nova-xray.exe"
+NOVA_XRAY_SOURCE_DIR = "nova-xray"
+NOVA_XRAY_PACKAGE = "./cmd/nova-xray"
 NOVA_GO_BUILD_TIMEOUT = 1800
 NOVA_GO_SMOKE_TIMEOUT = 30
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -865,6 +872,7 @@ def require_paths(base_dir: Path) -> None:
     ensure_tls_terminator(base_dir)
     ensure_nova_engine(base_dir)
     ensure_nova_go(base_dir)
+    ensure_nova_xray(base_dir)
 
 
 def ensure_tls_terminator(base_dir: Path) -> None:
@@ -983,12 +991,13 @@ def nova_go_build_env(base_env=None) -> dict:
     return env
 
 
-def nova_go_build_command(go: str, version: str, out_path: Path) -> list[str]:
+def nova_go_build_command(go: str, version: str, out_path: Path,
+                          package: str = NOVA_GO_PACKAGE) -> list[str]:
     return [
         go, "build",
         f"-ldflags=-s -w -buildid= -X main.version={version}",
         "-o", str(out_path),
-        NOVA_GO_PACKAGE,
+        package,
     ]
 
 
@@ -1100,10 +1109,11 @@ def smoke_test_nova_go(exe: Path, version: str) -> str:
     return output
 
 
-def build_nova_go(src_dir: Path, out_path: Path, version: str, go: str) -> None:
-    # go build runs with cwd=src_dir: a relative -o would land inside nova-go/.
+def build_nova_go(src_dir: Path, out_path: Path, version: str, go: str,
+                  package: str = NOVA_GO_PACKAGE, what: str = "nova-go") -> None:
+    # go build runs with cwd=src_dir: a relative -o would land inside the module folder.
     out_path = Path(out_path).resolve()
-    cmd = nova_go_build_command(go, version, out_path)
+    cmd = nova_go_build_command(go, version, out_path, package)
     try:
         result = subprocess.run(
             cmd, cwd=str(src_dir), env=nova_go_build_env(),
@@ -1112,7 +1122,7 @@ def build_nova_go(src_dir: Path, out_path: Path, version: str, go: str) -> None:
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"Сборка nova-go не уложилась в {NOVA_GO_BUILD_TIMEOUT} с.\n  Собрать без него: NOVA_SKIP_NOVA_GO=1"
+            f"Сборка {what} не уложилась в {NOVA_GO_BUILD_TIMEOUT} с.\n  Собрать без него: NOVA_SKIP_NOVA_GO=1"
         ) from exc
     except OSError as exc:
         raise RuntimeError(f"Не удалось запустить {go}: {exc}") from exc
@@ -1122,9 +1132,9 @@ def build_nova_go(src_dir: Path, out_path: Path, version: str, go: str) -> None:
             # By analogy with G50 (cargo): crates.io/proxy.golang.org are blocked here,
             # Nova's own egress on 1371 is the way out. Unverified for Go.
             hint = ("\n  Модуля нет в кэше, а сеть сборке запрещена (GOPROXY=off). Докачать один раз:"
-                    "\n    cd nova-go && HTTPS_PROXY=http://127.0.0.1:1371 go mod download")
+                    f"\n    cd {src_dir.name} && HTTPS_PROXY=http://127.0.0.1:1371 go mod download")
         raise RuntimeError(
-            f"Сборка nova-go провалилась (код {result.returncode}):\n"
+            f"Сборка {what} провалилась (код {result.returncode}):\n"
             f"{result.stdout}\n{result.stderr}{hint}\n"
             "  Собрать без него: NOVA_SKIP_NOVA_GO=1"
         )
@@ -1202,6 +1212,80 @@ def ensure_nova_go(base_dir: Path) -> None:
     if sha256_file(target) != digest:
         raise RuntimeError(f"{target} после установки не совпадает с собранным файлом.")
     print(f"[Go] nova-go.exe обновлён: {target} (sha256 {digest})")
+
+
+def smoke_test_nova_xray(exe: Path, version: str) -> str:
+    """`nova-xray version` must answer and name this build. Returns the line it printed."""
+    try:
+        result = subprocess.run(
+            [str(exe), "version"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60, creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{exe} не запустился: {exc}") from exc
+    text = (result.stdout or "").strip()
+    line = text.splitlines()[0] if text else ""
+    if result.returncode != 0 or not line.startswith("nova-xray "):
+        raise RuntimeError(f"{exe} version ответил «{line or (result.stderr or '').strip()}» (код {result.returncode})")
+    if version not in line:
+        raise RuntimeError(f"{exe} собран не из этой версии: «{line}», ожидалась {version}")
+    return line
+
+
+def ensure_nova_xray(base_dir: Path) -> None:
+    """Собрать bin/nova-xray.exe локально, свежим на каждую сборку.
+
+    Та же модель, что у nova-go: воспроизводимая сборка Go из исходников, никакой публикации ради
+    формы рукопожатия (I3/I5 сюда не относятся -- форму задаёт uTLS внутри Xray).
+
+    Отличие одно: отсутствие помощника не валит сборку. VLESS -- дополнительный вид профилей, а не
+    несущая функция: без него Nova работает ровно как раньше, только вкладка «VLESS» скажет, что
+    помощник не найден. Ронять из-за него выпуск было бы несоразмерно.
+    """
+    target = base_dir / "bin" / NOVA_XRAY_FILENAME
+    if os.environ.get("NOVA_SKIP_NOVA_XRAY", "") == "1":
+        state = f"в сборку попадёт имеющийся {target}" if target.is_file() else "nova-xray.exe в сборку не попадёт"
+        print(f"[Go] NOVA_SKIP_NOVA_XRAY=1 — без пересборки; {state}.")
+        return
+
+    version = read_version(base_dir / "nova.pyw")
+    if not re.fullmatch(r"[0-9A-Za-z._+-]+", version):
+        raise RuntimeError(f"CURRENT_VERSION {version!r} нельзя передать в -X main.version.")
+
+    src_dir = base_dir / NOVA_XRAY_SOURCE_DIR
+    go = shutil.which("go")
+    blocker = ""
+    if not (src_dir / "go.mod").is_file():
+        blocker = f"{src_dir / 'go.mod'} отсутствует"
+    elif not go:
+        blocker = "go не найден в PATH"
+    else:
+        missing = nova_go_missing_replace_dirs(src_dir)
+        if missing:
+            blocker = "нет каталогов из replace в go.mod: " + ", ".join(missing)
+
+    if blocker:
+        if target.is_file():
+            try:
+                smoke_test_nova_xray(target, version)
+            except RuntimeError as exc:
+                print(f"[Go] {blocker}; имеющийся {target} не подходит ({exc}) — VLESS в этой сборке не будет.")
+                return
+            print(f"[Go] {blocker} — беру имеющийся {target} (версия {version} совпадает).")
+        else:
+            print(f"[Go] {blocker} — nova-xray.exe в сборку не попадёт, вкладка «VLESS» будет без помощника.")
+        return
+
+    print(f"[Go] Сборка nova-xray.exe {version} (GOAMD64=v1, CGO_ENABLED=0)...")
+    with tempfile.TemporaryDirectory(prefix="nova-xray-build-") as tmp:
+        built = Path(tmp) / NOVA_XRAY_FILENAME
+        build_nova_go(src_dir, built, version, go, package=NOVA_XRAY_PACKAGE, what="nova-xray")
+        smoke_test_nova_xray(built, version)
+        digest = sha256_file(built)
+        install_binary(built, target)
+    if sha256_file(target) != digest:
+        raise RuntimeError(f"{target} после установки не совпадает с собранным файлом.")
+    print(f"[Go] nova-xray.exe обновлён: {target} (sha256 {digest})")
 
 
 def build_embedded_assets_module(base_dir: Path) -> Path:
@@ -1349,6 +1433,11 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         f"--paths={asset_dir}",
         f"--paths={BASE_DIR / RESOURCE_SOURCE_DIR}",
         "--hidden-import=embedded_assets",
+        # Imported through a try/except in nova_profiles (a build that lost the module must degrade,
+        # not crash), which is exactly the shape PyInstaller can miss. Named here so it cannot.
+        "--hidden-import=nova_vless",
+        "--hidden-import=nova_subscriptions",
+        "--hidden-import=nova_ping",
         "--hidden-import=pystray._win32",
         "--hidden-import=PIL.ImageTk",
         "--hidden-import=tkinter",

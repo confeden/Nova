@@ -48,6 +48,36 @@ Nova from `nova-go/`. It links the following open-source components:
 - Go standard library and `golang.org/x/*` — BSD-3-Clause —
   `licenses/third_party/golang-x-BSD-3-Clause.txt`
 
+`bin/nova-xray.exe`
+Nova's Xray helper (VLESS profiles), built by Nova from `nova-xray/`. It is a
+separate module and a separate binary from `bin/nova-go.exe` because Xray-core
+and the MASQUE helper require incompatible versions of the same QUIC library.
+- Xray-core — `https://github.com/XTLS/Xray-core` — MPL-2.0 —
+  `licenses/third_party/MPL-2.0.txt`
+- REALITY — `https://github.com/XTLS/REALITY` — MPL-2.0 —
+  `licenses/third_party/MPL-2.0.txt`
+- uTLS — `https://github.com/refraction-networking/utls` — BSD-3-Clause —
+  `licenses/third_party/utls-BSD-3-Clause.txt`
+- quic-go (fork) — `https://github.com/apernet/quic-go` — MIT —
+  `licenses/third_party/quic-go-MIT.txt`
+- CIRCL — `https://github.com/cloudflare/circl` — BSD-3-Clause —
+  `licenses/third_party/circl-BSD-3-Clause.txt`
+- gVisor — `https://github.com/google/gvisor` — Apache-2.0 —
+  `licenses/third_party/gvisor-Apache-2.0.txt`
+- sing, sing-shadowsocks — `https://github.com/SagerNet/sing`,
+  `https://github.com/SagerNet/sing-shadowsocks` — GPL-3.0-or-later —
+  `licenses/third_party/GPL-3.0.txt`,
+  `licenses/third_party/sing-GPL-3.0-notice.txt`
+- Go standard library and `golang.org/x/*` — BSD-3-Clause —
+  `licenses/third_party/golang-x-BSD-3-Clause.txt`
+
+Note on the two components above that are GPL-3.0-or-later: Nova does not use
+Shadowsocks and does not register its proxy, but Xray-core's JSON configuration
+loader (`infra/conf`) knows every protocol it supports, so linking the loader
+links the Shadowsocks configuration code with it. The sources of every part of
+this binary are public: Nova's own wrapper in `nova-xray/` in this repository,
+and each upstream at the address listed above.
+
 `bin/tor/nova-tor.exe`, `bin/tor/nova-lyrebird.exe`, `bin/tor/geoip`,
 `bin/tor/geoip6`, `bin/tor/pt_config.json`
 Unmodified files from the official Tor Expert Bundle 15.0.22 (tor 0.4.9.12,

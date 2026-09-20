@@ -113,6 +113,12 @@ CF_CONNECT_RACE_WIDTH = max(
     min(6, int(_env_float("NOVA_TG_RELAY_CF_RACE_WIDTH", 3.0, minimum=1.0))),
 )
 CF_RECENT_GOOD_TTL = _env_float("NOVA_TG_RELAY_CF_RECENT_GOOD_TTL", 900.0, minimum=30.0)
+# How many distinct names of one zone have to fail inside CF_ZONE_FAIL_WINDOW before the zone steps
+# aside for CF_ZONE_BAD_TTL. Three, because two is one name plus its media sibling — a pair that can
+# fail together for reasons that are not the zone's (a DC that is out, a name with no DNS record).
+CF_ZONE_FAIL_LIMIT = max(2, int(_env_float("NOVA_TG_RELAY_CF_ZONE_FAIL_LIMIT", 3.0, minimum=2.0)))
+CF_ZONE_FAIL_WINDOW = _env_float("NOVA_TG_RELAY_CF_ZONE_FAIL_WINDOW", 45.0, minimum=5.0)
+CF_ZONE_BAD_TTL = _env_float("NOVA_TG_RELAY_CF_ZONE_BAD_TTL", 90.0, minimum=5.0)
 CF_FIRST_DCS = {
     int(item)
     for item in str(os.environ.get("NOVA_TG_RELAY_CF_FIRST_DCS", "1,2,3,4,5,203") or "").replace(";", ",").split(",")
@@ -1868,6 +1874,9 @@ class TelegramTransparentRelayServer:
         self._cf_bootstrap_probe_logged: Dict[int, float] = {}
         self._cf_last_good_domain: Dict[Tuple[int, bool], Tuple[str, float]] = {}
         self._cf_bad_domain_until: Dict[str, float] = {}
+        # zone -> {name: when it last failed}; zone -> until when the whole zone stands aside.
+        self._cf_zone_fails: Dict[str, Dict[str, float]] = {}
+        self._cf_zone_bad_until: Dict[str, float] = {}
         self._cf_domain_score: Dict[str, Tuple[float, float]] = {}
         self._cf_health_cache_last_save = 0.0
         self._cf_prewarm_started: Dict[Tuple[int, bool], float] = {}
@@ -2195,6 +2204,8 @@ class TelegramTransparentRelayServer:
         try:
             self._wss_first_byte_fail.clear()
             self._wss_first_byte_disabled_until.clear()
+            self._cf_zone_fails.clear()
+            self._cf_zone_bad_until.clear()
         except Exception:
             pass
         try:
@@ -2779,7 +2790,7 @@ class TelegramTransparentRelayServer:
                 # означает просто оборванное соединение. Так был сломан
                 # обновлятор Telegram Desktop: его хост лежит внутри диапазона
                 # DC2, поэтому попадал сюда и умирал молча.
-                if _cf_route_worth_reconnecting(is_media) and not http_transport and not tls_transport:
+                if self._worth_reconnecting(dc_hint, is_media) and not http_transport and not tls_transport:
                     self._log_skipping_fallback(
                         "unparsed-init-no-wss",
                         target_ip,
@@ -2833,7 +2844,7 @@ class TelegramTransparentRelayServer:
                 # try it instead unless the last attempts proved it silent for
                 # this DC. Either way the outcome is recorded, so the next
                 # connection decides on evidence rather than on the assumption.
-                if _cf_route_worth_reconnecting(False) and not _native_worth_trying(dc_hint):
+                if self._worth_reconnecting(dc_hint, False) and not _native_worth_trying(dc_hint):
                     self._log_skipping_fallback(
                         "parsed-non-media-cf-failed",
                         target_ip,
@@ -2860,7 +2871,7 @@ class TelegramTransparentRelayServer:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
-                if _cf_route_worth_reconnecting(False):
+                if self._worth_reconnecting(dc_hint, False):
                     self._log_skipping_fallback(
                         "non-ws-capable",
                         target_ip,
@@ -2876,7 +2887,7 @@ class TelegramTransparentRelayServer:
                     prefetched_ws_task.cancel()
                     with contextlib.suppress(Exception):
                         await prefetched_ws_task
-                if _cf_route_worth_reconnecting(is_media):
+                if self._worth_reconnecting(dc_hint, is_media):
                     # Raw Telegram TCP is throttled on this route. During the
                     # short WSS cooldown, close and let Telegram reconnect once
                     # the circuit opens again without spending more Worker calls.
@@ -2915,7 +2926,7 @@ class TelegramTransparentRelayServer:
             if ws is None and not prefetched_route_consumed:
                 ws, route_label = await self._connect_ws_route(dc_hint, target_ip, is_media, label)
             if ws is None:
-                if _cf_route_worth_reconnecting(is_media):
+                if self._worth_reconnecting(dc_hint, is_media):
                     return
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, init_packet, label, media_hint=True)
                 return
@@ -2935,7 +2946,7 @@ class TelegramTransparentRelayServer:
             except Exception:
                 with contextlib.suppress(Exception):
                     await ws.close()
-                if _cf_route_worth_reconnecting(is_media):
+                if self._worth_reconnecting(dc_hint, is_media):
                     self._cf_note_bad_route_label(route_label, is_media, ttl=CF_MEDIA_BAD_TTL)
                     self._note_wss_first_byte_result(dc_hint, is_media, 0, route_label)
                     return
@@ -3036,7 +3047,7 @@ class TelegramTransparentRelayServer:
                 verdict = "first-byte timeout" if first_byte_timed_out else "empty close (peer sent nothing)"
                 # Skip TCP fallback when CF domains are available — ISP throttles
                 # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
-                if _cf_route_worth_reconnecting(is_media):
+                if self._worth_reconnecting(dc_hint, is_media):
                     self.log_func(
                         f"[TgRelay] WSS {verdict}; skipping TCP fallback (ISP throttled): proto={_proto_label(init_info.proto)} "
                         f"dc={dc_hint or '?'} media={is_media} target={target_ip}:{target_port} "
@@ -3240,7 +3251,7 @@ class TelegramTransparentRelayServer:
                 return True
             # Skip TCP fallback when CF domains are available — ISP throttles
             # raw Telegram TCP even through WARP. Let Telegram reconnect via WSS.
-            if _cf_route_worth_reconnecting(False):
+            if self._worth_reconnecting(dc_hint, False):
                 self.log_func(
                     f"[TgRelay] WSS empty response; skipping TCP fallback (ISP throttled): proto={proto_label} dc={dc_hint} "
                     f"target={target_ip}:{target_port} replay={len(replay_initial)} duration_ms={duration_ms}"
@@ -3725,7 +3736,7 @@ class TelegramTransparentRelayServer:
             self._last_wss_route_log[key] = now
         except Exception:
             pass
-        action = "closing for a clean WSS reconnect" if _cf_route_worth_reconnecting(is_media) else "switching to TCP fallback"
+        action = "closing for a clean WSS reconnect" if self._worth_reconnecting(dc_hint, is_media) else "switching to TCP fallback"
         self.log_func(
             f"[TgRelay] WSS path unavailable for DC{dc_hint} target={target_ip} media={is_media}; {action}."
         )
@@ -4180,10 +4191,55 @@ class TelegramTransparentRelayServer:
             # aside whole rather than one domain at a time.
             if _cf_zone_out_of_quota(normalized):
                 continue
+            if self._cf_zone_benched(normalized, now):
+                continue
             if float(self._cf_bad_domain_until.get(normalized, 0.0) or 0.0) > now:
                 continue
             filtered.append(domain)
         return filtered
+
+    def _cf_zone_benched(self, domain: str, now: Optional[float] = None) -> bool:
+        """Is the whole zone of `domain` standing aside right now?"""
+        base = _cf_domain_base(domain)
+        if not base:
+            return False
+        now = time.monotonic() if now is None else float(now)
+        return float(self._cf_zone_bad_until.get(base, 0.0) or 0.0) > now
+
+    def _cf_note_zone_failure(self, domain: str) -> None:
+        """One name of a zone failed. Enough distinct names in a window bench the zone.
+
+        Distinct **names**, not attempts: the same name retried three times in a burst is one piece
+        of evidence about the zone, and counting the retries would bench a zone on a single dead DC.
+        """
+        base = _cf_domain_base(domain)
+        if not base:
+            return
+        now = time.monotonic()
+        if float(self._cf_zone_bad_until.get(base, 0.0) or 0.0) > now:
+            return  # already aside; nothing to learn until it comes back
+        seen = self._cf_zone_fails.setdefault(base, {})
+        seen[domain] = now
+        for name, at in list(seen.items()):
+            if now - at > CF_ZONE_FAIL_WINDOW:
+                seen.pop(name, None)
+        if len(seen) < CF_ZONE_FAIL_LIMIT:
+            return
+        self._cf_zone_bad_until[base] = now + CF_ZONE_BAD_TTL
+        self._cf_zone_fails.pop(base, None)
+        _log_wss_egress(
+            f"[TgRelay] Зона {base} молчит: {len(seen)} разных имён подряд без ответа — "
+            f"отставляем её на {int(CF_ZONE_BAD_TTL)} с, чтобы гонка не выбирала её снова."
+        )
+
+    def _cf_clear_zone_failures(self, domain: str) -> None:
+        """A name of this zone carried bytes: whatever the counter said, it says no more."""
+        base = _cf_domain_base(domain)
+        if not base:
+            return
+        self._cf_zone_fails.pop(base, None)
+        if float(self._cf_zone_bad_until.pop(base, 0.0) or 0.0) > time.monotonic():
+            _log_wss_egress(f"[TgRelay] Зона {base} снова отвечает — возвращаем её в гонку.")
 
     def _cf_note_bad_domain(self, domain: str, is_media: bool = False, ttl: Optional[float] = None) -> None:
         domain = str(domain or "").strip().lower()
@@ -4194,6 +4250,7 @@ class TelegramTransparentRelayServer:
             self._cf_bad_domain_until[domain] = time.monotonic() + ttl
             score, _seen = self._cf_domain_score.get(domain, (0.0, 0.0))
             self._cf_domain_score[domain] = (max(0.0, float(score or 0.0) * 0.5), time.monotonic())
+            self._cf_note_zone_failure(domain)
         except Exception:
             pass
 
@@ -4216,6 +4273,7 @@ class TelegramTransparentRelayServer:
         now = time.monotonic()
         try:
             self._cf_bad_domain_until.pop(domain, None)
+            self._cf_clear_zone_failures(domain)
             prev_score, _seen = self._cf_domain_score.get(domain, (0.0, 0.0))
             gain = min(25.0, 2.0 + (int(down or 0).bit_length() / 2.0))
             self._cf_domain_score[domain] = (min(100.0, float(prev_score or 0.0) + gain), now)
@@ -4228,6 +4286,29 @@ class TelegramTransparentRelayServer:
         except Exception:
             pass
         return True
+
+    def _worth_reconnecting(self, dc_hint: int, is_media: bool) -> bool:
+        """`_cf_route_worth_reconnecting`, plus: is there actually a WSS route left to reconnect to?
+
+        The module predicate answers the policy question -- whether a WSS reconnect is the better
+        bet for this kind of traffic. This adds the one thing it cannot see: whether any route of
+        that kind is still in the race right now. A Cloudflare name that is benched or out of quota
+        is not, and neither is a web route inside its first-byte cooldown. When both are gone,
+        closing the client for "a clean WSS reconnect" sends it back to the same emptiness, and the
+        raw TCP fallback -- poor as it is on a throttling ISP -- is the only path left that can
+        carry anything. Measured live 2026-09-20: five zones benched, the web route in cooldown,
+        and every flow still closed for a reconnect that had nowhere to go.
+        """
+        if not _cf_route_worth_reconnecting(is_media):
+            return False
+        try:
+            if self._cf_order_domains(int(dc_hint or 0), bool(is_media),
+                                      _cf_ws_domains(int(dc_hint or 0), bool(is_media))):
+                return True
+            return not self._wss_first_byte_disabled(int(dc_hint or 0), bool(is_media), route_kind="web")
+        except Exception:
+            # Never let the bookkeeping decide a flow: on doubt keep the old behaviour.
+            return True
 
     def _cf_has_recent_good(self, dc_hint: int, is_media: bool, max_age: float = 180.0) -> bool:
         try:
@@ -4349,6 +4430,20 @@ class TelegramTransparentRelayServer:
                 bool(is_media),
                 _cf_ws_domains_for_bases(int(dc_hint or 0), _cf_ws_domain_bases(primary_only=True), bool(is_media)),
             )
+            if not ordered:
+                # The prewarm used to warm the owned zone and nothing else, so it warmed nothing at
+                # all whenever that zone was unavailable -- and it is unavailable for most of the
+                # day: its free Worker budget goes in about two hours after the 00:00 UTC reset
+                # (S35), and `_cf_order_domains` drops a zone that is out of quota or benched. The
+                # pool then stayed empty and the first real Telegram flow paid the full cold race,
+                # which is exactly the wait this prewarm exists to remove. The public zones carry
+                # plain sessions perfectly well; they are the ones the race falls to anyway.
+                ordered = self._cf_order_domains(
+                    int(dc_hint or 0),
+                    bool(is_media),
+                    _cf_ws_domains_for_bases(int(dc_hint or 0), _cf_ws_domain_bases(primary_only=False),
+                                             bool(is_media)),
+                )
             self._schedule_cf_refill((int(dc_hint or 0), bool(is_media), True), ordered)
             await asyncio.sleep(0.05)
         except Exception:

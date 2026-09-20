@@ -74,6 +74,7 @@ Name: "{app}\profiles"; Flags: uninsneveruninstall
 Name: "{app}\profiles\MASQUE"; Flags: uninsneveruninstall
 Name: "{app}\profiles\AWG Cloudflare"; Flags: uninsneveruninstall
 Name: "{app}\profiles\AWG Proton"; Flags: uninsneveruninstall
+Name: "{app}\profiles\VLESS"; Flags: uninsneveruninstall
 Name: "{app}\profiles\Custom"; Flags: uninsneveruninstall
 
 [Files]
@@ -172,16 +173,16 @@ begin
 
   Script :=
     '$ErrorActionPreference=''SilentlyContinue''; ' +
-    '$procs = Get-Process -Name Nova, winws, opera-proxy*, warp*, nova-go, nova-tor, nova-lyrebird -ErrorAction SilentlyContinue; ' +
+    '$procs = Get-Process -Name Nova, winws, opera-proxy*, warp*, nova-go, nova-xray, nova-tor, nova-lyrebird -ErrorAction SilentlyContinue; ' +
     '$svc = Get-CimInstance Win32_SystemDriver -Filter "Name=''WinDivert''" -ErrorAction SilentlyContinue; ' +
     'if ($procs -or ($svc -and $svc.State -eq ''Running'')) { ' +
     '  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); ' +
     '  if (-not $isAdmin) { ' +
-    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-tor.exe /IM nova-lyrebird.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
+    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-xray.exe /IM nova-tor.exe /IM nova-lyrebird.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '    Start-Process sc.exe -ArgumentList ''stop CloudflareWARP'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '    Start-Process sc.exe -ArgumentList ''stop WinDivert'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '  } else { ' +
-    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-tor.exe /IM nova-lyrebird.exe; ' +
+    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-xray.exe /IM nova-tor.exe /IM nova-lyrebird.exe; ' +
     '    sc.exe stop CloudflareWARP; ' +
     '    sc.exe stop WinDivert; ' +
     '  } ' +

@@ -1171,10 +1171,13 @@ class NovaWfpTcpProxy:
                         elif label == "opera-http":
                             attempt["timeout"] = min(float(attempt.get("timeout") or 3.0), 1.1)
                             attempt["first_byte_timeout"] = min(float(attempt.get("first_byte_timeout") or 2.4), 1.1)
-                if label == "opera-http" and attempt.get("egress") == "tor":
-                    # The per-app caps above are tuned for Opera's ~1 s CONNECT. Tor builds a
-                    # circuit first; capped the same way, every Tor attempt would time out.
-                    fresh = _vpn_slots.secondary_http_attempt({"secondary": {"kind": "tor"}})
+                egress = str(attempt.get("egress") or "").strip().lower()
+                if label == "opera-http" and egress in ("tor", "profile"):
+                    # The per-app caps above are tuned for Opera's ~1 s local CONNECT. Tor builds a
+                    # circuit first and an own profile dials its node abroad per flow; capped the
+                    # same way, every such attempt would time out. Each kind's own floor is in
+                    # nova_vpn_slots, which is the only place that knows them.
+                    fresh = _vpn_slots.secondary_http_attempt({"secondary": {"kind": egress}})
                     attempt["timeout"] = max(float(attempt.get("timeout") or 0.0), fresh["timeout"])
                     attempt["first_byte_timeout"] = max(
                         float(attempt.get("first_byte_timeout") or 0.0), fresh["first_byte_timeout"])

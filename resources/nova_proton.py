@@ -1704,11 +1704,18 @@ def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, pro
 
     # The attempt is marked before the first network step: whatever happens below, the next run
     # sees it (Android writeNodesAttempt), and the device frame stays the same across attempts.
+    #
+    # `nodes_checked_at` is deliberately NOT written here. It is what `_nodes_fresh` reads, and
+    # `_nodes_refresh_window` gives a live source 24 hours — so stamping it before the network made
+    # a run that never reached the API suppress every refresh for a day, while `nodes_source` still
+    # said "live" from the last success. That is how a set goes on being used for days after its
+    # nodes have died, which is the symptom the owner reported. Rate-limiting a failed run is what
+    # `failed_at` + FAILURE_COOLDOWN_S is for, and unlike this it is route-aware: it lifts when a
+    # route the failed run did not have appears.
     _update_account(group_dir, {
         "device": device,
         "device_name": DEVICE_NAME,
         "last_attempt_at": now,
-        "nodes_checked_at": now,
     })
 
     client = ProtonClient(device, log=emit, proxies=proxies, scrub=scrub)
@@ -1754,6 +1761,13 @@ def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, pro
                 warning = (f"список узлов Proton не обновился ({live_problem}) — "
                            f"прежний набор, {len(existing)} шт.")
                 _reuse_set(summary, account, existing, cert_expires_at, warning)
+                # Keeping the set is a decision taken after a real attempt, so this is where the
+                # "checked" stamp belongs -- and only here. It used to be written before the first
+                # network step, which made every failure look like a successful check and
+                # suppressed refreshes for a whole day on a `nodes_source` of "live". A set that is
+                # complete but dead is a different question, and nova_issuance.proton_set_is_dead
+                # is what answers it.
+                _update_account(group_dir, {"nodes_checked_at": now})
                 hours = _nodes_refresh_window(account) // 3600
                 emit(f"{LOG_PREFIX} {warning}; следующая попытка через {hours} ч")
                 return
