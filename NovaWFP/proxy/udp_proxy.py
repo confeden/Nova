@@ -138,6 +138,20 @@ def _get_app_route_mode(app_key: str) -> str:
     return mode
 
 
+# Жёсткая привязка к слоту обещана пока только для Telegram: «Осн.»/«Доп.» в
+# его строке настроек означает «этим маршрутом и никаким другим». Discord,
+# WhatsApp и OBS остались на прежнем поведении, где режим — предпочтение.
+PINNED_EGRESS_APPS = {"telegram"}
+PINNED_EGRESS_BY_MODE = {"warp": "warp-socks", "opera": "opera-http"}
+
+
+def _pinned_egress_label(app_family: str) -> str:
+    app = str(app_family or "").strip().lower()
+    if app not in PINNED_EGRESS_APPS:
+        return ""
+    return PINNED_EGRESS_BY_MODE.get(_get_app_route_mode(app), "")
+
+
 def _ctl_code(device_type: int, function: int, method: int, access: int) -> int:
     return ((int(device_type) << 16) | (int(access) << 14) | (int(function) << 2) | int(method))
 
@@ -432,6 +446,15 @@ def _resolve_divert_udp_flow(local_host: str, local_port: int) -> Optional[dict]
     return dict(best or {}) if best else None
 
 
+class PinnedRouteUnavailable(OSError):
+    """Егресс, к которому привязано приложение, не умеет UDP (или не поднят).
+
+    Отдельный класс, а не просто `OSError`: это не сбой, а исполнение выбора
+    пользователя, и в лог оно должно попадать по разу в полминуты, а не на
+    каждый пакет — во время звонка их десятки в секунду.
+    """
+
+
 class UdpSession:
     def __init__(
         self,
@@ -473,6 +496,13 @@ class UdpSession:
 
     def _open_upstream(self):
         attempts = self._attempt_specs()
+        if not attempts:
+            # Пустой список нельзя отдавать в open_udp_endpoint: там
+            # `attempts or get_udp_upstream_attempts()`, то есть пустой список
+            # означает «бери всё подряд» — мимо выбранного слота.
+            raise PinnedRouteUnavailable(
+                f"{self.app_family or 'flow'}: у выбранного слота нет UDP-маршрута"
+            )
         self.upstream, self.route_label = open_udp_endpoint(timeout=2.0, attempts=attempts)
         self.upstream_generation += 1
         self.owner.log(
@@ -492,6 +522,12 @@ class UdpSession:
                 pass
             self.upstream = None
             self.owner.mark_route_bad(self.target_host, self.target_port, self.route_label, ttl=45.0)
+            if _pinned_egress_label(self.app_family):
+                # Этот запасной путь ходит напрямую мимо любого слота. Для
+                # привязанного приложения он и есть та самая утечка, которую
+                # просили убрать: «Доп.» не должен на первой ошибке стать
+                # «напрямую».
+                return False
             attempts = [
                 attempt
                 for attempt in get_udp_upstream_attempts()
@@ -697,6 +733,18 @@ class NovaWfpUdpProxy:
         else:
             ordered_attempts = proxy_attempts + direct_attempts
 
+        pin = _pinned_egress_label(app_family)
+        if pin:
+            # Привязка, а не предпочтение: соседний егресс не берётся вовсе.
+            # UDP умеет только SOCKS5 и direct, а «Доп.» — это HTTP CONNECT
+            # (Opera/Tor/свой профиль), через который UDP не ходит. Пустой
+            # список здесь и означает «маршрута нет»; звонок уйдёт на
+            # TCP-рефлекторы Telegram, но не мимо выбранного слота.
+            return [
+                dict(attempt) for attempt in ordered_attempts
+                if str((attempt or {}).get("label") or (attempt or {}).get("kind") or "").strip().lower() == pin
+            ]
+
         route_mode = _get_app_route_mode(app_family) if app_family in {"discord", "telegram", "whatsapp", "obs"} else "auto"
         if route_mode != "auto":
             priority_map = {
@@ -815,6 +863,16 @@ class NovaWfpUdpProxy:
             preferred_egress=preferred_egress,
         )
 
+    def _log_pin_block(self, client_addr: Tuple[str, int], exc: BaseException) -> None:
+        now = time.monotonic()
+        if now < float(getattr(self, "_pin_block_log_until", 0.0) or 0.0):
+            return
+        self._pin_block_log_until = now + 30.0
+        self.log(
+            f"[NovaWFP][UDP] pin-block client={client_addr[0]}:{client_addr[1]} error={exc} "
+            f"— трафик привязан к слоту VPN, обходной маршрут не берём"
+        )
+
     def _cleanup_bad_routes(self):
         now = time.monotonic()
         expired = [key for key, expiry in self._bad_routes.items() if expiry <= now]
@@ -862,6 +920,8 @@ class NovaWfpUdpProxy:
                         f"target={_mask_ip_for_log(session.target_host)}:{session.target_port} "
                         f"route={session.route_label} size={len(packet)}"
                     )
+            except PinnedRouteUnavailable as exc:
+                self._log_pin_block(client_addr, exc)
             except Exception as exc:
                 self.log(
                     f"[NovaWFP][UDP] tx-failed client={client_addr[0]}:{client_addr[1]} "

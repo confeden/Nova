@@ -846,6 +846,107 @@ def _wss_candidate(target_host: str, target_ip: str, target_port: int) -> bool:
     return _is_telegram_ip(target_ip) or _is_telegram_domain(target_host)
 
 
+# --- Егресс, прибитый пользователем ----------------------------------------
+# «Осн.»/«Доп.» в строке Telegram — обещание, а не предпочтение. До сих пор
+# режим только переставлял порядок попыток: транспорт всё равно выбирал релей,
+# то есть WSS через чужой Worker, и «через Основной VPN» означало «через Worker,
+# до которого мы дошли через Основной VPN», а на первой же осечке — через
+# Дополнительный. Выбранный слот означает: прямой MTProto, этот егресс и никакой
+# другой; WSS не рассматривается вообще.
+PINNED_EGRESS_BY_MODE = {"warp": "warp-socks", "opera": "opera-http"}
+ROUTE_MODE_VALUES = ("auto", "warp", "opera", "direct")
+_route_mode_provider = None
+_route_mode_cache: Dict[str, object] = {"ts": 0.0, "mode": "auto"}
+_route_pin_state: Dict[str, str] = {"logged": ""}
+
+
+def set_route_mode_provider(provider) -> None:
+    """Кто отвечает на вопрос «какой режим выбран для Telegram».
+
+    Тот же приём, что и у `set_upstream_provider`: внутри Nova провайдер —
+    замыкание на `get_routing_app_mode`, у внепроцессных помощников его нет и
+    режим читается из файла настроек, как это делает NovaDivert.
+    """
+    global _route_mode_provider
+    _route_mode_provider = provider if callable(provider) else None
+    _route_mode_cache["ts"] = 0.0
+    # Перезапуск релея — повод сказать про режим заново: иначе после падения в
+    # логе не останется ни строчки о том, что WSS выключен намеренно.
+    _route_pin_state["logged"] = ""
+
+
+def _read_route_mode() -> str:
+    if callable(_route_mode_provider):
+        return str(_route_mode_provider() or "auto").strip().lower()
+    from nova_transport_plans import _get_app_route_mode
+
+    return str(_get_app_route_mode("telegram") or "auto").strip().lower()
+
+
+def telegram_route_mode() -> str:
+    now = time.monotonic()
+    try:
+        if now - float(_route_mode_cache.get("ts") or 0.0) <= 1.0:
+            return str(_route_mode_cache.get("mode") or "auto")
+    except Exception:
+        pass
+    try:
+        mode = _read_route_mode()
+    except Exception:
+        mode = "auto"
+    if mode not in ROUTE_MODE_VALUES:
+        mode = "auto"
+    _route_mode_cache["ts"] = now
+    _route_mode_cache["mode"] = mode
+    return mode
+
+
+def pinned_egress_label() -> str:
+    """Метка егресса, к которому привязан Telegram, или пустая строка."""
+    return PINNED_EGRESS_BY_MODE.get(telegram_route_mode(), "")
+
+
+def _note_route_pin(pin: str, log_func) -> None:
+    """Сказать в лог, что маршрут Telegram сменил природу, и только об этом.
+
+    Переход важен: «WSS выключен» объясняет и исчезнувшие строки про зоны `kws*`,
+    и то, почему при лежащем слоте Telegram молчит. Повторять на каждом
+    соединении нельзя — их сотни за сессию, поэтому состояние модульное: оно
+    переживает и смену сессии, и переподключение клиента.
+    """
+    pin = str(pin or "")
+    if str(_route_pin_state.get("logged") or "") == pin:
+        return
+    _route_pin_state["logged"] = pin
+    if pin:
+        slot = "Основному" if pin == "warp-socks" else "Дополнительному"
+        log_func(
+            f"[TgRelay] Telegram привязан к {slot} VPN: WSS выключен, "
+            f"трафик идёт прямым MTProto только через {pin}."
+        )
+    else:
+        log_func("[TgRelay] Telegram снова на «Auto»: маршрут выбирает релей.")
+
+
+def _pin_attempts(attempts, pin: str) -> List[Dict[str, object]]:
+    """Оставить только попытки прибитого егресса.
+
+    Пустой результат — это ответ «маршрута нет», а не повод взять соседний:
+    вызывающий обязан закрыть соединение, а не передать `None` в `open_stream`,
+    который в этом случае молча возьмёт полный список провайдера.
+    """
+    if not pin:
+        return [dict(a) for a in (attempts or []) if isinstance(a, dict)]
+    picked = []
+    for attempt in attempts or []:
+        if not isinstance(attempt, dict):
+            continue
+        label = str(attempt.get("label") or attempt.get("kind") or "").strip().lower()
+        if label == pin:
+            picked.append(dict(attempt))
+    return picked
+
+
 def _cfproxy_upstream_attempts() -> List[Dict[str, object]]:
     try:
         attempts = list(get_upstream_attempts() or [])
@@ -866,6 +967,11 @@ def _cfproxy_upstream_attempts() -> List[Dict[str, object]]:
                 continue
             rendered.setdefault("timeout", 1.2)
         selected_attempts.append(rendered)
+    pin = pinned_egress_label()
+    if pin:
+        # При явном слоте WSS вообще не берётся (см. _handle_client), но список
+        # ходит ещё и в пробы — пусть и там не окажется чужого егресса.
+        return _pin_attempts(selected_attempts, pin)
     if selected_attempts:
         return selected_attempts
     if allow_direct:
@@ -890,7 +996,7 @@ def _telegram_upstream_attempts(base_attempts=None) -> List[Dict[str, object]]:
         if str(attempt.get("kind") or "").strip().lower() == "direct" and not allow_direct:
             continue
         rendered.append(dict(attempt))
-    return rendered
+    return _pin_attempts(rendered, pinned_egress_label())
 
 
 async def _resolve_ip(host: str) -> str:
@@ -1839,7 +1945,7 @@ async def serve_until_stopped(server: asyncio.AbstractServer, stop_event: asynci
 
 
 class TelegramTransparentRelayServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 1372, log_func=None, upstream_provider=None, warp_bootstrap_waiter=None):
+    def __init__(self, host: str = "127.0.0.1", port: int = 1372, log_func=None, upstream_provider=None, warp_bootstrap_waiter=None, route_mode_provider=None):
         self.host = host
         self.port = int(port)
         self.log_func = log_func or (lambda msg: log.info(msg))
@@ -1851,6 +1957,12 @@ class TelegramTransparentRelayServer:
         set_transport_logger(self.log_func)
         self.upstream_provider = upstream_provider
         self.warp_bootstrap_waiter = warp_bootstrap_waiter
+        self.route_mode_provider = route_mode_provider
+        # Прибитый егресс лежит — говорим об этом раз в полминуты, а не на
+        # каждое соединение: Telegram переподключается пачками.
+        self._pin_warn_until = 0.0
+        self._pin_silent_streak = 0
+        self._pin_silent_warn_until = 0.0
         self.thread = None
         self.loop = None
         self.server = None
@@ -2272,6 +2384,10 @@ class TelegramTransparentRelayServer:
         loop.set_exception_handler(self._loop_exception_handler)
         self.stop_event = asyncio.Event()
         set_upstream_provider(self.upstream_provider)
+        # getattr, а не атрибут: сюда заходят и тестовые дубли, собранные через
+        # object.__new__ без полного __init__ — у них нового поля нет, и падение
+        # здесь остановило бы весь цикл жизни релея на пустом месте.
+        set_route_mode_provider(getattr(self, "route_mode_provider", None))
         with contextlib.suppress(Exception):
             import concurrent.futures
             loop.set_default_executor(
@@ -2555,6 +2671,13 @@ class TelegramTransparentRelayServer:
     async def _schedule_cf_bootstrap_prewarm_wave(self, delay: float = 0.0) -> None:
         try:
             await asyncio.sleep(max(0.0, float(delay or 0.0)))
+            if pinned_egress_label():
+                # Прогрев открывает туннели к Worker'у заранее. При выбранном
+                # слоте ими никто не воспользуется, а платит за них дневной
+                # бюджет Worker'а (S35) и сам прибитый егресс, через который
+                # эти рукопожатия и пойдут. Проверка после sleep, а не до:
+                # режим меняют на живой программе.
+                return
             recent_keys = sorted(
                 {
                     (int(dc), bool(is_media))
@@ -2669,6 +2792,17 @@ class TelegramTransparentRelayServer:
             client_key = self._register_client(writer, client_mode)
             await self._note_client_mode(client_mode)
             target_ip = await _resolve_ip(target_host)
+            egress_pin = pinned_egress_label()
+            _note_route_pin(egress_pin, self.log_func)
+            if egress_pin:
+                # Пользователь выбрал слот — значит WSS не рассматривается
+                # ВООБЩЕ: ни своя зона `kws*`, ни `web.telegram.org`. Иначе
+                # «идёт через Основной VPN» означало бы «идёт через чужой
+                # Worker, до которого мы дошли через Основной VPN» — ровно то,
+                # на что и пожаловались. Дальше — только прямой MTProto, и
+                # только через прибитый егресс (_handle_plain_tunnel).
+                await self._handle_plain_tunnel(reader, writer, target_host, target_port, prefetched, label, media_hint=None)
+                return
             if not _wss_candidate(target_host, target_ip, target_port):
                 await self._handle_plain_tunnel(reader, writer, target_host, target_port, prefetched, label, media_hint=None)
                 return
@@ -3562,6 +3696,7 @@ class TelegramTransparentRelayServer:
         if waited_warp > 0.01:
             route_suffix = f"{route_suffix} wait-warp={waited_warp:.2f}s".rstrip()
 
+        egress_pin = pinned_egress_label()
         attempts = None
         try:
             from .transport import get_upstream_attempts
@@ -3591,6 +3726,18 @@ class TelegramTransparentRelayServer:
                     attempts = base_attempts
         except Exception:
             attempts = None
+
+        if egress_pin and not attempts:
+            # Прибитый слот не поднят. Уйти на соседний егресс или напрямую —
+            # ровно то, что пользователь запретил, а `attempts=None` в
+            # `open_stream` означает «возьми весь список провайдера». Поэтому
+            # закрываем соединение и говорим почему: молчащий Telegram с
+            # объяснением в логе лучше, чем работающий не тем маршрутом.
+            self._log_pin_unavailable(egress_pin, effective_host, effective_port)
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
+            return
 
         connect_timeout = 2.5 if int(dc_hint or 0) in (1, 3, 5) else 6.0
         if bootstrap_canonical:
@@ -3649,6 +3796,10 @@ class TelegramTransparentRelayServer:
                     retry_attempts = proxy_retry_attempts or direct_attempts
                 except Exception:
                     retry_attempts = None
+                if egress_pin:
+                    # `None` здесь — это «весь список провайдера», то есть
+                    # выход мимо выбранного слота на повторной попытке.
+                    retry_attempts = _pin_attempts(retry_attempts or attempts or [], egress_pin)
 
                 upstream_reader, upstream_writer, route_label = await open_stream(
                     effective_host,
@@ -3700,6 +3851,46 @@ class TelegramTransparentRelayServer:
         # their silence says nothing about the native route.
         if not bootstrap_canonical and not _looks_like_http_request(initial) and int(dc_hint or 0) > 0:
             _native_record(dc_hint, route_label, total_down > 0)
+            if egress_pin:
+                self._note_pinned_outcome(egress_pin, total_down > 0)
+
+    def _note_pinned_outcome(self, pin: str, carried: bool) -> None:
+        """Прибитый слот принимает соединения и молчит — сказать это вслух.
+
+        Снаружи такое выглядит как «Nova сломалась», а на деле бывает, что выход
+        слота просто забанен у Telegram: прямой MTProto через Cloudflare WARP
+        измеренно поднимает TCP и не получает ни байта шесть секунд. Пока WSS был
+        включён, релей это обходил молча; теперь обходить нечем, и единственное,
+        что можно сделать честно, — назвать причину и напомнить про «Auto».
+        """
+        if carried:
+            self._pin_silent_streak = 0
+            return
+        self._pin_silent_streak = int(getattr(self, "_pin_silent_streak", 0) or 0) + 1
+        if self._pin_silent_streak < 3:
+            return
+        now = time.monotonic()
+        if now < float(getattr(self, "_pin_silent_warn_until", 0.0) or 0.0):
+            return
+        self._pin_silent_warn_until = now + 300.0
+        slot = "Основной" if pin == "warp-socks" else "Дополнительный"
+        self.log_func(
+            f"[TgRelay] {slot} VPN принимает соединения, но Telegram через него молчит "
+            f"({self._pin_silent_streak} туннеля подряд без единого байта). Похоже, выход этого "
+            f"слота у Telegram заблокирован — верните строке Telegram режим «Auto», если нужен "
+            f"обход через WSS."
+        )
+
+    def _log_pin_unavailable(self, pin: str, effective_host: str, effective_port: int) -> None:
+        now = time.monotonic()
+        if now < float(getattr(self, "_pin_warn_until", 0.0) or 0.0):
+            return
+        self._pin_warn_until = now + 30.0
+        slot = "Основной" if pin == "warp-socks" else "Дополнительный"
+        self.log_func(
+            f"[TgRelay] {slot} VPN не поднят, а Telegram привязан к нему: "
+            f"{effective_host}:{effective_port} закрыт, обходной маршрут не берём."
+        )
 
     def _log_fallback(self, route_label: str, effective_host: str, effective_port: int, route_suffix: str) -> None:
         try:
@@ -4417,6 +4608,12 @@ class TelegramTransparentRelayServer:
         key = (int(dc_hint or 0), bool(is_media))
         try:
             await asyncio.sleep(max(0.0, float(delay)))
+            if pinned_egress_label():
+                # Второй вход в прогрев: `_schedule_cf_bootstrap_prewarm`
+                # зовётся и напрямую, не только волной. Проверка после sleep —
+                # режим могли выбрать, пока задача ждала.
+                self._cf_prewarm_started.pop(key, None)
+                return
             fallback_host = str(_TG_TCP_FALLBACK_IPS.get(int(dc_hint or 0)) or "").strip()
             if fallback_host:
                 await self._maybe_wait_for_warp_bootstrap(

@@ -1,4 +1,4 @@
-# version: 1.40.1
+# version: 1.40.2
 1337x.to
 1e100cdn.net
 7tv.app
@@ -60,7 +60,6 @@ cloudflarestatus.com
 cloudflarestorage.com
 cloudflarestream.com
 cloudfront.net
-code.claude.com
 coinbase.com
 comicbook.com
 cryptocloud.plus
@@ -143,7 +142,6 @@ kinohub.vip
 kinozal.tv
 laozhang.ai
 lh3.googleusercontent.com
-links.email.claude.com
 litellm.ai
 live-video.net
 live.com
@@ -193,6 +191,7 @@ ookla.com
 open.live.bbc.co.uk
 optimizely.com
 pacloudflare.com
+pastes.dev
 pathofbuilding.community
 perfops.net
 phonevalidator.com

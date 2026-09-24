@@ -1,0 +1,5 @@
+# version: 1.40.2
+cloudcode-pa.googleapis.com
+gemini.google.com
+generativelanguage.googleapis.com
+daily-cloudcode-pa.googleapis.com

@@ -1,4 +1,4 @@
-# version: 1.40.1
+# version: 1.40.2
 4pda.to
 4pda.ws
 agent-router.org
@@ -12,6 +12,7 @@ cdn.cookielaw.org
 cdnbunny.org
 cerebras.ai
 chatgpt.com
+claude.ai
 claude.com
 codegpt.co
 collaborator.pro
@@ -46,6 +47,7 @@ hex-rays.com
 hsforms.com
 imgur.com
 intel.com
+inventati.org
 invideo.io
 ivpn.net
 jestkii.com

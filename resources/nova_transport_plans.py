@@ -99,6 +99,23 @@ def _browser_mode_from_legacy_pac(payload):
     return "auto"
 
 
+# Привязка к слоту VPN. «Осн.»/«Доп.» в строке Telegram — обещание, а не
+# предпочтение: выбранный слот и есть весь маршрут, соседний егресс не берётся
+# даже когда выбранный лежит, и WSS через чужой Worker не берётся тем более.
+# Остальные группы (Discord, WhatsApp, OBS, Games) остались на прежнем
+# поведении, где режим лишь переставляет порядок попыток.
+PINNED_EGRESS_BY_MODE = {"warp": "warp-socks", "opera": "opera-http"}
+PINNED_EGRESS_APPS = {"telegram"}
+
+
+def pinned_egress_label(app_key):
+    """Метка единственного разрешённого егресса, или пустая строка."""
+    app = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
+    if app not in PINNED_EGRESS_APPS:
+        return ""
+    return PINNED_EGRESS_BY_MODE.get(_get_app_route_mode(app), "")
+
+
 def _get_app_route_mode(app_key):
     payload = _load_routing_settings()
     key = ROUTING_GROUP_ALIASES.get(str(app_key or "").strip().lower(), "browser")
@@ -270,6 +287,12 @@ def build_public_app_transport_plan(
     ordered_attempts = [dict(by_label[label]) for label in ordered_labels if label in by_label]
     if ordered_attempts:
         attempts = ordered_attempts
+    pin = pinned_egress_label(normalized_app)
+    if pin:
+        # План — это то, что Nova показывает о себе в панели состояния. Если он
+        # перечисляет три егресса, а помощники ходят в один, расходится не план
+        # с кодом, а картинка с реальностью — и разбирать жалобу придётся по ней.
+        attempts = [dict(by_label[pin])] if pin in by_label else []
     return {
         "app": normalized_app,
         "tcp_attempts": attempts,

@@ -1,4 +1,4 @@
-# version: 1.40.1
+# version: 1.40.2
 1c-bitrix.ru
 akamaihd.net
 apptracer.ru
@@ -14,7 +14,6 @@ cdnwb.ru
 chrome.cloudflare-dns.com
 cikrf.ru
 cloud.ru
-cloudcode-pa.googleapis.com
 cloudflare-dns.com
 deploy.static.akamaitechnologies.com
 dev-tcsgroup.io

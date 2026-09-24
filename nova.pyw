@@ -8800,7 +8800,12 @@ try:
                 # лишь до первого вызова из другого места.
                 last_resort = "SOCKS5 127.0.0.1:1" if _env_bool_global("NOVA_PAC_KILLSWITCH", False) else "DIRECT"
 
-                def _route_for_target(target, strict=False):
+                # Прибитый слот лежит — PAC всё равно обязан вернуть строку, и
+                # «никуда» здесь честнее прямого пути: пользователь выбрал слот,
+                # а не «слот, пока он жив». Тот же приём, что у NOVA_PAC_KILLSWITCH.
+                closed_route = "SOCKS5 127.0.0.1:1"
+
+                def _route_for_target(target, strict=False, allow_last_resort=True):
                     target = str(target or "").strip().lower()
                     if target == "direct":
                         return "DIRECT"
@@ -8815,7 +8820,10 @@ try:
                             parts.append(primary_route)
                         elif not strict and secondary_active:
                             parts.append(secondary_route)
-                        parts.append(last_resort)
+                        if allow_last_resort:
+                            parts.append(last_resort)
+                        elif not parts:
+                            parts.append(closed_route)
                         return "; ".join(_dedupe_route_parts(parts))
                     if target == "opera":
                         parts = []
@@ -8823,7 +8831,10 @@ try:
                             parts.append(secondary_route)
                         elif not strict and warp_active:
                             parts.append(primary_route)
-                        parts.append(last_resort)
+                        if allow_last_resort:
+                            parts.append(last_resort)
+                        elif not parts:
+                            parts.append(closed_route)
                         return "; ".join(_dedupe_route_parts(parts))
                     if target == "tor":
                         # Browsers only (routing mode "tor"). No DIRECT tail and no fallback to
@@ -8836,14 +8847,20 @@ try:
                         return f"SOCKS5 127.0.0.1:{tor_socks_port}; PROXY 127.0.0.1:{tor_http_port}"
                     return "DIRECT"
 
-                def _route_for_app_mode(mode, default_route):
+                def _route_for_app_mode(mode, default_route, pinned=False):
                     # "tor" is a browser-only mode: app families never get it (they fall
                     # through to default_route), get_routing_app_mode maps it to auto.
+                    #
+                    # pinned=True — это обещание «этим маршрутом и никаким другим»
+                    # (пока его даёт только Telegram, nova_transport_plans.
+                    # PINNED_EGRESS_APPS). Тогда ни подмены на соседний слот, ни
+                    # хвоста DIRECT: тихая прямая нога обесценивает выбор ровно
+                    # так же, как обесценила бы его у Tor ниже.
                     mode = str(mode or "").strip().lower()
                     if mode == "warp":
-                        return _route_for_target("warp", strict=False)
+                        return _route_for_target("warp", strict=pinned, allow_last_resort=not pinned)
                     if mode == "opera":
-                        return _route_for_target("opera", strict=False)
+                        return _route_for_target("opera", strict=pinned, allow_last_resort=not pinned)
                     if mode == "direct":
                         return "DIRECT"
                     return default_route
@@ -8915,7 +8932,7 @@ try:
                 discord_route = ru_route
 
                 telegram_mode = get_routing_app_mode("telegram", routing_settings)
-                telegram_route = _route_for_app_mode(telegram_mode, ru_route)
+                telegram_route = _route_for_app_mode(telegram_mode, ru_route, pinned=True)
                 tgrelay_port = 1372
                 # Релей перебивает маршрут только пока пользователь не выбрал
                 # егресс сам. warp/opera/direct в настройках — явная воля, а до
@@ -9011,7 +9028,17 @@ try:
                 # Подъём делается ТОЛЬКО пока релей жив, а пользовательские
                 # списки и exclude остаются выше: это явно выраженная воля
                 # пользователя, её перебивать нельзя.
-                if tgrelay_active:
+                # Подъём нужен и при выбранном вручную режиме, и по той же
+                # причине, что ниже у app_domain_priority — только там тень
+                # была доменная, а здесь адресная и куда шире: `ip/ru.txt`
+                # содержит `149.154.0.0/16` и `91.108.0.0/16`, то есть ВСЕ DC
+                # Telegram, а цикл `ru_ips` стоит выше `telegram_ips`. Клиент
+                # на «системном прокси» набирает DC по адресу, поэтому при
+                # «Доп.» он получал ru_route — цепочку с Основным впереди, —
+                # и привязка к слоту не действовала ровно там, где её просили.
+                # Доменную ветку здесь по-прежнему не трогаем: её поднимает
+                # app_domain_priority, ниже пользовательских списков.
+                if tgrelay_active or str(telegram_mode or "auto").strip().lower() != "auto":
                     telegram_ip_priority = (
                         "        if (matchIpEntries(host, telegram_ips)) {\n"
                         f'            return "{telegram_route}";\n'
@@ -11041,7 +11068,17 @@ try:
                 log_func=self.log_func,
                 upstream_provider=self._build_upstream_attempts,
                 warp_bootstrap_waiter=self._wait_for_warp_bootstrap_window,
+                route_mode_provider=self._telegram_route_mode,
             )
+
+        def _telegram_route_mode(self):
+            # Релей спрашивает режим сам, а не получает его при старте: строку
+            # «Telegram» в настройках меняют на живой программе, и перезапуска
+            # релея за этим не следует.
+            try:
+                return get_routing_app_mode("telegram")
+            except:
+                return "auto"
 
         def _build_upstream_attempts(self):
             attempts_by_label = {}

@@ -379,6 +379,16 @@ def _get_app_route_mode(app_key: str) -> str:
     return mode
 
 
+# Жёсткая привязка обещана только Telegram (D29): «Осн.»/«Доп.» в его строке
+# означает «этим маршрутом и никаким другим». Discord, WhatsApp, OBS и Games
+# остались предпочтением, где режим лишь переставляет порядок попыток.
+PINNED_EGRESS_BY_MODE = {"warp": "warp-socks", "opera": "opera-http"}
+
+
+def _pinned_telegram_egress() -> str:
+    return PINNED_EGRESS_BY_MODE.get(_get_app_route_mode("telegram"), "")
+
+
 def _reorder_route_labels(mode: str, labels: List[str]) -> List[str]:
     normalized = [str(item or "").strip().lower() for item in list(labels or []) if str(item or "").strip()]
     if mode == "warp":
@@ -1108,6 +1118,13 @@ class NovaWfpTcpProxy:
             if not attempts:
                 attempts = ["warp-socks", "opera-http"]
 
+        # «Осн.»/«Доп.» в строке Telegram — привязка, а не предпочтение.
+        # Переупорядочивание выше оставляло соседний егресс в хвосте, и первая
+        # же осечка выбранного слота уводила трафик туда молча: в настройках
+        # «Доп.», в реальности — Основной. Ровно это и просили прекратить.
+        if (is_telegram_target or is_telegram_app) and route_mode in ("warp", "opera"):
+            attempts = [PINNED_EGRESS_BY_MODE[route_mode]]
+
         cached_label = self._route_label_cache_get(target_host, target_port, route_scope=route_scope)
         if cached_label in attempts:
             attempts = [cached_label] + [item for item in attempts if item != cached_label]
@@ -1429,6 +1446,14 @@ class NovaWfpTcpProxy:
         return bytes(data)
 
     def _tg_ws_deps_ready(self) -> bool:
+        # Этот прокси несёт свой собственный WSS-мост к Worker'у — тот же обход,
+        # что и в релее, только для трафика, дошедшего до 17870. При выбранном
+        # слоте он обязан молчать: единственная точка, через которую проходят
+        # все четыре входа в мост, поэтому проверка стоит здесь, а не в каждом.
+        # Прогрев пула на старте тоже висит на этом условии — и правильно:
+        # тратить квоту Worker'а на маршрут, которым не пойдут, незачем.
+        if _pinned_telegram_egress():
+            return False
         return bool(
             TG_WS_BRIDGE_ENABLED
             and TransparentMsgSplitter is not None
