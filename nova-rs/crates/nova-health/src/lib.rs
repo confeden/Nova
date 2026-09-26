@@ -128,7 +128,7 @@ impl Supervisor {
     /// and that is not a failure mode anyone would notice in testing.
     ///
     /// `u_ru` and `u_eu` are the user-editable halves of the same two lists
-    /// (`list/u_ru.txt`, `list/u_eu.txt`), so they inherit the same constraint.
+    /// (`list/u_main.txt`, `list/u_second.txt`), so they inherit the same constraint.
     pub const DEFAULT_POLICIES: [(&'static str, FallbackPolicy); 4] = [
         ("ru", FallbackPolicy::TunnelOnly),
         ("u_ru", FallbackPolicy::TunnelOnly),

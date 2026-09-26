@@ -1,2 +1,0 @@
-# version: 1.40.2
-# user Opera override IPs/CIDR

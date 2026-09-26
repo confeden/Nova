@@ -1,0 +1,4 @@
+# user main VPN override domains
+pornolab.net
+kinozal.me
+kinozal.guru

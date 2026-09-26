@@ -306,6 +306,9 @@ import nova_issuance
 import nova_wg_probe
 import nova_vless
 import nova_subscriptions
+import nova_list_sync
+import nova_ai_region
+import nova_dns_probe
 import nova_ping
 import nova_boot_timeline as boot_timeline
 import nova_win_routes
@@ -1100,153 +1103,22 @@ try:
         except: pass
 
     def restore_missing_strategies():
-        """Единое правило проверки версий файлов в list, ip, strat."""
+        """Списки и стратегии живут без номеров версий.
+
+        Отсутствующий или пустой файл восстанавливается из встроенной копии
+        (resources/builtin, её кладёт установщик); файл с содержимым не
+        трогается никогда — свежесть решает сверка с сетью (list_sync_worker),
+        и сетевой список обратно на встроенный не откатывается.
+        """
         logs = []
         try:
             base_dir = get_base_dir()
-            is_frozen_exe = getattr(sys, 'frozen', False)
-            
-            # Директории для проверки
-            dirs_to_check = ["list", "ip", "strat"]
-            
-            for d in dirs_to_check:
-                target_dir = os.path.join(base_dir, d)
-                internal_dir = get_internal_path(d)
-                
-                if not os.path.exists(target_dir):
-                    os.makedirs(target_dir, exist_ok=True)
-                
-                # Получаем список файлов
-                files_to_check = set()
-                if os.path.exists(target_dir):
-                    files_to_check.update(os.listdir(target_dir))
-                if is_frozen_exe and os.path.exists(internal_dir):
-                    files_to_check.update(os.listdir(internal_dir))
-                
-                for fname in files_to_check:
-                    if not (fname.endswith(".txt") or fname.endswith(".json")):
-                        continue
-                        
-                    target_path = os.path.join(target_dir, fname)
-                    internal_path = os.path.join(internal_dir, fname) if is_frozen_exe else None
-                    
-                    is_json = fname.endswith(".json")
-                    
-                    # Читаем версию из файла пользователя
-                    target_has_version = False
-                    target_version = None
-                    target_data = None
-                    target_lines = []
-                    
-                    if os.path.exists(target_path):
-                        if is_json:
-                            try:
-                                with open(target_path, "r", encoding="utf-8") as f:
-                                    target_data = json.load(f)
-                                if isinstance(target_data, dict) and "version" in target_data:
-                                    target_has_version = True
-                                    target_version = target_data["version"]
-                            except: pass
-                        else:
-                            try:
-                                with open(target_path, "r", encoding="utf-8") as f:
-                                    target_lines = f.readlines()
-                                if target_lines and target_lines[0].strip().startswith("# version:"):
-                                    target_has_version = True
-                                    target_version = target_lines[0].strip().split(":", 1)[1].strip()
-                            except: pass
-
-                    needs_replace_from_exe = False
-                    action = ""
-
-                    if is_frozen_exe:
-                        if not os.path.exists(internal_path):
-                            continue # В exe нет такого файла
-
-                        def _same_file(a, b):
-                            return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
-
-                        if _same_file(internal_path, target_path):
-                            # Бандла для list/, ip/ и strat/ не существует:
-                            # PyInstaller не получает для них --add-data, и в
-                            # установленном дереве нет resources/list. Поэтому
-                            # get_internal_path() доходит до последнего кандидата
-                            # — get_base_dir() — и возвращает тот же самый файл.
-                            # «Восстановление» тогда означает копирование файла в
-                            # самого себя. На этой системе оно падает с
-                            # PermissionError и файл остаётся цел, но полагаться
-                            # на это нельзя: copyfile открывает приёмник на
-                            # запись, то есть один шаг отделяет от обрезания
-                            # пользовательского списка. Восстанавливать нечем —
-                            # выходим молча, вместо ошибки в журнале на каждый
-                            # устаревший файл.
-                            continue
-
-                        if not os.path.exists(target_path):
-                            needs_replace_from_exe = True
-                            action = "Missing -> Restored from Bundle"
-                        elif not target_has_version:
-                            needs_replace_from_exe = True
-                            action = "No Version -> Restored from Bundle"
-                        else:
-                            # Если текущая версия в программе выше чем в файле -> заменяем из EXE
-                            if compare_versions(CURRENT_VERSION, target_version):
-                                needs_replace_from_exe = True
-                                action = f"Outdated (v{target_version} < v{CURRENT_VERSION}) -> Restored from Bundle"
-
-                        if needs_replace_from_exe:
-                            try:
-                                shutil.copy2(internal_path, target_path)
-                                logs.append(f"[Init] {d}/{fname}: {action}")
-                            except Exception as e:
-                                logs.append(f"[Init] Ошибка перезаписи {d}/{fname}: {e}")
-                    
-                    else:
-                        # Скрипт-режим: просто внедряем актуальную версию, не замещая содержимое
-                        if not os.path.exists(target_path):
-                            continue
-                        
-                        updated = False
-                        if is_json:
-                            if isinstance(target_data, dict):
-                                if not target_has_version:
-                                    target_data["version"] = CURRENT_VERSION
-                                    updated = True
-                                    action = "Version Added (Script)"
-                                elif compare_versions(CURRENT_VERSION, target_version) or target_version != CURRENT_VERSION:
-                                    target_data["version"] = CURRENT_VERSION
-                                    updated = True
-                                    action = f"Version Updated to v{CURRENT_VERSION} (Script)"
-                                
-                                if updated:
-                                    try:
-                                        with open(target_path, "w", encoding="utf-8") as f:
-                                            json.dump(target_data, f, indent=4, ensure_ascii=False)
-                                    except: pass
-                        else:
-                            if not target_has_version:
-                                target_lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                                updated = True
-                                action = "Version Added (Script)"
-                            elif compare_versions(CURRENT_VERSION, target_version) or target_version != CURRENT_VERSION:
-                                target_lines[0] = f"# version: {CURRENT_VERSION}\n"
-                                updated = True
-                                action = f"Version Updated to v{CURRENT_VERSION} (Script)"
-                                
-                            if updated:
-                                try:
-                                    with open(target_path, "w", encoding="utf-8") as f:
-                                        f.writelines(target_lines)
-                                except: pass
-                                
-                        if updated:
-                            logs.append(f"[Init] {d}/{fname}: {action}")
-
-            return logs
-
+            logs.extend(nova_list_sync.migrate_legacy_names(base_dir))
+            logs.extend(nova_list_sync.restore_from_builtin(base_dir))
+            logs.extend(nova_list_sync.strip_version_headers(base_dir))
         except Exception as e:
             print(f"[Init] Ошибка проверки файлов: {e}")
-            return logs
+        return logs
 
     def get_base_dir():
         """Возвращает папку, где лежит EXE файл (или скрипт)."""
@@ -1570,130 +1442,17 @@ try:
                  except: pass
 
             else:
-                # Для list, strat, ip: умное обновление
+                # list, strat, ip: только недостающие файлы. Версий у списков больше
+                # нет; пустые восстанавливает restore_missing_strategies, свежие
+                # приходят из сети (list_sync_worker).
                 try:
                     for item in os.listdir(internal_source):
                         s = os.path.join(internal_source, item)
                         d = os.path.join(target_folder_path, item)
-
-                        # 1. Если файла нет - просто копируем
-                        if not os.path.exists(d):
-                            if os.path.isfile(s):
-                                shutil.copy2(s, d)
-                                logs.append(f"Добавлен новый файл конфигурации: {item}")
-                            continue
-                        
-                        # 2. Если файл есть - проверяем тип
-                        if item.endswith(".txt"):
-                            try:
-                                with open(s, "r", encoding="utf-8") as f: src_lines = f.readlines()
-                                with open(d, "r", encoding="utf-8") as f: dst_lines = f.readlines()
-                                
-                                src_ver = "0.0"
-                                if src_lines and "version:" in src_lines[0]: src_ver = src_lines[0].split(":")[1].strip()
-                                
-                                dst_ver = "0.0"
-                                if dst_lines and "version:" in dst_lines[0]: dst_ver = dst_lines[0].split(":")[1].strip()
-                                
-                                def vt(v): 
-                                    try: return tuple(map(int, v.split('.')))
-                                    except: return (0,)
-                                
-                                # Logic for general.txt
-                                if item == "general.txt":
-                                    # Policy: Version < 1.9 -> Hard Reset
-                                    if vt(dst_ver) < vt("1.9"):
-                                        shutil.copy2(s, d)
-                                        logs.append(f"List: Полный сброс {item} (v{dst_ver} -> v{src_ver})")
-                                    else:
-                                        # Policy: Version >= 1.9 -> Merge
-                                        merged = set()
-                                        for l in dst_lines: 
-                                            if l.strip() and not l.startswith("#"): merged.add(l.strip())
-                                        for l in src_lines:
-                                            if l.strip() and not l.startswith("#"): merged.add(l.strip())
-                                        
-                                        with open(d, "w", encoding="utf-8") as f:
-                                            f.write(f"# version: {src_ver}\n")
-                                            for dom in sorted(list(merged)): f.write(f"{dom}\n")
-                                        logs.append(f"List: Обновлен {item} (Merge v{dst_ver} -> v{src_ver})")
-
-                                # Logic for cloudflare.txt
-                                elif item == "cloudflare.txt":
-                                    # Policy: If internal version is newer -> Replace
-                                    # If no version in file (dst_ver=0.0) -> Replace
-                                    if vt(dst_ver) < vt(src_ver):
-                                        # Force Replace but ensure header matches source
-                                        with open(d, "w", encoding="utf-8") as f:
-                                            # If source has no header, add it? Assuming source has header.
-                                            # If source is raw list, we should prepend header.
-                                            if "version:" not in src_lines[0]:
-                                                f.write(f"# version: {src_ver}\n")
-                                                f.writelines(src_lines)
-                                            else:
-                                                f.writelines(src_lines)
-                                        logs.append(f"List: Полный сброс {item} (v{dst_ver} -> v{src_ver})")
-                                
-                                else:
-                                    # Default behavior for other txt files (e.g. broken ones)
-                                    pass
-                                    
-                            except: pass
-
-                        elif item.endswith(".json"):
-                            # Strategies.json Smart Update
-                            if item == "strategies.json":
-                                try:
-                                    js_src = load_json_robust(s, {})
-                                    js_dst = load_json_robust(d, {})
-                                    
-                                    src_ver = js_src.get("version", "0.0")
-                                    dst_ver = js_dst.get("version", "0.0")
-                                    
-                                    # Helper to compare versions
-                                    def vt(v): 
-                                        try: return tuple(map(int, v.split('.')))
-                                        except: return (0,)
-
-                                    # Policy: Version < 1.8 -> Hard Reset (Structure changed)
-                                    if vt(dst_ver) < vt("1.8"):
-                                        shutil.copy2(s, d)
-                                        logs.append(f"Strat: Полный сброс {item} (v{dst_ver} -> v{src_ver})")
-                                    else:
-                                        # Policy: Version >= 1.8 -> Soft Update (Merge keys + Update Version)
-                                        changed = False
-                                        
-                                        # 1. Update Version
-                                        if dst_ver != src_ver:
-                                            js_dst["version"] = src_ver
-                                            changed = True
-                                            
-                                        # 2. Add missing top-level keys (new services)
-                                        for k, v in js_src.items():
-                                            if k not in js_dst:
-                                                js_dst[k] = v
-                                                changed = True
-                                                
-                                        if changed:
-                                            save_json_safe(d, js_dst)
-                                            logs.append(f"Strat: Обновлен {item} (v{dst_ver} -> v{src_ver})")
-                                except: pass
-                            else:
-                                # Other JSONs (Legacy behavior - fill missing keys)
-                                try:
-                                    js_src = load_json_robust(s, {})
-                                    js_dst = load_json_robust(d, {})
-                                    changed = False
-                                    for k, v in js_src.items():
-                                        if k not in js_dst:
-                                            js_dst[k] = v
-                                            changed = True
-                                    if changed:
-                                        save_json_safe(d, js_dst)
-                                        logs.append(f"Strat: дополнен {item}")
-                                except: pass
-
-                except Exception as e:
+                        if not os.path.exists(d) and os.path.isfile(s):
+                            shutil.copy2(s, d)
+                            logs.append(f"Добавлен новый файл конфигурации: {item}")
+                except Exception:
                     pass
 
         # FIX: Create winws_test.exe for background checks (Process Isolation)
@@ -1772,7 +1531,8 @@ try:
     AWG_PROFILES_DIRNAME = nova_profiles.PROFILES_DIRNAME
     AWG_PROFILE_STATE_FILENAME = "awg-profile-state.json"
     HARD_LIST_FILENAME = "hard.txt"
-    BLOCKED_LIST_FILENAME = "list/ru.txt"
+    # Свой список пользователя: main.txt сверяется с сетью и перезаписывается.
+    BLOCKED_LIST_FILENAME = "list/u_main.txt"
     VISITED_DOMAINS_FILE = "temp/visited_domains_stats.json"
     STRATEGIES_EVOLUTION_FILE = "temp/strategies_evolution.json"
     IP_HISTORY_FILE = "temp/ip_history.json"
@@ -5170,8 +4930,8 @@ try:
                 if nova_profiles.load_selection(get_base_dir()).get("mode") in (
                     nova_profiles.MODE_GROUP, nova_profiles.MODE_PROFILE
                 ):
-                    self.is_connected = False
-                    return "Disconnected (PROFILE)"
+                    if not self.is_connected:
+                        return "Disconnected (PROFILE)"
             except Exception:
                 pass
             result = self.run_warp_cli("status")
@@ -8678,10 +8438,11 @@ try:
                     # Until Tor is ready browsers keep the auto route; the Tor watcher rebuilds
                     # the PAC on the edge.
                     pac_config = {"mode": "hybrid", "full_target": "warp", "tor_pending": True}
-                user_ru_domains = self._load_domain_list(os.path.join(base, "list", "u_ru.txt"))
-                user_eu_domains = self._load_domain_list(os.path.join(base, "list", "u_eu.txt"))
-                ru_domains = self._load_domain_list(os.path.join(base, "list", "ru.txt"))
-                eu_domains = self._load_domain_list(os.path.join(base, "list", "eu.txt"))
+                user_ru_domains = self._load_domain_list(os.path.join(base, "list", "u_main.txt"))
+                user_eu_domains = self._load_domain_list(os.path.join(base, "list", "u_second.txt"))
+                ru_domains = self._load_domain_list(os.path.join(base, "list", "main.txt"))
+                eu_domains = self._load_domain_list(os.path.join(base, "list", "second.txt"))
+                ai_list_domains = self._load_domain_list(os.path.join(base, "list", "ai.txt"))
                 exclude_domains = self._load_domain_list(os.path.join(base, "list", "exclude.txt"))
                 discord_domains = get_discord_runtime_domains()
                 telegram_domains = get_telegram_runtime_domains()
@@ -8692,10 +8453,10 @@ try:
                     self._load_domain_list(os.path.join(base, "list", "youtube.txt"))))
                 youtube_domains.update(nova_vpn_slots.YOUTUBE_ROUTE_FOLLOWERS)
                 telegram_ips = self._load_ip_list(os.path.join(base, "ip", "telegram.txt"))
-                user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_ru.txt"))
-                user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_eu.txt"))
-                ru_ips = self._load_ip_list(os.path.join(base, "ip", "ru.txt"))
-                eu_ips = self._load_ip_list(os.path.join(base, "ip", "eu.txt"))
+                user_ru_ips = self._load_ip_list(os.path.join(base, "ip", "u_main.txt"))
+                user_eu_ips = self._load_ip_list(os.path.join(base, "ip", "u_second.txt"))
+                ru_ips = self._load_ip_list(os.path.join(base, "ip", "main.txt"))
+                eu_ips = self._load_ip_list(os.path.join(base, "ip", "second.txt"))
                 discord_ips = self._load_ip_list(os.path.join(base, "ip", "discord.txt"))
                 cloudflare_ips = self._load_ip_list(os.path.join(base, "ip", "cloudflare.txt"))
                 if not cloudflare_ips:
@@ -9012,6 +8773,44 @@ try:
                     if (secondary_active or (warp_active and primary_foreign))
                     else '    if (matchDomain(ai_unlock, host) && matchDomain(eu, host)) return "DIRECT";\n'
                 )
+                # Домены из list/ai.txt, которые есть и в second.txt: приоритет — только
+                # дополнительный VPN (second). Лежит он — напрямую: трафик берёт winws по
+                # стратегии ai, а при настроенном DNS-AI имена уже развёрнуты на его прокси
+                # правилами NRPT. Основной VPN для них не берётся вовсе.
+                def _covered_by(host_name, pool):
+                    parts = host_name.split(".")
+                    return any(".".join(parts[i:]) in pool for i in range(len(parts)))
+                _ai_set = set(ai_list_domains)
+                _second_set = set(eu_domains)
+                # В обе стороны: ai-домен под записью second и запись second под ai-доменом.
+                ai_second_domains = (
+                    {d for d in _ai_set if _covered_by(d, _second_set)}
+                    | {d for d in _second_set if _covered_by(d, _ai_set)}
+                )
+                ai_second_js = "{" + ",".join(f'"{d}":1' for d in sorted(ai_second_domains)) + "}"
+                ai_second_route = (f"{secondary_route}; DIRECT" if secondary_active else "DIRECT")
+                # Выход second заблокирован сервисом по региону (ai_region_worker пробует API
+                # через него) — тогда напрямую по winws, но только если имя этого сервиса
+                # разворачивает DNS-разблокировщик (DNS-AI, xbox-dns, comss, geohide: системный
+                # DNS или правило NRPT). Без разблокировщика прямой путь из России тоже
+                # упрётся в регион, и second остаётся лучшим из двух.
+                ai_region_direct = set()
+                if secondary_active:
+                    try:
+                        with _ai_region_lock:
+                            _verdicts = dict(_ai_region_state.get("verdicts") or {})
+                            _unblockers = _ai_region_state.get("unblockers")
+                        if _unblockers is not None:
+                            ai_region_direct = nova_ai_region.direct_domains(
+                                ai_second_domains, _verdicts, _unblockers)
+                    except Exception:
+                        ai_region_direct = set()
+                ai_region_direct_js = "{" + ",".join(f'"{d}":1' for d in sorted(ai_region_direct)) + "}"
+                ai_unlock_guard = (
+                    '    if (matchDomain(ai_region_direct, host)) return "DIRECT";\n'
+                    f'    if (matchDomain(ai_second, host)) return "{ai_second_route}";\n'
+                    + ai_unlock_guard
+                )
 
                 # Ветка telegram по адресам стояла ниже ru_ips и была для
                 # трафика Telegram недостижима: ip/ru.txt содержит супер-сети
@@ -9094,6 +8893,8 @@ try:
     var ru = {ru_js};
     var eu = {eu_js};
     var ai_unlock = {ai_unlock_js};
+var ai_second = {ai_second_js};
+var ai_region_direct = {ai_region_direct_js};
     var discord = {discord_js};
     var telegram = {telegram_js};
     var telegram_ips = {telegram_ips_js};
@@ -13900,12 +13701,12 @@ try:
             "cloudflare.txt": "",
             "general.txt": "twitter.com\ninstagram.com\n",
             "exclude.txt": "",
-            "u_ru.txt": "# user WARP override domains\n",
-            "u_eu.txt": "# user Opera override domains\n"
+            "u_main.txt": "# user main VPN override domains\n",
+            "u_second.txt": "# user second VPN override domains\n"
         }
         ip_files = {
-            "u_ru.txt": "# user WARP override IPs/CIDR\n",
-            "u_eu.txt": "# user Opera override IPs/CIDR\n"
+            "u_main.txt": "# user main VPN override IPs/CIDR\n",
+            "u_second.txt": "# user second VPN override IPs/CIDR\n"
         }
         res = {}
         
@@ -13917,12 +13718,10 @@ try:
             "cloudflare": [],
             "telegram": [],
             "whatsapp": [],
-            "general": [],
-            "version": CURRENT_VERSION
+            "general": []
         }
 
         DEFAULT_WARP_BOOTSTRAP = {
-            "version": CURRENT_VERSION,
             "strategies": [
                 {
                     "name": "fakex6-quic",
@@ -14035,16 +13834,12 @@ try:
         }
         
         DEFAULT_DISCORD = {
-            "version": CURRENT_VERSION,
             "strategies": []
         }
         
         for name, content in files.items():
             path = os.path.join(base_dir, "list", name)
             if not os.path.exists(path) or (name == "general.txt" and os.path.getsize(path) == 0):
-                # Ensure it has version header on creation
-                if name not in {"u_ru.txt", "u_eu.txt"} and not content.startswith("# version:"):
-                    content = f"# version: {CURRENT_VERSION}\n" + content
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
 
@@ -14084,36 +13879,10 @@ try:
             if missing_required or too_short:
                 try:
                     with open(path, "w", encoding="utf-8") as f:
-                        f.write(f"# version: {CURRENT_VERSION}\n")
                         for item in default_entries:
                             f.write(f"{item}\n")
                 except:
                     pass
-            
-        # PROACTIVE HEADER INJECTION: force # version: {CURRENT_VERSION} on ALL .txt lists
-        list_dir_path = os.path.join(base_dir, "list")
-        if os.path.exists(list_dir_path):
-            try:
-                for f in os.listdir(list_dir_path):
-                    if f.endswith(".txt"):
-                        if f in {"u_ru.txt", "u_eu.txt"}:
-                            continue
-                        f_path = os.path.join(list_dir_path, f)
-                        try:
-                            with open(f_path, "r", encoding="utf-8") as text_file:
-                                lines = text_file.readlines()
-                            if not lines:
-                                lines = [f"# version: {CURRENT_VERSION}\n"]
-                            elif lines[0].startswith("# version:"):
-                                if lines[0].strip() == f"# version: {CURRENT_VERSION}":
-                                    continue
-                                lines[0] = f"# version: {CURRENT_VERSION}\n"
-                            else:
-                                lines.insert(0, f"# version: {CURRENT_VERSION}\n")
-                            with open(f_path, "w", encoding="utf-8") as text_file:
-                                text_file.writelines(lines)
-                        except: pass
-            except: pass
             
         # === FIX: Config Auto-Update Logic ===
         def _strategy_payload_has_ports(arg_list):
@@ -14179,12 +13948,8 @@ try:
                                 if isinstance(d, list):
                                     should_update = True # Legacy format -> Update
                                 elif isinstance(d, dict):
-                                    # 1. Version Check
-                                    file_ver = d.get("version", "0.0")
-                                    if file_ver < CURRENT_VERSION:
-                                        should_update = True
-                                    # 2. Content Validation (if version matches but content is wrong)
-                                    elif validation_callback and not validation_callback(d):
+                                    # Версий у стратегий нет: решает только содержимое.
+                                    if validation_callback and not validation_callback(d):
                                         should_update = True
                                 else:
                                     should_update = True
@@ -14214,9 +13979,6 @@ try:
                                         merged_data[key] = value
                         except Exception:
                             pass
-                    # Update version stamp
-                    if isinstance(merged_data, dict):
-                        merged_data["version"] = CURRENT_VERSION
                     
                     with open(fpath, "w", encoding="utf-8") as f:
                         json.dump(merged_data, f, indent=4, ensure_ascii=False)
@@ -14352,13 +14114,6 @@ try:
         try:
             with open(filepath, "r", encoding="utf-8") as f: 
                 data = json.load(f)
-                
-                # FIX: Versioned Load (Discard < 0.997) - ONLY FOR FROZEN BUILD
-                # In script mode, we accept any valid JSON to allow testing without version headers
-                is_frozen = getattr(sys, 'frozen', False)
-                if is_frozen and isinstance(data, dict):
-                    ver = data.get("version", "0.0")
-                    if ver < "0.997": return {}
                 return data
         except: return {}
 
@@ -15080,8 +14835,8 @@ try:
             "2a0a:2b41:0:500d::53",
         )),
         ("xbox-dns.ru", (
-            "111.88.96.50",
-            "111.88.96.51",
+            "111.88.96.54",
+            "111.88.96.55",
             "2a00:ab00:1233:26::50",
             "2a00:ab00:1233:26::51",
         )),
@@ -15243,13 +14998,13 @@ try:
         _nrpt_state["system_dns_ai"] = bool(mode)
         return mode
 
-    def _nrpt_existing_namespaces(log_func=None):
-        """Namespace'ы уже поставленных правил Nova. None - опросить не вышло."""
+    def _nrpt_existing_rules(log_func=None):
+        """Правила Nova в формате {namespace: tuple(servers)}. None - опросить не вышло."""
         try:
             cmd = (
                 f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
                 f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
-                f"| Select-Object -ExpandProperty Namespace"
+                f"| ForEach-Object {{ ($_.Namespace -join '') + [char]9 + ($_.NameServers -join ',') }}"
             )
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
@@ -15257,16 +15012,52 @@ try:
             )
             if result.returncode != 0:
                 return None
-            existing = set()
+            rules = {}
             for line in result.stdout.strip().splitlines():
-                ns = line.strip()
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                ns = parts[0].strip()
+                servers = tuple(s.strip() for s in parts[1].split(",") if s.strip()) if len(parts) > 1 else ()
                 if ns:
-                    existing.add(ns)
-            return existing
+                    rules[ns] = servers
+            return rules
         except Exception as e:
             if log_func:
                 log_func(f"[NRPT] Ошибка проверки правил: {e}")
             return None
+
+    def _nrpt_existing_namespaces(log_func=None):
+        """Namespace'ы уже поставленных правил Nova. None - опросить не вышло."""
+        rules = _nrpt_existing_rules(log_func=log_func)
+        return set(rules) if rules is not None else None
+
+    def _nrpt_support(log_func=None, force=False):
+        cache_path = os.path.join(get_base_dir(), "temp", "nrpt_dns_support.json")
+        sig = nova_dns_probe.signature(NOVA_NRPT_NAMESERVER_CASCADE, NOVA_NRPT_NAMESPACES)
+        if not force:
+            cached = nova_dns_probe.load_cache(cache_path, sig)
+            if cached is not None:
+                return cached
+        if log_func:
+            log_func("[NRPT] Замер: какие DNS проксируют AI-имена…")
+        measurement = nova_dns_probe.measure(NOVA_NRPT_NAMESERVER_CASCADE, NOVA_NRPT_NAMESPACES)
+        support = nova_dns_probe.classify(measurement)
+        # Без сети на старте никто не отвечает, и «никто не проксирует» — не вывод, а отсутствие
+        # замера: в кэш на сутки оно попасть не должно, иначе правила снимутся на весь день.
+        if any(measurement.get("alive", {}).values()):
+            nova_dns_probe.save_cache(cache_path, support, sig)
+        if log_func:
+            total = len(NOVA_NRPT_NAMESPACES)
+            alive = measurement.get("alive", {})
+            for provider, _ in NOVA_NRPT_NAMESERVER_CASCADE:
+                if alive.get(provider) is None:
+                    log_func(f"[NRPT] {provider}: не отвечает по UDP/53")
+                else:
+                    n = sum(1 for provs in support.values() if provider in provs)
+                    log_func(f"[NRPT] {provider}: проксирует {n} из {total}")
+        return support
 
     def setup_nrpt_dns_unblock(log_func=None):
         """Setup NRPT rules for AI DNS unblocking. Idempotent: skips if already applied.
@@ -15300,32 +15091,44 @@ try:
                     _nrpt_state["rules_applied"] = False
                     return True
 
-                existing = _nrpt_existing_namespaces(log_func=log_func)
-                required = set(NOVA_NRPT_NAMESPACES)
-                if existing is not None:
-                    if required.issubset(existing):
-                        if log_func:
-                            log_func(f"[NRPT] DNS-правила уже применены ({len(existing)} правил).")
-                        _nrpt_state["rules_applied"] = True
-                        return True
+                support = _nrpt_support(log_func)
+                desired = dict(nova_dns_probe.rules(support, NOVA_NRPT_NAMESERVER_CASCADE))
+                if not desired:
+                    _remove_nrpt_dns_unblock_unlocked(log_func=log_func, silent=True)
                     if log_func:
-                        missing = required - existing
-                        log_func(f"[NRPT] Отсутствуют правила: {', '.join(sorted(missing))}")
+                        log_func("[NRPT] Ни один DNS-разблокировщик не проксирует AI-имена — правила не ставятся.")
+                    _nrpt_state["rules_applied"] = False
+                    return True
 
-                namespaces = ", ".join(_nrpt_ps_literal(ns) for ns in NOVA_NRPT_NAMESPACES)
-                # Сбои по конкретным namespace помечаем маркером, чтобы разобрать их
-                # построчно: код возврата один на весь пакет и деталей не несёт.
+                existing_rules = _nrpt_existing_rules(log_func=log_func)
+
+                def _canon(rules_map):
+                    return {str(ns).lstrip(".").lower(): tuple(nova_dns_ai.normalize_address(x) for x in srvs)
+                            for ns, srvs in (rules_map or {}).items()}
+
+                if existing_rules is not None and _canon(existing_rules) == _canon(desired):
+                    if log_func:
+                        log_func(f"[NRPT] DNS-правила уже применены ({len(desired)} правил).")
+                    _nrpt_state["rules_applied"] = True
+                    return True
+
+                rule_statements = []
+                for ns, srvs in desired.items():
+                    ns_lit = _nrpt_ps_literal(ns)
+                    srvs_lit = ", ".join(_nrpt_ps_literal(s) for s in srvs)
+                    statement = (
+                        f"try {{ Add-DnsClientNrptRule -Namespace {ns_lit} -NameServers @({srvs_lit}) "
+                        f"-Comment '{NOVA_NRPT_TAG}' -DisplayName 'Nova DNS Unblock' -ErrorAction Stop }} "
+                        f"catch {{ Write-Output ('NRPTFAIL' + [char]9 + {ns_lit} + [char]9 + $_.Exception.Message) }}"
+                    )
+                    rule_statements.append(statement)
+
+                rules_cmd_part = "; ".join(rule_statements)
                 cmd = (
-                    f"$namespaces = @({namespaces}); "
-                    f"$servers = @({NOVA_NRPT_NAMESERVERS}); "
                     f"Get-DnsClientNrptRule -ErrorAction SilentlyContinue "
                     f"| Where-Object {{ $_.Comment -eq '{NOVA_NRPT_TAG}' }} "
                     f"| Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue; "
-                    f"foreach ($ns in $namespaces) {{ "
-                    f"try {{ Add-DnsClientNrptRule -Namespace $ns -NameServers $servers "
-                    f"-Comment '{NOVA_NRPT_TAG}' -DisplayName 'Nova DNS Unblock' -ErrorAction Stop }} "
-                    f"catch {{ Write-Output ('NRPTFAIL' + [char]9 + $ns + [char]9 + $_.Exception.Message) }} "
-                    f"}}; "
+                    f"{rules_cmd_part}; "
                     f"Clear-DnsClientCache -ErrorAction SilentlyContinue"
                 )
                 result = subprocess.run(
@@ -15365,8 +15168,14 @@ try:
                     return False
                 _nrpt_state["rules_applied"] = True
                 if log_func:
-                    cascade = " -> ".join(provider for provider, _ in NOVA_NRPT_NAMESERVER_CASCADE)
-                    log_func(f"[NRPT] DNS-правила применены ({len(NOVA_NRPT_NAMESPACES)} правил, каскад {cascade}).")
+                    prov_counts = []
+                    for provider, _ in NOVA_NRPT_NAMESERVER_CASCADE:
+                        cnt = sum(1 for provs in support.values() if provider in provs)
+                        if cnt > 0:
+                            prov_counts.append(f"{provider} — {cnt}")
+                    unsupported = [ns for ns in NOVA_NRPT_NAMESPACES if ns not in desired]
+                    extra = ("; без поддержки: " + ", ".join(sorted(unsupported))) if unsupported else ""
+                    log_func(f"[NRPT] DNS-правила применены: {len(desired)} имён; {', '.join(prov_counts)}{extra}.")
                 return True
             except Exception as e:
                 if log_func:
@@ -15424,6 +15233,7 @@ try:
             ai_unlock_enabled = True
         if not ai_unlock_enabled:
             _remember_dns_ai_mode()
+            remove_nrpt_dns_unblock(log_func=log_func, silent=True)
             return
         setup_nrpt_dns_unblock(log_func=log_func)
 
@@ -19166,9 +18976,7 @@ try:
                             seen_args.add(t_args)
 
                     if new_list:
-                        # FIX: Save in MODERN FORMAT {"version": "...", "strategies": [...]}
                         final_data = {
-                            "version": CURRENT_VERSION,
                             "strategies": new_list
                         }
                         save_json_safe(svc_file, final_data)
@@ -21970,7 +21778,7 @@ try:
                             final_list = final_active + unchecked_strategies
                             
                             # Save
-                            new_data = {"version": CURRENT_VERSION, "strategies": final_list}
+                            new_data = {"strategies": final_list}
                             save_json_safe(start_path, new_data)
                             
                             # === СОХРАНЕНИЕ SCORES В temp/strategy_scores.json ===
@@ -22156,7 +21964,7 @@ try:
                                      kept_strategies = [x[1] for x in scored_prune[:lim]]
                                      
                                      # Save back
-                                     save_json_safe(p_path, {"version": CURRENT_VERSION, "strategies": kept_strategies})
+                                     save_json_safe(p_path, {"strategies": kept_strategies})
                                      log_func(f"[Pruner] {svc_p}: Оставлено {len(kept_strategies)} лучших стратегий (было {len(p_list)}).")
                                      
                      except Exception as e:
@@ -22808,7 +22616,7 @@ try:
                                         scored_final.sort(key=lambda x: x[0], reverse=True)
                                         kept_final = [x[1] for x in scored_final[:lim_final]]
                                         
-                                        save_json_safe(p_final, {"version": CURRENT_VERSION, "strategies": kept_final})
+                                        save_json_safe(p_final, {"strategies": kept_final})
                                         log_func(f"[Pruner-Final] {svc_final}: {len(kept_final)} (было {len(list_final)})")
                         except Exception as prune_err:
                             log_func(f"[Pruner-Final] Ошибка: {prune_err}")
@@ -23487,7 +23295,7 @@ try:
             print(f"Error removing from hard.txt: {e}")
 
     def add_to_blocked_list_safe(domain):
-        """Безопасно добавляет домен в list/ru.txt (кладбище)."""
+        """Безопасно добавляет домен в list/u_main.txt (кладбище)."""
         try:
             base_dir = get_base_dir()
             blocked_path = os.path.join(base_dir, BLOCKED_LIST_FILENAME)
@@ -23508,13 +23316,16 @@ try:
                 
                 domain_lower = domain.lower().strip()
                 if domain_lower in existing: return
+                # AI-домены не кладутся в список основного VPN: их маршрут —
+                # second, а без него winws напрямую (nova_list_sync.ai_domains).
+                if nova_list_sync.is_ai_domain(base_dir, domain_lower): return
 
                 with open(blocked_path, "a", encoding="utf-8") as f:
                     ts = time.strftime('%d.%m.%Y')
                     f.write(f"{domain_lower} # Blocked (No Strategy Found) {ts}\n")
                     
         except Exception as e:
-            print(f"Error updating ru.txt: {e}")
+            print(f"Error updating u_main.txt: {e}")
 
     def load_exclude_auto_checked():
         global exclude_auto_checked_domains
@@ -26292,16 +26103,17 @@ try:
         # Files to monitor
         # PAC relevant
         monitor_vpn_managed = [
-            os.path.join(base, "list", "ru.txt"),
-            os.path.join(base, "list", "eu.txt"),
-            os.path.join(base, "ip", "ru.txt"),
-            os.path.join(base, "ip", "eu.txt")
+            os.path.join(base, "list", "main.txt"),
+            os.path.join(base, "list", "second.txt"),
+            os.path.join(base, "list", "ai.txt"),
+            os.path.join(base, "ip", "main.txt"),
+            os.path.join(base, "ip", "second.txt")
         ]
         monitor_vpn_user = [
-            os.path.join(base, "list", "u_ru.txt"),
-            os.path.join(base, "list", "u_eu.txt"),
-            os.path.join(base, "ip", "u_ru.txt"),
-            os.path.join(base, "ip", "u_eu.txt")
+            os.path.join(base, "list", "u_main.txt"),
+            os.path.join(base, "list", "u_second.txt"),
+            os.path.join(base, "ip", "u_main.txt"),
+            os.path.join(base, "ip", "u_second.txt")
         ]
         monitor_vpn = monitor_vpn_managed + monitor_vpn_user
         
@@ -26378,10 +26190,8 @@ try:
             return False
 
         # Init state
-        # Initial cleanup: Deduplicate everything first
-        for f in monitor_vpn_managed + [file_exclude]:
-            deduplicate_list_file(f)
-            
+        # Поставляемые списки не переписываются: они сверяются с сетью по sha256,
+        # и любая локальная пересортировка означала бы повторную загрузку.
         file_hashes = {f: get_file_stats(f) for f in all_monitor_files}
         entries_snapshot = {f: read_unique_entries(f) for f in (monitor_vpn + [file_exclude])}
         
@@ -26414,10 +26224,6 @@ try:
                     current_hash = get_file_stats(f_path)
                     if current_hash != file_hashes[f_path]:
                         prev_entries = entries_snapshot.get(f_path, set())
-                        # Deduplicate only managed baseline lists, never user overrides.
-                        if f_path in monitor_vpn_managed and deduplicate_list_file(f_path):
-                            # Update hash to the cleaned version
-                            current_hash = get_file_stats(f_path)
                         cur_entries = read_unique_entries(f_path)
                         entries_snapshot[f_path] = cur_entries
                         vpn_new_unique_count += max(0, len(cur_entries - prev_entries))
@@ -27467,6 +27273,133 @@ try:
             for _ in range(pause_seconds):
                 if is_closing: return
                 time.sleep(1)
+    _ai_region_lock = threading.Lock()
+    # verdicts: {service_id: ok|blocked|unknown} через текущий second; unblockers — какие
+    # DNS-разблокировщики есть в системе; key — чей выход проверялся.
+    _ai_region_state = {"verdicts": {}, "unblockers": None, "key": None, "checked_at": 0.0}
+
+    def _ai_region_secondary():
+        """HTTP-прокси живого second и ключ его выхода; (None, None), если second лежит.
+
+        У каждого вида second есть HTTP-токен (Opera — 1371, Tor и свой профиль — свой
+        HTTP-порт), а requests без PySocks понимает только его.
+        """
+        ctl = globals().get("secondary_vpn_controller")
+        running = bool(ctl is not None and getattr(ctl, "running", False))
+        kind = ctl.serving_kind() if running else nova_vpn_slots.SECONDARY_OPERA
+        up = bool(ctl.is_up()) if running else is_local_port_open_quick(1371)
+        if not up:
+            return None, None
+        http = [t for t in nova_vpn_slots.secondary_pac_tokens(kind) if t.startswith("PROXY ")]
+        if not http:
+            return None, None
+        proxy_url = "http://" + http[-1].split(" ", 1)[1].strip()
+        label = country = ""
+        with contextlib.suppress(Exception):
+            label = str(ctl.label() or "") if running else ""
+        with contextlib.suppress(Exception):
+            country = str(ctl.secondary_country() or "") if running else ""
+        return proxy_url, (str(kind), proxy_url, label, country)
+
+    def ai_region_worker(log_func):
+        """Детектор блокировки AI-сервисов по региону на выходе second.
+
+        Раз в минуту: какие DNS-разблокировщики есть в системе (дёшево — реестр) и не
+        сменился ли выход second. Сменился или прошло 30 минут — запросы к API сервисов
+        через second (без ключей; 401 значит «регион разрешён»). Вердикт «не ясно»
+        (челлендж, 5xx) не перетирает прежний известный. Изменение → перестройка PAC.
+        """
+        my_run_id = SERVICE_RUN_ID
+        RECHECK_SEC = 1800
+        providers = tuple((name, tuple(addrs)) for name, addrs in NOVA_NRPT_NAMESERVER_CASCADE)
+        while not is_closing:
+            if SERVICE_RUN_ID != my_run_id:
+                break
+            try:
+                proxy_url, key = _ai_region_secondary()
+                dns_ai_mode = str((globals().get("_nrpt_state") or {}).get("dns_ai_mode") or "")
+                unblockers = nova_ai_region.detect_unblockers(providers, dns_ai_mode=dns_ai_mode)
+                with _ai_region_lock:
+                    prev = dict(_ai_region_state)
+                verdicts = dict(prev.get("verdicts") or {})
+                checked_at = prev.get("checked_at") or 0.0
+                probed = False
+                if proxy_url is None:
+                    verdicts = {}
+                elif key != prev.get("key") or time.time() - checked_at >= RECHECK_SEC:
+                    fresh = nova_ai_region.probe_all(proxy_url)
+                    same_exit = key == prev.get("key")
+                    for sid, verdict in fresh.items():
+                        if verdict == "unknown" and same_exit and verdicts.get(sid) in ("ok", "blocked"):
+                            fresh[sid] = verdicts[sid]
+                    verdicts = fresh
+                    checked_at = time.time()
+                    probed = True
+                changed = verdicts != prev.get("verdicts") or unblockers != prev.get("unblockers")
+                with _ai_region_lock:
+                    _ai_region_state.update(verdicts=verdicts, unblockers=unblockers,
+                                            key=key, checked_at=checked_at)
+                if probed and (changed or prev.get("key") != key):
+                    log_func(f"[AI] Проверка региона через Доп. VPN ({key[2] or key[0]}"
+                             f"{', ' + key[3] if key[3] else ''}): {nova_ai_region.summary(verdicts)}. "
+                             f"DNS-разблокировщик: {nova_ai_region.describe(unblockers)}")
+                if changed:
+                    pm = globals().get("pac_manager")
+                    if pm:
+                        pm.generate_pac()
+            except Exception as e:
+                safe_trace(f"[AI] Детектор региона: {type(e).__name__}: {e}")
+            for _ in range(60):
+                if is_closing or SERVICE_RUN_ID != my_run_id:
+                    return
+                time.sleep(1)
+
+    def list_sync_worker(log_func):
+        """Сверка list/*.txt с эталоном в github.com/confeden/nova_updates (nova_pc/).
+
+        Сетевые списки считаются самыми свежими: расходящийся файл перезаписывается,
+        обратно на встроенный он не откатывается. Рабочая копия git (ПК владельца)
+        не трогается — там списки правятся руками и уходят в сеть при сборке.
+        """
+        my_run_id = SERVICE_RUN_ID
+        LIST_SYNC_PAUSE_SEC = 6 * 3600
+        LIST_SYNC_RETRY_SEC = 300
+        LIST_SYNC_RETRY_LIMIT = 3
+        failures = 0
+        while not is_closing:
+            if SERVICE_RUN_ID != my_run_id:
+                break
+            failed = False
+            try:
+                proxies = []
+                try:
+                    if is_local_port_open_quick(1371):
+                        proxies.append("http://127.0.0.1:1371")
+                except Exception:
+                    pass
+                result = nova_list_sync.sync_from_network(get_base_dir(), proxies=proxies, log=log_func)
+                if result.get("skipped") == "dev":
+                    return
+                failed = bool(result.get("error") or result.get("failed"))
+                if result.get("updated"):
+                    try:
+                        load_special_strategy_domains()
+                    except Exception:
+                        pass
+            except Exception as e:
+                failed = True
+                log_func(f"[Списки] Ошибка сверки с сетью: {type(e).__name__}: {e}")
+            if failed and failures < LIST_SYNC_RETRY_LIMIT:
+                failures += 1
+                pause = LIST_SYNC_RETRY_SEC
+            else:
+                failures = 0
+                pause = LIST_SYNC_PAUSE_SEC
+            for _ in range(pause):
+                if is_closing or SERVICE_RUN_ID != my_run_id:
+                    return
+                time.sleep(1)
+
     def learning_data_flush_worker():
         """Периодически сбрасывает кэш обучения на диск."""
         while not is_closing:
@@ -27568,6 +27501,10 @@ try:
         _start_worker("NovaIpCacheWorker", update_ip_cache_worker, (paths, log_func), delay=0.5)
         _start_worker("NovaLearningFlush", learning_data_flush_worker, delay=1.0)
         _start_worker("NovaUpdateCheck", check_and_update_worker, (log_func,), delay=1.5)
+        # Через 15 с: к этому времени поднят собственный прокси на 1371, а
+        # raw.githubusercontent.com из России напрямую не отвечает.
+        _start_worker("NovaListSync", list_sync_worker, (log_func,), delay=15.0)
+        _start_worker("NovaAiRegion", ai_region_worker, (log_func,), delay=25.0)
 
         # === CORE CHECKERS ===
         for idx in range(2):
@@ -28179,7 +28116,6 @@ try:
             strategies = DEFAULT_STRATEGIES.copy()
             try:
                 repaired_payload = dict(strategies)
-                repaired_payload["version"] = CURRENT_VERSION
                 save_json_safe(paths['strat_json'], repaired_payload)
             except:
                 pass
@@ -29987,13 +29923,13 @@ try:
                                 for k, v in data.items():
                                     if k == "version": continue
                                     new_strats.append({"name": k, "args": v})
-                                new_data = {"version": CURRENT_VERSION, "strategies": new_strats}
+                                new_data = {"strategies": new_strats}
                                 needs_save = True
                                 log_func(f"[Migration] Сконвертирован {fname} (Legacy Dict -> Modern)")
                             
                             # Case 2: List [ {name, args}, ... ] (Intermediate)
                             elif isinstance(data, list):
-                                new_data = {"version": CURRENT_VERSION, "strategies": data}
+                                new_data = {"strategies": data}
                                 needs_save = True
                                 log_func(f"[Migration] Сконвертирован {fname} (List -> Modern)")
                                 
@@ -33005,7 +32941,14 @@ try:
                         wm = globals().get("warp_manager")
                         warp_connected = bool(getattr(wm, "is_connected", False)) if wm else False
                         warp_port = int(globals().get("WARP_PORT", 1370))
-                        warp_ok = bool(backend_ok and warp_connected and is_local_port_open_quick(warp_port, timeout=1.0))
+                        port_open = is_local_port_open_quick(warp_port, timeout=1.0)
+                        if not warp_connected and port_open and wm:
+                            backend = getattr(wm, "active_backend", "")
+                            helper_attr = f"{backend}_process" if backend in getattr(wm, "USERSPACE_BACKENDS", ()) else "awg_process"
+                            proc = getattr(wm, helper_attr, None)
+                            if proc and proc.poll() is None:
+                                warp_connected = True
+                        warp_ok = bool(warp_connected and port_open)
                         if wm is not None and hasattr(wm, "get_vpn_label"):
                             vpn_label = str(wm.get_vpn_label() or "АВТО")
                         elif wm is None:

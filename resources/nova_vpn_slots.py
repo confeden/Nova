@@ -63,8 +63,8 @@ __all__ = [
 # --------------------------------------------------------------------------------------------
 # Countries
 
-# The country whose exit counts as "not abroad". Nova's lists are built for Russia (ru.txt,
-# eu.txt), so the rule is written for Russia too; a user elsewhere gets the same lists anyway.
+# The country whose exit counts as "not abroad". Nova's lists are built for Russia (main.txt,
+# second.txt), so the rule is written for Russia too; a user elsewhere gets the same lists anyway.
 HOME_COUNTRY = "RU"
 
 _COUNTRY_RE = re.compile(r"^[A-Z]{2}$")

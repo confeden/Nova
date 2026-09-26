@@ -98,6 +98,7 @@ LEGACY_AWG_MOVED_FILES = (
 TOR_BIN_SUBDIR = "tor"
 TOR_REQUIRED_FILES = ("nova-tor.exe", "nova-lyrebird.exe")
 TOR_OPTIONAL_FILES = ("geoip", "geoip6", "pt_config.json")
+TLS_TERMINATOR_FILENAME = "nova-tls-terminator.exe"
 NOVA_GO_FILENAME = "nova-go.exe"
 NOVA_GO_SOURCE_DIR = "nova-go"
 NOVA_GO_PACKAGE = "./cmd/nova-go"
@@ -178,10 +179,10 @@ PYI_EXCLUDED_MODULES = (
 # *.part: an interrupted install_binary() leaves one next to the exe in bin/.
 IGNORED_PATTERNS = ("*.old", "*.tmp", "*.part", "__pycache__", "old", "warp_official")
 USER_OVERRIDE_HEADER_DEFAULTS = {
-    ("list", "u_ru.txt"): "# user WARP override domains\n",
-    ("list", "u_eu.txt"): "# user Opera override domains\n",
-    ("ip", "u_ru.txt"): "# user WARP override IPs/CIDR\n",
-    ("ip", "u_eu.txt"): "# user Opera override IPs/CIDR\n",
+    ("list", "u_main.txt"): "# user main VPN override domains\n",
+    ("list", "u_second.txt"): "# user second VPN override domains\n",
+    ("ip", "u_main.txt"): "# user main VPN override IPs/CIDR\n",
+    ("ip", "u_second.txt"): "# user second VPN override IPs/CIDR\n",
 }
 
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
@@ -875,43 +876,135 @@ def require_paths(base_dir: Path) -> None:
     ensure_nova_xray(base_dir)
 
 
-def ensure_tls_terminator(base_dir: Path) -> None:
-    """Привести bin/nova-tls-terminator.exe в соответствие с опубликованной сборкой.
+def tls_terminator_build_env(base_env=None) -> dict:
+    """Окружение сборки nova-tls-terminator: C-тулчейн BoringSSL (LLVM, NASM, CMake)."""
+    env = dict(os.environ if base_env is None else base_env)
 
-    Терминатор собирается не здесь: он единственная часть Nova, которой нужен
-    C-тулчейн (BoringSSL, а к нему cmake, MSVC, NASM, LLVM), поэтому его печёт
-    GitHub. Сюда он попадает загрузкой, и делается это на месте, а не отдельной
-    командой, которую надо помнить: ручной шаг перед сборкой — это шаг, который
-    однажды забудут, и релиз молча уедет с прежней формой ClientHello.
-    Единственное «тихо», которое здесь допустимо, — когда всё уже актуально.
+    # 1. libclang для bindgen внутри boring-sys
+    if not env.get("LIBCLANG_PATH"):
+        llvm_candidates = [
+            r"C:\Program Files\LLVM\bin",
+            r"C:\LLVM\bin",
+        ]
+        for cand in llvm_candidates:
+            if Path(cand, "libclang.dll").is_file():
+                env["LIBCLANG_PATH"] = cand
+                break
 
-    Приложение без терминатора работает: релей остаётся на прежнем TLS-пути.
-    Поэтому отсутствие сети при уже скачанном файле — не ошибка, а отсутствие
-    и файла, и сети — ошибка, потому что иначе установщик соберётся не тем,
-    чем его считают.
+    # 2. NASM и CMake в PATH
+    extra_paths = []
+    if not shutil.which("nasm", path=env.get("PATH")):
+        for cand in [r"C:\Program Files\NASM", r"C:\NASM"]:
+            if Path(cand, "nasm.exe").is_file():
+                extra_paths.append(cand)
+                break
+    if not shutil.which("cmake", path=env.get("PATH")):
+        for cand in [r"C:\Program Files\CMake\bin", r"C:\CMake\bin"]:
+            if Path(cand, "cmake.exe").is_file():
+                extra_paths.append(cand)
+                break
+
+    if extra_paths:
+        current = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(extra_paths + ([current] if current else []))
+
+    return env
+
+
+def smoke_test_tls_terminator(exe: Path) -> None:
+    """Терминатор без аргументов/токена обязан отказать с кодом 2.
+
+    Любой другой код выхода (краш DLL, segfault, код 0 или 1) означает,
+    что бинарник нерабочий.
     """
+    try:
+        result = subprocess.run(
+            [str(exe)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10.0,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{exe} не запустился: {exc}") from exc
+    if result.returncode != 2:
+        raise RuntimeError(
+            f"{exe} завершился с кодом {result.returncode} вместо 2:\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+
+
+def ensure_tls_terminator(base_dir: Path) -> None:
+    """Собрать bin/nova-tls-terminator.exe локально через cargo.
+
+    Терминатор собирается локально: `cargo build --release -p nova-tls --features shape --bin tls-terminator`.
+    Если cargo отсутствует, но бинарник уже лежит в bin/nova-tls-terminator.exe,
+    используется имеющийся. Если собрать невозможно и файла нет — ошибка.
+    """
+    target = base_dir / "bin" / TLS_TERMINATOR_FILENAME
     if os.environ.get("NOVA_SKIP_TLS_TERMINATOR", "") == "1":
-        print("[TLS] NOVA_SKIP_TLS_TERMINATOR=1 — терминатор в сборку не попадёт.")
+        state = f"в сборку попадёт имеющийся {target}" if target.is_file() else "терминатор в сборку не попадёт"
+        print(f"[TLS] NOVA_SKIP_TLS_TERMINATOR=1 — без пересборки; {state}.")
         return
 
-    sys.path.insert(0, str(base_dir))
-    try:
-        import fetch_tls_terminator
-    except Exception as exc:
-        raise RuntimeError(f"Не удалось загрузить fetch_tls_terminator.py: {exc}") from exc
+    nova_rs_dir = base_dir / "nova-rs"
+    if not nova_rs_dir.exists():
+        if target.is_file():
+            print(f"[TLS] nova-rs/ отсутствует — беру имеющийся {target.name}.")
+            return
+        print("[TLS] nova-rs/ отсутствует — nova-tls-terminator.exe в сборку не попадёт.")
+        return
 
-    try:
-        path = fetch_tls_terminator.ensure()
-    except fetch_tls_terminator.FetchError as exc:
+    cargo = shutil.which("cargo")
+    if not cargo:
+        if target.is_file():
+            try:
+                smoke_test_tls_terminator(target)
+                print(f"[TLS] cargo не найден в PATH — беру имеющийся {target.name}.")
+                return
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"cargo не найден в PATH, а имеющийся {target.name} повреждён: {exc}\n"
+                    "  Собрать без него: NOVA_SKIP_TLS_TERMINATOR=1"
+                ) from exc
         raise RuntimeError(
-            f"Терминатор TLS недоступен: {exc}\n"
-            "  Опубликовать сборку: Actions -> Build TLS terminator, галочка publish\n"
-            "  Собрать без него:    NOVA_SKIP_TLS_TERMINATOR=1"
-        ) from exc
+            "cargo не найден в PATH, и nova-tls-terminator.exe отсутствует.\n"
+            "  Установите Rust toolchain или соберите без него: NOVA_SKIP_TLS_TERMINATOR=1"
+        )
 
-    if not Path(path).exists():
-        raise RuntimeError(f"Терминатор TLS не появился по пути {path}.")
+    print("[TLS] Сборка nova-tls-terminator.exe (cargo build --release -p nova-tls --features shape --bin tls-terminator)...")
+    env = tls_terminator_build_env()
+    result = subprocess.run(
+        [cargo, "build", "--release", "-p", "nova-tls", "--features", "shape", "--bin", "tls-terminator"],
+        cwd=str(nova_rs_dir),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        if target.is_file():
+            try:
+                smoke_test_tls_terminator(target)
+                print(f"[WARN] Сборка nova-tls-terminator завершилась с ошибкой, сохранён имеющийся {target.name}:\n{result.stderr}")
+                return
+            except Exception:
+                pass
+        raise RuntimeError(
+            "Сборка nova-tls-terminator (nova-tls) провалилась:\n"
+            f"{result.stdout}\n{result.stderr}\n"
+            "  Собрать без него: NOVA_SKIP_TLS_TERMINATOR=1"
+        )
 
+    built = nova_rs_dir / "target" / "release" / "tls-terminator.exe"
+    if not built.is_file():
+        raise RuntimeError(f"cargo build завершился успешно, но {built} не появился.")
+
+    smoke_test_tls_terminator(built)
+    install_binary(built, target)
+    print(f"[TLS] nova-tls-terminator.exe обновлён: {target}")
 
 def ensure_nova_engine(base_dir: Path) -> None:
     """Собрать bin/nova-engine.exe локально, свежим на каждую сборку.
@@ -1480,6 +1573,22 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         else:
             dst_dir.mkdir(parents=True, exist_ok=True)
 
+    builtin_count = 0
+    for folder in ("list", "ip", "strat"):
+        builtin_dir = staging_dir / "resources" / "builtin" / folder
+        builtin_dir.mkdir(parents=True, exist_ok=True)
+        src_folder = base_dir / folder
+        if src_folder.exists():
+            for f in src_folder.iterdir():
+                # u_*.txt — личные списки владельца: во встроенную копию не попадают
+                # (их шаблоны ставит установщик отдельно, onlyifdoesntexist).
+                if f.name.startswith("u_"):
+                    continue
+                if f.is_file() and f.suffix in (".txt", ".json") and not f.name.endswith((".bak", ".tmp", ".old")):
+                    shutil.copy2(f, builtin_dir / f.name)
+                    builtin_count += 1
+    print(f"[BUILD] builtin: скопировано {builtin_count} файлов (list/ip/strat)")
+
     for filename in ROOT_DOC_FILES:
         src_file = base_dir / filename
         if src_file.exists():
@@ -1524,11 +1633,125 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
     return staging_dir
 
 
+def sync_lists_to_updates_repo(base_dir: Path, version: str) -> None:
+    """Выгрузить list/*.txt (кроме u_*) в github.com/confeden/nova_updates, папка nova_pc/.
+
+    Клиенты сверяют свои списки с nova_pc/manifest.json по sha256 и считают сетевые
+    самыми свежими, поэтому сборка без выгрузки дала бы установщик новее сети.
+    Файлы хранятся байт-в-байт (CRLF): `-text` в nova_pc/.gitattributes и
+    core.autocrlf=false, иначе git перевёл бы концы строк и sha256 не сошёлся бы.
+    """
+    import time
+    if os.environ.get("NOVA_SKIP_LIST_SYNC") == "1":
+        print("[WARN] NOVA_SKIP_LIST_SYNC=1: Пропуск синхронизации списков с nova_updates")
+        return
+
+    import nova_list_sync
+    removed = nova_list_sync.remove_ai_overlaps(base_dir / "list", keep=("ai.txt", "second.txt"))
+    for file_name, removed_domains in removed.items():
+        if removed_domains:
+            print(f"[Списки] {file_name}: удалено {len(removed_domains)} дублей AI-доменов")
+
+    clone_dir = base_dir / "temp" / "_nova_updates"
+    
+    def run_git(args, cwd=None):
+        try:
+            res = subprocess.run(
+                ["git"] + args,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+                creationflags=CREATE_NO_WINDOW
+            )
+            return res.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"git {' '.join(args)} failed:\n{e.stderr.strip()}")
+
+    try:
+        if not (clone_dir / ".git").exists():
+            if clone_dir.exists():
+                safe_rmtree(clone_dir)
+            run_git(["-c", "core.autocrlf=false", "clone", "--depth", "1",
+                     "https://github.com/confeden/nova_updates.git", str(clone_dir)])
+            run_git(["-C", str(clone_dir), "config", "core.autocrlf", "false"])
+        else:
+            run_git(["-C", str(clone_dir), "config", "core.autocrlf", "false"])
+            run_git(["fetch", "--depth", "1", "origin", "main"], cwd=str(clone_dir))
+            run_git(["reset", "--hard", "origin/main"], cwd=str(clone_dir))
+
+        remote_list_dir = clone_dir / nova_list_sync.REMOTE_DIR / "list"
+        remote_list_dir.mkdir(parents=True, exist_ok=True)
+        attributes = clone_dir / nova_list_sync.REMOTE_DIR / ".gitattributes"
+        attributes_text = b"* -text" + bytes([10])
+        attributes_changed = not attributes.exists() or attributes.read_bytes() != attributes_text
+        if attributes_changed:
+            attributes.write_bytes(attributes_text)
+        
+        local_files = []
+        for txt in (base_dir / "list").glob("*.txt"):
+            if not txt.name.startswith("u_"):
+                local_files.append(txt)
+                
+        local_names = {f.name for f in local_files}
+        
+        copied = 0
+        deleted = 0
+        for txt in local_files:
+            remote_txt = remote_list_dir / txt.name
+            if not remote_txt.exists() or remote_txt.read_bytes() != txt.read_bytes():
+                shutil.copyfile(txt, remote_txt)
+                copied += 1
+                
+        for remote_txt in remote_list_dir.glob("*.txt"):
+            if remote_txt.name not in local_names:
+                remote_txt.unlink()
+                deleted += 1
+                
+        rels = [f"list/{name}" for name in local_names]
+        manifest_files = nova_list_sync.build_manifest(base_dir, rels, 0)["files"]
+        
+        manifest_path = clone_dir / nova_list_sync.REMOTE_DIR / nova_list_sync.MANIFEST_NAME
+        old_manifest_files = {}
+        if manifest_path.exists():
+            try:
+                old_manifest_files = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", {})
+            except Exception:
+                pass
+                
+        if old_manifest_files == manifest_files and copied == 0 and deleted == 0 and not attributes_changed:
+            print("[Списки] nova_updates уже актуален")
+            return
+            
+        manifest_data = {
+            "schema": 1,
+            "generated": int(time.time()),
+            "version": version,
+            "files": manifest_files
+        }
+        
+        manifest_path.write_text(json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+        
+        run_git(["-C", str(clone_dir), "add", "-A", nova_list_sync.REMOTE_DIR])
+        run_git(["-C", str(clone_dir), "commit", "-m", f"Nova PC: списки {version}"])
+        hash_str = run_git(["-C", str(clone_dir), "rev-parse", "--short", "HEAD"])
+        run_git(["-C", str(clone_dir), "push", "origin", "HEAD:main"])
+        print(f"[Списки] Синхронизация успешна, коммит {hash_str}")
+        
+    except Exception as exc:
+        raise RuntimeError(
+            f"Синхронизация списков с nova_updates не удалась: {exc}\n"
+            "  Собрать без неё: NOVA_SKIP_LIST_SYNC=1"
+        )
+
+
 def build_installer(base_dir: Path) -> None:
     require_paths(base_dir)
     set_low_priority_and_build_affinity()
 
     version = read_version(base_dir / "nova.pyw")
+    sync_lists_to_updates_repo(base_dir, version)
     release_dir = BUILD_ROOT / f"v{version}"
     ensure_clean_dir(release_dir)
 

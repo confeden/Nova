@@ -8,7 +8,7 @@ re-derived from disk layout assumptions beyond what is passed.
 Flow: skip if the host is already routed by something -> gather evidence
 (nova_cloudflare_probe) -> ask nova-engine's cloudflare-classify subcommand
 for a verdict -> on Action::Reroute{to: "warp"}, append the host to
-list/u_ru.txt, which the existing pac_updater_worker picks up within ~2s with
+list/u_main.txt, which the existing pac_updater_worker picks up within ~2s with
 no restart. Any other action is a no-op by design (see the routing KB entry
 for why DirectBypass is out of scope for v1).
 """
@@ -50,7 +50,7 @@ def already_routed(host, list_dir):
     itself uses (nova.pyw:5156-5163), so this mirrors the live behaviour
     rather than guessing at it."""
     host = host.strip().lower()
-    for name in ("u_ru.txt", "u_eu.txt", "exclude.txt", "eu.txt", "ru.txt", "whatsapp.txt"):
+    for name in ("u_main.txt", "u_second.txt", "exclude.txt", "ai.txt", "second.txt", "main.txt", "whatsapp.txt"):
         if _domain_or_parent_in(host, _load_domain_set(os.path.join(list_dir, name))):
             return True
     return False
@@ -79,37 +79,18 @@ def _run_nova_engine(bin_path, request, timeout=SUBPROCESS_TIMEOUT_SEC):
         return None, f"nova-engine returned unparseable output: {e}"
 
 
-USER_WARP_LIST = "u_ru.txt"
+USER_WARP_LIST = "u_main.txt"
 
 
 def append_domain_to_user_ru_list(host, list_dir):
-    """Append `host` to list/u_ru.txt, CRLF-preserved (I6), skipping if it (or
+    """Append `host` to list/u_main.txt, CRLF-preserved (I6), skipping if it (or
     a parent of it) is already present. The next pac_updater_worker poll
     (<=2s) deduplicates, regenerates the PAC and refreshes it live.
 
-    The target used to be `ru.txt`, on the reasoning that `u_ru.txt` carries no
-    `# version:` header and would therefore be restored from the bundle by
-    `restore_missing_strategies()` on a compiled start. Both halves of that were
-    measured and are false:
-
-    * `u_ru.txt` **is** stamped — it carries a `# version:` header in the tree,
-      and an installed copy on the owner's machine carried `# version: 1.24`.
-      (Deliberately not quoting the tree's current number: it moves with every
-      release and a stale literal here would read as evidence of the opposite.)
-    * Nothing can be restored from a bundle here at all. PyInstaller is given no
-      `--add-data` for `list/`, `ip/` or `strat/` (`Inno.py`, the command in
-      `build_pyinstaller_dist`), and an installed tree has no `resources/list`.
-      `get_internal_path("list")` therefore falls through to `get_base_dir()`,
-      the *same* directory, so the "restore" is a copy of a file onto itself —
-      it raises and is swallowed. `restore_missing_strategies()` is inert for
-      these three directories in a compiled install.
-
-    Meanwhile the file that genuinely is wiped is `ru.txt`: `NovaInstaller.iss`
-    copies `{#MySourceDir}\\*` over `{app}` with `ignoreversion`, so every
-    upgrade replaces it wholesale. `u_ru.txt` is excluded from that copy and
-    installed `onlyifdoesntexist uninsneveruninstall` — it survives upgrades and
-    even uninstall. So the durable target is exactly the one the old note ruled
-    out.
+    Not `main.txt`: that file is replaced by every upgrade and by the network
+    reference list (`nova_list_sync`). `u_main.txt` is the user's own — the
+    installer lays it `onlyifdoesntexist uninsneveruninstall`, so it survives
+    upgrades, the network sync and even uninstall.
 
     Priority also happens to be right: `user_ru` is the PAC's first branch, above
     `exclude`. That cannot conflict here, because `already_routed()` refuses to
@@ -139,7 +120,7 @@ def classify_and_maybe_reroute(host, list_dir, cloudflare_cidr_path, bin_path, w
     status is one of: "already_routed", "reachable" (baseline probe already
     works, nothing to do), "probe_inconclusive" (neither probe confirmed
     anything actionable), "engine_error", "kept" (classified but policy said
-    Action::Keep), "rerouted" (appended to list/u_ru.txt).
+    Action::Keep), "rerouted" (appended to list/u_main.txt).
     """
     log = log_func or (lambda *_a, **_k: None)
     host = host.strip().lower()

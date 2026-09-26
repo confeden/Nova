@@ -78,11 +78,11 @@ Name: "{app}\profiles\VLESS"; Flags: uninsneveruninstall
 Name: "{app}\profiles\Custom"; Flags: uninsneveruninstall
 
 [Files]
-Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "list\u_ru.txt,list\u_eu.txt,ip\u_ru.txt,ip\u_eu.txt,bin\sing-box.exe,routing_settings.json,README.md,THIRD_PARTY_NOTICES.md,LICENSE,licenses,licenses\*,NovaWFP,NovaWFP\*,NovaDivert,NovaDivert\*,tgrelay,tgrelay\*"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#MySourceDir}\list\u_ru.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
-Source: "{#MySourceDir}\list\u_eu.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
-Source: "{#MySourceDir}\ip\u_ru.txt"; DestDir: "{app}\ip"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
-Source: "{#MySourceDir}\ip\u_eu.txt"; DestDir: "{app}\ip"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "list\u_main.txt,list\u_second.txt,ip\u_main.txt,ip\u_second.txt,bin\sing-box.exe,routing_settings.json,README.md,THIRD_PARTY_NOTICES.md,LICENSE,licenses,licenses\*,NovaWFP,NovaWFP\*,NovaDivert,NovaDivert\*,tgrelay,tgrelay\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MySourceDir}\list\u_main.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "{#MySourceDir}\list\u_second.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "{#MySourceDir}\ip\u_main.txt"; DestDir: "{app}\ip"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "{#MySourceDir}\ip\u_second.txt"; DestDir: "{app}\ip"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 Source: "{#MySourceDir}\routing_settings.json"; DestDir: "{app}\temp"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 Source: "{#MyRepoDir}\NovaWFP\proxy\*"; DestDir: "{app}\resources\NovaWFP\proxy"; Excludes: "__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#MyRepoDir}\NovaDivert\*.py"; DestDir: "{app}\resources\NovaDivert"; Flags: ignoreversion
@@ -97,6 +97,10 @@ Source: "{#MySourceDir}\licenses\*"; DestDir: "{app}\resources\legal\licenses"; 
 Type: files; Name: "{app}\nova_deploy_debug.txt"
 Type: files; Name: "{app}\routing_settings.json"
 Type: filesandordirs; Name: "{app}\resources\fake"
+Type: files; Name: "{app}\list\ru.txt"
+Type: files; Name: "{app}\list\eu.txt"
+Type: files; Name: "{app}\ip\ru.txt"
+Type: files; Name: "{app}\ip\eu.txt"
 Type: filesandordirs; Name: "{app}\licenses"
 Type: filesandordirs; Name: "{app}\NovaWFP"
 Type: filesandordirs; Name: "{app}\NovaDivert"

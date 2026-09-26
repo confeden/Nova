@@ -1,4 +1,3 @@
-# version: 1.40.2
 1c-bitrix.ru
 akamaihd.net
 apptracer.ru
@@ -10,6 +9,9 @@ bitrix24.ru
 bitrix24.tech
 cdn-tinkoff.ru
 cdnflow.ru
+ozonru.me
+ozonusercontent.com
+sellematics.com
 cdnwb.ru
 chrome.cloudflare-dns.com
 cikrf.ru

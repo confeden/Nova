@@ -84,6 +84,11 @@ ENTRIES = (
       needle='"wireproxy-secondary.log"'),
 
     # --- состояние: влияет на поведение ----------------------------------
+    E("nrpt_dns_support.json", "cache", "nova.pyw", "nova.pyw",
+      "какие DNS-разблокировщики проксируют какие AI-имена (замер, сутки); по нему ставятся правила NRPT"),
+    E("list_sync_state.json", "state", "nova_list_sync.py", "nova_list_sync.py",
+      "метка времени последнего применённого манифеста списков из nova_updates; "
+      "манифест старше неё (устаревшее зеркало) не применяется"),
     E("checker_state.json", "state", "nova.pyw", "nova.pyw",
       "докуда дошла проверка стратегий; переживает перезапуск"),
     E("strategy_scores.json", "state", "nova.pyw", "nova.pyw",
