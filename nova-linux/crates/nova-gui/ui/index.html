@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nova</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="window-shell">
+    <!-- Top Drag Handle & Titlebar -->
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <span class="logo-orb">✦</span>
+        <div class="brand-text">
+          <span class="brand-title">NOVA</span>
+          <span class="brand-tag">LINUX</span>
+        </div>
+      </div>
+      <div class="window-actions">
+        <button class="win-btn win-profile" id="profileSelectorBtn" title="Профиль обхода">⚡ Авто</button>
+        <button class="win-btn win-icon" id="minimizeBtn" title="Свернуть">─</button>
+        <button class="win-btn win-icon win-close" id="closeBtn" title="Закрыть">✕</button>
+      </div>
+    </header>
+
+    <!-- Main Widget Card -->
+    <main class="main-card">
+      <!-- Status Hero Section -->
+      <section class="hero-status" id="heroStatus">
+        <div class="status-indicator">
+          <div class="pulse-ring"></div>
+          <div class="pulse-dot"></div>
+        </div>
+        <div class="status-details">
+          <h2 class="status-heading" id="statusTitle">ПОДКЛЮЧЕНО</h2>
+          <p class="status-sub" id="statusSubtitle">Адаптивный обход активен</p>
+        </div>
+        <button class="toggle-btn active" id="powerToggleBtn" title="Включить / Выключить">
+          <span class="toggle-switch"></span>
+        </button>
+      </section>
+
+      <!-- Active Service Badges (Nova Pills) -->
+      <section class="services-section">
+        <div class="section-label">Активные маршруты</div>
+        <div class="pills-grid" id="pillsGrid">
+          <div class="pill yt-pill">
+            <span class="pill-dot"></span>
+            <span class="pill-name">YouTube</span>
+            <span class="pill-meta" id="pill-yt">QUIC Fake</span>
+          </div>
+          <div class="pill discord-pill">
+            <span class="pill-dot"></span>
+            <span class="pill-name">Discord</span>
+            <span class="pill-meta" id="pill-discord">Split 2</span>
+          </div>
+          <div class="pill tg-pill">
+            <span class="pill-dot"></span>
+            <span class="pill-name">Telegram</span>
+            <span class="pill-meta" id="pill-tg">kws-cf Relay</span>
+          </div>
+          <div class="pill ai-pill">
+            <span class="pill-dot"></span>
+            <span class="pill-name">AI</span>
+            <span class="pill-meta" id="pill-ai">WARP Tun</span>
+          </div>
+          <div class="pill cf-pill">
+            <span class="pill-dot"></span>
+            <span class="pill-name">Cloudflare</span>
+            <span class="pill-meta" id="pill-cf">Auto-Egress</span>
+          </div>
+          <div class="pill general-pill">
+            <span class="pill-dot"></span>
+            <span class="pill-name">Сайты</span>
+            <span class="pill-meta" id="pill-general">ciadpi SOCKS</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Bottom Status Bar -->
+      <footer class="footer-bar">
+        <button class="log-toggle-btn" id="logToggleBtn">
+          <span class="log-arrow" id="logArrow">▲</span> Журнал событий
+        </button>
+        <div class="stats-group">
+          <span class="stat-item" id="latencyStat">⚡ 28 ms</span>
+          <span class="stat-sep">•</span>
+          <span class="stat-item" id="speedStat">↑ 4.2 MB/s</span>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Collapsible Log Drawer (Nova Snap-on style) -->
+    <div class="log-drawer collapsed" id="logDrawer">
+      <div class="log-header">
+        <span>События ядра novad</span>
+        <button class="log-clear-btn" id="clearLogsBtn">Очистить</button>
+      </div>
+      <div class="log-feed" id="logFeed">
+        <div class="log-row info">
+          <span class="log-time">05:12:01</span>
+          <span class="log-badge">SYS</span>
+          <span class="log-text">Демон novad запущен. TUN интерфейс 'nova0' поднят.</span>
+        </div>
+        <div class="log-row success">
+          <span class="log-time">05:12:02</span>
+          <span class="log-badge">DPI</span>
+          <span class="log-text">ByeDPI запущен на 127.0.0.1:1080 (TCP split+disorder).</span>
+        </div>
+        <div class="log-row success">
+          <span class="log-time">05:12:03</span>
+          <span class="log-badge">NFT</span>
+          <span class="log-text">Правила nftables применены (TProxy 127.0.0.1:12345).</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
