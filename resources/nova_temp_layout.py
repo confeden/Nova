@@ -93,6 +93,8 @@ ENTRIES = (
       "докуда дошла проверка стратегий; переживает перезапуск"),
     E("strategy_scores.json", "state", "nova.pyw", "nova.pyw",
       "накопленные оценки стратегий. Самый ценный файл в папке"),
+    E("general_scoring.json", "state", "nova.pyw", "nova.pyw",
+      "каким методом получены оценки general; несовпадение с текущим сбрасывает их"),
     E("learning_data.json", "state", "nova.pyw", "nova.pyw",
       "что выучено про домены и стратегии"),
     E("NovaDivertRedirectState.json", "state", "windivert_redirect.py", "nova.pyw",

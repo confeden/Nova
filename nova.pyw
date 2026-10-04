@@ -18449,6 +18449,7 @@ function FindProxyForURLEx(url, host) {{
         # Разовая миграция: слоты hard_* выведены из обращения в 1.31.
         retire_legacy_hard_slots(log_func)
         invalidate_scores_on_panel_change(log_func)
+        invalidate_general_scores_on_method_change(log_func)
         cleanup_hard_lists(log_func)
         
         check_cache = load_json_robust(CHECK_CACHE_FILE, {})
@@ -18872,6 +18873,34 @@ function FindProxyForURLEx(url, host) {{
         except Exception as e:
             if log_func:
                 log_func(f"[Panel] Не удалось сверить оценки с панелями: {e}")
+
+    def invalidate_general_scores_on_method_change(log_func=None):
+        """Сбрасывает оценки general, полученные прежним методом (nova_general_scope)."""
+        base_dir = get_base_dir()
+        marker_path = os.path.join(base_dir, "temp", "general_scoring.json")
+        state_path = os.path.join(base_dir, "temp", "checker_state.json")
+        scores_path = os.path.join(base_dir, "temp", "strategy_scores.json")
+        try:
+            marker = load_json_robust(marker_path, {})
+            recorded = marker.get("method") if isinstance(marker, dict) else None
+            if recorded == nova_general_scope.GENERAL_SCORING_METHOD:
+                return
+            scores = load_json_robust(scores_path, {})
+            state = load_json_robust(state_path, {})
+            nova_general_scope.reset_stale_general_scores(scores, state, recorded)
+            save_json_safe(scores_path, scores)
+            save_json_safe(state_path, state)
+            # Пройденные задачи тоже: иначе чекер пропускает стратегии, измеренные прежним
+            # методом, как «уже проверенные» и сравнивает новые замеры со старыми.
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(base_dir, "temp", "checker_progress.json"))
+            save_json_safe(marker_path, {"method": nova_general_scope.GENERAL_SCORING_METHOD})
+            if log_func:
+                log_func(f"[Panel] general: оценки получены прежним методом ({recorded or 'без метки'}). "
+                         "Сброшены, пул будет измерен заново.")
+        except Exception as e:
+            if log_func:
+                log_func(f"[Panel] Не удалось сверить метод оценки general: {e}")
 
     def get_alt_slot_names():
         """Действующие слоты лестницы, сильнейший первым.
@@ -19531,7 +19560,18 @@ function FindProxyForURLEx(url, host) {{
                         # === FIX: Strict IP Filtering to prevent Twitch Lag ===
                         # 1. Get IPs for target domains
                         target_ips_map = ip_cache_manager.ensure_ips(target_domains)
-                        unique_ips = sorted(list(set(target_ips_map.values())))
+                        filter_ips = set(target_ips_map.values())
+                        # Проба (detect_throttled_load) резолвит домен сама, через dns_manager,
+                        # и у CDN это часто другой адрес, чем в 8-часовом кэше выше. Тогда
+                        # стратегия к пробе не применялась вовсе: сайт открывался напрямую и
+                        # засчитывался. Так split2, вешающий apple/microsoft/docker на 16 КБ,
+                        # набирал контрольные очки и обходил hostfakesplit (замер 2026-10-04).
+                        for _d in target_domains:
+                            with contextlib.suppress(Exception):
+                                _probe_ip, _status = dns_manager.resolve(_d, dns_manager.burst_limiter, check_cache=True)
+                                if _probe_ip:
+                                    filter_ips.add(_probe_ip)
+                        unique_ips = sorted(ip for ip in filter_ips if ip)
                         
                         ip_filter_part = ""
                         if unique_ips:
@@ -32268,7 +32308,8 @@ function FindProxyForURLEx(url, host) {{
                         if row[0] == chosen and row[0] not in ids:
                             shown.append(row)
                             break
-                out[group] = {"rows": shown, "total": len(rows)}
+                # "all": the whole group in the same order, for the «Все серверы» picker.
+                out[group] = {"rows": shown, "total": len(rows), "all": rows}
             return out
 
         def _gather_vpn_menu_data():
@@ -32305,6 +32346,93 @@ function FindProxyForURLEx(url, host) {{
 
         def _run_ui_worker(target, name, *args):
             threading.Thread(target=target, args=args, daemon=True, name=name).start()
+
+        def _show_imported_profile_picker(title, rows, current_id, on_pick, x_root, y_root):
+            """Scrollable, searchable list of a whole imported group.
+
+            A slot menu shows only the head of the group (IMPORTED_MENU_LIMIT): a Tk menu of
+            thousands of VLESS nodes is not usable. This window lists every node in the group's
+            connect order; typing narrows it (nova_vpn_slots.filter_profile_rows), Enter or a
+            double click connects the selected node through the same path as a menu entry.
+            """
+            rows = list(rows or [])
+            theme = SETTINGS_THEME
+            top = tk.Toplevel(root)
+            top.title(title)
+            top.configure(bg=theme["bg"])
+            with contextlib.suppress(Exception):
+                top.attributes("-topmost", True)
+            frame = tk.Frame(top, bg=theme["bg"])
+            frame.pack(fill="both", expand=True, padx=8, pady=8)
+            query = tk.StringVar()
+            entry = tk.Entry(frame, textvariable=query, bg=theme["panel"], fg=theme["text"],
+                             insertbackground=theme["text"], relief="flat", font=("Segoe UI", 9),
+                             highlightthickness=1, highlightbackground=theme["border"],
+                             highlightcolor=theme["pill_on_bg"])
+            entry.pack(fill="x", pady=(0, 4))
+            count = tk.Label(frame, bg=theme["bg"], fg=theme["muted"], font=("Segoe UI", 8), anchor="w")
+            count.pack(fill="x", pady=(0, 4))
+            box = tk.Frame(frame, bg=theme["bg"])
+            box.pack(fill="both", expand=True)
+            scroll = tk.Scrollbar(box, orient="vertical")
+            lb = tk.Listbox(box, yscrollcommand=scroll.set, activestyle="none", exportselection=False,
+                            bg=theme["panel"], fg=theme["text"], selectbackground=theme["pill_on_bg"],
+                            selectforeground=theme["pill_on_fg"], highlightthickness=0, relief="flat",
+                            font=("Segoe UI", 9), width=60, height=22)
+            scroll.config(command=lb.yview)
+            scroll.pack(side="right", fill="y")
+            lb.pack(side="left", fill="both", expand=True)
+            shown = []
+
+            def refill(*_args):
+                shown[:] = nova_vpn_slots.filter_profile_rows(rows, query.get())
+                lb.delete(0, "end")
+                if shown:
+                    lb.insert("end", *[str(name)[:80] for _pid, name in shown])
+                count.config(text=f"{len(shown)} из {len(rows)} — Enter или двойной щелчок подключает")
+                index = next((i for i, (pid, _name) in enumerate(shown) if pid == current_id), 0)
+                if shown:
+                    lb.selection_set(index)
+                    lb.activate(index)
+                    lb.see(index)
+
+            def pick(_event=None):
+                selected = lb.curselection()
+                if not selected or selected[0] >= len(shown):
+                    return "break"
+                profile_id = shown[selected[0]][0]
+                top.destroy()
+                on_pick(profile_id)
+                return "break"
+
+            def step(delta):
+                if not shown:
+                    return "break"
+                selected = lb.curselection()
+                index = max(0, min(len(shown) - 1, (selected[0] if selected else 0) + delta))
+                lb.selection_clear(0, "end")
+                lb.selection_set(index)
+                lb.activate(index)
+                lb.see(index)
+                return "break"
+
+            query.trace_add("write", refill)
+            lb.bind("<Double-Button-1>", pick)
+            lb.bind("<Return>", pick)
+            entry.bind("<Return>", pick)
+            entry.bind("<Down>", lambda _e: step(1))
+            entry.bind("<Up>", lambda _e: step(-1))
+            entry.bind("<Next>", lambda _e: step(20))
+            entry.bind("<Prior>", lambda _e: step(-20))
+            top.bind("<Escape>", lambda _e: top.destroy())
+            refill()
+            top.update_idletasks()
+            width, height = top.winfo_reqwidth(), top.winfo_reqheight()
+            x = max(0, min(int(x_root), top.winfo_screenwidth() - width))
+            y = max(0, min(int(y_root), top.winfo_screenheight() - height - 48))
+            top.geometry(f"+{x}+{y}")
+            entry.focus_set()
+            return top
 
         def _show_primary_vpn_menu(data, x_root, y_root):
             primary = data.get("primary") or {}
@@ -32368,8 +32496,16 @@ function FindProxyForURLEx(url, host) {{
                     sub.add_command(label="Профилей нет — импортируйте их в «Профили»", state="disabled")
                 elif int(info.get("total") or 0) > len(rows):
                     sub.add_separator()
-                    sub.add_command(label=f"…ещё {int(info['total']) - len(rows)} — в окне «Профили»",
-                                    state="disabled")
+                    sub.add_command(
+                        label=f"Все серверы ({int(info['total'])})…",
+                        command=lambda k=imported_kind, g=group_name, every=list(info.get("all") or rows):
+                            _show_imported_profile_picker(
+                                f"Основной VPN — {g}", every,
+                                primary.get("profile") if kind == k else "",
+                                lambda pid, k=k: _run_ui_worker(
+                                    _apply_primary_vpn_choice, "NovaPrimaryVpnSwitch", k, "", "меню", pid),
+                                x_root, y_root),
+                    )
                 menu.add_cascade(label=nova_vpn_slots.PRIMARY_MENU_LABELS[imported_kind], menu=sub)
             if primary.get("profile") and kind not in nova_vpn_slots.PRIMARY_IMPORTED_CHOICES:
                 menu.add_separator()
@@ -32445,6 +32581,17 @@ function FindProxyForURLEx(url, host) {{
                     )
                 if not rows:
                     own_menu.add_command(label="  профилей пока нет", state="disabled")
+                elif int(info.get("total") or 0) > len(rows):
+                    own_menu.add_command(
+                        label=f"  Все серверы ({int(info['total'])})…",
+                        command=lambda g=group_name, every=list(info.get("all") or rows):
+                            _show_imported_profile_picker(
+                                f"Дополнительный VPN — {g}", every, choice.get("profile") or "",
+                                lambda pid, g=g: _run_ui_worker(
+                                    _apply_secondary_vpn_choice, "NovaSecondaryVpnChoice",
+                                    nova_vpn_slots.SECONDARY_PROFILE, None, None, "меню", g, pid),
+                                x_root, y_root),
+                    )
                 own_menu.add_separator()
             if has_any:
                 own_menu.add_command(label="Резерв идёт по группе так же, как основной VPN:",

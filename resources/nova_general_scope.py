@@ -96,3 +96,34 @@ def remove_legacy_general_list(base_dir, log=None):
     if log:
         log("[Init] Удалён устаревший list/general.txt: general теперь применяется ко всем сайтам вне списков.")
     return True
+
+
+# Метод оценки general. С 1.42 панель general включает контрольные сайты
+# (nova_strategy_panel), и прежние оценки — «сколько заблокированного открылось»
+# — с новыми несопоставимы. Хуже того: чекер продвигает лучшую стратегию по
+# сохранённым оценкам, не перепроверяя её, и на первом же проходе вернул
+# старый split2 вместо выпущенной hostfakesplit (замер 2026-10-04): у новых
+# стратегий оценок не было вовсе. Смена метода сбрасывает оценки general,
+# и пул измеряется заново.
+# controls-v2: тестовый winws чекера фильтровал пакеты по IP из своего кэша, а
+# проба шла на свежий адрес CDN — обход к ней не применялся, и стратегия,
+# ломающая сайт, всё равно получала за него очко. Оценки v1 этим испорчены.
+GENERAL_SCORING_METHOD = "controls-v2"
+
+
+def reset_stale_general_scores(scores, state, recorded_method):
+    """Сбрасывает оценки general, если они получены другим методом.
+
+    Меняет scores и state на месте. True — сброс сделан.
+    """
+    if recorded_method == GENERAL_SCORING_METHOD:
+        return False
+    if isinstance(scores, dict):
+        # Пустой словарь, а не удаление ключа: save_json_safe не пишет пустой
+        # объект поверх непустого файла, и сброс молча не сохранился бы.
+        scores["general"] = {}
+    if isinstance(state, dict):
+        for key in ("general_score", "general_total", "general_checked"):
+            state.pop(key, None)
+        state["checks_completed"] = False
+    return True

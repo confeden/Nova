@@ -817,3 +817,22 @@ def remember_secondary(base_dir, kind, region="", entry="", profile="", now=None
         current["secondary"] = record
 
     return _save_last(base_dir, mutate)
+
+
+def filter_profile_rows(rows, query):
+    """Rows (id, name) whose name or id contains every word of `query`, case-insensitive.
+
+    The slot menus list only the head of an imported group; the «Все серверы» picker shows the
+    whole group (thousands of VLESS nodes after a subscription refresh) and narrows it as the user
+    types — «nl reality» keeps the nodes carrying both words in any order.
+    """
+    words = [w for w in str(query or "").lower().split() if w]
+    if not words:
+        return list(rows or [])
+    out = []
+    for row in rows or []:
+        pid, name = str(row[0]), str(row[1])
+        hay = f"{name} {pid}".lower()
+        if all(w in hay for w in words):
+            out.append(row)
+    return out
