@@ -6,9 +6,16 @@ anthropic.com
 autodesk.com
 autodesk360.com
 b-cdn.net
+telegram.me
 bbci.co.uk
+telesco.pe
+telegram.org
 broadcom.com
 cdn.cookielaw.org
+battle.net
+blizzard.com
+forge.akamaized.net
+blz-contentstack-images.akamaized.net
 cdnbunny.org
 cerebras.ai
 chatgpt.com
@@ -16,6 +23,7 @@ claude.ai
 claude.com
 claudemcpcontent.com
 claudeusercontent.com
+cline.bot
 codegpt.co
 collaborator.pro
 copilot.microsoft.com
@@ -27,7 +35,6 @@ cursor.so
 cursorapi.com
 digikey.com
 digikeyassets.com
-digiseller.mycdn.ink
 dreamina.capcut.com
 elevenmusic.io
 emergent.sh
@@ -90,7 +97,12 @@ performance.radar.cloudflare.com
 pixabay.com
 plati.io
 plati.market
+mycdn.ink
+digiseller.com
 play.google.com
+canva.com
+figma.com
+figma.ai
 puter.com
 qoder.com
 qt.io
@@ -108,6 +120,7 @@ soulmatcher.app
 sourceforge.net
 spotify.com
 spotifycdn.com
+store.steampowered.com
 streamx.cash
 stripe.com
 stripe.network

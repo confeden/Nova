@@ -241,6 +241,8 @@ ROUTING_GROUP_ALIASES = {
     "discord": "discord",
     "games": "games",
     "poe": "games",
+    "obs": "obs",
+    "spotify": "spotify",
 }
 
 
@@ -651,6 +653,8 @@ class NovaWfpTcpProxy:
             return "whatsapp"
         if any(token in lower for token in ("obs64.exe", "obs32.exe", "obs-studio")):
             return "obs"
+        if any(token in lower for token in ("\\spotify\\spotify.exe", "spotifyab.spotifymusic", "studio by spotify labs")):
+            return "spotify"
         if "pathofexile" in lower or "path of exile" in lower or " poe" in lower or lower.endswith("\\poe") or "client.exe" in lower:
             return "games"
         return ""
@@ -1038,6 +1042,8 @@ class NovaWfpTcpProxy:
             route_mode_key = "games"
         elif app_family == "obs":
             route_mode_key = "obs"
+        elif app_family == "spotify":
+            route_mode_key = "spotify"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
         games_auto_warp = route_mode_key == "games" and route_mode == "auto"
         is_eu_route_target = False

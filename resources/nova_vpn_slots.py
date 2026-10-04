@@ -681,14 +681,19 @@ def youtube_route_slots(primary_foreign, secondary_kind=SECONDARY_OPERA):
 
 
 def route_chain(slots, *, primary_up, secondary_up, primary_tokens, secondary_tokens, last_resort):
-    """PAC chain for an ordered slot list: only the slots that are up, `last_resort` always last."""
+    """PAC chain for an ordered slot list: only the slots that are up; `last_resort` only when none is.
+
+    Never as a tail: Chromium benches a proxy for 5 min for every request once one request failed on
+    it and the next token served it, so «…; DIRECT» sent all browser traffic direct after a single
+    site refused the VPN's address (G97)."""
     parts = []
     for slot in slots:
         if slot == "primary" and primary_up:
             parts.append(primary_tokens)
         elif slot == "secondary" and secondary_up:
             parts.append(secondary_tokens)
-    parts.append(last_resort)
+    if not parts:
+        parts.append(last_resort)
     return "; ".join(parts)
 
 

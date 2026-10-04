@@ -287,12 +287,15 @@ if getattr(sys, 'frozen', False):
     except Exception:
         pass
 from nova_platform import is_windows_admin
-from nova_routing_profiles import get_default_app_routing_profiles, match_app_by_process_path
+from nova_routing_profiles import SPOTIFY_DOMAINS, get_default_app_routing_profiles, match_app_by_process_path
 from nova_privacy import mask_provider_ip, redact_user_path, redact_user_paths_in_text
 from nova_route_flap import hold_route, FlapPenalty, OPERA_HOLD, WARP_HOLD, WARP_PENALTY_SETTINGS
 from nova_temp_log import trim_to_tail
 from nova_temp_layout import write_readme as write_temp_readme
 from nova_strategy_niche import classify_strategy_niche
+from nova_throttle import classify_throttle_type as _classify_throttle_type, FREEZE_OBSERVABLE_BYTES
+from nova_strategy_panel import control_domains as strategy_control_domains
+import nova_general_scope
 from nova_relay_env import relay_env_from_settings
 from nova_socks_probe import probe_socks5_payload
 import nova_profiles
@@ -8543,14 +8546,22 @@ try:
                         result.append(text)
                     return result
 
-                # Последнее звено любой цепочки, когда ни один VPN не отвечает.
+                # Маршрут на случай, когда ни один VPN не отвечает.
                 #
                 # Раньше здесь стоял blackhole «SOCKS5 127.0.0.1:1» — закрытый порт,
-                # на котором соединение умирало. Решение владельца: соединение не
-                # убивать, а пускать напрямую, где им займётся winws-стратегия, если
-                # для домена она есть. Порядок сохраняется: DIRECT стоит последним,
-                # поэтому пока жив WARP или Opera, трафик идёт туда, а прямой путь
-                # включается только на время их недоступности.
+                # на котором соединение умирало. Решение владельца (D6): соединение
+                # не убивать, а пускать напрямую, где им займётся winws-стратегия,
+                # если для домена она есть, — но только на время недоступности VPN.
+                #
+                # Поэтому DIRECT — не хвост цепочки, а её замена: он стоит в маршруте
+                # только когда ни один слот не поднят. Хвост «…; DIRECT» Chrome
+                # понимает не как «пока VPN жив», а как «пока VPN не отказал хоть
+                # раз»: один отказ на одном хосте (сайт не пускает зарубежный
+                # адрес, wireproxy отвечает 0x04), удачный DIRECT вместо него — и
+                # прокси помечен плохим на 5 минут для ВСЕХ запросов (G97). Замерено
+                # на машине владельца: Proton US жив, 1370 отвечает 25/25, а Chrome
+                # открывает wb.ru, googlevideo и прочее напрямую. Слот лёг — watchdog
+                # перестраивает PAC с новым URL, и маршрут становится last_resort.
                 #
                 # Осознанный размен: в окно, пока оба VPN лежат, трафик и реальный IP
                 # идут в обход туннеля. NOVA_PAC_KILLSWITCH=1 возвращает прежнее
@@ -8581,10 +8592,8 @@ try:
                             parts.append(primary_route)
                         elif not strict and secondary_active:
                             parts.append(secondary_route)
-                        if allow_last_resort:
-                            parts.append(last_resort)
-                        elif not parts:
-                            parts.append(closed_route)
+                        if not parts:
+                            parts.append(last_resort if allow_last_resort else closed_route)
                         return "; ".join(_dedupe_route_parts(parts))
                     if target == "opera":
                         parts = []
@@ -8592,10 +8601,8 @@ try:
                             parts.append(secondary_route)
                         elif not strict and warp_active:
                             parts.append(primary_route)
-                        if allow_last_resort:
-                            parts.append(last_resort)
-                        elif not parts:
-                            parts.append(closed_route)
+                        if not parts:
+                            parts.append(last_resort if allow_last_resort else closed_route)
                         return "; ".join(_dedupe_route_parts(parts))
                     if target == "tor":
                         # Browsers only (routing mode "tor"). No DIRECT tail and no fallback to
@@ -8656,7 +8663,8 @@ try:
                     eu_route_parts.append(primary_route)
                 if secondary_active:
                     eu_route_parts.append(secondary_route)
-                eu_route_parts.append(last_resort)
+                if not eu_route_parts:
+                    eu_route_parts.append(last_resort)
                 eu_route = "; ".join(eu_route_parts)
 
                 # RU-list traffic (blocked by DPI, not by geography): the primary first, the
@@ -8667,7 +8675,8 @@ try:
                     ru_route_parts.append(primary_route)
                 if secondary_active:
                     ru_route_parts.append(secondary_route)
-                ru_route_parts.append(last_resort)
+                if not ru_route_parts:
+                    ru_route_parts.append(last_resort)
                 ru_route = "; ".join(ru_route_parts)
 
                 # YouTube: RU-list order while the primary exits abroad. With a Russian (or not yet
@@ -8722,8 +8731,15 @@ try:
                 whatsapp_mode = get_routing_app_mode("whatsapp", routing_settings)
                 discord_route = _route_for_app_mode(discord_mode, discord_route)
                 whatsapp_route = _route_for_app_mode(whatsapp_mode, ru_route)
+                spotify_mode = get_routing_app_mode("spotify", routing_settings)
+                spotify_route = _route_for_app_mode(spotify_mode, eu_route)
                 pac_mode = str(pac_config.get("mode") or "hybrid").strip().lower()
                 pac_full_route = _route_for_target(pac_config.get("full_target"), strict=True)
+                # Без хвоста DIRECT сайты из exclude (госуслуги, банки, маркетплейсы
+                # — те, что не пускают зарубежный адрес) в полном режиме просто не
+                # открылись бы, поэтому exclude действует и здесь. Не для Tor: там
+                # прямая нога обесценила бы выбор.
+                pac_full_exclude = str(pac_config.get("full_target") or "").strip().lower() in ("warp", "opera")
 
                 # EU route is already set above. Keeping variable consistency.
                 pass
@@ -8741,6 +8757,17 @@ try:
                 # set у строк меняется от запуска к запуску, и без сортировки
                 # подпись «менялась» бы там, где не менялось ничего.
                 exclude_js = "{" + ",".join(f'"{d}":1' for d in sorted(exclude_domains)) + "}"
+                # Запись second, которая точнее записи exclude, важнее её:
+                # store.steampowered.com (second) против steampowered.com (exclude).
+                # Регион магазина Steam решается по IP запроса именно к store,
+                # а остальной Steam должен остаться напрямую.
+                _exclude_set = set(exclude_domains)
+                eu_over_exclude_domains = {
+                    d for d in eu_domains
+                    if d not in _exclude_set
+                    and any(d.split(".", i)[-1] in _exclude_set for i in range(1, d.count(".") + 1))
+                }
+                eu_over_exclude_js = "{" + ",".join(f'"{d}":1' for d in sorted(eu_over_exclude_domains)) + "}"
                 user_ru_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_ru_domains)) + "}"
                 user_eu_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_eu_domains)) + "}"
                 ru_js = "{" + ",".join(f'"{d}":1' for d in sorted(ru_domains)) + "}"
@@ -8749,6 +8776,7 @@ try:
                 telegram_js = "{" + ",".join(f'"{d}":1' for d in sorted(telegram_domains)) + "}"
                 telegram_ips_js = json.dumps(telegram_ips)
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in sorted(whatsapp_domains)) + "}"
+                spotify_js = "{" + ",".join(f'"{d}":1' for d in sorted(SPOTIFY_DOMAINS)) + "}"
                 youtube_js = "{" + ",".join(f'"{d}":1' for d in sorted(youtube_domains)) + "}"
 
                 # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
@@ -8788,7 +8816,8 @@ try:
                     | {d for d in _second_set if _covered_by(d, _ai_set)}
                 )
                 ai_second_js = "{" + ",".join(f'"{d}":1' for d in sorted(ai_second_domains)) + "}"
-                ai_second_route = (f"{secondary_route}; DIRECT" if secondary_active else "DIRECT")
+                # Без хвоста DIRECT: один отказ second — и Chrome на 5 минут пускал бы все ИИ-домены напрямую (G97).
+                ai_second_route = (secondary_route if secondary_active else "DIRECT")
                 # Выход second заблокирован сервисом по региону (ai_region_worker пробует API
                 # через него) — тогда напрямую по winws, но только если имя этого сервиса
                 # разворачивает DNS-разблокировщик (DNS-AI, xbox-dns, comss, geohide: системный
@@ -8864,6 +8893,7 @@ try:
                     ("discord", discord_mode, discord_route),
                     ("telegram", telegram_mode, telegram_route),
                     ("whatsapp", whatsapp_mode, whatsapp_route),
+                    ("spotify", spotify_mode, spotify_route),
                 ):
                     if str(_mode or "auto").strip().lower() != "auto":
                         app_domain_priority += (
@@ -8881,15 +8911,14 @@ try:
     }}
     var pac_mode = {json.dumps(pac_mode)};
     var pac_full_route = {json.dumps(pac_full_route)};
+    var pac_full_exclude = {json.dumps(pac_full_exclude)};
     if (pac_mode === "off") {{
         return "DIRECT";
-    }}
-    if (pac_mode === "full") {{
-        return pac_full_route;
     }}
     var user_ru = {user_ru_js};
     var user_eu = {user_eu_js};
     var exclude = {exclude_js};
+    var eu_over_exclude = {eu_over_exclude_js};
     var ru = {ru_js};
     var eu = {eu_js};
     var ai_unlock = {ai_unlock_js};
@@ -8899,6 +8928,7 @@ var ai_region_direct = {ai_region_direct_js};
     var telegram = {telegram_js};
     var telegram_ips = {telegram_ips_js};
     var whatsapp = {whatsapp_js};
+    var spotify = {spotify_js};
     var youtube = {youtube_js};
     var user_ru_ips = {user_ru_ips_js};
     var user_eu_ips = {user_eu_ips_js};
@@ -8915,6 +8945,16 @@ var ai_region_direct = {ai_region_direct_js};
             pos = h.indexOf('.', pos + 1);
         }}
         return false;
+    }}
+
+    if (pac_mode === "full") {{
+        if (pac_full_exclude && !matchDomain(eu_over_exclude, host) && matchDomain(exclude, host)) {{
+            return "DIRECT";
+        }}
+        // Строка приложения, выбранная явно (не Auto), действует и здесь: Spotify шлёт
+        // свой HTTP через системный прокси, и без этой ветки «Доп.» в его строке молча
+        // проигрывал «Осн.» браузеров (G94).
+{app_domain_priority}        return pac_full_route;
     }}
 
     function matchIpEntries(ip, entries) {{
@@ -9045,6 +9085,7 @@ var ai_region_direct = {ai_region_direct_js};
     
     if (matchDomain(user_ru, host)) return "{ru_route}";
     if (matchDomain(user_eu, host)) return "{eu_route}";
+    if (matchDomain(eu_over_exclude, host)) return "{eu_route}";
     if (matchDomain(exclude, host)) return "DIRECT";
 {app_domain_priority}{ai_unlock_guard}    if (matchDomain(eu, host)) return "{eu_route}";
     if (matchDomain(youtube, host)) return "{youtube_route}";
@@ -9057,6 +9098,27 @@ var ai_region_direct = {ai_region_direct_js};
     if (!isIpV4 && !isIpV6 && anyIpMatches(resolveHostIps(host), cloudflare_ips)) return "{ru_route}";
     
     return "DIRECT";
+}}
+
+// WinINET/WinHTTP вызывают FindProxyForURLEx, если она есть, и только её; Chrome и Firefox
+// её не вызывают (проверено: headless Chrome с PAC из двух функций ходит только по
+// FindProxyForURL, WinINET — только по Ex). Цепочки выше не кончаются на DIRECT, пока жив
+// хоть один VPN (G97), а WinINET слова SOCKS5 не знает: на «SOCKS5 127.0.0.1:1370» без
+// второго токена InternetOpenUrl возвращает битый хэндл без единого пакета — установщик
+// Spotify падал с «Error code: 51». Здесь программам отдаётся то, что они умеют: SOCKS5
+// выброшен, PROXY сохранён; не осталось ничего — DIRECT, как и было до G97. Закрытый порт
+// (прибитый слот лежит) остаётся закрытым и для них.
+function FindProxyForURLEx(url, host) {{
+    var parts = String(FindProxyForURL(url, host) || "DIRECT").split(";");
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {{
+        var token = parts[i].replace(/^\\s+|\\s+$/g, "");
+        if (!token) continue;
+        if (token === "{closed_route}") return "PROXY 127.0.0.1:1";
+        if (/^SOCKS5\\s/i.test(token)) continue;
+        out.push(token);
+    }}
+    return out.length ? out.join("; ") : "DIRECT";
 }}
 """
                 pac_temp_path = f"{self.pac_file}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -13699,7 +13761,6 @@ var ai_region_direct = {ai_region_direct_js};
             "telegram.txt": "telegram.org\nt.me\ntelegra.ph\ntdesktop.com\n",
             "whatsapp.txt": "whatsapp.com\nwhatsapp.net\nwa.me\n",
             "cloudflare.txt": "",
-            "general.txt": "twitter.com\ninstagram.com\n",
             "exclude.txt": "",
             "u_main.txt": "# user main VPN override domains\n",
             "u_second.txt": "# user second VPN override domains\n"
@@ -13839,9 +13900,11 @@ var ai_region_direct = {ai_region_direct_js};
         
         for name, content in files.items():
             path = os.path.join(base_dir, "list", name)
-            if not os.path.exists(path) or (name == "general.txt" and os.path.getsize(path) == 0):
+            if not os.path.exists(path):
                 with open(path, "w", encoding="utf-8") as f: f.write(content)
             res[f"list_{name.split('.')[0]}"] = path
+        # С 1.42 general охватывает все сайты вне списков, list/general.txt не нужен.
+        nova_general_scope.remove_legacy_general_list(base_dir, log=print)
 
         for name, content in ip_files.items():
             path = os.path.join(base_dir, "ip", name)
@@ -14081,9 +14144,6 @@ var ai_region_direct = {ai_region_direct_js};
             with open(res["ip_exclude"], "w") as f: pass
         res["ip_telegram"] = os.path.join(base_dir, "ip", "ip_telegram.txt")
         
-        res["ip_general"] = os.path.join(base_dir, "ip", "general.txt")
-        if not os.path.exists(res["ip_general"]):
-             with open(res["ip_general"], "w") as f: pass # No header to prevent winws crash
 
         res["strat_json"] = os.path.join(base_dir, "strat", STRATEGIES_FILENAME)
         res["strat_warp"] = os.path.join(base_dir, "strat", WARP_STRATEGIES_FILENAME)
@@ -14148,7 +14208,7 @@ var ai_region_direct = {ai_region_direct_js};
 
     ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
     LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
-    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "games", "obs")
+    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "games", "obs", "spotify")
     ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
     # Modes only the browser group may carry. Tor is TCP-only and slow, so it never becomes
     # the egress of the relay, the WFP/Divert proxies or the UDP path (DESIGN.md §9); the
@@ -14166,6 +14226,7 @@ var ai_region_direct = {ai_region_direct_js};
         "obs": "obs",
         "obs64": "obs",
         "obs32": "obs",
+        "spotify": "spotify",
     }
     DEFAULT_ROUTING_SETTINGS = {
         "version": CURRENT_VERSION,
@@ -14188,6 +14249,8 @@ var ai_region_direct = {ai_region_direct_js};
             "discord": "warp",
             "games": "auto",
             "obs": "direct",
+            # Spotify (and Studio by Spotify Labs) on the secondary slot: owner, 2026-10-04.
+            "spotify": "opera",
         },
         "system": {
             "suppress_game_overlay": False,
@@ -18365,16 +18428,6 @@ var ai_region_direct = {ai_region_direct_js};
                                 count += 1
                 except: pass
         
-        # Загружаем домены из general.txt (чтобы они сразу попадали в статистику без проверки)
-        general_path = os.path.join(base_dir, "list", "general.txt")
-        if os.path.exists(general_path):
-            try:
-                with open(general_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        d = line.strip().split('#')[0].strip().lower()
-                        if d: special_strategy_domains.add(d)
-            except: pass
-        
         # Домены, назначенные персональным профилям (лестница и boost).
         # Имена берутся из конфига: прежние циклы 1..12 не совпадали ни с одним
         # реальным boost-слотом, потому что те названы по технике, а не номером.
@@ -20846,6 +20899,7 @@ var ai_region_direct = {ai_region_direct_js};
 
                 # === НОВОЕ: Проверка прямой доступности для HOT доменов ===
                 truly_blocked_hot = []
+                direct_ok_hot = []
                 for d in alive_hot:
                     if is_closing: break
                     port = 0
@@ -20854,7 +20908,7 @@ var ai_region_direct = {ai_region_direct_js};
                     try:
                         status, _ = detect_throttled_load(d, port)
                         if status == "ok":
-                            pass # Доступен напрямую, пропускаем
+                            direct_ok_hot.append(d)  # Доступен напрямую: в контрольную панель
                         else:
                             truly_blocked_hot.append(d)
                     finally:
@@ -20876,9 +20930,16 @@ var ai_region_direct = {ai_region_direct_js};
                         alive_cold = filter_alive_domains(cold_candidates, needed)
                 
                 domains_for_general = alive_hot + alive_cold
+                # Контрольная панель: general применяется ко всем сайтам вне списков,
+                # поэтому стратегия, ломающая рабочие сайты, должна терять очки.
+                general_controls = [
+                    c for c in strategy_control_domains(direct_ok_hot)
+                    if c not in domains_for_general and not is_service_domain(c)
+                ]
+                domains_for_general = domains_for_general + general_controls
                 
                 if not skip_main_check:
-                     log_func(f"[Check] Тестирование на {len(alive_hot)} заблокированных доменах из истории посещений и {len(alive_cold)} доменов из списка rkn")
+                     log_func(f"[Check] Тестирование на {len(alive_hot)} заблокированных доменах из истории посещений, {len(alive_cold)} доменов из списка rkn и {len(general_controls)} контрольных (не должны ломаться)")
                 elif state.get("evolution_stage", 0) > 0 and not state.get("completed", False):
                      # Log ONLY if we are actually resuming an incomplete session
                      log_func(f"[Check] Основная проверка уже завершена. Переход к эволюции (Domains: {len(domains_for_general)})...")
@@ -23091,6 +23152,7 @@ var ai_region_direct = {ai_region_direct_js};
             accumulated = b''
             start_time = time.time()
             last_chunk_time = start_time
+            pumps_left = 3
 
             while True:
                 try:
@@ -23100,6 +23162,24 @@ var ai_region_direct = {ai_region_direct_js};
                         if min_success_bytes > 0 and len(accumulated) < min_success_bytes:
                             conn.close()
                             return "blocked", f"short_response_{len(accumulated)//1024}kb"
+                        # Страница короче окна замирания ТСПУ (16-24 КБ) не может его
+                        # показать. Добираем объём повторными запросами в том же
+                        # соединении: замирание считается по байтам соединения.
+                        if (min_success_bytes == 0 and pumps_left > 0
+                                and FREEZE_OBSERVABLE_BYTES // 4 <= len(accumulated) < FREEZE_OBSERVABLE_BYTES
+                                and not getattr(resp, "will_close", True)):
+                            pumps_left -= 1
+                            try:
+                                conn.request("GET", probe_path, headers=headers)
+                                resp = conn.getresponse()
+                            except socket.timeout:
+                                conn.close()
+                                return "blocked", f"timeout_at_{len(accumulated)//1024}kb"
+                            except Exception:
+                                conn.close()
+                                return "ok", "ok"
+                            last_chunk_time = time.time()
+                            continue
                         conn.close()
                         return "ok", "ok"
                     
@@ -23165,27 +23245,8 @@ var ai_region_direct = {ai_region_direct_js};
             return "error", f"error_{error_type}"
 
     def classify_throttle_type(diag_info):
-        """Классифицирует тип замедления на основе диагностики и возвращает тип для boost стратегии."""
-        if not diag_info:
-            return "unknown"
-        
-        diag_lower = diag_info.lower()
-        
-        # Классификация по диагностической информации
-        if "slow_speed" in diag_lower:
-            return "Slow_DPI"
-        elif "connection_closed_at_16kb" in diag_lower or "connection_closed_at_17kb" in diag_lower or "connection_closed_at_18kb" in diag_lower or "connection_closed_at_19kb" in diag_lower:
-            return "DPI_16KB"
-        elif "tcp_reset" in diag_lower:
-            return "TCP_RST"
-        elif "timeout_at_16kb" in diag_lower or "timeout_at_17kb" in diag_lower or "timeout_at_18kb" in diag_lower or "timeout_at_19kb" in diag_lower:
-            return "DPI_16KB"  # Похоже на DPI 16KB, но с таймаутом
-        elif "timeout_at" in diag_lower:
-            return "Early_Timeout"
-        elif "slow_speed" in diag_lower:
-            return "Slow_DPI"
-        else:
-            return "unknown"
+        """Классифицирует тип замедления (resources/nova_throttle.py)."""
+        return _classify_throttle_type(diag_info)
 
     def mark_domain_as_throttled(domain):
         """Отмечает домен как замедленный (для подтверждения нужно несколько проверок)."""
@@ -23475,7 +23536,7 @@ var ai_region_direct = {ai_region_direct_js};
             #
             # Списки меняются крайне редко, поэтому сначала сверяем сигнатуру
             # (mtime, размер) и при совпадении просто продлеваем TTL.
-            watched = [os.path.join(base_dir, "rkn.txt"), os.path.join(base_dir, "list", "general.txt")]
+            watched = [os.path.join(base_dir, "rkn.txt")]
             list_dir = os.path.join(base_dir, "list")
             if os.path.exists(list_dir):
                 watched.extend(
@@ -23503,14 +23564,8 @@ var ai_region_direct = {ai_region_direct_js};
                     new_rkn = {l.strip().split('#')[0].strip().lower() for l in f if l.strip() and not l.startswith("#")}
             rkn_domains_cache = new_rkn
 
-            # 2. Strategy lists cache (General, Hard, Boost)
+            # 2. Strategy lists cache (Hard, Boost). General has no list since 1.42.
             new_strat_domains = set()
-            
-            # General
-            gen_path = os.path.join(base_dir, "list", "general.txt")
-            if os.path.exists(gen_path):
-                with open(gen_path, "r", encoding="utf-8") as f:
-                    new_strat_domains.update(l.strip().split('#')[0].strip().lower() for l in f if l.strip() and not l.startswith("#"))
             
             # Hard & Boost (scan directory)
             list_dir = os.path.join(base_dir, "list")
@@ -28242,7 +28297,11 @@ var ai_region_direct = {ai_region_direct_js};
             local_bypass_clause = get_loopback_bypass_clause()
             raw_proto_parts = []
             if tcp_port_clause:
-                raw_proto_parts.append(f"(tcp and {tcp_port_clause}{local_bypass_clause} and (tcp.SrcPort < 16000 or tcp.SrcPort > 16500))")
+                # Пустые ACK-и winws не нужны: десинк работает с SYN (syndata)
+                # и пакетами с данными (ClientHello, HTTP-запрос). Без этого
+                # условия через winws шёл каждый ACK любой загрузки по 80/443,
+                # и на ~200 Мбит/с (Steam) он упирался в 100% одного ядра.
+                raw_proto_parts.append(f"(tcp and {tcp_port_clause}{local_bypass_clause} and (tcp.SrcPort < 16000 or tcp.SrcPort > 16500) and (tcp.Syn or tcp.Fin or tcp.Rst or tcp.PayloadLength > 0))")
             if udp_port_clause:
                 raw_proto_parts.append(f"(udp and {udp_port_clause}{local_bypass_clause} and (udp.SrcPort < 16000 or udp.SrcPort > 16500))")
             if raw_proto_parts:
@@ -28360,26 +28419,24 @@ var ai_region_direct = {ai_region_direct_js};
                     elif arg.startswith("--wf-udp"): args.append(arg.replace("--wf-udp", "--filter-udp"))
                     else: args.append(arg)
 
-        target_gen_list = paths['list_general']
-        # General must stay hostlist-based.
-        # Global web mode turned out to be too aggressive for excluded/browser domains
-        # and could still delay or break sites like github.com before hostname-based
-        # exclusions stabilized.
-        general_global_mode = False
-        gen_list_exists = file_has_noncomment_entries(target_gen_list)
+        # General — профиль «всё остальное»: стоит последним, без --hostlist и
+        # --ipset и ловит любой сайт на своих портах, кроме исключений и списков
+        # со своим маршрутом или стратегией (resources/nova_general_scope.py).
+        # До 1.42 он был привязан к list/general.txt и к ip/general.txt — а там
+        # лежали только диапазоны Cloudflare, и ipset сужал профиль до них.
         general_has_args = any(isinstance(arg, str) and str(arg).strip() for arg in strategies.get("general", []))
-        
+
         # FIX: Check if General is blocked
         is_gen_blocked = False
         if blocked_state.get("general_checked", False) and blocked_state.get("general_score", 0) <= 0:
              is_gen_blocked = True
-        
+
         if is_gen_blocked:
              if not silent: print("[Init] Пропуск General стратегии (сервис заблокирован)")
         elif general_has_args:
             if num_specific_strats_added > 0:
                 args.append("--new")
-            
+
             # Define common args for General strategy reuse
             general_common_args = []
             general_seen_args = set()
@@ -28393,36 +28450,18 @@ var ai_region_direct = {ai_region_direct_js};
 
             for item in exclusions:
                 _append_general_arg(item)
-
-            if general_global_mode:
-                general_service_hostlists = [
-                    youtube_runtime_list_path,
-                    discord_runtime_list_path,
-                    telegram_runtime_list_path,
-                    os.path.join(get_base_dir(), "list", "whatsapp.txt"),
-                    os.path.join(get_base_dir(), "list", "cloudflare.txt"),
-                ]
-                general_service_ipsets = [
-                    os.path.join(get_base_dir(), "ip", "warp.txt"),
-                    os.path.join(get_base_dir(), "ip", "discord.txt"),
-                    os.path.join(get_base_dir(), "ip", "telegram.txt"),
-                    os.path.join(get_base_dir(), "ip", "whatsapp.txt"),
-                    os.path.join(get_base_dir(), "ip", "cloudflare.txt"),
-                ]
-
-                for hostlist_path in general_service_hostlists:
-                    if hostlist_path and file_has_noncomment_entries(hostlist_path):
-                        _append_general_arg(f"--hostlist-exclude={hostlist_path}")
-                for ipset_path in general_service_ipsets:
-                    if ipset_path and file_has_noncomment_entries(ipset_path):
-                        _append_general_arg(f"--ipset-exclude={ipset_path}")
-                if not silent:
-                    print("[Init] General стратегия применяется глобально ко всему web-трафику, кроме сервисных исключений.")
-            else:
-                if gen_list_exists:
-                    _append_general_arg(f"--hostlist={target_gen_list}")
-                if file_has_noncomment_entries(paths['ip_general']):
-                    _append_general_arg(f"--ipset={paths['ip_general']}")
+            for item in nova_general_scope.general_scope_args(
+                get_base_dir(),
+                runtime_lists={
+                    "youtube.txt": youtube_runtime_list_path,
+                    "discord.txt": discord_runtime_list_path,
+                    "telegram.txt": telegram_runtime_list_path,
+                },
+                has_entries=file_has_noncomment_entries,
+            ):
+                _append_general_arg(item)
+            if not silent:
+                print("[Init] General применяется ко всем сайтам вне списков (исключения: exclude, main/second, сервисные списки).")
 
             args.extend(general_common_args)
             
@@ -31285,6 +31324,7 @@ var ai_region_direct = {ai_region_direct_js};
             ("discord", "Discord"),
             ("games", "Games"),
             ("obs", "OBS"),
+            ("spotify", "Spotify"),
         )
         # "warp" and "opera" are the two VPN slots now: the primary (Cloudflare or Proton) and the
         # secondary (Opera or Tor). The stored values stay, so settings of every version still read.

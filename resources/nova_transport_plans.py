@@ -18,6 +18,7 @@ ROUTING_GROUP_ALIASES = {
     # вообще начал находиться.
     "obs": "obs",
     "games-steam-direct": "games",
+    "spotify": "spotify",
 }
 ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
 

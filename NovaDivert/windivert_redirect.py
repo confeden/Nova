@@ -95,6 +95,7 @@ APP_FAMILY = {
     "Games": "games",
     "GamesDirect": "games-steam-direct",
     "OBS": "obs",
+    "Spotify": "spotify",
 }
 
 
@@ -113,6 +114,7 @@ PREFERRED_EGRESS = {
     "whatsapp": 1,  # WARP
     "games": 1,     # WARP
     "games-steam-direct": 3,
+    "spotify": 2,   # the secondary slot, the «Spotify» row defaults to «Доп.»
 }
 
 _TELEGRAM_IPV6_NETWORKS = [
@@ -533,7 +535,7 @@ class ProcessResolver:
         # и опознаётся дальше (`_app_family_from_app_id` ищет в нём подстроки
         # вроде `telegram desktop`).
         path = redact_user_path(path)
-        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "GamesDirect", "OBS"}:
+        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "GamesDirect", "OBS", "Spotify"}:
             app = None
         with self._lock:
             self._cache[pid] = {"ts": now, "path": path, "app": app}

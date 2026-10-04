@@ -11,6 +11,11 @@ robinfrontend-pa.googleapis.com
 jules.google.com
 flow.google.com
 aisandbox-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
+antigravity-unleash.goog
+www.googleapis.com
+play.googleapis.com
+lh3.googleusercontent.com
 claude.ai
 www.claude.ai
 api.anthropic.com
@@ -35,11 +40,14 @@ downloads.claude.com
 claudeusercontent.com
 www.claudeusercontent.com
 bridge.claudeusercontent.com
+cline.bot
 grok.com
 chatgpt.com
+app.cline.bot
 ab.chatgpt.com
 auth.openai.com
 api.openai.com
+api.cline.bot
 ws.chatgpt.com
 webrtc.chatgpt.com
 api.chatgpt.com

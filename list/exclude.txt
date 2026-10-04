@@ -36,8 +36,10 @@ mozilla.cloudflare-dns.com
 ok.me
 ok.ru
 okcdn.ru
+geobasket.ru
 okko.tv
 ozon.com
+sellmonitor.com
 ozon.ru
 ozon.travel
 ozone.ru
@@ -81,6 +83,7 @@ vkuseraudio.net
 vkuserphoto.ru
 vkuservideo.net
 vkvideo.ru
+paywb.com
 wb-bank.ru
 wb.ru
 wbbasket.ru

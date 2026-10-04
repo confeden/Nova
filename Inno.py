@@ -1634,111 +1634,19 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
 
 
 def sync_lists_to_updates_repo(base_dir: Path, version: str) -> None:
-    """Выгрузить list/*.txt (кроме u_*) в github.com/confeden/nova_updates, папка nova_pc/.
+    """Выгрузить списки в nova_updates/nova_pc (list_publish.py) до сборки.
 
-    Клиенты сверяют свои списки с nova_pc/manifest.json по sha256 и считают сетевые
-    самыми свежими, поэтому сборка без выгрузки дала бы установщик новее сети.
-    Файлы хранятся байт-в-байт (CRLF): `-text` в nova_pc/.gitattributes и
-    core.autocrlf=false, иначе git перевёл бы концы строк и sha256 не сошёлся бы.
+    Клиенты считают сетевые списки самыми свежими, поэтому сборка без выгрузки дала
+    бы установщик новее сети. Обычно наблюдатель `list_publish.py --watch` уже всё
+    выгрузил, и здесь остаётся «уже актуален».
     """
-    import time
     if os.environ.get("NOVA_SKIP_LIST_SYNC") == "1":
         print("[WARN] NOVA_SKIP_LIST_SYNC=1: Пропуск синхронизации списков с nova_updates")
         return
-
-    import nova_list_sync
-    removed = nova_list_sync.remove_ai_overlaps(base_dir / "list", keep=("ai.txt", "second.txt"))
-    for file_name, removed_domains in removed.items():
-        if removed_domains:
-            print(f"[Списки] {file_name}: удалено {len(removed_domains)} дублей AI-доменов")
-
-    clone_dir = base_dir / "temp" / "_nova_updates"
-    
-    def run_git(args, cwd=None):
-        try:
-            res = subprocess.run(
-                ["git"] + args,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                check=True,
-                creationflags=CREATE_NO_WINDOW
-            )
-            return res.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"git {' '.join(args)} failed:\n{e.stderr.strip()}")
-
+    sys.path.insert(0, str(base_dir))
+    import list_publish
     try:
-        if not (clone_dir / ".git").exists():
-            if clone_dir.exists():
-                safe_rmtree(clone_dir)
-            run_git(["-c", "core.autocrlf=false", "clone", "--depth", "1",
-                     "https://github.com/confeden/nova_updates.git", str(clone_dir)])
-            run_git(["-C", str(clone_dir), "config", "core.autocrlf", "false"])
-        else:
-            run_git(["-C", str(clone_dir), "config", "core.autocrlf", "false"])
-            run_git(["fetch", "--depth", "1", "origin", "main"], cwd=str(clone_dir))
-            run_git(["reset", "--hard", "origin/main"], cwd=str(clone_dir))
-
-        remote_list_dir = clone_dir / nova_list_sync.REMOTE_DIR / "list"
-        remote_list_dir.mkdir(parents=True, exist_ok=True)
-        attributes = clone_dir / nova_list_sync.REMOTE_DIR / ".gitattributes"
-        attributes_text = b"* -text" + bytes([10])
-        attributes_changed = not attributes.exists() or attributes.read_bytes() != attributes_text
-        if attributes_changed:
-            attributes.write_bytes(attributes_text)
-        
-        local_files = []
-        for txt in (base_dir / "list").glob("*.txt"):
-            if not txt.name.startswith("u_"):
-                local_files.append(txt)
-                
-        local_names = {f.name for f in local_files}
-        
-        copied = 0
-        deleted = 0
-        for txt in local_files:
-            remote_txt = remote_list_dir / txt.name
-            if not remote_txt.exists() or remote_txt.read_bytes() != txt.read_bytes():
-                shutil.copyfile(txt, remote_txt)
-                copied += 1
-                
-        for remote_txt in remote_list_dir.glob("*.txt"):
-            if remote_txt.name not in local_names:
-                remote_txt.unlink()
-                deleted += 1
-                
-        rels = [f"list/{name}" for name in local_names]
-        manifest_files = nova_list_sync.build_manifest(base_dir, rels, 0)["files"]
-        
-        manifest_path = clone_dir / nova_list_sync.REMOTE_DIR / nova_list_sync.MANIFEST_NAME
-        old_manifest_files = {}
-        if manifest_path.exists():
-            try:
-                old_manifest_files = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", {})
-            except Exception:
-                pass
-                
-        if old_manifest_files == manifest_files and copied == 0 and deleted == 0 and not attributes_changed:
-            print("[Списки] nova_updates уже актуален")
-            return
-            
-        manifest_data = {
-            "schema": 1,
-            "generated": int(time.time()),
-            "version": version,
-            "files": manifest_files
-        }
-        
-        manifest_path.write_text(json.dumps(manifest_data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-        
-        run_git(["-C", str(clone_dir), "add", "-A", nova_list_sync.REMOTE_DIR])
-        run_git(["-C", str(clone_dir), "commit", "-m", f"Nova PC: списки {version}"])
-        hash_str = run_git(["-C", str(clone_dir), "rev-parse", "--short", "HEAD"])
-        run_git(["-C", str(clone_dir), "push", "origin", "HEAD:main"])
-        print(f"[Списки] Синхронизация успешна, коммит {hash_str}")
-        
+        list_publish.publish_lists(base_dir, version)
     except Exception as exc:
         raise RuntimeError(
             f"Синхронизация списков с nova_updates не удалась: {exc}\n"

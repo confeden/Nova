@@ -14,6 +14,17 @@ class AppRoutingProfile:
     path_markers: tuple[str, ...] = ()
 
 
+# Spotify's own names. The desktop client reaches them over the system proxy (PAC), so the PAC
+# routes them by the «Spotify» row too; the rest of its traffic (the access point on :4070, which
+# ignores the proxy) is caught by process. akamaized hosts are Spotify's audio CDN by full name.
+SPOTIFY_DOMAINS = (
+    "spotify.com", "spotify.net", "spotify.link", "spoti.fi", "byspotify.com",
+    "scdn.co", "pscdn.co", "spotifycdn.com", "spotifycdn.net",
+    "audio-ak-spotify-com.akamaized.net", "audio4-ak-spotify-com.akamaized.net",
+    "heads4-ak-spotify-com.akamaized.net",
+)
+
+
 @lru_cache(maxsize=1)
 def get_default_app_routing_profiles():
     return {
@@ -75,6 +86,16 @@ def get_default_app_routing_profiles():
             ),
             process_path_regex=r"(?i).*[\\/](obs64|obs32|obs-studio)[\\/].*",
             path_markers=("obs64.exe", "obs32.exe", "obs-studio"),
+        ),
+        # Before "games": its "poe" marker is a bare substring and must not get the first look.
+        # The Microsoft Store build lives under WindowsApps\SpotifyAB.SpotifyMusic_*; Studio by
+        # Spotify Labs ships its own client plus node.exe helpers in its folder, all of it Spotify's.
+        "spotify": AppRoutingProfile(
+            key="spotify",
+            display_name="Spotify",
+            process_names=("Spotify.exe", "spotify.exe", "Studio by Spotify Labs.exe"),
+            process_path_regex=r"(?i).*([\\/]spotify[\\/]spotify\.exe|spotifyab\.spotifymusic|studio by spotify labs).*",
+            path_markers=("\\spotify\\spotify.exe", "spotifyab.spotifymusic", "studio by spotify labs"),
         ),
         "games": AppRoutingProfile(
             key="games",
