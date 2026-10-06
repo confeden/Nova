@@ -24,6 +24,29 @@ SPOTIFY_DOMAINS = (
     "heads4-ak-spotify-com.akamaized.net",
 )
 
+# AI apps — Claude, Codex/ChatGPT, OpenCode (owner, 2026-10-05: through the secondary slot while
+# Nova runs). The desktop apps use the system proxy, so the PAC routes these names by the
+# «ИИ-приложения» row; the CLIs ignore the system proxy and are caught by process instead. A browser
+# on these sites follows the same row: one choice for everything the agents talk to.
+AI_APP_DOMAINS = (
+    # Anthropic / Claude
+    "claude.ai", "claude.com", "claude.site", "clau.de", "claudeusercontent.com", "anthropic.com",
+    # OpenAI / ChatGPT / Codex
+    "chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com",
+    # OpenCode
+    "opencode.ai",
+)
+
+
+# Path substrings (lowercase) that mark an AI app. One tuple, read by the process matcher here and
+# by tcp_proxy's own family classifier, so the two cannot drift apart.
+AI_APP_PATH_MARKERS = (
+    "\\windowsapps\\claude_", "\\anthropicclaude\\", "\\claude\\claude-code\\",
+    "\\.local\\bin\\claude.exe",
+    "\\windowsapps\\openai.", "\\openai\\codex\\", "\\@openai\\codex\\",
+    "\\opencode.exe", "\\@opencode-ai",
+)
+
 
 @lru_cache(maxsize=1)
 def get_default_app_routing_profiles():
@@ -97,6 +120,22 @@ def get_default_app_routing_profiles():
             process_path_regex=r"(?i).*([\\/]spotify[\\/]spotify\.exe|spotifyab\.spotifymusic|studio by spotify labs).*",
             path_markers=("\\spotify\\spotify.exe", "spotifyab.spotifymusic", "studio by spotify labs"),
         ),
+        # Claude: the Store build under WindowsApps\Claude_* (Claude.exe, cowork-svc.exe), its
+        # bundled Claude Code under %APPDATA%\Claude\claude-code\<ver>\claude.exe, the standalone
+        # CLI in ~\.local\bin\claude.exe, the old Squirrel build in %LOCALAPPDATA%\AnthropicClaude.
+        # Codex/ChatGPT: the Store app WindowsApps\OpenAI.Codex_* (ChatGPT.exe, Codex.exe, codex.exe)
+        # and the CLI in %LOCALAPPDATA%\[Programs\]OpenAI\Codex\bin\codex.exe; npm's @openai/codex
+        # runs a native codex.exe under its folder. OpenCode: the desktop app OpenCode.exe and npm's
+        # opencode-ai, which ships a native opencode.exe. Agents run as plain node.exe (Claude Code
+        # from npm) cannot be told apart from any other node by path and are not caught.
+        "ai_apps": AppRoutingProfile(
+            key="ai_apps",
+            display_name="AI Apps",
+            process_names=("Claude.exe", "claude.exe", "cowork-svc.exe", "ChatGPT.exe", "Codex.exe",
+                           "codex.exe", "OpenCode.exe", "opencode.exe"),
+            process_path_regex=r"(?i).*(\\windowsapps\\(claude_|openai\.)|\\anthropicclaude\\|\\claude\\claude-code\\|\\\.local\\bin\\claude\.exe|\\@?openai\\codex\\|\\opencode\.exe|\\@opencode-ai).*",
+            path_markers=AI_APP_PATH_MARKERS,
+        ),
         "games": AppRoutingProfile(
             key="games",
             display_name="Games",
@@ -125,3 +164,22 @@ def match_app_by_process_path(process_path):
             if marker and marker in path_value:
                 return profile.display_name
     return None
+
+
+VPN_ROUTE_MODES = ("warp", "opera")
+
+
+def name_in_domains(name, domains):
+    """True when `name` is one of `domains` or a subdomain of one."""
+    host = str(name or "").strip().lower().lstrip(".")
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def drop_family_names(rules, family_domains):
+    """NRPT rules without the names of a family that rides a VPN slot.
+
+    The AI-unlock rules send a name's DNS to an unblocker, whose answer is the unblocker's own
+    proxy. Claude Code is redirected by address, so with those rules in place its "secondary VPN"
+    connection would reach Anthropic from the unblocker's server, not from the slot's exit.
+    """
+    return {ns: srvs for ns, srvs in dict(rules or {}).items() if not name_in_domains(ns, family_domains)}

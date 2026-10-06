@@ -36,6 +36,12 @@ except Exception:  # модуль не найден — лучше писать 
     def redact_user_paths_in_text(value):
         return value
 
+# Which processes are AI apps: one tuple shared with nova.pyw's matcher (nova_routing_profiles).
+try:
+    from nova_routing_profiles import AI_APP_PATH_MARKERS
+except Exception:  # the module ships beside this one (RESOURCE_ROOT_FILES); without it, no family
+    AI_APP_PATH_MARKERS = ()
+
 
 
 def _data_path(*parts):
@@ -243,6 +249,8 @@ ROUTING_GROUP_ALIASES = {
     "poe": "games",
     "obs": "obs",
     "spotify": "spotify",
+    "ai_apps": "ai_apps",
+    "claude": "ai_apps",
 }
 
 
@@ -295,6 +303,55 @@ def _load_domain_list(name: str) -> set:
     _DOMAIN_LISTS_CACHE[name] = domains
     _DOMAIN_LISTS_MTIMES[name] = mtime
     return domains
+
+
+# Families whose redirected TLS is dialled upstream by the name in its ClientHello, not by the
+# address the app connected to. That address came from the local DNS, and on a machine whose DNS is
+# an AI unblocker (dns-ai.ru) it is the unblocker's own proxy (62.60.230.61 for api.anthropic.com):
+# CONNECTing to it through the secondary slot reached the unblocker from abroad, which took the
+# ClientHello and closed with zero bytes back (measured 2026-10-05, 20 of 20 flows). By name, the
+# slot resolves it on its own side and the app reaches the real service from the slot's exit.
+DIAL_BY_SNI_FAMILIES = frozenset({"ai_apps"})
+TLS_HELLO_READ_TIMEOUT = 1.5
+TLS_HELLO_MAX_BYTES = 16384 + 5
+
+
+def _tls_client_hello_sni(data: bytes) -> str:
+    """server_name from a TLS ClientHello record, lowercase; "" when absent or malformed."""
+    try:
+        if len(data) < 9 or data[0] != 0x16:
+            return ""
+        record_len = int.from_bytes(data[3:5], "big")
+        body = data[5:5 + record_len]
+        if len(body) < 4 or body[0] != 0x01:
+            return ""
+        p = 4 + 2 + 32                                   # handshake header, version, random
+        p += 1 + body[p]                                 # session id
+        p += 2 + int.from_bytes(body[p:p + 2], "big")    # cipher suites
+        p += 1 + body[p]                                 # compression methods
+        end = min(len(body), p + 2 + int.from_bytes(body[p:p + 2], "big"))
+        p += 2
+        while p + 4 <= end:
+            ext_type = int.from_bytes(body[p:p + 2], "big")
+            ext_len = int.from_bytes(body[p + 2:p + 4], "big")
+            p += 4
+            if ext_type == 0:
+                q, ext_end = p + 2, min(end, p + ext_len)
+                while q + 3 <= ext_end:
+                    name_type = body[q]
+                    name_len = int.from_bytes(body[q + 1:q + 3], "big")
+                    q += 3
+                    if name_type == 0:
+                        name = body[q:q + name_len].decode("ascii", "ignore").strip().lower().rstrip(".")
+                        if name and all(c.isalnum() or c in "-." for c in name) and "." in name:
+                            return name
+                        return ""
+                    q += name_len
+                return ""
+            p += ext_len
+    except Exception:
+        return ""
+    return ""
 
 
 def _match_domain(host: str, domain_set: set) -> bool:
@@ -655,6 +712,8 @@ class NovaWfpTcpProxy:
             return "obs"
         if any(token in lower for token in ("\\spotify\\spotify.exe", "spotifyab.spotifymusic", "studio by spotify labs")):
             return "spotify"
+        if any(token in lower for token in AI_APP_PATH_MARKERS):
+            return "ai_apps"
         if "pathofexile" in lower or "path of exile" in lower or " poe" in lower or lower.endswith("\\poe") or "client.exe" in lower:
             return "games"
         return ""
@@ -1044,6 +1103,8 @@ class NovaWfpTcpProxy:
             route_mode_key = "obs"
         elif app_family == "spotify":
             route_mode_key = "spotify"
+        elif app_family == "ai_apps":
+            route_mode_key = "ai_apps"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
         games_auto_warp = route_mode_key == "games" and route_mode == "auto"
         is_eu_route_target = False
@@ -1434,6 +1495,32 @@ class NovaWfpTcpProxy:
         if last_error is None:
             last_error = OSError("no upstream attempts available")
         raise last_error
+
+    async def _read_tls_client_hello(self, reader: asyncio.StreamReader, timeout: float = TLS_HELLO_READ_TIMEOUT) -> bytes:
+        """The first TLS record from the client (normally the whole ClientHello), or what came in time.
+
+        Whatever is read is forwarded upstream unchanged, so a short or non-TLS read costs nothing
+        but the wait: the caller then simply dials by address as before.
+        """
+        data = bytearray()
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        want = 5
+        while len(data) < want:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                chunk = await asyncio.wait_for(reader.read(want - len(data)), timeout=max(0.05, remaining))
+            except asyncio.TimeoutError:
+                break
+            if not chunk:
+                break
+            data.extend(chunk)
+            if want == 5 and len(data) >= 5:
+                if data[0] != 0x16:
+                    break
+                want = min(TLS_HELLO_MAX_BYTES, 5 + int.from_bytes(bytes(data[3:5]), "big"))
+        return bytes(data)
 
     async def _read_initial_probe(self, reader: asyncio.StreamReader, want: int = 64, timeout: float = TG_INITIAL_PROBE_TIMEOUT) -> bytes:
         data = bytearray()
@@ -2042,6 +2129,14 @@ class NovaWfpTcpProxy:
                 ):
                     if _get_app_route_mode("telegram") == "direct":
                         preferred_egress = 3
+            dial_host = target_host
+            if (not initial_data and int(target_port) == 443
+                    and str(app_family or "").strip().lower() in DIAL_BY_SNI_FAMILIES):
+                initial_data = await self._read_tls_client_hello(reader)
+                sni = _tls_client_hello_sni(initial_data)
+                if sni:
+                    dial_host = sni
+                    target_note = f"{target_note} sni={sni}"
             route_attempts = self._build_attempts_for_target(
                 target_host,
                 int(target_port),
@@ -2062,7 +2157,7 @@ class NovaWfpTcpProxy:
                 )
             elif initial_data:
                 upstream_reader, upstream_writer, route_label, route_open_ms = await self._open_upstream_with_attempts(
-                    target_host,
+                    dial_host,
                     int(target_port),
                     route_attempts,
                     route_scope=route_scope,

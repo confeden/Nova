@@ -287,7 +287,7 @@ if getattr(sys, 'frozen', False):
     except Exception:
         pass
 from nova_platform import is_windows_admin
-from nova_routing_profiles import SPOTIFY_DOMAINS, get_default_app_routing_profiles, match_app_by_process_path
+from nova_routing_profiles import AI_APP_DOMAINS, SPOTIFY_DOMAINS, VPN_ROUTE_MODES, drop_family_names, get_default_app_routing_profiles, match_app_by_process_path
 from nova_privacy import mask_provider_ip, redact_user_path, redact_user_paths_in_text
 from nova_route_flap import hold_route, FlapPenalty, OPERA_HOLD, WARP_HOLD, WARP_PENALTY_SETTINGS
 from nova_temp_log import trim_to_tail
@@ -8733,6 +8733,8 @@ try:
                 whatsapp_route = _route_for_app_mode(whatsapp_mode, ru_route)
                 spotify_mode = get_routing_app_mode("spotify", routing_settings)
                 spotify_route = _route_for_app_mode(spotify_mode, eu_route)
+                ai_apps_mode = get_routing_app_mode("ai_apps", routing_settings)
+                ai_apps_route = _route_for_app_mode(ai_apps_mode, eu_route)
                 pac_mode = str(pac_config.get("mode") or "hybrid").strip().lower()
                 pac_full_route = _route_for_target(pac_config.get("full_target"), strict=True)
                 # Без хвоста DIRECT сайты из exclude (госуслуги, банки, маркетплейсы
@@ -8777,6 +8779,7 @@ try:
                 telegram_ips_js = json.dumps(telegram_ips)
                 whatsapp_js = "{" + ",".join(f'"{d}":1' for d in sorted(whatsapp_domains)) + "}"
                 spotify_js = "{" + ",".join(f'"{d}":1' for d in sorted(SPOTIFY_DOMAINS)) + "}"
+                ai_apps_js = "{" + ",".join(f'"{d}":1' for d in sorted(AI_APP_DOMAINS)) + "}"
                 youtube_js = "{" + ",".join(f'"{d}":1' for d in sorted(youtube_domains)) + "}"
 
                 # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
@@ -8894,6 +8897,7 @@ try:
                     ("telegram", telegram_mode, telegram_route),
                     ("whatsapp", whatsapp_mode, whatsapp_route),
                     ("spotify", spotify_mode, spotify_route),
+                    ("ai_apps", ai_apps_mode, ai_apps_route),
                 ):
                     if str(_mode or "auto").strip().lower() != "auto":
                         app_domain_priority += (
@@ -8929,6 +8933,7 @@ var ai_region_direct = {ai_region_direct_js};
     var telegram_ips = {telegram_ips_js};
     var whatsapp = {whatsapp_js};
     var spotify = {spotify_js};
+    var ai_apps = {ai_apps_js};
     var youtube = {youtube_js};
     var user_ru_ips = {user_ru_ips_js};
     var user_eu_ips = {user_eu_ips_js};
@@ -14208,7 +14213,7 @@ function FindProxyForURLEx(url, host) {{
 
     ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "temp", "routing_settings.json")
     LEGACY_ROUTING_SETTINGS_PATH = os.path.join(get_base_dir(), "routing_settings.json")
-    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "games", "obs", "spotify")
+    ROUTING_GROUP_KEYS = ("browser", "telegram", "whatsapp", "discord", "games", "obs", "spotify", "ai_apps")
     ROUTING_MODE_VALUES = {"auto", "warp", "opera", "direct"}
     # Modes only the browser group may carry. Tor is TCP-only and slow, so it never becomes
     # the egress of the relay, the WFP/Divert proxies or the UDP path (DESIGN.md §9); the
@@ -14227,6 +14232,9 @@ function FindProxyForURLEx(url, host) {{
         "obs64": "obs",
         "obs32": "obs",
         "spotify": "spotify",
+        "ai_apps": "ai_apps",
+        # 1.42 draft name of the row, before Codex and OpenCode joined it.
+        "claude": "ai_apps",
     }
     DEFAULT_ROUTING_SETTINGS = {
         "version": CURRENT_VERSION,
@@ -14251,6 +14259,9 @@ function FindProxyForURLEx(url, host) {{
             "obs": "direct",
             # Spotify (and Studio by Spotify Labs) on the secondary slot: owner, 2026-10-04.
             "spotify": "opera",
+            # AI apps (Claude, Codex/ChatGPT, OpenCode — desktop and CLI) on the secondary slot:
+            # owner, 2026-10-05.
+            "ai_apps": "opera",
         },
         "system": {
             "suppress_game_overlay": False,
@@ -15156,6 +15167,13 @@ function FindProxyForURLEx(url, host) {{
 
                 support = _nrpt_support(log_func)
                 desired = dict(nova_dns_probe.rules(support, NOVA_NRPT_NAMESERVER_CASCADE))
+                # ИИ-приложения на VPN-слоте: их имена мимо разблокировщика, иначе агент,
+                # перехваченный по адресу, выходил бы к сервису с сервера разблокировщика.
+                if get_routing_app_mode("ai_apps") in VPN_ROUTE_MODES:
+                    kept = drop_family_names(desired, AI_APP_DOMAINS)
+                    if len(kept) != len(desired) and log_func:
+                        log_func(f"[NRPT] ИИ-приложения идут через VPN: {len(desired) - len(kept)} имён без DNS-разблокировщика.")
+                    desired = kept
                 if not desired:
                     _remove_nrpt_dns_unblock_unlocked(log_func=log_func, silent=True)
                     if log_func:
@@ -31365,6 +31383,7 @@ function FindProxyForURLEx(url, host) {{
             ("games", "Games"),
             ("obs", "OBS"),
             ("spotify", "Spotify"),
+            ("ai_apps", "ИИ-приложения"),
         )
         # "warp" and "opera" are the two VPN slots now: the primary (Cloudflare or Proton) and the
         # secondary (Opera or Tor). The stored values stay, so settings of every version still read.
@@ -31486,6 +31505,9 @@ function FindProxyForURLEx(url, host) {{
             prev_sys = previous.get("system") or {}
             new_sys = saved.get("system") or {}
             ai_unlock_changed = bool(prev_sys.get("ai_unlock", True)) != bool(new_sys.get("ai_unlock", True))
+            # Строка «ИИ-приложения» решает, входят ли их имена в правила NRPT (drop_family_names).
+            ai_apps_vpn_changed = ((get_routing_app_mode("ai_apps", previous) in VPN_ROUTE_MODES)
+                                   != (get_routing_app_mode("ai_apps", saved) in VPN_ROUTE_MODES))
             prev_browser_mode = get_routing_group_mode("browser", previous)
             new_browser_mode = get_routing_group_mode("browser", saved)
             tor_route_changed = prev_browser_mode != new_browser_mode and "tor" in (prev_browser_mode, new_browser_mode)
@@ -31553,7 +31575,7 @@ function FindProxyForURLEx(url, host) {{
                     logger(f"[Tor] Ошибка применения маршрута Tor: {e}")
 
             # 3. AI DNS unlock (only if ai_unlock setting changed)
-            if ai_unlock_changed:
+            if ai_unlock_changed or (ai_apps_vpn_changed and bool(new_sys.get("ai_unlock", True))):
                 try:
                     ai_unlock_enabled = bool(new_sys.get("ai_unlock", True))
                     if ai_unlock_enabled:

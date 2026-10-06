@@ -407,7 +407,7 @@ class ObserverService:
             data = addr.Socket
         pid = int(data.ProcessId)
         process_path, app = self.resolver.resolve(pid)
-        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "OBS", "Spotify"}:
+        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "OBS", "Spotify", "AI Apps"}:
             return None
         local_ip = self._format_addr(data.LocalAddr)
         remote_ip = self._format_addr(data.RemoteAddr)
