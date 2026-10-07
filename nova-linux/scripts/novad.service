@@ -1,0 +1,22 @@
+[Unit]
+Description=Nova Linux Adaptive Core Networking Daemon
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/novad --socket /run/nova/novad.sock
+Restart=on-failure
+RestartSec=3s
+
+# Capability-based security: only grant network admin privileges
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+LimitNOFILE=65535
+
+# Graceful termination: allows clean removal of nftables and tun interfaces
+KillSignal=SIGTERM
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target
