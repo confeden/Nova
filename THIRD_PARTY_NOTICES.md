@@ -111,9 +111,9 @@ to the terms and license conditions of its upstream project and its own
 dependencies.
 
 `bin/warp-cli.exe`, `bin/warp-svc.exe`,
-`bin/aws_lc_fips_0_13_14_crypto.dll`, `bin/wintun.dll`
+`bin/aws_lc_fips_0_14_2_crypto.dll`, `bin/wintun.dll`
 Files taken from the official Cloudflare WARP distribution (client version
-2026.7.1210.1). These files remain subject to Cloudflare's terms and to any
+2026.8.2033.1). These files remain subject to Cloudflare's terms and to any
 upstream component licenses applicable to the shipped runtime.
 Reference links:
 - https://developers.cloudflare.com/warp-client/

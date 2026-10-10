@@ -2155,6 +2155,16 @@ def _amnezia_candidate(key, stem):
         payload = _decode_amnezia_payload(key)
     except ValueError:
         return _invalid_candidate(stem or "Amnezia vpn://", [ISSUE_AMNEZIA_UNREADABLE])
+    api_config = payload.get("api_config")
+    if isinstance(api_config, dict) or isinstance(payload.get("auth_data"), dict):
+        # A subscription key (Amnezia Premium/Free): only an API key for Amnezia's own gateway,
+        # no server and no config inside. Nova does not talk to that gateway by design.
+        service = _json_str(payload.get("name")) or (
+            _json_str(api_config.get("service_type")) if isinstance(api_config, dict) else "") or "Amnezia"
+        return _invalid_candidate(stem or service, [
+            f"Это ключ подписки {service}, а не VPN-конфигурация: в нём нет сервера, только доступ к "
+            f"API Amnezia. Nova такие ключи не поддерживает — экспортируйте в Amnezia нативный "
+            f"AWG-конфиг (.conf) и импортируйте его."])
     host = _json_str(payload.get("hostName"))
     default_container = _json_str(payload.get("defaultContainer"))
     dns1, dns2 = _json_str(payload.get("dns1")), _json_str(payload.get("dns2"))

@@ -182,12 +182,12 @@ begin
     'if ($procs -or ($svc -and $svc.State -eq ''Running'')) { ' +
     '  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); ' +
     '  if (-not $isAdmin) { ' +
-    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-xray.exe /IM nova-tor.exe /IM nova-lyrebird.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
-    '    Start-Process sc.exe -ArgumentList ''stop CloudflareWARP'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
+    '    Start-Process taskkill -ArgumentList ''/F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-xray.exe /IM nova-tor.exe /IM nova-lyrebird.exe'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
+    '    Start-Process sc.exe -ArgumentList ''stop NovaWARP'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '    Start-Process sc.exe -ArgumentList ''stop WinDivert'' -Verb RunAs -WindowStyle Hidden -Wait; ' +
     '  } else { ' +
-    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp-cli.exe /IM warp-svc.exe /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-xray.exe /IM nova-tor.exe /IM nova-lyrebird.exe; ' +
-    '    sc.exe stop CloudflareWARP; ' +
+    '    taskkill /F /IM Nova.exe /IM winws.exe /IM winws_test.exe /IM opera-proxy* /IM warp.exe /IM wireproxy-awg.exe /IM nova-go.exe /IM nova-xray.exe /IM nova-tor.exe /IM nova-lyrebird.exe; ' +
+    '    sc.exe stop NovaWARP; ' +
     '    sc.exe stop WinDivert; ' +
     '  } ' +
     '}';
@@ -198,6 +198,55 @@ begin
   ExecHiddenAndWait(PsExe, Params);
   DeleteFile(ScriptPath);
   Sleep(1500); // Give processes time to fully terminate
+end;
+
+{ Shared service names left as found (resources/nova_foreign_services.py does the same on exit):
+  our warp-svc/warp-cli by path, never the official client's; the WinDivert registration when it
+  points into {app} (other WinDivert programs install their own); a CloudflareWARP an older Nova
+  took over is given back to the official client, or deleted when there is none. NovaWARP, Nova's
+  own service, is deleted on uninstall. Elevates only when there is something to release. }
+procedure ReleaseNovaServices(Uninstalling: Boolean);
+var
+  PsExe, Script, Params, ScriptPath, UninstallFlag: string;
+begin
+  PsExe := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  if not FileExists(PsExe) then
+    PsExe := 'powershell.exe';
+  if Uninstalling then
+    UninstallFlag := '$true'
+  else
+    UninstallFlag := '$false';
+
+  Script :=
+    '$ErrorActionPreference=''SilentlyContinue''; ' +
+    '$app = (''' + PsQuote(ExpandConstant('{app}')) + ''').TrimEnd(''\'').ToLower() + ''\''; ' +
+    '$uninstall = ' + UninstallFlag + '; ' +
+    'function Ours($n) { $p = (Get-ItemProperty ("HKLM:\SYSTEM\CurrentControlSet\Services\" + $n)).ImagePath; return ($p -and $p.ToLower().Contains($app)) }; ' +
+    '$cf = Ours ''CloudflareWARP''; $wd = Ours ''WinDivert''; ' +
+    '$nw = $uninstall -and (Test-Path ''HKLM:\SYSTEM\CurrentControlSet\Services\NovaWARP''); ' +
+    '$procs = Get-Process warp-svc, warp-cli | Where-Object { $_.Path -and $_.Path.ToLower().StartsWith($app) }; ' +
+    'if (-not ($cf -or $wd -or $nw -or $procs)) { exit 0 }; ' +
+    '$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); ' +
+    'if (-not $isAdmin) { Start-Process powershell.exe -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList (''-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'' + $PSCommandPath + ''"''); exit 0 }; ' +
+    'sc.exe stop NovaWARP | Out-Null; ' +
+    '$procs | Stop-Process -Force; ' +
+    'if ($nw) { sc.exe delete NovaWARP | Out-Null }; ' +
+    'if ($wd) { sc.exe stop WinDivert | Out-Null; Start-Sleep -Milliseconds 500; sc.exe delete WinDivert | Out-Null }; ' +
+    'if ($cf) { ' +
+    '  sc.exe stop CloudflareWARP | Out-Null; Start-Sleep -Milliseconds 800; ' +
+    '  $pf = $env:ProgramW6432; if (-not $pf) { $pf = $env:ProgramFiles }; ' +
+    '  $off = Join-Path $pf ''Cloudflare\Cloudflare WARP\warp-svc.exe''; ' +
+    '  if (Test-Path $off) { ' +
+    '    Start-Process sc.exe -Wait -WindowStyle Hidden -ArgumentList (''config CloudflareWARP binPath= "'' + $off + ''" start= auto DisplayName= "Cloudflare WARP"''); ' +
+    '    sc.exe start CloudflareWARP | Out-Null ' +
+    '  } else { sc.exe delete CloudflareWARP | Out-Null } ' +
+    '}';
+
+  ScriptPath := ExpandConstant('{tmp}\nova_services.ps1');
+  SaveStringToFile(ScriptPath, Script, False);
+  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + ScriptPath + '"';
+  ExecHiddenAndWait(PsExe, Params);
+  DeleteFile(ScriptPath);
 end;
 
 procedure OpenLicenseLink(Sender: TObject);
@@ -211,13 +260,17 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   NeedsRestart := False;
   ForceCloseNovaInstallBlockers;
+  ReleaseNovaServices(False);
   Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
+  begin
     ForceCloseNovaInstallBlockers;
+    ReleaseNovaServices(True);
+  end;
 end;
 
 procedure InitializeWizard;

@@ -40,6 +40,9 @@ downloads.claude.com
 claudeusercontent.com
 www.claudeusercontent.com
 bridge.claudeusercontent.com
+a.claude.ai
+s-cdn.anthropic.com
+assets-proxy.anthropic.com
 cline.bot
 grok.com
 chatgpt.com

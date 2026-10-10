@@ -24,7 +24,10 @@ TLS relay `https://nova-pc-<ver>:<pw>@relay.nova-app.eu:8443` -- urllib3 2.x spe
 an HTTPS proxy). Proxy URLs carry the relay password, so they are never logged: every
 log line uses `redact_proxy_url`, and exception text is scrubbed before it is logged.
 
-Human verification (Proton code 9001) is surfaced and never solved or routed around.
+Human verification (Proton code 9001) is never solved or routed around by Nova. A run the owner
+started by hand passes `human_verifier`: Proton's own CAPTCHA page is shown to them
+(nova_captcha_window) and the request that got 9001 is repeated once with their answer, as Proton's
+own clients do. An unattended run only says which button opens that window.
 
 Every run that reaches step 2 creates a new anonymous Proton account and gets a session-bound node
 subset (a set with entirely new names), so a normal run first reuses a complete, fresh set without
@@ -71,8 +74,12 @@ CERT_MODE = "persistent"
 CONNECT_TIMEOUT_S = 10.0
 READ_TIMEOUT_S = 25.0
 
-# Proton's human-verification challenge. Surfaced as-is: solving or dodging it is not ours to do.
+# Proton's human-verification challenge. Nova never solves it: the owner can, in the CAPTCHA window
+# of a run they started (`human_verifier`); the answer goes back in these two headers.
 CODE_HUMAN_VERIFICATION = 9001
+HV_TOKEN_HEADER = "x-pm-human-verification-token"
+HV_TOKEN_TYPE_HEADER = "x-pm-human-verification-token-type"
+HV_METHOD_CAPTCHA = "captcha"
 
 # --- Layout (mirrors nova_profiles; kept literal so this module imports on its own) -----------
 
@@ -687,7 +694,7 @@ class ProtonApiError(Exception):
     """A Proton API step failed. `transport` = nobody answered; otherwise Proton said no."""
 
     def __init__(self, message, *, status=None, code=None, error="", transport=False,
-                 relay_outdated=False):
+                 relay_outdated=False, hv_token="", hv_methods=(), answered_by=None):
         super().__init__(message)
         self.message = message
         self.status = status
@@ -695,6 +702,22 @@ class ProtonApiError(Exception):
         self.error = error
         self.transport = transport
         self.relay_outdated = relay_outdated
+        # Code 9001 only: Details.HumanVerificationToken / HumanVerificationMethods, and the
+        # (route index, host) that asked, so the verified repeat goes the same way.
+        self.hv_token = hv_token
+        self.hv_methods = tuple(hv_methods or ())
+        self.answered_by = answered_by
+
+
+def _hv_details(data):
+    """(HumanVerificationToken, methods) from a 9001 answer's Details; ("", ()) when absent."""
+    details = data.get("Details") if isinstance(data, dict) else None
+    if not isinstance(details, dict):
+        return "", ()
+    token = str(details.get("HumanVerificationToken") or "").strip()
+    methods = details.get("HumanVerificationMethods")
+    methods = tuple(str(m).strip().lower() for m in methods) if isinstance(methods, list) else ()
+    return token, methods
 
 
 class _Route:
@@ -755,8 +778,12 @@ class ProtonClient:
     the whole run minutes long (Android `preferredDirectHost` / `relayProven`).
     """
 
-    def __init__(self, device, *, log=None, proxies=(), direct=True, hosts=None, scrub=None):
+    def __init__(self, device, *, log=None, proxies=(), direct=True, hosts=None, scrub=None,
+                 human_verifier=None):
         self.device = device
+        # human_verifier(api_host, hv_token, proxy_url) -> (answer or None, reason): shows the
+        # CAPTCHA to the owner. None: a 9001 ends the call as before.
+        self._human_verifier = human_verifier
         self._hosts = tuple(hosts if hosts is not None else API_HOSTS)
         self._log = _safe_log(log, scrub or _Scrubber(proxies))
         self._routes = []
@@ -837,13 +864,49 @@ class ProtonClient:
     def call(self, method, path, body=None, auth=None):
         """One API call over all routes. Returns the JSON object or raises ProtonApiError.
 
-        An answer from Proton with an error Code is final for the call (another route reaches
+        On Code 9001 with a `human_verifier` and a CAPTCHA among the offered methods, the owner
+        solves it and the same request is repeated once, on the route and host that asked, with
+        the answer in the HV headers. A second 9001 is final.
+        """
+        try:
+            return self._call(method, path, body, auth)
+        except ProtonApiError as exc:
+            if exc.code != CODE_HUMAN_VERIFICATION or self._human_verifier is None or not exc.hv_token:
+                raise
+            if exc.hv_methods and HV_METHOD_CAPTCHA not in exc.hv_methods:
+                raise
+            label = path.split("?", 1)[0]
+            route_index, host = exc.answered_by or (0, self._hosts[0])
+            proxy_url = self._routes[route_index].proxy_url if route_index < len(self._routes) else None
+            self._log(f"{LOG_PREFIX} {label}: Proton просит проверку человеком — открываю окно с капчей, "
+                      "решите её, и выпуск продолжится")
+            try:
+                answer, reason = self._human_verifier(host, exc.hv_token, proxy_url)
+            except Exception as verifier_exc:
+                answer, reason = None, f"окно капчи упало: {type(verifier_exc).__name__}"
+            if not answer:
+                message = f"проверка человеком не пройдена (Code {exc.code}): {reason or 'ответа нет'}"
+                self._log(f"{LOG_PREFIX} {label}: {message}")
+                raise ProtonApiError(message, status=exc.status, code=exc.code, error=exc.error) from None
+            self._log(f"{LOG_PREFIX} {label}: капча решена — повторяю запрос с ответом")
+            self._preferred = (route_index, host)
+            return self._call(method, path, body, auth, extra_headers={
+                HV_TOKEN_TYPE_HEADER: HV_METHOD_CAPTCHA,
+                HV_TOKEN_HEADER: answer,
+            })
+
+    def _call(self, method, path, body=None, auth=None, extra_headers=None):
+        """One pass over all routes.
+
+        An answer from Proton with an error Code is final for the pass (another route reaches
         the same backend and would repeat it, and routing around 9001 or a rate limit is not
         ours to do). Only "nobody answered" -- transport errors, 5xx, non-JSON pages -- moves on.
         """
         label = path.split("?", 1)[0]
         payload = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
         headers = self._headers(auth, payload is not None)
+        if extra_headers:
+            headers.update(extra_headers)
         failures = []
         started = time.monotonic()
         for route_index, route, hosts in self._attempt_order():
@@ -897,15 +960,22 @@ class ProtonClient:
                 if isinstance(data, dict) and ("Code" in data or "Error" in data) and status < 500:
                     code = _opt_int(data.get("Code"), None)
                     error = _clean_api_text(data.get("Error"))
+                    hv_token, hv_methods = "", ()
                     if code == CODE_HUMAN_VERIFICATION:
-                        message = (
-                            f"Proton требует проверку человеком (Code {code}) — Nova её не проходит, "
-                            "выпуск остановлен; попробуйте позже"
-                        )
+                        hv_token, hv_methods = _hv_details(data)
+                        if self._human_verifier is not None and hv_token:
+                            message = f"Proton требует проверку человеком (Code {code})"
+                        else:
+                            message = (
+                                f"Proton требует проверку человеком (Code {code}) — нажмите «Выпустить "
+                                "профили» на вкладке Proton в окне профилей и решите капчу"
+                            )
                     else:
                         message = f"Proton ответил HTTP {status}, Code {code}: {error or 'без описания'}"
                     self._log(f"{LOG_PREFIX} {label}: {message} ({route.label}, {_host_of(host)})")
-                    raise ProtonApiError(message, status=status, code=code, error=error)
+                    raise ProtonApiError(message, status=status, code=code, error=error,
+                                         hv_token=hv_token, hv_methods=hv_methods,
+                                         answered_by=(route_index, host))
                 reason = f"HTTP {status}" + (", не JSON" if data is None else "")
                 self._log(f"{LOG_PREFIX} {label}: {_host_of(host)} {route.label} — {reason}")
                 failures.append(reason)
@@ -1503,7 +1573,8 @@ def _previous_set_nodes(group_dir, names, own_keys, known_nodes):
     return carried
 
 
-def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False, progress=None, liveness=None):
+def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False, progress=None, liveness=None,
+                   human_verifier=None):
     """Issue the Proton profile set into `profiles/AWG Proton/`. Never raises; returns a summary.
 
     A normal run keeps a complete set written with the live key and does not touch the network
@@ -1522,6 +1593,8 @@ def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False
     kept. Nodes are deliberately not probed here: measured 2026-09-15, a burst of handshakes across
     dozens of servers left the most-used nodes refusing the key for tens of minutes, and a finished
     handshake takes the key over from a live tunnel (nova_wg_probe).
+    `human_verifier` (ProtonClient) is passed only by a run the owner started by hand: it shows a
+    CAPTCHA window and blocks until they answer or close it.
     """
     proxies = tuple(str(p).strip() for p in (proxies or ()) if str(p or "").strip())
     scrub = _Scrubber(proxies)
@@ -1533,7 +1606,8 @@ def issue_profiles(base_dir, *, log, proxies=(), count=TARGET_COUNT, force=False
         emit(f"{LOG_PREFIX} {summary['error']} — второй не начинаю")
         return summary
     try:
-        _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress, liveness)
+        _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress, liveness,
+               human_verifier)
     except _Cancelled:
         summary["cancelled"] = True
         summary["ok"] = False
@@ -1598,7 +1672,8 @@ def _source_text(source):
     return "живой список" if source == NODES_SOURCE_LIVE else "встроенный список"
 
 
-def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress, liveness=None):
+def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, progress, liveness=None,
+           human_verifier=None):
     def step(text):
         emit(f"{LOG_PREFIX} {text}")
         if progress is not None:
@@ -1718,7 +1793,7 @@ def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, pro
         "last_attempt_at": now,
     })
 
-    client = ProtonClient(device, log=emit, proxies=proxies, scrub=scrub)
+    client = ProtonClient(device, log=emit, proxies=proxies, scrub=scrub, human_verifier=human_verifier)
     try:
         step("создаю сессию")
         auth = None

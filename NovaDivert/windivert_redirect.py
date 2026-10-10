@@ -71,6 +71,17 @@ NETWORK_CAPTURE_SIZE = 0xFFFF
 MAP_TTL_SECONDS = 300.0
 MAP_REMOVE_GRACE_SECONDS = 20.0
 WINDIVERT_REDIRECT_NETWORK_PRIORITY = -1190
+
+# Loopback to 127.0.0.0/8 and ::1 is never rewritten here: a redirect goes to the LAN address
+# (see _as_local_proxy_inbound) and only global destinations are taken. Leaving it in the filter
+# put every browser<->1370/1371 byte and every watchdog probe of those ports through this Python
+# loop; under a bulk download (Steam) its queue made a loopback connect miss the watchdog's 0.6 s,
+# which read as «порт 1370 закрыт» / «порт 1371 недоступен» on live tunnels. The ternary form is
+# what WinDivertHelperCompileFilter accepts; `not (...)` around a field test does not compile.
+NETWORK_FILTER = (
+    "outbound and (tcp or udp) and not impostor and "
+    "(ipv6 ? ipv6.DstAddr != ::1 : (ip.DstAddr < 127.0.0.0 or ip.DstAddr > 127.255.255.255))"
+)
 WINDIVERT_REDIRECT_EVENT_PRIORITY = 1191
 WINDIVERT_FLAG_OUTBOUND_BIT = 1 << 17
 WINDIVERT_FLAG_LOOPBACK_BIT = 1 << 18
@@ -697,9 +708,16 @@ def _tuple_key(proto, src_ip, src_port, dst_ip, dst_port):
     )
 
 
+# RFC 6598 shared space: `is_private` is False for it, but it is never an internet host. Tailscale
+# hands out 100.64.0.0/10 (peers, MagicDNS at 100.100.100.100), so those flows stay untouched.
+_SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _is_global_target(host):
     try:
         addr = ipaddress.ip_address(str(host or ""))
+        if addr.version == 4 and addr in _SHARED_ADDRESS_SPACE:
+            return False
         return not (addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_private)
     except ValueError:
         return False
@@ -793,7 +811,7 @@ def _rewrite_ipv4_udp(packet, *, src_ip=None, src_port=None, dst_ip=None, dst_po
 
 
 class RedirectService:
-    def __init__(self, log_path, state_path, map_path, tcp_proxy_port=17870, udp_proxy_port=17871, telegram_relay_port=1372, filter_text="outbound and (tcp or udp) and not impostor"):
+    def __init__(self, log_path, state_path, map_path, tcp_proxy_port=17870, udp_proxy_port=17871, telegram_relay_port=1372, filter_text=NETWORK_FILTER):
         self.base_dir = BASE_DIR
         self.bin_dir = os.path.join(self.base_dir, "bin")
         self.log_path = log_path
@@ -803,7 +821,7 @@ class RedirectService:
         self.tcp_proxy_port = int(tcp_proxy_port)
         self.udp_proxy_port = int(udp_proxy_port)
         self.telegram_relay_port = int(telegram_relay_port)
-        self.filter_text = str(filter_text or "outbound and (tcp or udp) and not impostor")
+        self.filter_text = str(filter_text or NETWORK_FILTER)
         self.api = WinDivertApi(self.bin_dir)
         self.resolver = ProcessResolver()
         self.state = RedirectState()
@@ -1602,7 +1620,7 @@ def main():
     parser.add_argument("--tcp-proxy-port", type=int, default=17870)
     parser.add_argument("--udp-proxy-port", type=int, default=17871)
     parser.add_argument("--telegram-relay-port", type=int, default=1372)
-    parser.add_argument("--filter", default="outbound and (tcp or udp) and not impostor")
+    parser.add_argument("--filter", default=NETWORK_FILTER)
     args = parser.parse_args()
     try:
         _write_bootstrap_log(args.log, "[NovaDivert][Redirect] bootstrap.")

@@ -261,6 +261,12 @@ _RESOURCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resou
 if os.path.isdir(_RESOURCES_DIR) and _RESOURCES_DIR not in sys.path:
     sys.path.insert(0, _RESOURCES_DIR)
 
+# Окно капчи Proton (nova_captcha_window): Nova.exe --proton-captcha показывает одно окно и выходит,
+# до мьютекса, перезапуска от администратора и заставки.
+if "--proton-captcha" in sys.argv:
+    import nova_captcha_window as _nova_captcha_window
+    sys.exit(_nova_captcha_window.main(sys.argv[1:]))
+
 from nova_console_logging import (
     SessionConsoleLogWriter,
     format_session_console_log_lines,
@@ -287,6 +293,9 @@ if getattr(sys, 'frozen', False):
     except Exception:
         pass
 from nova_platform import is_windows_admin
+from nova_foreign_services import (NOVA_WARP_DISPLAY_NAME, NOVA_WARP_SERVICE, delete_windivert_if_nova,
+                                   kill_images_in_dir, official_warp_service_running, official_warp_svc_path,
+                                   release_legacy_warp_service)
 from nova_routing_profiles import AI_APP_DOMAINS, SPOTIFY_DOMAINS, VPN_ROUTE_MODES, drop_family_names, get_default_app_routing_profiles, match_app_by_process_path
 from nova_privacy import mask_provider_ip, redact_user_path, redact_user_paths_in_text
 from nova_route_flap import hold_route, FlapPenalty, OPERA_HOLD, WARP_HOLD, WARP_PENALTY_SETTINGS
@@ -299,8 +308,10 @@ import nova_general_scope
 from nova_relay_env import relay_env_from_settings
 from nova_socks_probe import probe_socks5_payload
 import nova_profiles
+import nova_tk_clipboard
 import nova_warp_generator
 import nova_proton
+import nova_captcha_window
 import nova_tor
 import nova_vpn_slots
 import nova_exit_probe
@@ -1235,8 +1246,13 @@ try:
     # не перезапишется, старый warp-svc остался бы на диске уже без своей
     # aws_lc_fips_0_13_7_crypto.dll, и WARP перестал бы работать совсем. Лучше
     # оставить лишние 7 МБ, чем выключить пользователю VPN.
-    OBSOLETE_BIN_GUARD = "aws_lc_fips_0_13_14_crypto.dll"
+    OBSOLETE_BIN_GUARD = "aws_lc_fips_0_14_2_crypto.dll"
+    # The binary that imports the guard library: cleanup also waits until it is the new one,
+    # because a busy warp-svc.exe is skipped by the copy while the new DLL still lands.
+    OBSOLETE_BIN_GUARD_USER = "warp-svc.exe"
     OBSOLETE_BIN_FILES = (
+        # Cloudflare WARP 2026.8 (2026.8.2033.1): warp-svc imports aws_lc_fips_0_14_2 instead.
+        "aws_lc_fips_0_13_14_crypto.dll",
         # Cloudflare WARP 2026.7 линкует часть crypto статически и переименовал
         # оставшуюся библиотеку.
         "aws_lc_fips_0_13_7_crypto.dll",
@@ -1432,7 +1448,15 @@ try:
                     # Чистим только когда замена уже на диске. См. комментарий у
                     # OBSOLETE_BIN_GUARD: иначе неудачный порядок обновления
                     # оставил бы старый warp-svc без его crypto-библиотеки.
-                    if os.path.exists(os.path.join(target_folder_path, OBSOLETE_BIN_GUARD)):
+                    _guard_user_src = os.path.join(internal_source, OBSOLETE_BIN_GUARD_USER)
+                    _guard_user_dst = os.path.join(target_folder_path, OBSOLETE_BIN_GUARD_USER)
+                    _guard_user_current = True
+                    try:
+                        if os.path.exists(_guard_user_src) and os.path.exists(_guard_user_dst):
+                            _guard_user_current = calculate_file_hash(_guard_user_src) == calculate_file_hash(_guard_user_dst)
+                    except Exception:
+                        _guard_user_current = False
+                    if _guard_user_current and os.path.exists(os.path.join(target_folder_path, OBSOLETE_BIN_GUARD)):
                         for stale in OBSOLETE_BIN_FILES:
                             stale_path = os.path.join(target_folder_path, stale)
                             if os.path.exists(stale_path) and not os.path.exists(os.path.join(internal_source, stale)):
@@ -1614,7 +1638,9 @@ try:
         Supports portable service installation if WARP is not installed system-wide.
         """
         
-        SERVICE_NAME = "CloudflareWARP"
+        # Not "CloudflareWARP": that is the official Cloudflare One client's service, and sharing
+        # the name kept the official client from starting even with Nova closed (nova_foreign_services).
+        SERVICE_NAME = NOVA_WARP_SERVICE
         # Backends served by a helper process of ours on the SOCKS port (payload probe,
         # profile recovery, stop by handle). "cloudflare" is the warp-cli path.
         USERSPACE_BACKENDS = ("awg", "masque", "vless")
@@ -1742,15 +1768,7 @@ try:
                     pass
 
                 self.stop_service()
-                for proc_name in self._warp_process_names():
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/IM", proc_name, "/T"],
-                            capture_output=True,
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                        )
-                    except:
-                        pass
+                kill_images_in_dir(self._warp_process_names(), self.bin_dir)
 
                 time.sleep(1.0)
 
@@ -1776,6 +1794,11 @@ try:
                         os.path.join(windir, "ServiceProfiles", "NetworkService", "AppData", "Local", "Cloudflare"),
                     ]
 
+                    if official_warp_svc_path():
+                        # These folders are the official client's too (its registration, Zero Trust
+                        # enrollment): with it installed they are not ours to wipe.
+                        profile_dirs = []
+                        self.log_func("[RU] Установлен официальный клиент Cloudflare WARP — его данные в ProgramData не трогаем.")
                     for target_dir in profile_dirs:
                         try:
                             if os.path.exists(target_dir):
@@ -4468,12 +4491,12 @@ try:
                     ]
                     winreg.SetValueEx(key, "Environment", 0, winreg.REG_MULTI_SZ, env)
                     if IS_DEBUG_MODE:
-                        self.log_func("[RU] [Diag] Прокси-окружение службы CloudflareWARP установлено (127.0.0.1:1371).")
+                        self.log_func("[RU] [Diag] Прокси-окружение службы WARP установлено (127.0.0.1:1371).")
                 else:
                     try:
                         winreg.DeleteValue(key, "Environment")
                         if IS_DEBUG_MODE:
-                            self.log_func("[RU] [Diag] Прокси-окружение службы CloudflareWARP очищено.")
+                            self.log_func("[RU] [Diag] Прокси-окружение службы WARP очищено.")
                     except FileNotFoundError:
                         pass
 
@@ -4637,6 +4660,7 @@ try:
 
         def _ensure_service_registered(self):
             quoted_path = f'"{self.warp_svc_path}"'
+            release_legacy_warp_service(self.bin_dir, self.log_func)
 
             rc, out, err = self._run_sc("query", self.SERVICE_NAME)
             query_msg = f"{out}\n{err}".lower()
@@ -4655,7 +4679,7 @@ try:
                     "type=", "own",
                     "start=", "demand",
                     "obj=", "LocalSystem",
-                    "DisplayName=", "Cloudflare WARP (Nova)"
+                    "DisplayName=", NOVA_WARP_DISPLAY_NAME
                 )
                 if rc != 0:
                     msg = (err or out or f"code {rc}").strip()
@@ -4668,7 +4692,7 @@ try:
                 "type=", "own",
                 "start=", "demand",
                 "obj=", "LocalSystem",
-                "DisplayName=", "Cloudflare WARP (Nova)"
+                "DisplayName=", NOVA_WARP_DISPLAY_NAME
             )
             if rc != 0:
                 msg = (err or out or f"code {rc}").strip()
@@ -4684,13 +4708,15 @@ try:
                     self.log_func(f"[RU] ОШИБКА: Бинарный файл {self.warp_svc_path} не найден!")
                     return False
 
-                # Keep WARP helper GUI processes away from service bootstrap.
-                for proc_name in ["warp-taskbar.exe", "Cloudflare WARP.exe", "warp-cli.exe", "warp-svc.exe"]:
-                    subprocess.run(
-                        ["taskkill", "/F", "/IM", proc_name, "/T"],
-                        capture_output=True,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
+                # The official client's daemon owns the same IPC pipe and ProgramData\Cloudflare:
+                # two daemons side by side break both, and the user's own client wins.
+                release_legacy_warp_service(self.bin_dir, self.log_func)
+                if official_warp_service_running(self.bin_dir):
+                    self.log_func("[RU] Запущен официальный клиент Cloudflare WARP / Cloudflare One — встроенная служба WARP Nova не запускается, чтобы не мешать ему.")
+                    return False
+
+                # Leftovers of our own warp-svc/warp-cli only: by path, never the official client's.
+                kill_images_in_dir(("warp-cli.exe", "warp-svc.exe"), self.bin_dir)
 
                 try:
                     pdata = os.environ.get('ProgramData', 'C:\\ProgramData')
@@ -5740,15 +5766,7 @@ try:
             stopped = self._wait_for_service_stopped(self.SERVICE_NAME, timeout=8.0)
 
             if force_kill or not stopped:
-                for proc_name in self._warp_process_names():
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/IM", proc_name, "/T"],
-                            capture_output=True,
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                        )
-                    except:
-                        pass
+                kill_images_in_dir(self._warp_process_names(), self.bin_dir)
                 try:
                     self._run_sc("stop", self.SERVICE_NAME, timeout=8)
                 except:
@@ -5764,6 +5782,10 @@ try:
                 self._stop_warp_bootstrap_process()
                 self._stop_warp_runtime(force_kill=True)
             except:
+                pass
+            try:
+                release_legacy_warp_service(self.bin_dir, self.log_func)
+            except Exception:
                 pass
 
         def is_port_open(self, port):
@@ -6183,7 +6205,12 @@ try:
 
             return self._run("warp", _work, wait, "NovaWarpGenerate")
 
-        def issue_proton(self, force=False, wait=False):
+        def issue_proton(self, force=False, wait=False, interactive=False):
+            """`interactive`: the owner pressed the button, so a Proton CAPTCHA (Code 9001) opens a
+            window for them to solve. Unattended runs never pop a window up or block on one."""
+            def _human_verifier(api_host, hv_token, proxy_url):
+                return nova_captcha_window.solve(api_host, hv_token, proxy=proxy_url)
+
             def _work():
                 base = get_base_dir()
                 # What this install's own tunnels and pre-start handshakes proved, never a probe run
@@ -6200,6 +6227,7 @@ try:
                     force=bool(force),
                     progress=self._progress("proton"),
                     liveness=liveness,
+                    human_verifier=_human_verifier if interactive else None,
                 )
                 if result.get("ok"):
                     alive = result.get("alive")
@@ -7579,7 +7607,7 @@ try:
                 return bool(runner is not None and runner.is_up())
             opm = globals().get("opera_proxy_manager")
             try:
-                return bool(opm is not None and opm.is_tunnel_ready_cached(max_age=8.0))
+                return bool(opm is not None and opm.is_tunnel_ready_cached(max_age=30.0))
             except Exception:
                 return False
 
@@ -8415,9 +8443,15 @@ try:
 
         def is_port_open(self, port):
             import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(0.5)
-                return s.connect_ex(('127.0.0.1', port)) == 0
+            for connect_timeout in (0.5, 1.5):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(connect_timeout)
+                        if s.connect_ex(('127.0.0.1', port)) == 0:
+                            return True
+                except OSError:
+                    pass
+            return False
 
         def _is_http_proxy_alive(self, port, timeout=1.5):
             """Verify local HTTP proxy is really usable for CONNECT tunnels."""
@@ -8577,6 +8611,16 @@ try:
                 # а не «слот, пока он жив». Тот же приём, что у NOVA_PAC_KILLSWITCH.
                 closed_route = "SOCKS5 127.0.0.1:1"
 
+                # Second лёг, а выход main - Russia: трафик second не отдаём в main (он вышел бы
+                # с российским адресом), а пускаем напрямую - но только пока в системе активен
+                # DNS-AI (владелец, 2026-10-08): без него прямой путь отдал бы подменённые адреса.
+                try:
+                    _ru_primary_blocked = bool(
+                        not secondary_active and not primary_foreign
+                        and globals().get("_nrpt_state", {}).get("system_dns_ai", False))
+                except Exception:
+                    _ru_primary_blocked = False
+
                 def _route_for_target(target, strict=False, allow_last_resort=True):
                     target = str(target or "").strip().lower()
                     if target == "direct":
@@ -8599,7 +8643,7 @@ try:
                         parts = []
                         if secondary_active:
                             parts.append(secondary_route)
-                        elif not strict and warp_active:
+                        elif not strict and warp_active and not _ru_primary_blocked:
                             parts.append(primary_route)
                         if not parts:
                             parts.append(last_resort if allow_last_resort else closed_route)
@@ -9833,6 +9877,7 @@ function FindProxyForURLEx(url, host) {{
             self._start_in_progress = False
             self._last_tunnel_health_ts = 0.0
             self._last_tunnel_health_ok = False
+            self._last_tunnel_ok_wall = 0.0
             self.endpoint_cache_file = os.path.join(get_base_dir(), "temp", "opera_endpoint_cache.json")
             self._current_attempt_mode = ""
             self._current_bootstrap_proxy = ""
@@ -9888,11 +9933,34 @@ function FindProxyForURLEx(url, host) {{
             except:
                 return False
 
+        # A tunnel that answered within this window gets a second, patient probe before a miss
+        # counts. A bulk download (Steam) fills the line, and the CONNECT probe -- a TCP+TLS
+        # round trip to Opera's server and a TCP dial onward -- then takes seconds instead of
+        # ~1 s; at 1.5 s it read a live, loaded proxy as down every few ticks, and the
+        # indicator and the PAC dropped the secondary each time. A dead proxy pays the wait once:
+        # after one patient miss the window is no longer refreshed.
+        PATIENT_TUNNEL_PROBE_SEC = 8.0
+        PATIENT_TUNNEL_WINDOW_SEC = 60.0
+
         def _is_http_proxy_alive(self, timeout=1.5):
             try:
                 result = bool(is_local_http_proxy_tunnel_ready(port=self.port, timeout=timeout))
             except:
                 result = False
+            if not result and float(timeout) < self.PATIENT_TUNNEL_PROBE_SEC:
+                last_ok = float(self._last_tunnel_ok_wall or 0.0)
+                started = float(self._started_at_ts or 0.0)
+                if last_ok and last_ok >= started and (time.time() - last_ok) < self.PATIENT_TUNNEL_WINDOW_SEC:
+                    try:
+                        result = bool(is_local_http_proxy_tunnel_ready(
+                            port=self.port, timeout=self.PATIENT_TUNNEL_PROBE_SEC))
+                    except:
+                        result = False
+                    if result and IS_DEBUG_MODE:
+                        safe_trace(f"[EU] [Diag] Проба {self.port} прошла только с запасом "
+                                   f"{self.PATIENT_TUNNEL_PROBE_SEC:.0f} с: канал загружен, не мёртв.")
+            if result:
+                self._last_tunnel_ok_wall = time.time()
             self._last_tunnel_health_ts = time.monotonic()
             self._last_tunnel_health_ok = result
             return result
@@ -17697,6 +17765,9 @@ function FindProxyForURLEx(url, host) {{
                 "loopback pseudo-interface",
                 # AmneziaWG — Nova's own WireGuard adapter, not external VPN.
                 "amnezia",
+                # Tailscale is a mesh to the owner's own servers (100.64.0.0/10), not a full-PC VPN:
+                # its adapter must not pause Nova. An exit node is not detected here.
+                "tailscale",
             ]
 
             for adapter in adapters:
@@ -26592,13 +26663,18 @@ function FindProxyForURLEx(url, host) {{
     def proxy_watchdog_worker(log_func):
         """Monitors WARP and Opera Proxy, restarts if crashed."""
         def is_local_port_open(port):
-            try:
-                import socket
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.6)
-                    return s.connect_ex(("127.0.0.1", int(port))) == 0
-            except:
-                return False
+            # Second try with a longer timeout: one missed 0.6 s loopback connect under load is
+            # not a closed port, and «закрыт» here restarts Opera outright.
+            import socket
+            for connect_timeout in (0.6, 2.0):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(connect_timeout)
+                        if s.connect_ex(("127.0.0.1", int(port))) == 0:
+                            return True
+                except:
+                    pass
+            return False
 
         def is_local_http_proxy_alive(port, timeout=1.5):
             return is_local_http_proxy_tunnel_ready(port=port, timeout=timeout)
@@ -26635,6 +26711,8 @@ function FindProxyForURLEx(url, host) {{
         WARP_TRAFFIC_DEAD_BASE_STREAK = 2
         WARP_TRAFFIC_DEAD_MAX_EXTRA = 4
         WARP_FALSE_ALARM_FORGIVE_STREAK = 20
+        WARP_PATIENT_PROBE_SEC = 6.0
+        WARP_PATIENT_PROBE_WINDOW_SEC = 60.0
         WARP_ISSUE_LOG_INTERVAL_SEC = 45.0
         startup_state_hold_until = time.time() + 12.0
         startup_fast_retry_until = time.time() + 150.0
@@ -26719,6 +26797,17 @@ function FindProxyForURLEx(url, host) {{
                             warp_socks_ok = bool(warp_manager._test_socks5_internet(warp_port, timeout=1.8))
                         except:
                             warp_socks_ok = False
+                        # Same rule as Opera's PATIENT_TUNNEL_PROBE_SEC: on a line filled by a bulk
+                        # download the 4 s probe through the tunnel misses while traffic still
+                        # flows. Only for a tunnel that answered within the window, so a dead one
+                        # is not slowed down for long.
+                        if (not warp_socks_ok) and warp_last_good_ts and (now - warp_last_good_ts) < WARP_PATIENT_PROBE_WINDOW_SEC:
+                            try:
+                                warp_socks_ok = bool(warp_manager._test_socks5_internet(warp_port, timeout=WARP_PATIENT_PROBE_SEC))
+                            except:
+                                warp_socks_ok = False
+                            if warp_socks_ok and IS_DEBUG_MODE:
+                                safe_trace(f"[RU] [Diag] Проба {warp_port} прошла только с запасом: канал загружен, не мёртв.")
 
                     if warp_port_open and warp_socks_ok:
                         warp_bad_proxy_streak = 0
@@ -28737,7 +28826,7 @@ function FindProxyForURLEx(url, host) {{
                             pass
                         try:
                             subprocess.run(
-                                ["sc", "stop", getattr(wm, "SERVICE_NAME", "CloudflareWARP")],
+                                ["sc", "stop", getattr(wm, "SERVICE_NAME", NOVA_WARP_SERVICE)],
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 creationflags=subprocess.CREATE_NO_WINDOW,
@@ -28746,13 +28835,7 @@ function FindProxyForURLEx(url, host) {{
                         except:
                             pass
                         try:
-                            subprocess.run(
-                                ["taskkill", "/F", "/IM", "warp-svc.exe", "/T"],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                creationflags=subprocess.CREATE_NO_WINDOW,
-                                timeout=3
-                            )
+                            kill_images_in_dir(("warp-svc.exe", "warp-cli.exe"), get_bin_dir())
                         except:
                             pass
                 except Exception as _e:
@@ -29726,7 +29809,7 @@ function FindProxyForURLEx(url, host) {{
                     time.sleep(0.25)
                 return False
 
-            for svc_name in ["CloudflareWARP", "windivert"]:
+            for svc_name in [NOVA_WARP_SERVICE, "windivert"]:
                 try:
                     subprocess.run(["sc", "stop", svc_name],
                                    creationflags=subprocess.CREATE_NO_WINDOW,
@@ -29740,7 +29823,7 @@ function FindProxyForURLEx(url, host) {{
 
             _kill_singbox_processes_best_effort()
 
-            for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "wireproxy-awg.exe", "warp-svc.exe", "warp-cli.exe",
+            for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "wireproxy-awg.exe",
                               "nova-go.exe", "nova-xray.exe", "nova-tor.exe", "nova-lyrebird.exe",
                               "opera-proxy.windows-amd64.exe", "opera-proxy.exe", "opera-proxy*",
                               TLS_TERMINATOR_FILENAME, *_novawfp_service_image_names()]:
@@ -29772,6 +29855,16 @@ function FindProxyForURLEx(url, host) {{
                                    creationflags=subprocess.CREATE_NO_WINDOW,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
                 except: pass
+
+            # Leave shared names as found: our warp-svc by path (the official client's keeps running),
+            # the WinDivert registration that points at our driver (other WinDivert programs install
+            # their own), a CloudflareWARP an older Nova took over (nova_foreign_services).
+            try: kill_images_in_dir(("warp-svc.exe", "warp-cli.exe"), get_bin_dir())
+            except: pass
+            try: delete_windivert_if_nova(get_bin_dir())
+            except: pass
+            try: release_legacy_warp_service(get_bin_dir())
+            except: pass
         
         # Run heavy cleanup in thread with HARD 5-second timeout
         cleanup_thread = threading.Thread(target=_heavy_cleanup, daemon=True)
@@ -31093,6 +31186,9 @@ function FindProxyForURLEx(url, host) {{
         root = tk.Tk()
         root.withdraw()
         root.title(f"Nova v{CURRENT_VERSION}")
+        # Ctrl+V/C/X at any keyboard layout and a right-click menu in every text field.
+        try: nova_tk_clipboard.install(root)
+        except Exception: pass
         try: apply_window_icon(root)
         except: pass
         root.resizable(False, False)
@@ -31328,7 +31424,15 @@ function FindProxyForURLEx(url, host) {{
         btn_update.bind("<Enter>", lambda e: main_canvas.config(cursor="hand2"))
         btn_update.bind("<Leave>", lambda e: main_canvas.config(cursor=""))
         btn_update.set_visible(False)
-        btn_logs = CanvasButton(main_canvas, w-10, h-10, "Показать лог", ("Segoe UI", 9), toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
+        # Bottom corner rows, shared by the indicator pills (left) and the buttons (right): the
+        # same centres and the same font. A pill is ~23 px tall, so the lowest centre stays 16 px
+        # above the edge -- at 10 px its lower part was cut off by the window.
+        MAIN_ROW_STEP = 26
+        MAIN_ROW_1 = h - 16
+        MAIN_ROW_2 = MAIN_ROW_1 - MAIN_ROW_STEP
+        MAIN_ROW_3 = MAIN_ROW_2 - MAIN_ROW_STEP
+        MAIN_CORNER_FONT = ("Segoe UI", 9, "bold")
+        btn_logs = CanvasButton(main_canvas, w-10, MAIN_ROW_1, "Показать лог", MAIN_CORNER_FONT, toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
         btn_logs.set_visible(False)
         btn_settings = None
         btn_profiles = None
@@ -32838,7 +32942,7 @@ function FindProxyForURLEx(url, host) {{
                 get_profile_jobs().generate_warp(force=bool(force))
 
             def issue_proton(self, force=False):
-                get_profile_jobs().issue_proton(force=bool(force))
+                get_profile_jobs().issue_proton(force=bool(force), interactive=True)
 
             def register_masque(self, replace=False):
                 get_profile_jobs().register_masque(replace=bool(replace))
@@ -32917,9 +33021,9 @@ function FindProxyForURLEx(url, host) {{
         btn_settings = CanvasButton(
             main_canvas,
             w - 10,
-            h - 44,
+            MAIN_ROW_2,
             "⚙ Настройки",
-            ("Segoe UI", 9),
+            MAIN_CORNER_FONT,
             toggle_routing_settings_window,
             anchor="e",
             fg=log_fg,
@@ -32930,9 +33034,9 @@ function FindProxyForURLEx(url, host) {{
         btn_profiles = CanvasButton(
             main_canvas,
             w - 10,
-            h - 78,
+            MAIN_ROW_3,
             "Профили",
-            ("Segoe UI", 9),
+            MAIN_CORNER_FONT,
             toggle_profiles_window_ui,
             anchor="e",
             fg=log_fg,
@@ -32952,8 +33056,8 @@ function FindProxyForURLEx(url, host) {{
         region_indicator_pill = CanvasRegionPill(
             main_canvas,
             10,
-            h - 10,
-            ("Segoe UI", 9, "bold"),
+            MAIN_ROW_1,
+            MAIN_CORNER_FONT,
             anchor="sw",
             bg_color=log_bg,
         )
@@ -32968,8 +33072,8 @@ function FindProxyForURLEx(url, host) {{
         dns_ai_indicator_pill = CanvasRegionPill(
             main_canvas,
             10,
-            h - 36,
-            ("Segoe UI", 9, "bold"),
+            MAIN_ROW_2,
+            MAIN_CORNER_FONT,
             anchor="sw",
             bg_color=log_bg,
         )
@@ -33183,7 +33287,7 @@ function FindProxyForURLEx(url, host) {{
                             opm = globals().get("opera_proxy_manager")
                             opera_ok = bool(
                                 opm
-                                and getattr(opm, "is_tunnel_ready_cached", lambda max_age=6.0: False)(max_age=6.0)
+                                and getattr(opm, "is_tunnel_ready_cached", lambda max_age=30.0: False)(max_age=30.0)
                             )
                             if opm and hasattr(opm, "get_runtime_region_label"):
                                 opera_label = str(opm.get_runtime_region_label() or opera_label)

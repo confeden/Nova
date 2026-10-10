@@ -218,6 +218,12 @@ def ensure_pyinstaller() -> None:
         import PyInstaller  # noqa: F401
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "pyinstaller", "pillow"])
+    # The Proton CAPTCHA window (nova_captcha_window) is pywebview on Edge WebView2. Without it the
+    # build still runs, but a 9001 can only be reported, not solved -- so it is installed here.
+    try:
+        import webview  # noqa: F401
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pywebview"])
 
 
 def locate_iscc() -> str | None:
@@ -1531,6 +1537,11 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         "--hidden-import=nova_vless",
         "--hidden-import=nova_subscriptions",
         "--hidden-import=nova_ping",
+        "--hidden-import=nova_captcha_window",
+        "--hidden-import=webview",
+        "--hidden-import=webview.platforms.edgechromium",
+        "--hidden-import=clr",
+        "--collect-all=webview",
         "--hidden-import=pystray._win32",
         "--hidden-import=PIL.ImageTk",
         "--hidden-import=tkinter",
