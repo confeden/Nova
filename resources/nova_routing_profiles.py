@@ -35,6 +35,8 @@ AI_APP_DOMAINS = (
     "chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com",
     # OpenCode
     "opencode.ai",
+    # Jan: its own mirror apps.jan.ai, models from Hugging Face (huggingface.co, *.hf.co CDN)
+    "jan.ai", "huggingface.co", "hf.co",
 )
 
 
@@ -45,6 +47,7 @@ AI_APP_PATH_MARKERS = (
     "\\.local\\bin\\claude.exe",
     "\\windowsapps\\openai.", "\\openai\\codex\\", "\\@openai\\codex\\",
     "\\opencode.exe", "\\@opencode-ai",
+    "\\programs\\jan\\", "\\roaming\\jan\\data\\",
 )
 
 
@@ -126,14 +129,15 @@ def get_default_app_routing_profiles():
         # Codex/ChatGPT: the Store app WindowsApps\OpenAI.Codex_* (ChatGPT.exe, Codex.exe, codex.exe)
         # and the CLI in %LOCALAPPDATA%\[Programs\]OpenAI\Codex\bin\codex.exe; npm's @openai/codex
         # runs a native codex.exe under its folder. OpenCode: the desktop app OpenCode.exe and npm's
-        # opencode-ai, which ships a native opencode.exe. Agents run as plain node.exe (Claude Code
+        # opencode-ai, which ships a native opencode.exe. Jan: %LOCALAPPDATA%\Programs\Jan (Jan-Desktop,
+        # bun, uv) and its llama.cpp engines under %APPDATA%\Jan\data. Agents run as plain node.exe (Claude Code
         # from npm) cannot be told apart from any other node by path and are not caught.
         "ai_apps": AppRoutingProfile(
             key="ai_apps",
             display_name="AI Apps",
             process_names=("Claude.exe", "claude.exe", "cowork-svc.exe", "ChatGPT.exe", "Codex.exe",
-                           "codex.exe", "OpenCode.exe", "opencode.exe"),
-            process_path_regex=r"(?i).*(\\windowsapps\\(claude_|openai\.)|\\anthropicclaude\\|\\claude\\claude-code\\|\\\.local\\bin\\claude\.exe|\\@?openai\\codex\\|\\opencode\.exe|\\@opencode-ai).*",
+                           "codex.exe", "OpenCode.exe", "opencode.exe", "Jan-Desktop.exe"),
+            process_path_regex=r"(?i).*(\\windowsapps\\(claude_|openai\.)|\\anthropicclaude\\|\\claude\\claude-code\\|\\\.local\\bin\\claude\.exe|\\@?openai\\codex\\|\\opencode\.exe|\\@opencode-ai|\\programs\\jan\\|\\roaming\\jan\\data\\).*",
             path_markers=AI_APP_PATH_MARKERS,
         ),
         "games": AppRoutingProfile(

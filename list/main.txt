@@ -52,6 +52,10 @@ cloudflare.com
 cloudflare.dev
 zerofs.link
 crowdsec.net
+www.deviantart.com
+wixmp.com
+deviantart.net
+wix.com
 mycountrymobile.com
 ipway.com
 tailscale.com

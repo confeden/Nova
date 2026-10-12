@@ -86,7 +86,9 @@ oaistatic.com
 oaiusercontent.com
 onlinesim.io
 openai.com
+tokenharbor.ai
 openrouter.ai
+tiktok.com
 orbsrv.com
 otzyvmarketing.ru
 paddle.com
@@ -136,7 +138,9 @@ spotify.com
 spotifycdn.com
 store.steampowered.com
 streamx.cash
-stripe.com
+stripe.comclientservices.googleapis.com
+accountcapabilities-pa.googleapis.com
+optimizationguide-pa.googleapis.com
 stripe.network
 suno.com
 t.me

@@ -181,6 +181,7 @@ IGNORED_PATTERNS = ("*.old", "*.tmp", "*.part", "__pycache__", "old", "warp_offi
 USER_OVERRIDE_HEADER_DEFAULTS = {
     ("list", "u_main.txt"): "# user main VPN override domains\n",
     ("list", "u_second.txt"): "# user second VPN override domains\n",
+    ("list", "u_direct.txt"): "# user domains that always go direct (browsers on Auto)\n",
     ("ip", "u_main.txt"): "# user main VPN override IPs/CIDR\n",
     ("ip", "u_second.txt"): "# user second VPN override IPs/CIDR\n",
 }

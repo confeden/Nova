@@ -61,6 +61,7 @@ www.copilot.com
 generativelanguage.googleapis.com
 www.strava.com
 strava.com
+nova-app.eu
 cdn-1.strava.com
 graphql.strava.com
 accounts.youtube.com
@@ -71,6 +72,7 @@ www.genspark.ai
 api2.cursor.sh
 api2direct.cursor.sh
 api3.cursor.sh
+tokenharbor.ai
 api4.cursor.sh
 repo42.cursor.sh
 prod.authentication.cursor.sh
@@ -80,3 +82,6 @@ agentn.global.api5.cursor.sh
 us-only.gcpp.cursor.sh
 gql.twitch.tv
 usher.ttvnw.net
+clientservices.googleapis.com
+accountcapabilities-pa.googleapis.com
+optimizationguide-pa.googleapis.com

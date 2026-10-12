@@ -78,9 +78,10 @@ Name: "{app}\profiles\VLESS"; Flags: uninsneveruninstall
 Name: "{app}\profiles\Custom"; Flags: uninsneveruninstall
 
 [Files]
-Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "list\u_main.txt,list\u_second.txt,ip\u_main.txt,ip\u_second.txt,bin\sing-box.exe,routing_settings.json,README.md,THIRD_PARTY_NOTICES.md,LICENSE,licenses,licenses\*,NovaWFP,NovaWFP\*,NovaDivert,NovaDivert\*,tgrelay,tgrelay\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "list\u_main.txt,list\u_second.txt,list\u_direct.txt,ip\u_main.txt,ip\u_second.txt,bin\sing-box.exe,routing_settings.json,README.md,THIRD_PARTY_NOTICES.md,LICENSE,licenses,licenses\*,NovaWFP,NovaWFP\*,NovaDivert,NovaDivert\*,tgrelay,tgrelay\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#MySourceDir}\list\u_main.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 Source: "{#MySourceDir}\list\u_second.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "{#MySourceDir}\list\u_direct.txt"; DestDir: "{app}\list"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 Source: "{#MySourceDir}\ip\u_main.txt"; DestDir: "{app}\ip"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 Source: "{#MySourceDir}\ip\u_second.txt"; DestDir: "{app}\ip"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 Source: "{#MySourceDir}\routing_settings.json"; DestDir: "{app}\temp"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
@@ -202,7 +203,7 @@ end;
 
 { Shared service names left as found (resources/nova_foreign_services.py does the same on exit):
   our warp-svc/warp-cli by path, never the official client's; the WinDivert registration when it
-  points into {app} (other WinDivert programs install their own); a CloudflareWARP an older Nova
+  points into the install dir (other WinDivert programs install their own); a CloudflareWARP an older Nova
   took over is given back to the official client, or deleted when there is none. NovaWARP, Nova's
   own service, is deleted on uninstall. Elevates only when there is something to release. }
 procedure ReleaseNovaServices(Uninstalling: Boolean);

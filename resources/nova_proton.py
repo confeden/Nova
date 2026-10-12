@@ -1763,6 +1763,11 @@ def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, pro
 
     if not force:
         cooldown = _failure_cooldown(account, now, _route_labels(proxies))
+        if cooldown is not None and cooldown[2] == CODE_HUMAN_VERIFICATION and human_verifier is not None:
+            # The 9001 cooldown keeps unattended runs from asking again; a run the owner started can
+            # show the CAPTCHA, which is what the 9001 message told them to press the button for.
+            emit(f"{LOG_PREFIX} прошлая попытка упёрлась в проверку человеком — пробую снова с окном капчи")
+            cooldown = None
         if cooldown is not None:
             text = _cooldown_text(cooldown)
             if existing is not None:

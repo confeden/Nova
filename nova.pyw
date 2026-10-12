@@ -8351,7 +8351,8 @@ try:
                     [
                         "winhttp", "set", "proxy",
                         "proxy-server=127.0.0.1:1371",
-                        "bypass-list=localhost;127.0.0.1;::1;<local>"
+                        "bypass-list=localhost;127.0.0.1;::1;<local>;*.local;10.*;192.168.*;169.254.*;"
+                        + ";".join(f"172.{n}.*" for n in range(16, 32))
                     ],
                     timeout=8
                 )
@@ -8477,6 +8478,7 @@ try:
                     pac_config = {"mode": "hybrid", "full_target": "warp", "tor_pending": True}
                 user_ru_domains = self._load_domain_list(os.path.join(base, "list", "u_main.txt"))
                 user_eu_domains = self._load_domain_list(os.path.join(base, "list", "u_second.txt"))
+                user_direct_domains = self._load_domain_list(os.path.join(base, "list", "u_direct.txt"))
                 ru_domains = self._load_domain_list(os.path.join(base, "list", "main.txt"))
                 eu_domains = self._load_domain_list(os.path.join(base, "list", "second.txt"))
                 ai_list_domains = self._load_domain_list(os.path.join(base, "list", "ai.txt"))
@@ -8816,6 +8818,7 @@ try:
                 eu_over_exclude_js = "{" + ",".join(f'"{d}":1' for d in sorted(eu_over_exclude_domains)) + "}"
                 user_ru_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_ru_domains)) + "}"
                 user_eu_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_eu_domains)) + "}"
+                user_direct_js = "{" + ",".join(f'"{d}":1' for d in sorted(user_direct_domains)) + "}"
                 ru_js = "{" + ",".join(f'"{d}":1' for d in sorted(ru_domains)) + "}"
                 eu_js = "{" + ",".join(f'"{d}":1' for d in sorted(eu_domains)) + "}"
                 discord_js = "{" + ",".join(f'"{d}":1' for d in sorted(discord_domains)) + "}"
@@ -8957,6 +8960,22 @@ try:
     if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || isPlainHostName(host)) {{
         return "DIRECT";
     }}
+    // Локальная сеть никогда не идёт в прокси, в любом режиме: принтеры, роутеры, NAS. В режиме
+    // «весь трафик» «http://192.168.1.20» и «printer.local» уходили в 1371, и выход за
+    // границей честно не находил чужой LAN (жалобы «не печатает при включённой Nova»).
+    if (/\\.(local|lan|home|home\\.arpa|internal|localdomain)$/.test(host)) {{
+        return "DIRECT";
+    }}
+    if (/^\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}$/.test(host)) {{
+        if (isInNet(host, "10.0.0.0", "255.0.0.0") || isInNet(host, "172.16.0.0", "255.240.0.0") ||
+            isInNet(host, "192.168.0.0", "255.255.0.0") || isInNet(host, "169.254.0.0", "255.255.0.0") ||
+            isInNet(host, "100.64.0.0", "255.192.0.0") || isInNet(host, "127.0.0.0", "255.0.0.0")) {{
+            return "DIRECT";
+        }}
+    }}
+    if (host.indexOf(":") > -1 && /^\\[?(fe[89ab][0-9a-f]?:|f[cd][0-9a-f]{{0,2}}:)/.test(host)) {{
+        return "DIRECT";
+    }}
     var pac_mode = {json.dumps(pac_mode)};
     var pac_full_route = {json.dumps(pac_full_route)};
     var pac_full_exclude = {json.dumps(pac_full_exclude)};
@@ -8965,6 +8984,7 @@ try:
     }}
     var user_ru = {user_ru_js};
     var user_eu = {user_eu_js};
+    var user_direct = {user_direct_js};
     var exclude = {exclude_js};
     var eu_over_exclude = {eu_over_exclude_js};
     var ru = {ru_js};
@@ -9132,6 +9152,7 @@ var ai_region_direct = {ai_region_direct_js};
         }}
     }}
     
+    if (matchDomain(user_direct, host)) return "DIRECT";
     if (matchDomain(user_ru, host)) return "{ru_route}";
     if (matchDomain(user_eu, host)) return "{eu_route}";
     if (matchDomain(eu_over_exclude, host)) return "{eu_route}";
@@ -13836,7 +13857,8 @@ function FindProxyForURLEx(url, host) {{
             "cloudflare.txt": "",
             "exclude.txt": "",
             "u_main.txt": "# user main VPN override domains\n",
-            "u_second.txt": "# user second VPN override domains\n"
+            "u_second.txt": "# user second VPN override domains\n",
+            "u_direct.txt": "# user domains that always go direct (browsers on Auto)\n"
         }
         ip_files = {
             "u_main.txt": "# user main VPN override IPs/CIDR\n",
@@ -26296,6 +26318,7 @@ function FindProxyForURLEx(url, host) {{
         monitor_vpn_user = [
             os.path.join(base, "list", "u_main.txt"),
             os.path.join(base, "list", "u_second.txt"),
+            os.path.join(base, "list", "u_direct.txt"),
             os.path.join(base, "ip", "u_main.txt"),
             os.path.join(base, "ip", "u_second.txt")
         ]
