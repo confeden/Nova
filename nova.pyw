@@ -274,6 +274,7 @@ from nova_console_logging import (
 )
 from nova_metadata import CURRENT_VERSION, UPDATE_URL, WINWS_FILENAME
 from nova_opera_failover import OperaFailoverController, build_fake_sni_args, build_full_dial_proxy_args
+from nova_opera_feed import endpoints_for_country, fetch_endpoint_feed
 
 # FIX: In compiled (PyInstaller) builds, CURRENT_VERSION is frozen at build time.
 # If the installer overwrites nova_metadata.py on disk with a newer version,
@@ -7528,8 +7529,8 @@ try:
         """
 
         # Opera restarts itself (EU direct -> EU over WARP -> US in «Авто»); «Авто» moves on to Tor
-        # only when none of that brought the proxy back for this long.
-        OPERA_AUTO_FAIL_SEC = 180.0
+        # only when none of that brought the proxy back for this long (1.44: 90 s, was 180 s).
+        OPERA_AUTO_FAIL_SEC = 90.0
         # Tor walks its own entries; a "failed" that stays failed this long moves «Авто» on.
         TOR_AUTO_FAIL_GRACE_SEC = 15.0
         OPERA_RETURN_BASE_SEC = 20 * 60.0
@@ -8059,6 +8060,10 @@ try:
         def route_primary_up(self):
             with self._lock:
                 return self._route_primary_up
+
+        def route_secondary_up(self):
+            with self._lock:
+                return self._route_secondary_up
 
         @staticmethod
         def _live_key():
@@ -9943,7 +9948,7 @@ function FindProxyForURLEx(url, host) {{
             try:
                 return self.failover.runtime_label()
             except:
-                return "US" if str(self.country or "EU").upper() == "AM" else "EU"
+                return {"AM": "US", "AS": "AS"}.get(str(self.country or "EU").upper(), "EU")
 
         def _is_port_open_local(self):
             try:
@@ -10020,6 +10025,22 @@ function FindProxyForURLEx(url, host) {{
                 return endpoint
             except:
                 return None
+
+        def _published_endpoints(self):
+            """Endpoints for this region from the published feed; the fetch is cached for an hour
+            and a failed fetch is retried after 15 minutes, so a dead GitHub costs one timeout."""
+            now = time.time()
+            feed = getattr(self, "_endpoint_feed", None)
+            checked = float(getattr(self, "_endpoint_feed_checked_ts", 0.0) or 0.0)
+            if feed:
+                stale = now - checked >= 3600.0
+            else:
+                stale = now - checked >= 900.0
+            if stale:
+                feed = fetch_endpoint_feed(timeout=2.5)
+                self._endpoint_feed = feed
+                self._endpoint_feed_checked_ts = now
+            return endpoints_for_country(feed, self.country)
 
         def _save_cached_endpoint(self, endpoint):
             try:
@@ -10472,6 +10493,10 @@ function FindProxyForURLEx(url, host) {{
                 attempts = []
                 if cached_endpoint:
                     attempts.append(("cached", cached_endpoint, 2.5, None))
+                # Опубликованные адреса (opera_endpoints.json) идут раньше живого discover:
+                # discover из РФ часто отдаёт адреса, на которые не дозвониться.
+                for _published in self._published_endpoints()[:2]:
+                    attempts.append(("feed", _published, 6.5, None))
                 for _api_proxy in api_bootstrap_proxies:
                     attempts.append(("discover-api-proxy", None, 6.5, _api_proxy))
                 attempts.append(("discover", None, 6.5, None))
@@ -10517,7 +10542,8 @@ function FindProxyForURLEx(url, host) {{
                             )
                     if override_endpoint:
                         cmd.extend(["-override-proxy-address", override_endpoint])
-                        self.log_func(f"[EU] [Diag] Пробуем кэшированный endpoint {override_endpoint}.")
+                        endpoint_kind = "опубликованный" if attempt_mode == "feed" else "кэшированный"
+                        self.log_func(f"[EU] [Diag] Пробуем {endpoint_kind} endpoint {override_endpoint}.")
                     self._current_attempt_mode = str(attempt_mode or "")
                     self._current_bootstrap_proxy = str(base_proxy or "")
                     self._current_override_endpoint = str(override_endpoint or "")
@@ -10583,6 +10609,9 @@ function FindProxyForURLEx(url, host) {{
                         self._startup_grace_deadline = 0.0
                         self._started_at_ts = 0.0
                         _close_log_handle()
+                    elif attempt_mode == "feed":
+                        _terminate_managed_process("[EU] [Diag] Опубликованный endpoint не поднялся вовремя. Переходим к следующему варианту...")
+                        continue
                     elif attempt_mode.startswith("cached"):
                         self._clear_cached_endpoint()
                         _terminate_managed_process("[EU] [Diag] Кэшированный endpoint не поднялся вовремя. Переходим к следующему варианту...")
@@ -14309,7 +14338,7 @@ function FindProxyForURLEx(url, host) {{
     # the egress of the relay, the WFP/Divert proxies or the UDP path (DESIGN.md §9); the
     # helper processes keep ROUTING_MODE_VALUES and read "tor" as auto.
     BROWSER_EXTRA_ROUTE_MODES = {"tor"}
-    OPERA_REGION_VALUES = {"EU", "US"}
+    OPERA_REGION_VALUES = {"EU", "US", "AS"}
     ROUTING_GROUP_ALIASES = {
         "browser": "browser",
         "telegram": "telegram",
@@ -14422,7 +14451,7 @@ function FindProxyForURLEx(url, host) {{
 
     def _opera_region_to_country(region):
         normalized = _normalize_opera_region(region, "EU")
-        return "AM" if normalized == "US" else "EU"
+        return {"US": "AM", "AS": "AS"}.get(normalized, "EU")
 
     # Ключи верхнего уровня, за которые эта функция отвечает. Всё остальное она
     # обязана пронести через себя нетронутым — см. ниже.
@@ -14982,7 +15011,9 @@ function FindProxyForURLEx(url, host) {{
     # уходит к следующему по таймауту, то есть сам список и есть каскад.
     #
     # Замерено, а не предположено (nslookup к каждому адресу, UDP/53):
-    #   dns-ai   192.144.59.14 и 186.246.49.127 — таймаут на chatgpt.com,
+    #   dns-ai   (адреса сервиса: endpoints.json, serial 7 — spb7 194.87.196.13 и
+    #            msk7 45.151.102.219 с их IPv6; прежние msk3 192.144.59.14 и
+    #            spb1 186.246.49.127 сняты, 2026-10) — таймаут на chatgpt.com,
     #            example.com и google.com. Обычного DNS у сервиса нет: система
     #            ходит к нему по DoH (Get-DnsClientDohServerAddress отдаёт
     #            шаблон https://dns.dns-ai.ru/dns-query, AutoUpgrade=True,
@@ -14993,10 +15024,10 @@ function FindProxyForURLEx(url, host) {{
     #   geohide  45.155.204.190 -> 193.233.112.67, 37.230.192.51 -> 46.8.158.6
     NOVA_NRPT_NAMESERVER_CASCADE = (
         ("dns-ai.ru", (
-            "192.144.59.14",
-            "186.246.49.127",
-            "2a0d:8480:0:67c::14",
-            "2a0a:2b41:0:500d::53",
+            "194.87.196.13",
+            "45.151.102.219",
+            "2a00:b700:5::3:62",
+            "2a12:5940:d4ef::219",
         )),
         ("xbox-dns.ru", (
             "111.88.96.54",
@@ -31524,6 +31555,7 @@ function FindProxyForURLEx(url, host) {{
         opera_region_pill_labels = {
             "EU": "EU",
             "US": "US",
+            "AS": "AS",
         }
 
         class PopupPillButton(tk.Canvas):
@@ -33285,6 +33317,13 @@ function FindProxyForURLEx(url, host) {{
                             if proc and proc.poll() is None:
                                 warp_connected = True
                         warp_ok = bool(warp_connected and port_open)
+                        # The watchdog's verdict is what the PAC and vpn-egress.json are built from. A
+                        # working WARP with a stale is_connected flag read as down here (the status
+                        # then stayed «ПОДКЛЮЧЕНИЕ» with both VPNs up), so the verdict wins when it exists.
+                        _runtime = globals().get("vpn_slots_runtime")
+                        _primary_verdict = _runtime.route_primary_up() if _runtime is not None else None
+                        if _primary_verdict is not None:
+                            warp_ok = bool(_primary_verdict)
                         if wm is not None and hasattr(wm, "get_vpn_label"):
                             vpn_label = str(wm.get_vpn_label() or "АВТО")
                         elif wm is None:

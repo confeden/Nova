@@ -111,6 +111,11 @@ struct Request {
     /// current behaviour", which is not to.
     #[serde(default)]
     verify: bool,
+    /// Path to a PEM bundle of trusted roots. Giving it implies `verify`, and
+    /// replaces the process-wide `--verify-roots` for this tunnel. BoringSSL has
+    /// no system store on Windows, so verification needs roots from the caller.
+    #[serde(default)]
+    verify_roots: Option<String>,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -132,18 +137,30 @@ fn default_handshake_timeout() -> u64 {
 /// a process-wide one, which is what the learner needs: it picks a shape per
 /// attempt and the terminator must be able to honour that without a restart.
 struct Shapers {
-    built: std::sync::Mutex<std::collections::HashMap<(String, bool), Arc<shape::Shaper>>>,
+    built: std::sync::Mutex<std::collections::HashMap<(String, bool, String), Arc<shape::Shaper>>>,
     default_profile: String,
+    /// `--verify-roots`: used when a verifying request names no bundle itself.
+    default_roots: Option<String>,
 }
 
 impl Shapers {
-    fn new(default_profile: String) -> Self {
-        Self { built: std::sync::Mutex::new(std::collections::HashMap::new()), default_profile }
+    fn new(default_profile: String, default_roots: Option<String>) -> Self {
+        Self {
+            built: std::sync::Mutex::new(std::collections::HashMap::new()),
+            default_profile,
+            default_roots,
+        }
     }
 
-    fn get(&self, name: Option<&str>, verify: bool) -> Result<Arc<shape::Shaper>, Failure> {
+    fn get(
+        &self,
+        name: Option<&str>,
+        verify: bool,
+        roots: Option<&str>,
+    ) -> Result<Arc<shape::Shaper>, Failure> {
         let name = name.unwrap_or(&self.default_profile).to_owned();
-        let key = (name.clone(), verify);
+        let roots = roots.or(if verify { self.default_roots.as_deref() } else { None });
+        let key = (name.clone(), verify || roots.is_some(), roots.unwrap_or("").to_owned());
         if let Ok(guard) = self.built.lock()
             && let Some(shaper) = guard.get(&key)
         {
@@ -152,9 +169,21 @@ impl Shapers {
         let profile = built_in_profile(&name).ok_or_else(|| {
             Failure::new(reached::NOTHING, ended::CLOSED, format!("unknown profile {name:?}"))
         })?;
+        let built = match roots {
+            Some(path) => {
+                let pem = std::fs::read(path).map_err(|err| {
+                    Failure::new(
+                        reached::NOTHING,
+                        ended::CLOSED,
+                        format!("cannot read verify_roots {path:?}: {err}"),
+                    )
+                })?;
+                shape::Shaper::with_roots(&profile, &pem)
+            }
+            None => shape::Shaper::new(&profile, verify),
+        };
         let shaper = Arc::new(
-            shape::Shaper::new(&profile, verify)
-                .map_err(|err| Failure::new(reached::NOTHING, ended::CLOSED, err.to_string()))?,
+            built.map_err(|err| Failure::new(reached::NOTHING, ended::CLOSED, err.to_string()))?,
         );
         if let Ok(mut guard) = self.built.lock() {
             guard.insert(key, Arc::clone(&shaper));
@@ -198,6 +227,7 @@ fn main() {
     let mut port: u16 = 1374;
     let mut token = String::new();
     let mut default_profile = String::from("yandex-windows");
+    let mut default_roots: Option<String> = None;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -215,8 +245,12 @@ fn main() {
                 default_profile = args[i + 1].clone();
                 i += 2;
             }
+            "--verify-roots" if i + 1 < args.len() => {
+                default_roots = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--help" | "-h" => {
-                println!("usage: tls-terminator --token <secret> [--port 1374] [--profile yandex-windows]");
+                println!("usage: tls-terminator --token <secret> [--port 1374] [--profile yandex-windows] [--verify-roots <pem>]");
                 return;
             }
             other => {
@@ -269,7 +303,7 @@ fn main() {
 
     phase_watch::spawn_watchdog();
     let token = Arc::new(token);
-    let shapers = Arc::new(Shapers::new(profile.name.clone()));
+    let shapers = Arc::new(Shapers::new(profile.name.clone(), default_roots));
     // A bound on concurrency rather than an async runtime. The relay's cold
     // start opens 48 tunnels at once and its own executor is sized to match, so
     // the ceiling is set above that: queueing here would be spent against the
@@ -632,13 +666,14 @@ fn establish(
     let _ = socket.set_read_timeout(Some(handshake_timeout));
     let _ = socket.set_write_timeout(Some(handshake_timeout));
 
-    let shaper = shapers.get(request.profile.as_deref(), request.verify)?;
+    let shaper = shapers.get(request.profile.as_deref(), request.verify, request.verify_roots.as_deref())?;
 
     // Past this point the ClientHello is on the wire, which is the one window
     // where its shape is a live suspect.
     let stream = shaper.connect(&request.sni, socket).map_err(|err| {
-        let text = err.to_string();
+        let mut text = err.to_string();
         let ended = if text.contains("certificate") || text.contains("CERTIFICATE") {
+            text = format!("certificate verification failed for {:?}: {text}", request.sni);
             ended::CERT_MISMATCH
         } else if text.contains("timed out") || text.contains("timeout") {
             ended::TIMEOUT

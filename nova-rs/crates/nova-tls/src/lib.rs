@@ -34,6 +34,11 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("yandex-windows", include_str!("../profiles/yandex-windows.json")),
     ("chrome-windows", include_str!("../profiles/chrome-windows.json")),
     ("firefox-windows", include_str!("../profiles/firefox-windows.json")),
+    // Yandex Browser 26.10 as it greets a WebSocket server (captured 2026-10-18):
+    // adds extension 0xca34 and signature algorithms 0x0904..0x0906, which only
+    // the patched BoringSSL of `bssl-patch/prepare.py` can write. Last, so the
+    // preference order above is unchanged; a stock build refuses it by name.
+    ("yandex-windows-26.10", include_str!("../profiles/yandex-windows-26.10.json")),
 ];
 
 /// Every profile Nova knows, in preference order.
@@ -175,12 +180,18 @@ mod tests {
     #[test]
     fn every_built_in_profile_parses_and_is_named_after_itself() {
         let profiles = built_in_profiles();
-        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles.len(), 4);
         for profile in &profiles {
             assert!(built_in_profile(&profile.name).is_some(), "{} is not findable", profile.name);
             assert!(!profile.ciphers.is_empty(), "{}", profile.name);
             assert!(!profile.signature_algorithms.is_empty(), "{}", profile.name);
-            assert_eq!(profile.alpn, vec!["h2".to_owned(), "http/1.1".to_owned()], "{}", profile.name);
+            // The 26.10 capture is of a WebSocket connection, which offers no h2.
+            let alpn = if profile.name == "yandex-windows-26.10" {
+                vec!["http/1.1".to_owned()]
+            } else {
+                vec!["h2".to_owned(), "http/1.1".to_owned()]
+            };
+            assert_eq!(profile.alpn, alpn, "{}", profile.name);
         }
         assert!(built_in_profile("netscape-4").is_none());
     }

@@ -4,6 +4,7 @@ agent-router.org
 analog.com
 anthropic.com
 autodesk.com
+autodesk.net
 autodesk360.com
 b-cdn.net
 telegram.me
@@ -80,10 +81,16 @@ nitter.net
 notebooklm.google.com
 notion.com
 notion.so
+mapquest.com
 ntc.party
+playground.google
+chromewebstore.google.com
+gemini.google
 nxp.com
 oaistatic.com
 oaiusercontent.com
+okta.com
+oktacdn.com
 onlinesim.io
 openai.com
 tokenharbor.ai

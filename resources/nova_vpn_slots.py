@@ -70,7 +70,10 @@ HOME_COUNTRY = "RU"
 _COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 
 # Nova Android CountryDisplayOrder.kt: preferred exits first, then Europe, America, Asia, other.
-_PREFERRED_COUNTRIES = ("NL", "NO", "PL", "RO", "CH", "US", "CA", "MX", "JP", "SG")
+# Preferred = nearest first, measured from Russia 2026-10-12 (TCP-443 median over the live Proton
+# list): NL 92, NO 112, PL 137, RO 148, CA 162, MX 187, US 189, SG 224, JP 316 ms; CH silent.
+# Change it together with the Android list.
+_PREFERRED_COUNTRIES = ("NL", "NO", "PL", "RO", "CA", "MX", "US", "SG", "JP", "CH")
 _EUROPE = frozenset((
     "AL", "AD", "AT", "BA", "BE", "BG", "BY", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR",
     "GB", "GR", "HR", "HU", "IE", "IS", "IT", "LI", "LT", "LU", "LV", "MC", "MD", "ME", "MK", "MT",
@@ -299,13 +302,14 @@ SECONDARY_MENU_LABELS = {
     SECONDARY_TOR: "Tor",
     SECONDARY_PROFILE: "Свой профиль",
 }
-OPERA_REGIONS = ("EU", "US")
+OPERA_REGIONS = ("EU", "US", "AS")
 
-# The settings row offers five pills: the Opera region is part of the choice there.
+# The settings row offers six pills: the Opera region is part of the choice there.
 SECONDARY_PILL_CHOICES = (
     ("auto", "Авто"),
     ("opera:EU", "Opera EU"),
     ("opera:US", "Opera US"),
+    ("opera:AS", "Opera AS"),
     ("tor", "Tor"),
     ("profile", "Свой"),
 )

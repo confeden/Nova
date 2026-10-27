@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 def _normalize_country(value):
     country = str(value or "EU").strip().upper()
-    return country if country in {"EU", "AM"} else "EU"
+    return country if country in {"EU", "AM", "AS"} else "EU"
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,8 @@ use boring::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslConnectorBuilder,
     SslMethod, SslOptions, SslSignatureAlgorithm, SslVerifyMode, SslVersion,
 };
+use boring::x509::X509;
+use boring::x509::store::X509StoreBuilder;
 
 use crate::Profile;
 
@@ -27,6 +29,7 @@ const SIGNED_CERTIFICATE_TIMESTAMP: u16 = 0x0012;
 const COMPRESS_CERTIFICATE: u16 = 0x001b;
 const APPLICATION_SETTINGS: u16 = 0x44cd;
 const ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
+const YANDEX_CA34: u16 = 0xca34;
 
 /// Certificate decompression, offered because Chromium offers it.
 ///
@@ -133,11 +136,13 @@ fn signature_algorithm(id: u16) -> Option<SslSignatureAlgorithm> {
         0x0805 => SslSignatureAlgorithm::RSA_PSS_RSAE_SHA384,
         0x0806 => SslSignatureAlgorithm::RSA_PSS_RSAE_SHA512,
         0x0807 => SslSignatureAlgorithm::ED25519,
-        // 0x0904..0x0906 are Chrome's newest additions and have no constant in
-        // this binding, whose newtype cannot be built from a raw value. They
-        // are exactly the three algorithms that separate Chrome from Yandex —
-        // so the profile Nova most wants is the one that is fully expressible,
-        // and the one that is not is the one it was not going to use.
+        // 0x0904..0x0906 are Chrome's newest additions (Yandex 26.10 sends them
+        // too) and have no constant in this binding. A stock BoringSSL also
+        // rejects them in `set_verify_algorithm_prefs`. The patched one of
+        // `bssl-patch/prepare.py` accepts them, and `From<u16>` makes the value;
+        // so they are expressible only when this build is known to be patched.
+        #[cfg(bssl_patched)]
+        0x0904..=0x0906 => SslSignatureAlgorithm::from(id),
         _ => return None,
     })
 }
@@ -180,9 +185,17 @@ pub fn unsupported_extensions(profile: &Profile) -> Vec<u16> {
     /// - `0x001c` record_size_limit and `0x0022` delegated_credentials are
     ///   Firefox's, and likewise unreachable — listed so that a Firefox profile
     ///   reports its real gap rather than appearing exact.
+    ///
+    /// - `0xca34` (Yandex 26.10's list of short ids) exists only in the
+    ///   patched BoringSSL, so it is unreachable in a stock build.
     const UNREACHABLE: [u16; 3] = [APPLICATION_SETTINGS, 0x001c, 0x0022];
-    let mut missing: Vec<u16> =
-        profile.extensions.iter().copied().filter(|id| UNREACHABLE.contains(id)).collect();
+    let patched = cfg!(bssl_patched);
+    let mut missing: Vec<u16> = profile
+        .extensions
+        .iter()
+        .copied()
+        .filter(|id| UNREACHABLE.contains(id) || (*id == YANDEX_CA34 && !patched))
+        .collect();
     missing.sort_unstable();
     missing
 }
@@ -258,6 +271,32 @@ impl Shaper {
         can_express(profile)?;
         let mut builder = SslConnector::builder(SslMethod::tls_client())?;
         configure(&mut builder, profile, verify)?;
+        Ok(Self {
+            connector: builder.build(),
+            ech_grease: profile.extensions.contains(&ENCRYPTED_CLIENT_HELLO),
+        })
+    }
+
+    /// A verifying shaper that trusts exactly the roots in `roots_pem`.
+    ///
+    /// BoringSSL has no Windows system store, so `Shaper::new(.., true)` fails
+    /// every handshake there with "unable to get local issuer". The caller
+    /// supplies the roots instead (for example Mozilla's bundle). The store is
+    /// replaced, not extended, so what is trusted is what the caller shipped.
+    /// The peer name is checked against the `sni` given to [`Shaper::connect`].
+    pub fn with_roots(profile: &Profile, roots_pem: &[u8]) -> Result<Self, ShapeError> {
+        can_express(profile)?;
+        let certs = X509::stack_from_pem(roots_pem)?;
+        if certs.is_empty() {
+            return Err(ShapeError::Boring("the roots bundle holds no certificates".to_owned()));
+        }
+        let mut store = X509StoreBuilder::new()?;
+        for cert in certs {
+            store.add_cert(cert)?;
+        }
+        let mut builder = SslConnector::builder(SslMethod::tls_client())?;
+        configure(&mut builder, profile, true)?;
+        builder.set_cert_store_builder(store);
         Ok(Self {
             connector: builder.build(),
             ech_grease: profile.extensions.contains(&ENCRYPTED_CLIENT_HELLO),
@@ -370,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(bssl_patched))]
     fn a_profile_this_build_cannot_emit_says_so_instead_of_approximating() {
         // Chrome carries 0x0904..0x0906. Silently dropping them would produce a
         // hello that is neither Chrome nor Yandex nor the old stack — a third
@@ -395,6 +435,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg(not(bssl_patched))]
+    fn the_26_10_profile_is_refused_by_name_without_the_patched_boringssl() {
+        let yandex = built_in_profile("yandex-windows-26.10").expect("built in");
+        assert_eq!(can_express(&yandex), Err(ShapeError::UnknownSignatureAlgorithm(0x0904)));
+    }
+
+    #[test]
+    #[cfg(bssl_patched)]
+    fn the_26_10_profile_is_fully_expressible_with_the_patched_boringssl() {
+        let yandex = built_in_profile("yandex-windows-26.10").expect("built in");
+        assert_eq!(can_express(&yandex), Ok(()));
+        assert!(unsupported_extensions(&yandex).is_empty());
+        assert!(divergence(&yandex).is_exact());
+        assert!(connector(&yandex, true).is_ok());
     }
 
     #[test]
