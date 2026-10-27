@@ -78,6 +78,12 @@ def window_available():
         return False
 
 
+# Chromium's switch for "no proxy at all". Without it, a direct API call gets a captcha window that
+# follows the system proxy -- Nova's own PAC -- so the answer leaves by another address and Proton
+# answers 12087.
+DIRECT_BROWSER_PROXY = "direct://"
+
+
 def browser_proxy(proxy_url):
     """A proxy WebView2 can use as `--proxy-server`, or None. Chromium takes no credentials on the
     command line, so a proxy with a login (the TLS relay) is not usable here."""
@@ -119,7 +125,8 @@ def solve(api_host, hv_token, *, proxy=None, timeout_s=DEFAULT_TIMEOUT_S, log=No
         os.remove(out_path)
     except OSError:
         pass
-    command = _child_command(url, out_path, browser_proxy(proxy))
+    browser = DIRECT_BROWSER_PROXY if proxy is None else browser_proxy(proxy)
+    command = _child_command(url, out_path, browser)
     try:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL,

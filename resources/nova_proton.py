@@ -64,8 +64,8 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # Both hosts serve the whole flow; the second one is for networks where the first is closed.
 API_HOSTS = ("https://vpn-api.proton.me", "https://api.protonvpn.ch")
-APP_VERSION = "android-vpn@5.4.44.0"
-USER_AGENT_APP = "ProtonVPN/5.4.44.0"
+APP_VERSION = "android-vpn@5.20.21.0"
+USER_AGENT_APP = "ProtonVPN/5.20.21.0"
 CHALLENGE_FRAME_KEY = "vpn-android-v4-challenge-0"
 CHALLENGE_VERSION = "2.0.7"
 DEVICE_NAME = "Nova PC"
