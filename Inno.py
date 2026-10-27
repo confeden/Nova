@@ -708,7 +708,9 @@ def write_helper_runtime_path_file(target_root: Path) -> None:
     executables = [p for p in target_root.glob("python*.exe") if p.is_file()]
     if not executables:
         raise RuntimeError(f"No python*.exe in bundled runtime: {target_root}")
-    content = "Lib\nLib\\site-packages\nDLLs\n.\nimport site\n"
+    # No `import site`: with it, site adds the user site-packages from %APPDATA%, which is exactly
+    # the leak the hostile-env check below catches. Lib\site-packages is listed explicitly instead.
+    content = "Lib\nLib\\site-packages\nDLLs\n.\n"
     for exe in executables:
         (target_root / f"{exe.stem}._pth").write_text(content, encoding="ascii")
 
