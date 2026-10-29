@@ -4,6 +4,7 @@
 7tv.io
 abuseipdb.com
 accounts.google.com
+nova-app.eu
 soundcloud.cloud
 activatica.org
 adguard-mail.com

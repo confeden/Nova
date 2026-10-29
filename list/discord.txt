@@ -24,3 +24,4 @@ ptb.dl2.discordapp.net
 stable.dl2.discordapp.net
 status.discord.com
 updates.discord.com
+discord-attachments-uploads-prd.storage.googleapis.com

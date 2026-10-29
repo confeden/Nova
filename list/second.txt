@@ -145,7 +145,8 @@ spotify.com
 spotifycdn.com
 store.steampowered.com
 streamx.cash
-stripe.comclientservices.googleapis.com
+stripe.com
+clientservices.googleapis.com
 accountcapabilities-pa.googleapis.com
 optimizationguide-pa.googleapis.com
 stripe.network

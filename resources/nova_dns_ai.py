@@ -40,10 +40,19 @@ AG Unlocker. Поэтому Legacy определяется по владель�
 import contextlib
 import ipaddress
 import re
+import subprocess
+import time
 
 # Что вернул `detect_mode`. Пустая строка - DNS-AI машину не обслуживает.
 MODE_NATIVE = "native"
 MODE_STUB = "stub"
+
+# Шаблон DoH, который DNS-AI ставит в систему. Адреса в адаптере без него -
+# это открытый UDP/53, а сервис на нём не отвечает (G74 / D18): такая машина
+# DNS-AI не обслуживает, и разблокировку ставит Nova.
+DOH_TEMPLATE = "https://dns.dns-ai.ru/dns-query"
+DOH_CACHE_SECONDS = 60.0
+_doh_cache = {"ts": 0.0, "value": False}
 
 # Имя процесса резолвера. Оно одно и то же и для службы `DnsAiClient` (она
 # запускает тот же файл с аргументом `service`), и для портативного запуска;
@@ -362,20 +371,64 @@ def client_present():
 
 # ============================== сам ответ ==============================
 
-def detect_mode(dns_ai_servers, servers=None, owners=None, present=None):
+def doh_encrypted(dns_ai_servers, lines=None):
+    """Включено ли в системе шифрование DNS-AI: его адрес с шаблоном DoH.
+
+    Читается `Get-DnsClientDohServerAddress`. Процесс порождается не чаще раза в
+    `DOH_CACHE_SECONDS`: опрос индикатора идёт каждые 10 с, а в native-режиме
+    он попадает сюда только когда адреса DNS-AI уже стоят в адаптере.
+    `lines` подменяется в тестах (строки `адрес<TAB>шаблон`).
+    """
+    now = time.time()
+    if lines is None:
+        if now - _doh_cache["ts"] < DOH_CACHE_SECONDS:
+            return bool(_doh_cache["value"])
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-DnsClientDohServerAddress | ForEach-Object { "
+                 "$_.ServerAddress + [char]9 + $_.DohTemplate }"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            lines = result.stdout.splitlines() if result.returncode == 0 else []
+        except Exception:
+            lines = []
+        value = _doh_matches(dns_ai_servers, lines)
+        _doh_cache["ts"] = now
+        _doh_cache["value"] = value
+        return value
+    return _doh_matches(dns_ai_servers, lines)
+
+
+def _doh_matches(dns_ai_servers, lines):
+    addresses = normalize_addresses(dns_ai_servers)
+    template = DOH_TEMPLATE.rstrip("/").lower()
+    for line in lines:
+        address, _, doh = str(line).partition("\t")
+        if normalize_addresses([address.strip()]) & addresses and doh.strip().rstrip("/").lower() == template:
+            return True
+    return False
+
+
+def detect_mode(dns_ai_servers, servers=None, owners=None, present=None, doh=None):
     """`MODE_NATIVE`, `MODE_STUB` или `""` - как машина сейчас ходит в DNS.
 
     `dns_ai_servers` - собственные адреса резолвера; единственный источник
     правды для них в Nova - каскад NRPT, поэтому они приходят аргументом, а не
     заводятся здесь второй копией.
 
-    `servers`, `owners`, `present` подменяются в тестах; по умолчанию читается
+    Native считается только при включённом DoH-шифровании DNS-AI (`doh_encrypted`):
+    адреса без шифрования сервис не обслуживают, и Nova должна поставить разблокировку.
+
+    `servers`, `owners`, `present`, `doh` подменяются в тестах; по умолчанию читается
     настоящая система.
     """
     values = servers if servers is not None else system_dns_servers()
     configured = normalize_addresses(values)
     if configured & normalize_addresses(dns_ai_servers):
-        return MODE_NATIVE
+        encrypted = doh() if doh is not None else doh_encrypted(dns_ai_servers)
+        return MODE_NATIVE if encrypted else ""
 
     loopback = {a for a in configured if is_loopback(a)}
     if not loopback:

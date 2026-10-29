@@ -8875,7 +8875,7 @@ try:
                 ai_second_route = (secondary_route if secondary_active else "DIRECT")
                 # Выход second заблокирован сервисом по региону (ai_region_worker пробует API
                 # через него) — тогда напрямую по winws, но только если имя этого сервиса
-                # разворачивает DNS-разблокировщик (DNS-AI, xbox-dns, comss, geohide: системный
+                # разворачивает DNS-разблокировщик (DNS-AI, comss, geohide: системный
                 # DNS или правило NRPT). Без разблокировщика прямой путь из России тоже
                 # упрётся в регион, и second остаётся лучшим из двух.
                 ai_region_direct = set()
@@ -14530,9 +14530,9 @@ function FindProxyForURLEx(url, host) {{
                 normalized["system"]["suppress_game_overlay"] = bool(
                     system_payload.get("suppress_game_overlay", normalized["system"]["suppress_game_overlay"])
                 )
-                normalized["system"]["ai_unlock"] = bool(
-                    system_payload.get("ai_unlock", normalized["system"].get("ai_unlock", True))
-                )
+                # Разблокировка ИИ больше не выключается: она работает по умолчанию и
+                # молчит только тогда, когда DNS-AI уже обслуживает машину (D19).
+                normalized["system"]["ai_unlock"] = True
                 normalized["system"]["vpn_autoconnect"] = bool(
                     system_payload.get("vpn_autoconnect", normalized["system"].get("vpn_autoconnect", True))
                 )
@@ -15006,9 +15006,10 @@ function FindProxyForURLEx(url, host) {{
 
     NOVA_NRPT_TAG = "NOVA_DNS_UNBLOCK"
 
-    # Каскад резолверов в порядке, заданном владельцем: dns-ai, затем xbox-dns,
-    # затем comss и geohide. Windows опрашивает серверы правила по порядку и
-    # уходит к следующему по таймауту, то есть сам список и есть каскад.
+    # Каскад резолверов в порядке, заданном владельцем: dns-ai, затем comss и
+    # geohide. xbox-dns.ru убран - сервис больше не работает. Windows опрашивает
+    # серверы правила по порядку и уходит к следующему по таймауту, то есть сам
+    # список и есть каскад.
     #
     # Замерено, а не предположено (nslookup к каждому адресу, UDP/53):
     #   dns-ai   (адреса сервиса: endpoints.json, serial 7 — spb7 194.87.196.13 и
@@ -15017,9 +15018,8 @@ function FindProxyForURLEx(url, host) {{
     #            example.com и google.com. Обычного DNS у сервиса нет: система
     #            ходит к нему по DoH (Get-DnsClientDohServerAddress отдаёт
     #            шаблон https://dns.dns-ai.ru/dns-query, AutoUpgrade=True,
-    #            AllowFallbackToUdp=False). В каскаде он стоит первым, но на
-    #            машине без этого шаблона ответ придёт уже от xbox-dns.
-    #   xbox-dns 111.88.96.50 -> 2a00:ab00:533:6::100 (свой фронтенд)
+    #            AllowFallbackToUdp=False). В каскаде он стоит первым; на машине
+    #            без этого шаблона ответ придёт от comss или geohide.
     #   comss    83.220.169.155 и 212.109.195.93 -> 91.207.75.110
     #   geohide  45.155.204.190 -> 193.233.112.67, 37.230.192.51 -> 46.8.158.6
     NOVA_NRPT_NAMESERVER_CASCADE = (
@@ -15028,12 +15028,6 @@ function FindProxyForURLEx(url, host) {{
             "45.151.102.219",
             "2a00:b700:5::3:62",
             "2a12:5940:d4ef::219",
-        )),
-        ("xbox-dns.ru", (
-            "111.88.96.54",
-            "111.88.96.55",
-            "2a00:ab00:1233:26::50",
-            "2a00:ab00:1233:26::51",
         )),
         ("comss.one", (
             "83.220.169.155",
@@ -16181,6 +16175,7 @@ function FindProxyForURLEx(url, host) {{
         "ptb.dl2.discordapp.net",
         "canary.dl2.discordapp.net",
         "status.discord.com",
+        "discord-attachments-uploads-prd.storage.googleapis.com",
     ]
 
     def discover_discord_update_hosts():
@@ -31969,8 +31964,6 @@ function FindProxyForURLEx(url, host) {{
             saved_system_settings = saved.get("system") or {}
             game_overlay_state = {"enabled": bool(saved_system_settings.get("suppress_game_overlay", False))}
             game_overlay_pills = {}
-            ai_unlock_state = {"enabled": bool(saved_system_settings.get("ai_unlock", True))}
-            ai_unlock_pills = {}
             vpn_autoconnect_state = {"enabled": get_vpn_autoconnect_enabled(saved)}
             vpn_autoconnect_pills = {}
 
@@ -32183,40 +32176,6 @@ function FindProxyForURLEx(url, host) {{
                 game_overlay_pills[mode_key] = btn
             _refresh_game_overlay_pills()
 
-            def _refresh_ai_unlock_pills():
-                enabled = bool(ai_unlock_state.get("enabled", True))
-                for mode_key, btn in ai_unlock_pills.items():
-                    btn.set_selected((mode_key == "on" and enabled) or (mode_key == "off" and not enabled))
-
-            def _set_ai_unlock_enabled(enabled):
-                ai_unlock_state["enabled"] = bool(enabled)
-                _refresh_ai_unlock_pills()
-
-            ai_unlock_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
-            ai_unlock_row.pack(fill="x", pady=(3, 3))
-            tk.Label(
-                ai_unlock_row,
-                text="Разблок. ИИ",
-                width=11,
-                anchor="w",
-                bg=SETTINGS_THEME["bg"],
-                fg=SETTINGS_THEME["text"],
-                font=("Segoe UI", 9),
-            ).pack(side="left")
-            ai_unlock_pill_frame = tk.Frame(ai_unlock_row, bg=SETTINGS_THEME["bg"])
-            ai_unlock_pill_frame.pack(side="right", fill="x", expand=True)
-            for index, mode_key in enumerate(("on", "off")):
-                btn = PopupPillButton(
-                    ai_unlock_pill_frame,
-                    "Вкл" if mode_key == "on" else "Выкл",
-                    command=lambda enabled=(mode_key == "on"): _set_ai_unlock_enabled(enabled),
-                    width=74,
-                    height=26,
-                )
-                btn.pack(side="left", padx=(0 if index == 0 else 4, 0))
-                ai_unlock_pills[mode_key] = btn
-            _refresh_ai_unlock_pills()
-
             button_row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
             button_row.pack(fill="x", pady=(8, 0))
 
@@ -32224,7 +32183,7 @@ function FindProxyForURLEx(url, host) {{
                 latest_settings = load_routing_settings()
                 system_settings = dict(latest_settings.get("system") or {})
                 system_settings["suppress_game_overlay"] = bool(game_overlay_state.get("enabled", False))
-                system_settings["ai_unlock"] = bool(ai_unlock_state.get("enabled", True))
+                system_settings["ai_unlock"] = True
                 system_settings["vpn_autoconnect"] = bool(vpn_autoconnect_state.get("enabled", True))
                 secondary_mode, secondary_region = nova_vpn_slots.secondary_choice_for_pill(
                     secondary_state.get("value"), get_secondary_vpn_choice(latest_settings))
@@ -32339,8 +32298,6 @@ function FindProxyForURLEx(url, host) {{
                 system_settings = latest.get("system") or {}
                 game_overlay_state["enabled"] = bool(system_settings.get("suppress_game_overlay", False))
                 _refresh_game_overlay_pills()
-                ai_unlock_state["enabled"] = bool(system_settings.get("ai_unlock", True))
-                _refresh_ai_unlock_pills()
                 vpn_autoconnect_state["enabled"] = bool(system_settings.get("vpn_autoconnect", True))
                 _refresh_vpn_autoconnect_pills()
 
