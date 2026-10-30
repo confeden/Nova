@@ -7536,6 +7536,9 @@ try:
         OPERA_RETURN_BASE_SEC = 20 * 60.0
         OPERA_RETURN_MAX_SEC = 2 * 3600.0
         OPERA_TRIAL_BUDGET_SEC = 120.0
+        # Our own Proton group inside «Авто» (D35): the runner walks the group's nodes itself, and a
+        # group that carried nothing for this long moves «Авто» on to Tor.
+        PROFILE_AUTO_FAIL_SEC = 75.0
 
         def __init__(self, log_func=None):
             self.log_func = log_func or _profiles_log
@@ -7660,7 +7663,7 @@ try:
                 self.mode = choice["mode"]
                 self.profile_choice = {"group": choice.get("profile_group", ""),
                                        "profile": choice.get("profile", "")}
-                self._attempts = nova_vpn_slots.secondary_attempts(choice, last)
+                self._attempts = self._ring(choice, last)
                 self._index = 0
                 self._reset_trial()
                 self._generation += 1
@@ -7668,6 +7671,20 @@ try:
                 attempt = self._attempts[0]
             self._activate(generation, attempt, "запуск")
             return True
+
+        @staticmethod
+        def _ring(choice, last):
+            """secondary_attempts, minus the Proton step of «Авто» when no Proton profile exists yet."""
+            attempts = nova_vpn_slots.secondary_attempts(choice, last)
+            if choice.get("mode") != nova_vpn_slots.SECONDARY_AUTO:
+                return attempts
+            have = False
+            with contextlib.suppress(Exception):
+                have = any(str(r.get("group") or "") == nova_profiles.GROUP_PROTON
+                           for r in nova_profiles.list_profiles(get_base_dir()))
+            if have:
+                return attempts
+            return [a for a in attempts if a[0] != nova_vpn_slots.SECONDARY_PROFILE] or attempts
 
         def apply_now(self, reason=""):
             """The choice changed in the UI: switch at once, keeping a reserve that already fits."""
@@ -7681,7 +7698,7 @@ try:
                 self.mode = choice["mode"]
                 self.profile_choice = {"group": choice.get("profile_group", ""),
                                        "profile": choice.get("profile", "")}
-                self._attempts = nova_vpn_slots.secondary_attempts(choice, current)
+                self._attempts = self._ring(choice, current)
                 self._index = 0
                 self._reset_trial()
                 self._generation += 1
@@ -7766,6 +7783,10 @@ try:
                         self._reset_trial()
                     elif kind == nova_vpn_slots.SECONDARY_TOR:
                         self.entry = nova_vpn_slots.normalize_tor_entry(value)
+                    elif self.mode == nova_vpn_slots.SECONDARY_AUTO:
+                        # A step of the «Авто» ring: the group, not a pinned node; the trial back to
+                        # Opera that _advance_locked scheduled must survive the switch.
+                        self.profile_choice = {"group": str(value or ""), "profile": ""}
                     else:
                         self._reset_trial()
                     self._attempt_started = time.time()
@@ -7868,21 +7889,26 @@ try:
                     # A named reserve is never replaced by another kind (I1). What it does when its
                     # tunnel dies is walk to the next profile of its own group -- the same answer the
                     # primary gives, and the reason the choice may be a group and not only one node.
+                    walk = False
                     if up:
                         self._profile_dead_since = 0.0
-                        return
-                    if not self._profile_dead_since:
+                    elif not self._profile_dead_since:
                         self._profile_dead_since = now
+                    elif now - self._profile_dead_since >= SecondaryProfileRunner.DEAD_GRACE_SEC:
+                        self._profile_dead_since = now
+                        walk = True
+                    if walk:
+                        threading.Thread(
+                            target=self._advance_profile, args=(self.profile_runner(), self._generation),
+                            daemon=True, name="NovaSecondaryProfileWalk").start()
+                    if self.mode != nova_vpn_slots.SECONDARY_AUTO:
                         return
-                    if now - self._profile_dead_since < SecondaryProfileRunner.DEAD_GRACE_SEC:
+                    # «Авто» on Proton: the group walks its own nodes, and when none carried traffic
+                    # for PROFILE_AUTO_FAIL_SEC the ring moves on (Tor). Opera is tried back below.
+                    since = max(self._attempt_started, self._last_good)
+                    if not up and since and now - since >= self.PROFILE_AUTO_FAIL_SEC:
+                        self._advance_locked(now, self._generation, f"Proton не отвечает {int(now - since)} с")
                         return
-                    self._profile_dead_since = now
-                    generation = self._generation
-                    runner = self.profile_runner()
-                    threading.Thread(
-                        target=self._advance_profile, args=(runner, generation),
-                        daemon=True, name="NovaSecondaryProfileWalk").start()
-                    return
                 if self.mode != nova_vpn_slots.SECONDARY_AUTO:
                     return
                 generation = self._generation
@@ -7891,7 +7917,7 @@ try:
                     if not up and since and now - since >= self.OPERA_AUTO_FAIL_SEC:
                         self._advance_locked(now, generation, f"Opera не отвечает {int(now - since)} с")
                     return
-                # On Tor: try Opera back now and then, and walk on when Tor itself gave up.
+                # On Tor or Proton: try Opera back now and then; Tor that gave up moves the ring on.
                 if self._trial_started:
                     if opera_usable:
                         self._reset_trial()
@@ -7915,7 +7941,8 @@ try:
                 state = ""
                 with contextlib.suppress(Exception):
                     state = str(tm.status().get("state") or "") if tm is not None else ""
-                if state == "failed" and now - self._attempt_started >= self.TOR_AUTO_FAIL_GRACE_SEC:
+                if (kind == nova_vpn_slots.SECONDARY_TOR and state == "failed"
+                        and now - self._attempt_started >= self.TOR_AUTO_FAIL_GRACE_SEC):
                     self._advance_locked(now, generation, "Tor не подключился ни одним способом")
 
         def _schedule_trial(self, now):
@@ -7926,7 +7953,7 @@ try:
             opm = globals().get("opera_proxy_manager")
             if opm is None:
                 return
-            self.log_func(f"[VPN] Проверяем, вернулась ли Opera {self.region}: дополнительный VPN пока на Tor.")
+            self.log_func(f"[VPN] Проверяем, вернулась ли Opera {self.region}: дополнительный VPN пока на резерве.")
             try:
                 opm.configure_country(_opera_region_to_country(self.region))
                 with contextlib.suppress(Exception):
@@ -7947,7 +7974,7 @@ try:
             self._index = (self._index + 1) % len(self._attempts)
             attempt = self._attempts[self._index]
             self._reset_trial()
-            if attempt[0] == nova_vpn_slots.SECONDARY_TOR:
+            if attempt[0] != nova_vpn_slots.SECONDARY_OPERA:
                 self._schedule_trial(now)
             self._generation += 1
             self._activate_async(self._generation, attempt, why)
@@ -32465,6 +32492,13 @@ function FindProxyForURLEx(url, host) {{
                 data["imported"] = _imported_profile_menu_data(
                     base, chosen_ids=(data["primary"].get("profile") or "",
                                       data["secondary"].get("profile") or ""))
+            with contextlib.suppress(Exception):
+                by_country = {}
+                for record in nova_profiles.list_profiles(base):
+                    country = nova_profiles.record_country(record)
+                    if country and record.get("valid") and record.get("id"):
+                        by_country.setdefault(country, str(record["id"]))
+                data["proton_by_country"] = by_country
             jobs = globals().get("profile_jobs")
             with contextlib.suppress(Exception):
                 data["reissue_busy"] = bool(jobs is not None and jobs._pipeline_lock.locked())
@@ -32685,6 +32719,27 @@ function FindProxyForURLEx(url, host) {{
                     command=lambda r=region: _run_ui_worker(_apply_secondary_vpn_choice, "NovaSecondaryVpnChoice",
                                                             nova_vpn_slots.SECONDARY_OPERA, r, None, "меню"),
                 )
+            proton_group = nova_profiles.GROUP_PROTON
+            proton_menu = tk.Menu(menu, **_vpn_menu_options())
+            proton_menu.add_radiobutton(
+                label="Любая страна (ближайшая)", variable=var, value=f"profile:{proton_group}",
+                command=lambda: _run_ui_worker(
+                    _apply_secondary_vpn_choice, "NovaSecondaryVpnChoice",
+                    nova_vpn_slots.SECONDARY_PROFILE, None, None, "меню", proton_group, ""),
+            )
+            proton_by_country = data.get("proton_by_country") or {}
+            if proton_by_country:
+                proton_menu.add_separator()
+            for code in nova_vpn_slots.order_countries(proton_by_country):
+                proton_menu.add_radiobutton(
+                    label=code, variable=var, value=f"profile:{proton_by_country[code]}",
+                    command=lambda pid=proton_by_country[code]: _run_ui_worker(
+                        _apply_secondary_vpn_choice, "NovaSecondaryVpnChoice",
+                        nova_vpn_slots.SECONDARY_PROFILE, None, None, "меню", proton_group, pid),
+                )
+            if not proton_by_country:
+                proton_menu.add_command(label="Профилей Proton ещё нет — выпустятся сами", state="disabled")
+            menu.add_cascade(label="Proton", menu=proton_menu)
             tor_menu = tk.Menu(menu, **_vpn_menu_options())
             for entry_key, entry_label in nova_vpn_slots.TOR_ENTRIES:
                 tor_menu.add_radiobutton(
