@@ -1,0 +1,7 @@
+/target
+/crates/nova-gui/ui/dist
+node_modules
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
