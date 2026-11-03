@@ -325,9 +325,27 @@ def _veil(target, base):
     return '#%02X%02X%02X%02X' % (alpha, *channels)
 
 
+def font_roles(theme_id='aurora'):
+    """Keep compact UI text readable; reserve each theme's face for display roles."""
+    display = THEMES.get(theme_id, THEMES['aurora'])['font_family']
+    body = 'Segoe UI'
+    return {
+        'brand': (display, 20, 'bold'),
+        'title': (display, 16, 'bold'),
+        'body': (body, 10),
+        'control': (body, 9),
+        'action': ('Segoe UI Semibold', 11),
+        'status': (display, 12, 'bold'),
+        'section': (body, 9, 'bold'),
+        'caption': (body, 9),
+        'mono': ('Consolas', 9),
+    }
+
+
 def settings_theme(theme_id='aurora'):
     """Compatible with nova.pyw SETTINGS_THEME and nova_profiles_ui contexts."""
     theme = THEMES.get(theme_id, THEMES['aurora'])
+    fonts = font_roles(theme_id)
     base = theme['bg'][1]
     fill = theme['card_fill']
     if isinstance(fill, tuple):
@@ -336,7 +354,10 @@ def settings_theme(theme_id='aurora'):
     return {
         'bg': base, 'panel': panel, 'border': _over(theme['card_stroke'], base),
         'text': theme['t_title'], 'muted': theme['t_hint'], 'value': theme['t_value'],
-        'accent': theme['accent'], 'font_family': theme['font_family'],
+        'accent': theme['accent'], 'font_family': fonts['body'][0],
+        'heading_family': fonts['title'][0], 'status_family': fonts['status'][0],
+        'control_family': fonts['control'][0], 'mono_family': fonts['mono'][0],
+        'theme_id': theme_id if theme_id in THEMES else 'aurora',
         'radius': theme['radius'], 'field': _over(theme['field_fill'], base),
         'pill_on_bg': _mix(panel, theme['accent'], 0.20),
         'pill_on_fg': theme['t_title'],

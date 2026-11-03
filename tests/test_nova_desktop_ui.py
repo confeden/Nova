@@ -46,6 +46,23 @@ class _GuardedCanvas(tk.Canvas):
         return super().tag_lower(*args)
 
 
+class CaptionTests(unittest.TestCase):
+    def test_long_profile_name_fits_without_measuring_every_character(self):
+        measurements = []
+
+        def measure(text):
+            measurements.append(text)
+            return len(text) * 7
+
+        result = ui.fit_caption("Long imported profile " * 500, 140, measure)
+        self.assertTrue(result.endswith("…"))
+        self.assertLessEqual(len(result) * 7, 140)
+        self.assertLess(len(measurements), 20)
+
+    def test_insufficient_space_cannot_draw_an_ellipsis_outside_the_slot(self):
+        self.assertEqual(ui.fit_caption("Long name", 4, lambda text: len(text) * 7), "")
+
+
 class DesktopSceneTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
