@@ -328,7 +328,7 @@ def _veil(target, base):
 def font_roles(theme_id='aurora'):
     """Keep compact UI text readable; reserve each theme's face for display roles."""
     display = THEMES.get(theme_id, THEMES['aurora'])['font_family']
-    body = 'Segoe UI'
+    body = 'Segoe UI Semibold'
     return {
         'brand': (display, 20, 'bold'),
         'title': (display, 16, 'bold'),

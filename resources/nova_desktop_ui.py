@@ -94,8 +94,15 @@ def supernova_icon(size=64, accent="#50C878"):
     pen = ImageDraw.Draw(glow)
     pen.ellipse((center - unit * .16, center - unit * .16,
                  center + unit * .16, center + unit * .16), fill=color + (95,))
+    radius = unit * .325
+    pen.ellipse((center - radius, center - radius, center + radius, center + radius),
+                outline=color + (180,), width=max(1, round(unit * .025)))
     image = Image.alpha_composite(image, glow.filter(ImageFilter.GaussianBlur(unit * .11)))
     pen = ImageDraw.Draw(image)
+    for radius, opacity, width in ((.36, 50, .006), (.325, 220, .009), (.304, 70, .005)):
+        distance = unit * radius
+        pen.ellipse((center - distance, center - distance, center + distance, center + distance),
+                    outline=color + (opacity,), width=max(1, round(unit * width)))
     for index in range(12):
         angle = index * math.tau / 12 - math.pi / 2
         length = unit * (.46 if index % 3 == 0 else .30 if index % 2 == 0 else .21)

@@ -191,7 +191,7 @@ DEFAULT_THEME = {
     "pill_on_fg": "#50C878",
     "pill_off_bg": "#1A1432",
     "pill_off_fg": "#A8ADD4",
-    "font_family": "Segoe UI",
+    "font_family": "Segoe UI Semibold",
 }
 # Row/notice tones. Dark values are nova.pyw LOG_COLOR_TEXT_*; light ones are darker variants
 # that stay readable on SETTINGS_THEME light panels.
