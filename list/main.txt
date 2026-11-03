@@ -5,9 +5,12 @@
 abuseipdb.com
 accounts.google.com
 soundcloud.cloud
+nova-app.eu
 activatica.org
+phncdn.com
 adguard-mail.com
 adobe.com
+team.ga
 ctfassets.net
 adobe.io
 akamaiedge.net
