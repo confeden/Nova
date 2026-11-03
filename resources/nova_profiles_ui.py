@@ -180,24 +180,25 @@ _STATUS_GETTERS = (("get_runtime_status", "runtime", {}), ("job_status", "jobs",
 _REASON_PROFILE_DELETED = "профиль удалён"
 _WARNING_AWG3_MARK = "AWG 3.x"
 
-# nova.pyw SETTINGS_THEME (dark) — used only when ctx.theme lacks a key.
+# Android Aurora defaults, used only when ctx.theme lacks a key.
 DEFAULT_THEME = {
-    "bg": "#0B1410",
-    "panel": "#111B15",
-    "border": "#22402B",
-    "text": "#E5F7E8",
-    "muted": "#93AD98",
-    "pill_on_bg": "#12381D",
-    "pill_on_fg": "#D9FFE1",
-    "pill_off_bg": "#1A241D",
-    "pill_off_fg": "#8DA38F",
+    "bg": "#090817",
+    "panel": "#120D27",
+    "border": "#302449",
+    "text": "#EEF0F8",
+    "muted": "#A8ADD4",
+    "pill_on_bg": "#20382F",
+    "pill_on_fg": "#50C878",
+    "pill_off_bg": "#1A1432",
+    "pill_off_fg": "#A8ADD4",
+    "font_family": "Segoe UI",
 }
 # Row/notice tones. Dark values are nova.pyw LOG_COLOR_TEXT_*; light ones are darker variants
 # that stay readable on SETTINGS_THEME light panels.
-_TONES_DARK = {"ok": "#47E05F", "fail": "#FF6B6B", "warn": "#E4C05B"}
+_TONES_DARK = {"ok": "#50C878", "fail": "#EF8B93", "warn": "#F4C67E"}
 _TONES_LIGHT = {"ok": "#13A10E", "fail": "#C62828", "warn": "#9A6700"}
-_OUTLINE_ACCENT = "#13A10E"  # nova.pyw OUTLINE_ACCENT_COLOR = MAIN_COLOR_TEXT_NORMAL
-_SCROLL_THUMB_DARK = ("#2D5A37", "#418050")  # nova.pyw ModernScrollbar (thumb, hover)
+_OUTLINE_ACCENT = "#50C878"
+_SCROLL_THUMB_DARK = ("#443660", "#72628F")
 _SCROLL_THUMB_LIGHT = ("#9CC8A5", "#79B487")
 
 _REGISTRY_ATTR = "_nova_profiles_window_ref"
@@ -840,7 +841,7 @@ class FallbackPillButton(tk.Canvas):
         self._height = int(height)
         self._shape = self.create_polygon(
             _round_rect_points(1, 1, self._width - 2, self._height - 2, 10), smooth=True, width=2)
-        self._text_id = self.create_text(self._width // 2, self._height // 2, text=text, font=("Segoe UI", 8))
+        self._text_id = self.create_text(self._width // 2, self._height // 2, text=text, font=(self._theme["font_family"], 9, "bold"))
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", lambda _e: self.invoke())
@@ -872,22 +873,25 @@ class FallbackPillButton(tk.Canvas):
         fill = t["pill_on_bg"] if self._selected else t["pill_off_bg"]
         fg = t["pill_on_fg"] if self._selected else t["pill_off_fg"]
         if self._hover:
-            outline = _OUTLINE_ACCENT
+            outline = t.get("accent", _OUTLINE_ACCENT)
         elif self._selected:
             outline = t["border"]
         else:
             outline = fill
         self.itemconfigure(self._shape, fill=fill, outline=outline)
         self.itemconfigure(self._text_id, fill=_lighter_hex(fg, 0.18) if self._hover else fg,
-                           font=("Segoe UI Semibold", 8) if self._hover else ("Segoe UI", 8))
+                           font=(self._theme["font_family"], 9, "bold"))
 
 
 class ThemedScrollbar(tk.Canvas):
     """nova.pyw ModernScrollbar with SETTINGS_THEME colours; the thumb hides when all rows fit."""
 
     def __init__(self, master, command, theme, dark, width=14):
-        self.bg_color = merge_theme(theme)["panel"]
-        self.thumb_color, self.hover_color = _SCROLL_THUMB_DARK if dark else _SCROLL_THUMB_LIGHT
+        theme = merge_theme(theme)
+        self.bg_color = theme["panel"]
+        thumb, hover = _SCROLL_THUMB_DARK if dark else _SCROLL_THUMB_LIGHT
+        self.thumb_color = theme.get("scrollbar", thumb)
+        self.hover_color = theme.get("scrollbar_hover", hover)
         # height=1: a Canvas otherwise requests ~7 cm and would stretch the list next to it.
         super().__init__(master, bg=self.bg_color, width=width, height=1, highlightthickness=0, bd=0,
                          cursor="sb_v_double_arrow")
@@ -1142,15 +1146,19 @@ class ProfilesWindow:
         return int(self.root.tk.call("font", "measure", font, text))
 
     def _pill_width(self, text, min_width=62):
-        return max(int(min_width), self._measure(self.font_pill, text) + 22)
+        return max(int(min_width), self._measure(self.font_pill, text) + 26)
 
-    def _make_pill(self, master, text, command, width=None, height=26, min_width=62):
+    def _make_pill(self, master, text, command, width=None, height=30, min_width=62):
         if width is None:
             width = self._pill_width(text, min_width)
         cls = getattr(self.ctx, "pill_button_cls", None)
         if cls is None:
-            return FallbackPillButton(master, text, command, width=width, height=height, theme=self.theme)
-        return cls(master, text, command, width=width, height=height)
+            pill = FallbackPillButton(master, text, command, width=width, height=height, theme=self.theme)
+        else:
+            pill = cls(master, text, command, width=width, height=height)
+        pill._nova_pill = True
+        pill._nova_min_width = width
+        return pill
 
     def _divider(self, parent, pady):
         tk.Frame(parent, bg=self.theme["border"], height=1).pack(fill="x", pady=pady)
@@ -1160,9 +1168,10 @@ class ProfilesWindow:
         root = self.root
         # Font descriptions, not tkinter.font.Font objects: a Font has __del__ that calls into Tcl, and
         # the cyclic GC may run it on a refresh worker (measured: the worker blocked in `font delete`).
-        self.font_title = ("Segoe UI", 10)
-        self.font_text = ("Segoe UI", 9)
-        self.font_pill = ("Segoe UI Semibold", 8)
+        family = t["font_family"]
+        self.font_title = (family, 15, "bold")
+        self.font_text = (family, 10)
+        self.font_pill = (family, 9, "bold")
 
         win = tk.Toplevel(root)
         win.withdraw()
@@ -1182,18 +1191,19 @@ class ProfilesWindow:
         win.bind("<Escape>", lambda _e: self.hide())
         win.bind("<Control-KeyPress>", self._on_control_key)
 
-        outer = tk.Frame(win, bg=t["bg"], padx=10, pady=10)
+        outer = tk.Frame(win, bg=t["bg"], padx=18, pady=16)
+        self._outer = outer
         outer.pack(fill="both", expand=True)
 
         tk.Label(outer, text="Профили", font=self.font_title, bg=t["bg"], fg=t["text"], anchor="w").pack(
-            fill="x", pady=(0, 6))
+            fill="x", pady=(0, 14))
 
         tabs_row = tk.Frame(outer, bg=t["bg"])
         tabs_row.pack(fill="x")
         self.tab_pills = {}
         for index, (key, caption) in enumerate(TABS):
             pill = self._make_pill(tabs_row, caption, lambda k=key: self.select_tab(k), min_width=52)
-            pill.pack(side="left", padx=(0 if index == 0 else 4, 0))
+            pill.pack(side="left", padx=(0 if index == 0 else 6, 0))
             self.tab_pills[key] = pill
 
         # The «Режим: Авто / Группа / Профиль» row was removed on the owner's word 2026-09-20
@@ -1201,11 +1211,11 @@ class ProfilesWindow:
         # under them and the main window's own VPN pill — and two of its three buttons duplicated
         # «Подключить». What remains is the one line that says what is actually in use.
         self.selection_label = self._label(outer, tone="muted")
-        self.selection_label.pack(fill="x", pady=(8, 0))
+        self.selection_label.pack(fill="x", pady=(14, 0))
         self.runtime_label = self._label(outer)
-        self.runtime_label.pack(fill="x", pady=(1, 0))
+        self.runtime_label.pack(fill="x", pady=(4, 0))
 
-        self._divider(outer, (8, 8))
+        self._divider(outer, (12, 12))
 
         body = tk.Frame(outer, bg=t["bg"])
         body.pack(fill="x")
@@ -1217,7 +1227,7 @@ class ProfilesWindow:
         self._build_list_panel(self.list_panel)
         self._build_tor_panel(self.tor_panel)
 
-        self._divider(outer, (8, 8))
+        self._divider(outer, (12, 12))
 
         actions = tk.Frame(outer, bg=t["bg"])
         actions.pack(fill="x")
@@ -1231,19 +1241,19 @@ class ProfilesWindow:
             self.action_pills[key] = {}
             for row_index, row in enumerate(TAB_ACTION_ROWS[key]):
                 row_frame = tk.Frame(frame, bg=t["bg"])
-                row_frame.pack(fill="x", pady=(0 if row_index == 0 else 4, 0))
+                row_frame.pack(fill="x", pady=(0 if row_index == 0 else 6, 0))
                 for index, action in enumerate(row):
                     caption = ACTION_LABELS[action]
                     width = None
                     if action == "tor_toggle":
                         width = max(self._pill_width(TOR_CONNECT_LABEL), self._pill_width(TOR_DISCONNECT_LABEL))
                     pill = self._make_pill(row_frame, caption, lambda a=action: self._dispatch_action(a), width=width)
-                    pill.pack(side="left", padx=(0 if index == 0 else 4, 0))
+                    pill.pack(side="left", padx=(0 if index == 0 else 6, 0))
                     self.action_pills[key][action] = pill
 
         bottom = tk.Frame(outer, bg=t["bg"])
-        bottom.pack(fill="x", pady=(10, 0))
-        self.close_pill = self._make_pill(bottom, "Закрыть", self.hide, width=74)
+        bottom.pack(fill="x", pady=(14, 0))
+        self.close_pill = self._make_pill(bottom, "Закрыть", self.hide, width=86)
         self.close_pill.pack(side="right")
         self.notice_label = self._label(bottom, tone="muted")
         self.notice_label.pack(side="left", fill="x", expand=True)
@@ -1264,10 +1274,99 @@ class ProfilesWindow:
         self._marker_pad = " " * max(1, round(self._measure(self.font_text, "● ") / space))
         self.select_tab(self.current_tab if self.current_tab in dict(TABS) else GROUP_CLOUDFLARE)
 
+    def apply_theme(self, theme):
+        """Repaint the live window without replacing its selection, jobs or import preview."""
+        if not self.alive():
+            return
+        previous = dict(self.theme)
+        old_tones = dict(self.tones)
+        self.theme = merge_theme(theme)
+        self.dark = is_dark_theme(self.theme)
+        self.tones = dict(_TONES_DARK if self.dark else _TONES_LIGHT)
+        family = self.theme["font_family"]
+        self.font_title = (family, 15, "bold")
+        self.font_text = (family, 10)
+        self.font_pill = (family, 9, "bold")
+        self._fit_cache.clear()
+        mapping = {value: self.theme[key] for key, value in previous.items()
+                   if key in self.theme and value.startswith("#")}
+        mapping.update({value: self.tones[key] for key, value in old_tones.items()})
+        radius = theme.get("radius", 12) if isinstance(theme, dict) else 12
+        radius = max(0, min(12, radius)) if isinstance(radius, int) else 12
+
+        def repaint(widget):
+            options = widget.keys()
+            for option in ("bg", "fg", "insertbackground", "highlightbackground", "highlightcolor",
+                           "selectbackground", "selectforeground", "activebackground", "activeforeground"):
+                if option in options:
+                    value = str(widget.cget(option))
+                    if value in mapping:
+                        widget.configure(**{option: mapping[value]})
+            if "font" in options:
+                current = widget.cget("font")
+                size = self.root.tk.call("font", "actual", current, "-size")
+                weight = self.root.tk.call("font", "actual", current, "-weight")
+                widget.configure(font=(family, size, weight))
+            if getattr(widget, "_nova_pill", False):
+                if isinstance(widget, FallbackPillButton):
+                    widget._theme = dict(self.theme)
+                width = max(widget._nova_min_width, self._pill_width(widget.itemcget(widget._text_id, "text")))
+                height = int(widget.cget("height"))
+                widget.configure(width=width, bg=self.theme["bg"])
+                widget._width = width
+                widget.itemconfigure(widget._text_id, font=self.font_pill)
+                widget.coords(widget._text_id, width / 2, height / 2)
+                if isinstance(widget, FallbackPillButton):
+                    widget.coords(widget._shape, *_round_rect_points(1, 1, width - 2, height - 2, radius))
+                if hasattr(widget, "_base_font"):
+                    widget._base_font = self.font_pill
+                    widget._hover_font = self.font_pill
+                    widget._radius = radius
+                    for item in (widget._fill_id, widget._outline_id):
+                        widget.coords(item, width / 2, height / 2)
+                render = getattr(widget, "_render", None)
+                if callable(render):
+                    render()
+            if isinstance(widget, tk.Listbox):
+                widget.configure(bg=self.theme["panel"], fg=self.theme["text"],
+                                 selectbackground=self.theme["pill_on_bg"],
+                                 selectforeground=self.theme["pill_on_fg"])
+            if isinstance(widget, ThemedScrollbar):
+                thumb, hover = _SCROLL_THUMB_DARK if self.dark else _SCROLL_THUMB_LIGHT
+                widget.bg_color = self.theme["panel"]
+                widget.thumb_color = self.theme.get("scrollbar", thumb)
+                widget.hover_color = self.theme.get("scrollbar_hover", hover)
+                widget.configure(bg=widget.bg_color)
+                widget._draw()
+            if isinstance(widget, tk.Toplevel):
+                apply_title_bar_theme(widget, self.dark)
+            for child in widget.winfo_children():
+                repaint(child)
+
+        top = self.listbox.yview()[0]
+        repaint(self.win)
+        if self._row_signature:
+            for index, (_row_id, _text, tone) in enumerate(self._row_signature[1]):
+                self.listbox.itemconfigure(index, fg=self._tone_color(tone))
+        if self._preview is not None and self._preview.alive():
+            for index in range(len(self._preview.rows)):
+                self._preview.listbox.itemconfigure(index, fg=self._preview._row_color(index))
+        self.win.update_idletasks()
+        self._tor_caption_width = self._tor_caption.winfo_reqwidth()
+        space = max(1, self._measure(self.font_text, " "))
+        self._marker_pad = " " * max(1, round(self._measure(self.font_text, "● ") / space))
+        self._min_content_px = max(self._min_content_px, self._outer.winfo_reqwidth() - self._outer_pad_px)
+        self.win.minsize(max(self.win.minsize()[0], self.win.winfo_reqwidth()), 1)
+        self._apply_content_width(max(self._min_content_px, self.win.winfo_width() - self._outer_pad_px))
+        self._set_label(self.notice_label, self._notice_text, self._notice_tone, max_px=self._notice_px)
+        self._render_all()
+        self.listbox.yview_moveto(top)
+        self._call_ctx_quiet("place_window", self.win)
+
     def _build_list_panel(self, panel):
         t = self.theme
         self.list_header = self._label(panel)
-        self.list_header.pack(fill="x", pady=(0, 5))
+        self.list_header.pack(fill="x", pady=(0, 8))
         box = tk.Frame(panel, bg=t["panel"], highlightthickness=1, highlightbackground=t["border"],
                        highlightcolor=t["border"], bd=0)
         box.pack(fill="both", expand=True)
@@ -1279,12 +1378,12 @@ class ProfilesWindow:
         self.scrollbar = ThemedScrollbar(box, self.listbox.yview, t, self.dark)
         self.listbox.configure(yscrollcommand=self.scrollbar.set)
         self.scrollbar.pack(side="right", fill="y", pady=2)
-        self.listbox.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
+        self.listbox.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=8)
         self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
         self.listbox.bind("<Delete>", lambda _e: self._dispatch_action("delete")
                           if "delete" in self.action_pills.get(self.current_tab, {}) else None)
         self.job_label = self._label(panel, tone="muted")
-        self.job_label.pack(fill="x", pady=(5, 0))
+        self.job_label.pack(fill="x", pady=(8, 0))
 
     def _build_tor_panel(self, panel):
         t = self.theme
@@ -1293,10 +1392,11 @@ class ProfilesWindow:
         caption = tk.Label(entry_row, text="Вход", width=10, anchor="w", bg=t["bg"], fg=t["text"],
                            font=self.font_text)
         caption.pack(side="left")
+        self._tor_caption = caption
         self.tor_entry_pills = {}
         for index, (entry, label) in enumerate(TOR_ENTRIES):
             pill = self._make_pill(entry_row, label, lambda e=entry: self._on_tor_entry(e), min_width=46)
-            pill.pack(side="left", padx=(0 if index == 0 else 4, 0))
+            pill.pack(side="left", padx=(0 if index == 0 else 6, 0))
             self.tor_entry_pills[entry] = pill
         self.tor_labels = {}
         for key, text in (("state", "Состояние"), ("progress", ""), ("bridges", "Мосты"), ("ports", "Порты"),
@@ -2958,11 +3058,11 @@ class ImportPreview:
         top.protocol("WM_DELETE_WINDOW", self.close)
         top.bind("<Escape>", lambda _e: self.close())
 
-        outer = tk.Frame(top, bg=t["bg"], padx=10, pady=10)
+        outer = tk.Frame(top, bg=t["bg"], padx=18, pady=16)
         outer.pack(fill="both", expand=True)
         total = len(self.rows)
         new = sum(1 for r in self.rows if r["status"] == "new")
-        tk.Label(outer, text=f"Найдено профилей: {total} · новых: {new}", font=view.font_title, bg=t["bg"],
+        tk.Label(outer, text=f"Найдено профилей: {total} · новых: {new}", font=(t["font_family"], 12, "bold"), bg=t["bg"],
                  fg=t["text"], anchor="w").pack(fill="x")
         # The group follows the kind, not the button: a vless:// link goes to «VLESS» and a
         # wg-quick block to «Custom», and one paste can carry both.
@@ -2975,7 +3075,7 @@ class ImportPreview:
         where = " и ".join(f"«{g}»" for g in groups) or f"«{GROUP_CUSTOM}»"
         tk.Label(outer, text=f"Отмеченные попадут в {'группы' if len(groups) > 1 else 'группу'} {where}. "
                              "Режим подключения не меняется.",
-                 font=view.font_text, bg=t["bg"], fg=t["muted"], anchor="w").pack(fill="x", pady=(2, 6))
+                 font=view.font_text, bg=t["bg"], fg=t["muted"], anchor="w").pack(fill="x", pady=(6, 12))
 
         box = tk.Frame(outer, bg=t["panel"], highlightthickness=1, highlightbackground=t["border"], bd=0)
         box.pack(fill="both", expand=True)
@@ -2987,7 +3087,7 @@ class ImportPreview:
         scrollbar = ThemedScrollbar(box, self.listbox.yview, t, view.dark)
         self.listbox.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y", pady=2)
-        self.listbox.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
+        self.listbox.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=8)
 
         self._checked = {i for i, row in enumerate(self.rows) if row["status"] == "new"}
         for index in range(total):
@@ -3001,8 +3101,8 @@ class ImportPreview:
         self.status_label.pack(fill="x", pady=(6, 0))
 
         buttons = tk.Frame(outer, bg=t["bg"])
-        buttons.pack(fill="x", pady=(8, 0))
-        self.cancel_pill = view._make_pill(buttons, "Отмена", self.close, width=74)
+        buttons.pack(fill="x", pady=(12, 0))
+        self.cancel_pill = view._make_pill(buttons, "Отмена", self.close, width=86)
         self.cancel_pill.pack(side="right")
         width = max(view._pill_width("Импортировать 999"), 110)
         self.import_pill = view._make_pill(buttons, self._button_text(), self._on_import, width=width)

@@ -787,6 +787,8 @@ try:
     # The «Профили» window imports tkinter itself, so it sits inside the same guard:
     # a broken Tk runtime keeps the readable boot error instead of a bare traceback.
     import nova_profiles_ui
+    import nova_appearance
+    import nova_desktop_ui
 except ImportError as e:
     ctypes.windll.user32.MessageBoxW(0, f"Critical Error: Failed to load Tkinter.\n\n{e}", "Nova Boot Error", 0x10)
     sys.exit(1)
@@ -955,12 +957,11 @@ try:
     def apply_window_icon(window):
         try:
             from PIL import ImageTk
-            pil_image = _load_embedded_pil_image("icon")
+            pil_image = nova_desktop_ui.supernova_icon(
+                64, globals().get("SETTINGS_THEME", {}).get("accent", "#50C878"))
             if pil_image is not None:
                 tk_image = ImageTk.PhotoImage(pil_image, master=window)
-                refs = getattr(window, "_nova_icon_refs", [])
-                refs.append(tk_image)
-                window._nova_icon_refs = refs
+                window._nova_icon_refs = [tk_image]
                 window.iconphoto(True, tk_image)
                 return True
         except Exception:
@@ -15773,71 +15774,26 @@ function FindProxyForURLEx(url, host) {{
             return "light" if val == 1 else "dark"
         except: return "light"
 
-    SYSTEM_THEME = detect_system_theme()
-
-    COLOR_BLUEBERRY_YOGURT = "#DCD0FF"
-    COLOR_BG = "#F0F0F0"
-    MAIN_COLOR_TEXT_NORMAL = "#13A10E"
-    MAIN_COLOR_TEXT_WARNING = "#FFA500"
-    MAIN_COLOR_TEXT_ERROR = "#FFA500"
-    MAIN_COLOR_TEXT_INFO = "#AAAAAA"
-    MAIN_COLOR_TEXT_FAIL = "#FF4444"
+    APPEARANCE_FILE = os.path.join(get_base_dir(), "appearance.json")
+    APPEARANCE = nova_appearance.load_preferences(APPEARANCE_FILE)
+    SYSTEM_THEME = "dark"
+    SETTINGS_THEME = nova_appearance.settings_theme(APPEARANCE["theme"])
+    LOG_THEME = nova_appearance.log_theme(APPEARANCE["theme"])
+    COLOR_BLUEBERRY_YOGURT = SETTINGS_THEME["accent"]
+    COLOR_BG = SETTINGS_THEME["bg"]
+    MAIN_COLOR_TEXT_NORMAL = SETTINGS_THEME["accent"]
+    MAIN_COLOR_TEXT_WARNING = "#F0B86A"
+    MAIN_COLOR_TEXT_ERROR = "#F0B86A"
+    MAIN_COLOR_TEXT_INFO = SETTINGS_THEME["muted"]
+    MAIN_COLOR_TEXT_FAIL = "#FF737E"
     COLOR_TEXT_NORMAL = MAIN_COLOR_TEXT_NORMAL
     COLOR_TEXT_WARNING = MAIN_COLOR_TEXT_WARNING
     COLOR_TEXT_ERROR = MAIN_COLOR_TEXT_ERROR
     COLOR_TEXT_FAIL = MAIN_COLOR_TEXT_FAIL
-    if SYSTEM_THEME == "dark":
-        LOG_THEME = {
-            "bg": "#000000",
-            "panel": "#000000",
-            "text": "#B8F5C2",
-            "button": "#000000",
-            "button_hover": "#1E1B3A",
-            "button_fg": COLOR_BLUEBERRY_YOGURT,
-            "button_hover_fg": "#FFFFFF",
-            "grip": "#2F4A36",
-        }
-        LOG_COLOR_TEXT_NORMAL = "#47E05F"
-        LOG_COLOR_TEXT_ERROR = "#E4C05B"
-        LOG_COLOR_TEXT_INFO = "#C5DFCC"
-        LOG_COLOR_TEXT_FAIL = "#FF6B6B"
-        SETTINGS_THEME = {
-            "bg": "#0B1410",
-            "panel": "#111B15",
-            "border": "#22402B",
-            "text": "#E5F7E8",
-            "muted": "#93AD98",
-            "pill_on_bg": "#12381D",
-            "pill_on_fg": "#D9FFE1",
-            "pill_off_bg": "#1A241D",
-            "pill_off_fg": "#8DA38F",
-        }
-    else:
-        LOG_THEME = {
-            "bg": "#000000",
-            "panel": "#000000",
-            "text": "#0E5F21",
-            "button": "#000000",
-            "button_hover": "#1E1B3A",
-            "button_fg": COLOR_BLUEBERRY_YOGURT,
-            "button_hover_fg": "#FFFFFF",
-            "grip": "#82A28A",
-        }
-        LOG_COLOR_TEXT_NORMAL = "#47E05F"
-        LOG_COLOR_TEXT_ERROR = "#E4C05B"
-        LOG_COLOR_TEXT_INFO = "#C5DFCC"
-        LOG_COLOR_TEXT_FAIL = "#FF6B6B"
-        SETTINGS_THEME = {
-            "bg": "#F4F8F5",
-            "panel": "#FFFFFF",
-            "border": "#C8D8CB",
-            "text": "#183120",
-            "muted": "#667B6B",
-            "pill_on_bg": "#D6F0DA",
-            "pill_on_fg": "#145328",
-            "pill_off_bg": "#E8EFEB",
-            "pill_off_fg": "#6A7C6E",
-        }
+    LOG_COLOR_TEXT_NORMAL = SETTINGS_THEME["accent"]
+    LOG_COLOR_TEXT_ERROR = MAIN_COLOR_TEXT_ERROR
+    LOG_COLOR_TEXT_INFO = SETTINGS_THEME["value"]
+    LOG_COLOR_TEXT_FAIL = MAIN_COLOR_TEXT_FAIL
 
     log_window = None
     log_text_widget = None
@@ -16482,16 +16438,9 @@ function FindProxyForURLEx(url, host) {{
 
     class ModernScrollbar(tk.Canvas):
         def __init__(self, master, command=None, **kwargs):
-            # Цвета скроллбара в зависимости от темы Windows
-            if SYSTEM_THEME == "dark":
-                self.bg_color = LOG_THEME["bg"]
-                self.thumb_color = "#2D5A37"
-                self.hover_color = "#418050"
-            else:
-                self.bg_color = LOG_THEME["bg"]
-                self.thumb_color = "#9CC8A5"
-                self.hover_color = "#79B487"
-            
+            self.bg_color = LOG_THEME["bg"]
+            self.thumb_color = SETTINGS_THEME["border"]
+            self.hover_color = SETTINGS_THEME["accent"]
             super().__init__(master, bg=self.bg_color, width=18, highlightthickness=0, cursor="sb_v_double_arrow", **kwargs)
             self.command = command
             self.y_lo = 0.0
@@ -18041,13 +17990,7 @@ function FindProxyForURLEx(url, host) {{
     def init_tray_icon():
         global TRAY_ICON
         try:
-            image = _load_embedded_pil_image("icon")
-            if image is None:
-                image_path = get_internal_path("icon.ico")
-                if os.path.exists(image_path):
-                    image = Image.open(image_path)
-            if image is None:
-                image = Image.new('RGB', (64, 64), color = (73, 109, 137))
+            image = nova_desktop_ui.supernova_icon(64, SETTINGS_THEME["accent"])
 
             menu = (pystray.MenuItem('Открыть', on_tray_open, default=True), pystray.MenuItem('Выход', on_tray_quit))
             TRAY_ICON = pystray.Icon("name", image, "Nova", menu)
@@ -30333,7 +30276,7 @@ function FindProxyForURLEx(url, host) {{
             self.command = command
             self.state_val = "normal"
             self.normal_color = color
-            self.disabled_color = "#E0E0E0"
+            self.disabled_color = SETTINGS_THEME["pill_off_bg"]
             self.width = width
             self.height = height
             self.radius = radius
@@ -30341,7 +30284,7 @@ function FindProxyForURLEx(url, host) {{
             self.y = y
             self.base_fg = fg
             self.hover_fg = fg
-            self.normal_font = ("Segoe UI", 10, "bold")
+            self.normal_font = (SETTINGS_THEME["font_family"], 14, "bold")
             self.hover_font = self.normal_font
             
             self.bg_image = None # Ссылка для предотвращения GC
@@ -30358,9 +30301,7 @@ function FindProxyForURLEx(url, host) {{
                 canvas.tag_bind(item, "<Leave>", self._on_leave)
         
         def _update_image(self, color):
-            # Используем градиентную заливку с размытием краев (как у меток)
-            # center_alpha=170 (33% прозрачности)
-            self.bg_image = create_gradient_pill_img(self.width, self.height, self.radius, get_rgb(color), center_alpha=170)
+            self.bg_image = create_round_rect_img(self.width, self.height, self.radius, color)
             self.canvas.itemconfig(self.bg_id, image=self.bg_image)
             self.outline_image = create_round_outline_img(self.width, self.height, self.radius, OUTLINE_ACCENT_COLOR, thickness=2, alpha=240)
             self.canvas.itemconfig(self.outline_id, image=self.outline_image)
@@ -30379,7 +30320,7 @@ function FindProxyForURLEx(url, host) {{
         def _on_leave(self, event):
             self.canvas.config(cursor="")
             self.canvas.itemconfig(self.outline_id, state="hidden")
-            self.canvas.itemconfig(self.text_id, fill=self.base_fg, font=self.normal_font)
+            self.canvas.itemconfig(self.text_id, fill=self.base_fg if self.state_val == "normal" else SETTINGS_THEME["muted"], font=self.normal_font)
         def config(self, **kwargs):
             if "text" in kwargs: 
                 self.canvas.itemconfig(self.text_id, text=kwargs["text"])
@@ -30387,10 +30328,21 @@ function FindProxyForURLEx(url, host) {{
                 self.state_val = kwargs["state"]
                 color = self.normal_color if self.state_val == "normal" else self.disabled_color
                 self._update_image(color)
+                self.canvas.itemconfig(self.text_id, fill=self.base_fg if self.state_val == "normal" else SETTINGS_THEME["muted"])
             if "bg" in kwargs:
                 self.normal_color = kwargs["bg"]
                 if self.state_val == "normal":
                     self._update_image(self.normal_color)
+            if "fg" in kwargs:
+                self.base_fg = kwargs["fg"]
+                self.hover_fg = self.base_fg
+                self.canvas.itemconfig(self.text_id, fill=self.base_fg if self.state_val == "normal" else SETTINGS_THEME["muted"])
+
+        def move_to(self, x, y):
+            self.x, self.y = x, y
+            for item in (self.bg_id, self.outline_id, self.text_id):
+                self.canvas.coords(item, x, y)
+
         def configure(self, **kwargs): self.config(**kwargs)
 
     class CanvasLabel:
@@ -30460,6 +30412,9 @@ function FindProxyForURLEx(url, host) {{
             self._apply_bindings()
 
         def _draw_bg(self):
+            if self.bg_color is None:
+                self.canvas.itemconfig(self.bg_id, state="hidden")
+                return
             if not self.text_items:
                 self.canvas.itemconfig(self.bg_id, state="hidden")
                 return
@@ -30786,6 +30741,14 @@ function FindProxyForURLEx(url, host) {{
 
             for index, (text, color) in enumerate(self.segments):
                 seg_width = widths[index]
+                slot_width = getattr(self, "slot_width", 0)
+                item_y = self.y
+                if slot_width:
+                    if index < 2:
+                        cur_x = self.x + slot_width * (index + 0.5) / 2 - seg_width / 2
+                    else:
+                        cur_x = self.x + slot_width / 2 - seg_width / 2
+                        item_y += 24
                 stops = self._gradient_stops(color)
                 seg_items = []
                 if stops:
@@ -30794,7 +30757,7 @@ function FindProxyForURLEx(url, host) {{
                         share = ((char_x - cur_x) + char_w / 2.0) / float(max(1, seg_width))
                         item_id = self.canvas.create_text(
                             char_x + char_w / 2.0,
-                            self.y,
+                            item_y,
                             text=char,
                             font=self.font_spec,
                             fill=self._sample_gradient(stops, share),
@@ -30806,7 +30769,7 @@ function FindProxyForURLEx(url, host) {{
                 else:
                     item_id = self.canvas.create_text(
                         cur_x + seg_width / 2,
-                        self.y,
+                        item_y,
                         text=text,
                         font=self.font_spec,
                         fill=color,
@@ -30978,9 +30941,9 @@ function FindProxyForURLEx(url, host) {{
             h = (y2 - y1) + self.padding_y * 2
             r = h / 2
             
-            # Генерируем градиентный фон
-            bg_source = self.bg_color if self.bg_color is not None else self.fg
-            self.bg_image = create_gradient_pill_img(w, h, r, get_darker_rgb(bg_source), center_alpha=128)
+            bg_source = self.bg_color if self.bg_color is not None else SETTINGS_THEME["panel"]
+            r = min(r, SETTINGS_THEME["radius"])
+            self.bg_image = create_round_rect_img(w, h, r, bg_source)
             self.outline_image = create_round_outline_img(max(1, int(w)), max(1, int(h)), max(1, int(r)), OUTLINE_ACCENT_COLOR, thickness=2, alpha=240)
             
             cx = x1 + (x2 - x1) / 2
@@ -31267,7 +31230,8 @@ function FindProxyForURLEx(url, host) {{
         except Exception: pass
         try: apply_window_icon(root)
         except: pass
-        root.resizable(False, False)
+        root.resizable(True, True)
+        root.minsize(nova_desktop_ui.MIN_WIDTH, nova_desktop_ui.MIN_HEIGHT)
         root.configure(bg=COLOR_BG)
         
         # Применяем тему Windows к заголовку окна
@@ -31351,17 +31315,21 @@ function FindProxyForURLEx(url, host) {{
 
         state = load_window_state()
         geom = state.get("main_geometry")
-        w, h = 360, 270
+        w, h = nova_desktop_ui.MIN_WIDTH, nova_desktop_ui.MIN_HEIGHT
         if geom:
             geom_applied = False
             try:
                 m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", str(geom).strip())
                 if m:
-                    w_try, h_try = int(m.group(1)), int(m.group(2))
+                    w_try = max(nova_desktop_ui.MIN_WIDTH, int(m.group(1)))
+                    h_try = max(nova_desktop_ui.MIN_HEIGHT, int(m.group(2)))
                     x_try, y_try = int(m.group(3)), int(m.group(4))
                     probe_x = x_try + max(20, w_try // 2)
                     probe_y = y_try + 20
                     if is_monitor_available(probe_x, probe_y):
+                        left, top, right, bottom = get_monitor_work_area(probe_x, probe_y)
+                        x_try = max(left, min(x_try, right - w_try))
+                        y_try = max(top + 32, min(y_try, bottom - h_try - 40))
                         root.geometry(f"{w_try}x{h_try}+{x_try}+{y_try}")
                         w, h = w_try, h_try
                         geom_applied = True
@@ -31370,10 +31338,11 @@ function FindProxyForURLEx(url, host) {{
                             print(f"[UI] Геометрия вне экрана, сброс: {geom}")
                 else:
                     # Legacy format fallback (size only)
-                    root.geometry(geom)
                     m2 = re.match(r"(\d+)x(\d+)", str(geom))
                     if m2:
-                        w, h = int(m2.group(1)), int(m2.group(2))
+                        w = max(nova_desktop_ui.MIN_WIDTH, int(m2.group(1)))
+                        h = max(nova_desktop_ui.MIN_HEIGHT, int(m2.group(2)))
+                    root.geometry(f"{w}x{h}")
                     geom_applied = True
             except:
                 geom_applied = False
@@ -31405,150 +31374,48 @@ function FindProxyForURLEx(url, host) {{
         main_canvas.bind("<Button-1>", start_move)
         main_canvas.bind("<B1-Motion>", do_move)
 
-        # Beta Mode Flag
-        is_beta_mode = False
-        try:
-            bg_image = None
-            if not getattr(sys, 'frozen', False):
-                img_path = get_internal_path(os.path.join("img", "background.png"))
-                if os.path.exists(os.path.join(get_base_dir(), "img", "background.jpg")):
-                    print("[UI] Внимание: найден background.jpg, но программа поддерживает только PNG!")
-                if os.path.exists(img_path):
-                    bg_image = tk.PhotoImage(file=img_path, master=root)
-            if bg_image is None:
-                try:
-                    from PIL import ImageTk
-                    embedded_bg = _load_embedded_pil_image("background")
-                    if embedded_bg is not None:
-                        bg_image = ImageTk.PhotoImage(embedded_bg, master=root)
-                except:
-                    pass
-
-            if bg_image is not None:
-                main_canvas.bg_image = bg_image
-                main_canvas.create_image(0, 0, image=bg_image, anchor="nw")
-            else:
-                # Fallback: Gradient Background (Sapphire -> Yogurt)
-                # Only if running as script (.pyw)
-                if not getattr(sys, 'frozen', False):
-                    is_beta_mode = True # Set flag
-                    # Draw Gradient Rectangle
-                    # Sapphire (#0F52BA) to Yogurt (#FFB6C1)
-                    # We can simulate this with lines or a pill image stretched
-                    w_c = main_canvas.winfo_reqwidth()
-                    h_c = main_canvas.winfo_reqheight()
-                    if w_c < 10: w_c, h_c = w, h
-                    
-                    # Create gradient image manually
-                    try:
-                        from PIL import Image, ImageTk, ImageDraw
-                        grad = Image.new('RGB', (w_c, h_c), "#0F52BA")
-                        draw = ImageDraw.Draw(grad)
-                        
-                        r1, g1, b1 = 15, 82, 186   # Sapphire
-                        r2, g2, b2 = 255, 182, 193 # Yogurt
-                        
-                        for i in range(h_c):
-                            r = int(r1 + (r2 - r1) * i / h_c)
-                            g = int(g1 + (g2 - g1) * i / h_c)
-                            b = int(b1 + (b2 - b1) * i / h_c)
-                            draw.line([(0, i), (w_c, i)], fill=(r, g, b))
-                            
-                        grad_tk = ImageTk.PhotoImage(grad)
-                        main_canvas.bg_image = grad_tk
-                        main_canvas.create_image(0, 0, image=grad_tk, anchor="nw")
-                        
-                        # Add Beta Tester Label
-                        # Position: Below the toggle button (h/2 + 10 + 40 + gap)
-                        # Center: w/2
-                        main_canvas.create_text(w/2, h/2 + 65, text="версия для бета-тестеров", 
-                                              font=("Segoe UI", 8), fill="#FFFFFF")
-
-                    except ImportError:
-                        pass # PIL not found, fallback to default bg color
-                        
-        except Exception as e:
-            print(f"[UI] Ошибка загрузки фона: {e}")
-
-        status_label = CanvasLabel(main_canvas, w/2, h/2 - 45, "Запуск...", ("Segoe UI Semibold", 10), "grey", outline_color="#DFF07E", outline_width=2)
+        main_scene = nova_desktop_ui.DesktopScene(
+            main_canvas, APPEARANCE, CURRENT_VERSION, preferences_path=APPEARANCE_FILE,
+            on_error=lambda message: globals().get("log_print", print)(message))
+        main_scene.draw(w, h)
+        status_label = CanvasLabel(main_canvas, w / 2, 171, "Запуск...",
+                                   (SETTINGS_THEME["font_family"], 13, "bold"),
+                                   SETTINGS_THEME["text"], spacing=1, outline_width=0)
         status_label.bind("<Button-1>", start_move)
         status_label.bind("<B1-Motion>", do_move)
-        
-        btn_toggle = RoundedButton(main_canvas, w/2, h/2 + 10, 160, 40, 20, COLOR_BLUEBERRY_YOGURT, "ПОДКЛЮЧИТЬ", toggle_service)
-        
-        # Style for Log Button
-        log_fg = "#777777"
-        log_bg = "#E0E0E0"
-        if is_beta_mode:
-             log_fg = "#FFFFFF"     # White Text
-             log_bg = "#0F52BA"     # Sapphire Background
-             
+        btn_toggle = RoundedButton(main_canvas, w / 2, 239, 280, 60,
+                                   SETTINGS_THEME["radius"], COLOR_BLUEBERRY_YOGURT,
+                                   "ПОДКЛЮЧИТЬ", toggle_service,
+                                   fg=nova_desktop_ui.action_foreground(APPEARANCE["theme"]))
+        log_fg = SETTINGS_THEME["text"]
+        log_bg = SETTINGS_THEME["panel"]
+
         update_button_default_fg = COLOR_TEXT_NORMAL
         update_button_available_fg = COLOR_TEXT_NORMAL
         btn_update = CanvasLabel(
             main_canvas,
-            w - 12,
-            14,
+            w / 2,
+            322,
             "Обновить до",
             ("Segoe UI Semibold", 9),
             fg=update_button_available_fg,
-            anchor="ne",
-            outline_color="#DFF07E",
-            outline_width=2,
+            anchor="center",
+            outline_width=0,
         )
         btn_update.bind("<Button-1>", lambda e: request_installer_update())
         btn_update.bind("<Enter>", lambda e: main_canvas.config(cursor="hand2"))
         btn_update.bind("<Leave>", lambda e: main_canvas.config(cursor=""))
         btn_update.set_visible(False)
-        # Bottom corner rows, shared by the indicator pills (left) and the buttons (right): the
-        # same centres and the same font. A pill is ~23 px tall, so the lowest centre stays 16 px
-        # above the edge -- at 10 px its lower part was cut off by the window.
-        MAIN_ROW_STEP = 26
-        MAIN_ROW_1 = h - 16
-        MAIN_ROW_2 = MAIN_ROW_1 - MAIN_ROW_STEP
-        MAIN_ROW_3 = MAIN_ROW_2 - MAIN_ROW_STEP
-        MAIN_CORNER_FONT = ("Segoe UI", 9, "bold")
-        btn_logs = CanvasButton(main_canvas, w-10, MAIN_ROW_1, "Показать лог", MAIN_CORNER_FONT, toggle_log_window, anchor="e", fg=log_fg, bg_color=log_bg)
-        btn_logs.set_visible(False)
+        MAIN_ROW_STEP = 0
+        MAIN_ROW_1 = h - 59
+        MAIN_ROW_2 = MAIN_ROW_1
+        MAIN_ROW_3 = MAIN_ROW_1
+        MAIN_CORNER_FONT = (SETTINGS_THEME["font_family"], 11)
+        btn_logs = CanvasButton(main_canvas, w * 5 / 6 - 8, MAIN_ROW_1, "Показать лог",
+                                MAIN_CORNER_FONT, toggle_log_window, anchor="center", fg=log_fg, bg_color=log_bg)
         btn_settings = None
         btn_profiles = None
         refresh_update_button()
-
-        window_hovered = False
-
-        def on_window_enter(event):
-            global window_hovered
-            if window_hovered:
-                return
-            window_hovered = True
-            if btn_logs:
-                btn_logs.set_visible(True)
-            if btn_settings:
-                btn_settings.set_visible(True)
-            if btn_profiles:
-                btn_profiles.set_visible(True)
-
-        def on_window_leave(event):
-            global window_hovered
-            if not window_hovered:
-                return
-            # Prevent flickering on child widgets
-            x, y = root.winfo_pointerxy()
-            wx = root.winfo_rootx()
-            wy = root.winfo_rooty()
-            ww = root.winfo_width()
-            wh = root.winfo_height()
-            if not (wx <= x < wx + ww and wy <= y < wy + wh):
-                window_hovered = False
-                if btn_logs:
-                    btn_logs.set_visible(False)
-                if btn_settings:
-                    btn_settings.set_visible(False)
-                if btn_profiles:
-                    btn_profiles.set_visible(False)
-
-        root.bind("<Enter>", on_window_enter)
-        root.bind("<Leave>", on_window_leave)
 
         routing_settings_window_ref = {
             "win": None,
@@ -31596,9 +31463,9 @@ function FindProxyForURLEx(url, host) {{
                 self._hover = False
                 self._width = int(width)
                 self._height = int(height)
-                self._radius = 11
-                self._base_font = ("Segoe UI", 8)
-                self._hover_font = ("Segoe UI Semibold", 8)
+                self._radius = min(SETTINGS_THEME["radius"], 12)
+                self._base_font = (SETTINGS_THEME["font_family"], 9)
+                self._hover_font = (SETTINGS_THEME["font_family"], 9, "bold")
                 self._fill_id = self.create_image(self._width // 2, self._height // 2, anchor="center")
                 self._outline_id = self.create_image(self._width // 2, self._height // 2, anchor="center", state="hidden")
                 self._text_id = self.create_text(self._width // 2, self._height // 2, text=text, font=self._base_font)
@@ -31626,6 +31493,15 @@ function FindProxyForURLEx(url, host) {{
                     self._command()
 
             def _render(self):
+                text = self.itemcget(self._text_id, "text")
+                text_width = max(int(self.tk.call("font", "measure", font, text))
+                                 for font in (self._base_font, self._hover_font))
+                width = max(self._width, text_width + 20)
+                if width != self._width:
+                    self._width = width
+                    self.configure(width=width)
+                    for item in (self._fill_id, self._outline_id, self._text_id):
+                        self.coords(item, width / 2, self._height / 2)
                 bg = SETTINGS_THEME["pill_on_bg"] if self._selected else SETTINGS_THEME["pill_off_bg"]
                 fg = SETTINGS_THEME["pill_on_fg"] if self._selected else SETTINGS_THEME["pill_off_fg"]
                 hover_fg = get_lighter_hex(fg, 0.18)
@@ -31864,8 +31740,8 @@ function FindProxyForURLEx(url, host) {{
                 if event and getattr(event, "widget", None) not in (None, root):
                     return
                 existing.update_idletasks()
-                popup_w = max(360, existing.winfo_width() or existing.winfo_reqwidth())
-                popup_h = existing.winfo_height() or existing.winfo_reqheight()
+                popup_w = max(360, existing.winfo_width(), existing.winfo_reqwidth())
+                popup_h = max(existing.winfo_height(), existing.winfo_reqheight())
                 pos_x, pos_y = _compute_settings_popup_geometry(
                     popup_w,
                     popup_h,
@@ -31964,13 +31840,13 @@ function FindProxyForURLEx(url, host) {{
 
             win.protocol("WM_DELETE_WINDOW", _close_settings)
 
-            outer = tk.Frame(win, bg=SETTINGS_THEME["bg"], padx=10, pady=10)
+            outer = tk.Frame(win, bg=SETTINGS_THEME["bg"], padx=20, pady=18)
             outer.pack(fill="both", expand=True)
 
             tk.Label(
                 outer,
-                text="Настройки",
-                font=("Segoe UI", 10),
+                text="Маршрутизация",
+                font=(SETTINGS_THEME["font_family"], 16, "bold"),
                 bg=SETTINGS_THEME["bg"],
                 fg=SETTINGS_THEME["text"],
                 anchor="w",
@@ -32005,7 +31881,7 @@ function FindProxyForURLEx(url, host) {{
 
             for group_key, group_label in routing_group_rows:
                 row = tk.Frame(outer, bg=SETTINGS_THEME["bg"])
-                row.pack(fill="x", pady=3)
+                row.pack(fill="x", pady=5)
                 tk.Label(
                     row,
                     text=group_label,
@@ -32013,7 +31889,7 @@ function FindProxyForURLEx(url, host) {{
                     anchor="w",
                     bg=SETTINGS_THEME["bg"],
                     fg=SETTINGS_THEME["text"],
-                    font=("Segoe UI", 9),
+                    font=(SETTINGS_THEME["font_family"], 9),
                 ).pack(side="left")
                 pill_frame = tk.Frame(row, bg=SETTINGS_THEME["bg"])
                 pill_frame.pack(side="right", fill="x", expand=True)
@@ -32068,7 +31944,7 @@ function FindProxyForURLEx(url, host) {{
                     anchor="w",
                     bg=SETTINGS_THEME["bg"],
                     fg=SETTINGS_THEME["text"],
-                    font=("Segoe UI", 9),
+                    font=(SETTINGS_THEME["font_family"], 9),
                 ).pack(side="left")
                 slot_pill_frame = tk.Frame(slot_row, bg=SETTINGS_THEME["bg"])
                 slot_pill_frame.pack(side="right", fill="x", expand=True)
@@ -32119,7 +31995,7 @@ function FindProxyForURLEx(url, host) {{
                 anchor="w",
                 bg=SETTINGS_THEME["bg"],
                 fg=SETTINGS_THEME["text"],
-                font=("Segoe UI", 9),
+                font=(SETTINGS_THEME["font_family"], 9),
             ).pack(side="left")
             autostart_pill_frame = tk.Frame(autostart_row, bg=SETTINGS_THEME["bg"])
             autostart_pill_frame.pack(side="right", fill="x", expand=True)
@@ -32153,7 +32029,7 @@ function FindProxyForURLEx(url, host) {{
                 anchor="w",
                 bg=SETTINGS_THEME["bg"],
                 fg=SETTINGS_THEME["text"],
-                font=("Segoe UI", 9),
+                font=(SETTINGS_THEME["font_family"], 9),
             ).pack(side="left")
             vpn_autoconnect_pill_frame = tk.Frame(vpn_autoconnect_row, bg=SETTINGS_THEME["bg"])
             vpn_autoconnect_pill_frame.pack(side="right", fill="x", expand=True)
@@ -32187,7 +32063,7 @@ function FindProxyForURLEx(url, host) {{
                 anchor="w",
                 bg=SETTINGS_THEME["bg"],
                 fg=SETTINGS_THEME["text"],
-                font=("Segoe UI", 9),
+                font=(SETTINGS_THEME["font_family"], 9),
             ).pack(side="left")
             game_overlay_pill_frame = tk.Frame(game_overlay_row, bg=SETTINGS_THEME["bg"])
             game_overlay_pill_frame.pack(side="right", fill="x", expand=True)
@@ -33087,29 +32963,29 @@ function FindProxyForURLEx(url, host) {{
 
         btn_settings = CanvasButton(
             main_canvas,
-            w - 10,
+            w / 2,
             MAIN_ROW_2,
-            "⚙ Настройки",
+            "Настройки",
             MAIN_CORNER_FONT,
             toggle_routing_settings_window,
-            anchor="e",
+            anchor="center",
             fg=log_fg,
             bg_color=log_bg,
         )
-        btn_settings.set_visible(False)
+        btn_settings.set_visible(True)
 
         btn_profiles = CanvasButton(
             main_canvas,
-            w - 10,
+            w / 6 + 8,
             MAIN_ROW_3,
             "Профили",
             MAIN_CORNER_FONT,
             toggle_profiles_window_ui,
-            anchor="e",
+            anchor="center",
             fg=log_fg,
             bg_color=log_bg,
         )
-        btn_profiles.set_visible(False)
+        btn_profiles.set_visible(True)
 
         INDICATOR_WARP = "#8FD8FF"
         INDICATOR_EU = "#D8B6BF"
@@ -33122,12 +32998,13 @@ function FindProxyForURLEx(url, host) {{
 
         region_indicator_pill = CanvasRegionPill(
             main_canvas,
-            10,
-            MAIN_ROW_1,
+            44,
+            450,
             MAIN_CORNER_FONT,
             anchor="sw",
             bg_color=log_bg,
         )
+        region_indicator_pill.slot_width = w - 88
         region_indicator_pill.set_regions([])
         # Сегменты «основной» и «дополнительный» кликабельны: меню быстрого переключения.
         region_indicator_pill.set_click_handler(open_vpn_slot_menu)
@@ -33138,13 +33015,148 @@ function FindProxyForURLEx(url, host) {{
         # подмену делает Nova своим каскадом. Пусто - ни того, ни другого.
         dns_ai_indicator_pill = CanvasRegionPill(
             main_canvas,
-            10,
-            MAIN_ROW_2,
-            MAIN_CORNER_FONT,
-            anchor="sw",
+            w - 44,
+            380,
+            (SETTINGS_THEME["font_family"], 9),
+            anchor="e",
             bg_color=log_bg,
         )
         dns_ai_indicator_pill.set_regions([])
+
+        appearance_window_ref = {"view": None}
+
+        def _retheme_widget_tree(widget, previous, current):
+            mapping = {value: current[key] for key, value in previous.items()
+                       if key in current and isinstance(value, str) and value.startswith("#")}
+            for option in ("bg", "fg", "insertbackground", "highlightbackground", "troughcolor"):
+                if option in widget.keys():
+                    old_color = str(widget.cget(option))
+                    if old_color in mapping:
+                        widget.configure(**{option: mapping[old_color]})
+            if "font" in widget.keys() and not isinstance(widget, tk.Text):
+                font = widget.cget("font")
+                size = root.tk.call("font", "actual", font, "-size")
+                weight = root.tk.call("font", "actual", font, "-weight")
+                widget.configure(font=(SETTINGS_THEME["font_family"], size, weight))
+            if isinstance(widget, ModernScrollbar):
+                widget.bg_color = LOG_THEME["bg"]
+                widget.thumb_color = SETTINGS_THEME["border"]
+                widget.hover_color = SETTINGS_THEME["accent"]
+                widget._draw()
+            if isinstance(widget, PopupPillButton):
+                widget._radius = min(SETTINGS_THEME["radius"], 12)
+                widget._base_font = (SETTINGS_THEME["font_family"], 9)
+                widget._hover_font = (SETTINGS_THEME["font_family"], 9, "bold")
+                widget._render()
+            for child in widget.winfo_children():
+                _retheme_widget_tree(child, previous, current)
+
+        def apply_appearance(preferences):
+            global COLOR_BLUEBERRY_YOGURT, COLOR_BG, COLOR_TEXT_NORMAL, OUTLINE_ACCENT_COLOR
+            global LOG_COLOR_TEXT_NORMAL, LOG_COLOR_TEXT_INFO
+            previous_settings, previous_log = dict(SETTINGS_THEME), dict(LOG_THEME)
+            APPEARANCE.update(preferences)
+            SETTINGS_THEME.update(nova_appearance.settings_theme(APPEARANCE["theme"]))
+            LOG_THEME.update(nova_appearance.log_theme(APPEARANCE["theme"]))
+            COLOR_BG = SETTINGS_THEME["bg"]
+            COLOR_BLUEBERRY_YOGURT = COLOR_TEXT_NORMAL = OUTLINE_ACCENT_COLOR = SETTINGS_THEME["accent"]
+            LOG_COLOR_TEXT_NORMAL = SETTINGS_THEME["accent"]
+            LOG_COLOR_TEXT_INFO = SETTINGS_THEME["value"]
+            apply_window_icon(root)
+            if globals().get("TRAY_ICON") is not None:
+                TRAY_ICON.icon = nova_desktop_ui.supernova_icon(64, SETTINGS_THEME["accent"])
+            root.configure(bg=COLOR_BG)
+            main_canvas.configure(bg=COLOR_BG)
+            main_scene.set_appearance(APPEARANCE)
+            btn_toggle.radius = SETTINGS_THEME["radius"]
+            btn_toggle.disabled_color = SETTINGS_THEME["pill_off_bg"]
+            btn_toggle.normal_font = (SETTINGS_THEME["font_family"], 14, "bold")
+            btn_toggle.hover_font = btn_toggle.normal_font
+            btn_toggle.config(bg=SETTINGS_THEME["accent"],
+                              fg=nova_desktop_ui.action_foreground(APPEARANCE["theme"]))
+            main_canvas.itemconfig(btn_toggle.text_id, font=btn_toggle.normal_font)
+            status_label.font_spec = (SETTINGS_THEME["font_family"], 13, "bold")
+            status_label.tk_font.configure(family=SETTINGS_THEME["font_family"], size=13, weight="bold")
+            for pill, size in ((region_indicator_pill, 11), (dns_ai_indicator_pill, 9)):
+                pill.font_spec = (SETTINGS_THEME["font_family"], size)
+                pill.tk_font.configure(family=SETTINGS_THEME["font_family"], size=size, weight="normal")
+                pill.bg_color = SETTINGS_THEME["panel"]
+                pill._redraw()
+            old_status_color = status_label.fg
+            status_label.config(fg=SETTINGS_THEME["accent"] if old_status_color == previous_settings["accent"]
+                                else SETTINGS_THEME["text"] if old_status_color == previous_settings["text"]
+                                else old_status_color)
+            for button in (btn_logs, btn_settings, btn_profiles, btn_appearance):
+                button.base_font = (SETTINGS_THEME["font_family"], 11)
+                button.hover_font = (SETTINGS_THEME["font_family"], 11, "bold")
+                button.hover_fg = SETTINGS_THEME["accent"]
+                main_canvas.itemconfig(button.text_id, font=button.base_font)
+                button.config(fg=SETTINGS_THEME["text"], bg=SETTINGS_THEME["panel"])
+            profiles_view = nova_profiles_ui.get_profiles_window(profiles_ui_ctx)
+            for child in root.winfo_children():
+                if profiles_view is not None and child is profiles_view.win:
+                    continue
+                if isinstance(child, tk.Toplevel) and child.winfo_exists():
+                    _retheme_widget_tree(child, previous_log if child is log_window else previous_settings,
+                                         LOG_THEME if child is log_window else SETTINGS_THEME)
+                    apply_window_icon(child)
+                    if child is routing_settings_window_ref.get("win"):
+                        child.update_idletasks()
+                        popup_w, popup_h = child.winfo_reqwidth(), child.winfo_reqheight()
+                        x, y = _compute_settings_popup_geometry(popup_w, popup_h)
+                        child.geometry(f"{popup_w}x{popup_h}+{x}+{y}")
+            if profiles_view is not None:
+                profiles_view.apply_theme(SETTINGS_THEME)
+            if log_text_widget is not None:
+                for tag, color in (("normal", SETTINGS_THEME["accent"]), ("info", SETTINGS_THEME["value"]),
+                                   ("clickable_cmd", SETTINGS_THEME["accent"])):
+                    log_text_widget.tag_config(tag, foreground=color)
+
+        def toggle_appearance_window():
+            view = appearance_window_ref["view"]
+            if view is not None and view.top.winfo_exists():
+                view.top.lift()
+                view.top.focus_set()
+                return
+            def _place_appearance(win):
+                x, y = _compute_settings_popup_geometry(win.winfo_reqwidth(), win.winfo_reqheight())
+                left, top, right, bottom = get_monitor_work_area(root.winfo_rootx() + root.winfo_width() // 2,
+                                                                root.winfo_rooty() + 10)
+                x = max(left, min(x, right - win.winfo_reqwidth()))
+                y = max(top + 32, min(y, bottom - win.winfo_reqheight() - 40))
+                win.geometry(f"+{x}+{y}")
+                apply_window_icon(win)
+            appearance_window_ref["view"] = nova_desktop_ui.AppearanceWindow(
+                root, APPEARANCE, apply_appearance, place_window=_place_appearance)
+
+        btn_appearance = CanvasButton(main_canvas, w - 32, 44, "Оформление", MAIN_CORNER_FONT,
+                                      toggle_appearance_window, anchor="e", fg=log_fg, bg_color=log_bg)
+
+        def layout_main_scene(event=None):
+            if event is not None and event.widget is not main_canvas:
+                return
+            width, height = max(640, main_canvas.winfo_width()), max(600, main_canvas.winfo_height())
+            if (width, height) == getattr(main_canvas, "_layout_size", None):
+                return
+            main_canvas._layout_size = (width, height)
+            main_scene.draw(width, height)
+            status_label.move_to(width / 2, 171)
+            btn_toggle.move_to(width / 2, 239)
+            btn_update.move_to(width / 2, 322)
+            btn_appearance.move_to(width - 32, 44, "e")
+            for button, x in ((btn_profiles, width / 6 + 8), (btn_settings, width / 2),
+                              (btn_logs, width * 5 / 6 - 8)):
+                button.move_to(x, height - 59, "center")
+            region_indicator_pill.slot_width = width - 88
+            region_indicator_pill.move_to(44, 450)
+            dns_ai_indicator_pill.move_to(width - 44, 380)
+
+        main_canvas.bind("<Configure>", layout_main_scene, add="+")
+        root.after_idle(layout_main_scene)
+        root.bind("<Control-comma>", lambda event: toggle_appearance_window())
+        root.bind("<Control-l>", lambda event: toggle_log_window())
+        root.bind("<Control-p>", lambda event: toggle_profiles_window_ui())
+        root.bind("<Control-space>", lambda event: btn_toggle._on_click(event))
 
         def _get_opera_region_indicator_label():
             """The secondary slot's pill text: EU / US (Opera, maybe «/WARP») or TOR."""
