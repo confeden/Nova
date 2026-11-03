@@ -136,6 +136,32 @@ _TELEGRAM_IPV6_NETWORKS = [
     ipaddress.ip_network("2001:0b28:f23f:f000::/52"),
 ]
 
+# Пути из которых программы будут идти напрямую
+def load_bypass_folders(filename="bypass_folders.txt"):
+    if not os.path.exists(filename):
+        return []
+    
+    folders = []
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            cleaned = line.strip().lower() # Убираем пробелы и перенос строки, приводим к нижнему регистру
+            if cleaned:
+                # Если пользователь скопировал путь целиком (например, "C:\Program Files\Steam")
+                # избавляемся от буквы диска, чтобы поиск "папка в пути" работал корректно
+                if ":" in cleaned:
+                    cleaned = cleaned.split(":", 1)[1]
+                
+                # Гарантируем, что путь начинается и заканчивается обратным слешем
+                # Это защитит от ложных срабатываний (например, чтобы папка "\steam\" не сработала на "\steam_games\")
+                if not cleaned.startswith("\\"):
+                    cleaned = "\\" + cleaned
+                if not cleaned.endswith("\\"):
+                    cleaned = cleaned + "\\"
+                    
+                folders.append(cleaned)
+    return folders
+
+BYPASS_DIRECT_FOLDERS = load_bypass_folders()
 
 def _data_file(*parts):
     """Файл данных верхнего уровня (`ip/`, `list/`, `temp/`) — не рядом с модулем.
@@ -947,6 +973,11 @@ class RedirectService:
             return None
         pid = int(data.ProcessId)
         process_path, app = self.resolver.resolve(pid)
+        # Проверяем есть ли папка в списке исключений, чтобы игнорировать процессы из неё
+        if process_path:
+            normalized_path = process_path.lower()
+            if any(folder in normalized_path for folder in BYPASS_DIRECT_FOLDERS):
+                return None
         if app not in APP_FAMILY:
             return None
         direct_bypass = app == "GamesDirect"
