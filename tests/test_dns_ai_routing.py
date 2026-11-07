@@ -37,9 +37,9 @@ def proxy(monkeypatch, main=True, second=True):
 
 
 @pytest.mark.parametrize("main,second,expected", [
-    (True, True, ["warp-socks", "opera-http"]),
-    (False, True, ["opera-http"]),
-    (True, False, ["warp-socks"]),
+    (True, True, ["direct", "warp-socks", "opera-http"]),
+    (False, True, ["direct", "opera-http"]),
+    (True, False, ["direct", "warp-socks"]),
     (False, False, ["direct"]),
 ])
 def test_resolver_order_ignores_site_lists_and_old_direct_cache(monkeypatch, active, main, second, expected):
@@ -49,48 +49,57 @@ def test_resolver_order_ignores_site_lists_and_old_direct_cache(monkeypatch, act
         assert [attempt["label"] for attempt in attempts] == expected
 
 
-def test_client_family_uses_main_even_for_a_custom_upstream(monkeypatch, active):
+def test_client_family_goes_direct_first_even_for_a_custom_upstream(monkeypatch, active):
     instance = proxy(monkeypatch)
     assert profiles.match_app_by_process_path(r"C:\DNS-AI\dns-ai-svc.exe") == "DNS-AI"
     assert tp.NovaWfpTcpProxy._app_family_from_app_id(r"C:\DNS-AI\dns-ai-svc.exe") == "dns_ai"
     attempts = instance._build_attempts_for_target("custom.resolver.test", 443, 2, app_family="dns_ai")
-    assert [attempt["label"] for attempt in attempts] == ["warp-socks", "opera-http"]
+    assert [attempt["label"] for attempt in attempts] == ["direct", "warp-socks", "opera-http"]
 
 
-def test_dns_ai_uses_faster_secondary_and_reverses_order_after_new_measurements(monkeypatch, active):
+def test_dns_ai_fallback_uses_faster_vpn_and_reverses_order_after_new_measurements(monkeypatch, active):
     instance = proxy(monkeypatch)
     active['vpn_up'] = {'warp-socks': True, 'opera-http': True}
     active['latency_ms'] = {'warp-socks': 90, 'opera-http': 25}
     route = lambda: [a['label'] for a in instance._build_attempts_for_target(active['servers'][0], 443, 3)]
-    assert route() == ['opera-http', 'warp-socks']
+    assert route() == ['direct', 'opera-http', 'warp-socks']
     active['latency_ms']['warp-socks'] = 12
-    assert route() == ['warp-socks', 'opera-http']
+    assert route() == ['direct', 'warp-socks', 'opera-http']
     active['vpn_up']['warp-socks'] = False
-    assert route() == ['opera-http']
+    assert route() == ['direct', 'opera-http']
     active['vpn_up']['opera-http'] = False
     assert route() == ['direct']
+
+
+def test_failed_direct_probe_moves_direct_behind_the_vpns(monkeypatch, active):
+    instance = proxy(monkeypatch)
+    active['vpn_up'] = {'warp-socks': True, 'opera-http': True}
+    active['latency_ms'] = {'warp-socks': 90, 'opera-http': 25}
+    active['latency_errors'] = {'direct': 'TLS до dns.dns-ai.ru: TimeoutError'}
+    route = lambda: [a['label'] for a in instance._build_attempts_for_target(active['servers'][0], 443, 3)]
+    assert route() == ['opera-http', 'warp-socks', 'direct']
+    active['latency_errors'] = {}
+    assert route() == ['direct', 'opera-http', 'warp-socks']
 
 
 @pytest.mark.parametrize('bad', [None, -1, float('nan'), float('inf'), '1', True])
 def test_invalid_latency_cannot_win_the_route(bad):
     assert profiles.dns_ai_route_labels(True, True, {'latency_ms': {'warp-socks': bad, 'opera-http': 30}}) == [
-        'opera-http', 'warp-socks']
+        'direct', 'opera-http', 'warp-socks']
 
 
-def test_dns_ai_udp_cannot_escape_direct_when_the_fastest_vpn_is_tcp_only(monkeypatch, active):
+def test_dns_ai_udp_goes_direct_first_and_skips_the_tcp_only_secondary(monkeypatch, active):
     from NovaWFP.proxy import udp_proxy as udp
-    monkeypatch.setattr(udp, 'get_udp_upstream_attempts', lambda: [
-        {'label': 'warp-socks', 'kind': 'socks5'}, {'label': 'direct', 'kind': 'direct'}])
+    warp, direct = {'label': 'warp-socks', 'kind': 'socks5'}, {'label': 'direct', 'kind': 'direct'}
+    monkeypatch.setattr(udp, 'get_udp_upstream_attempts', lambda: [warp, direct])
     instance = object.__new__(udp.NovaWfpUdpProxy)
     active['vpn_up'] = {'warp-socks': True, 'opera-http': True}
     active['latency_ms'] = {'warp-socks': 80, 'opera-http': 20}
-    assert instance.build_attempts_for_target(active['servers'][0], 443, 'dns_ai') == []
-    active['latency_ms']['warp-socks'] = 10
-    assert instance.build_attempts_for_target(active['servers'][0], 443, 'dns_ai') == [
-        {'label': 'warp-socks', 'kind': 'socks5'}]
+    assert instance.build_attempts_for_target(active['servers'][0], 443, 'dns_ai') == [direct, warp]
+    active['latency_errors'] = {'direct': 'TimeoutError'}
+    assert instance.build_attempts_for_target(active['servers'][0], 443, 'dns_ai') == [warp, direct]
     active['vpn_up'] = {'warp-socks': False, 'opera-http': False}
-    assert instance.build_attempts_for_target(active['servers'][0], 443, 'dns_ai') == [
-        {'label': 'direct', 'kind': 'direct'}]
+    assert instance.build_attempts_for_target(active['servers'][0], 443, 'dns_ai') == [direct]
 
 
 def test_inactive_or_stale_detection_never_claims_a_destination(monkeypatch, active):
@@ -123,6 +132,10 @@ def test_static_capture_excludes_proxys_direct_connections(monkeypatch, tmp_path
     monkeypatch.setattr(wr, "_tcp_owner_pid", lambda _: 5678)
     assert instance._dns_ai_meta(packet)["app_family"] == "dns_ai"
     monkeypatch.setattr(wr, "_tcp_owner_pid", lambda _: None)
+    assert instance._dns_ai_meta(packet)["app_family"] == "dns-ai-direct"
+    # Nova's own direct DoH probe is never recaptured into the proxy.
+    active["owner_pid"] = 4321
+    monkeypatch.setattr(wr, "_tcp_owner_pid", lambda _: 4321)
     assert instance._dns_ai_meta(packet)["app_family"] == "dns-ai-direct"
 
 

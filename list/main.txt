@@ -7,6 +7,7 @@ accounts.google.com
 soundcloud.cloud
 activatica.org
 phncdn.com
+payproglobal.com
 adguard-mail.com
 adobe.com
 team.ga

@@ -109,7 +109,7 @@ class RouteLatencyMonitor:
             except nova_exit_probe.ProbeError as error:
                 return label, (None, str(error))
         try:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 results = dict(pool.map(measure, routes.items()))
             now = self._clock()
             with self._lock:

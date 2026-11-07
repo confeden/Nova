@@ -726,9 +726,11 @@ class NovaWfpUdpProxy:
         dns_state = dns_ai_route_state()
         if (str(app_family).lower() == "dns_ai" and dns_state) or is_dns_ai_endpoint(host, port):
             labels = dns_ai_route_labels(True, True, dns_state)
-            # The secondary's HTTP CONNECT cannot carry UDP. Reject QUIC/DoQ there so the client
-            # retries encrypted DNS over TCP through the fastest VPN, without a direct UDP escape.
-            return [a for a in upstream_attempts if a.get("label") == labels[0]]
+            # Same order as TCP (direct first, D48). The secondary's HTTP CONNECT cannot carry
+            # UDP, so it simply has no attempt here; when it is the only fallback the client
+            # retries encrypted DNS over TCP, which can reach it.
+            by_label = {a.get("label"): a for a in upstream_attempts}
+            return [by_label[label] for label in labels if label in by_label]
         if not upstream_attempts:
             upstream_attempts = []
         direct_attempts = [

@@ -8016,6 +8016,10 @@ try:
                     ports = nova_vpn_slots.secondary_ports(secondary[0])
                     kind = "socks5" if ports.get("socks_port") else "http"
                     routes["opera-http"] = (secondary, kind, ports.get("socks_port") or ports["http_port"])
+                if routes:
+                    # D48: DIRECT goes first while this real DoH probe answers; a VPN is only
+                    # the fallback. Without a VPN DIRECT is the sole route and needs no probe.
+                    routes["direct"] = (("direct",), "direct", 0)
             self._dns_ai_routes.refresh(routes)
             return self._dns_ai_routes.snapshot(routes)
 

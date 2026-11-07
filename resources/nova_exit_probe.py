@@ -271,19 +271,27 @@ def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, pr
                     target_port=443, use_tls=True, ssl_context=None, binary=False, http2=False):
     """GET through a local proxy; return text or binary body. Raises ProbeError.
 
-    `proxy_kind` is "socks5" or "http". `use_tls=False` exists for tests with a plain fake server.
+    `proxy_kind` is "socks5", "http" or "direct" (no proxy: `proxy_port` is ignored and the
+    target is dialled straight). `use_tls=False` exists for tests with a plain fake server.
     """
     deadline = _Deadline(budget)
     kind = str(proxy_kind or "").strip().lower()
-    if kind not in ("socks5", "http"):
+    if kind not in ("socks5", "http", "direct"):
         raise ProbeError(f"неизвестный вид прокси {kind!r}")
     raw = None
     conn = None
     try:
-        try:
-            raw = socket.create_connection((str(proxy_host), int(proxy_port)), timeout=min(2.0, deadline.timeout()))
-        except OSError as exc:
-            raise ProbeError(f"локальный порт {int(proxy_port)} не принимает: {exc.__class__.__name__}") from None
+        if kind == "direct":
+            try:
+                raw = socket.create_connection((str(target_host), int(target_port)),
+                                               timeout=min(2.0, deadline.timeout()))
+            except OSError as exc:
+                raise ProbeError(f"напрямую до {target_host}: {exc.__class__.__name__}") from None
+        else:
+            try:
+                raw = socket.create_connection((str(proxy_host), int(proxy_port)), timeout=min(2.0, deadline.timeout()))
+            except OSError as exc:
+                raise ProbeError(f"локальный порт {int(proxy_port)} не принимает: {exc.__class__.__name__}") from None
         try:
             raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
@@ -291,7 +299,7 @@ def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, pr
         try:
             if kind == "socks5":
                 _socks5_connect(raw, target_host, target_port, deadline)
-            else:
+            elif kind == "http":
                 _http_connect(raw, target_host, target_port, deadline)
         except (OSError, socket.timeout) as exc:
             raise ProbeError(f"туннель до {target_host}: {exc.__class__.__name__}") from None

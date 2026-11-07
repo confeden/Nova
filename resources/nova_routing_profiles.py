@@ -221,7 +221,11 @@ def is_dns_ai_endpoint(host, port):
 
 
 def dns_ai_route_labels(primary_up, secondary_up, state=None):
-    """Prefer the lowest measured DoH latency; DIRECT is allowed only with neither VPN up."""
+    """DIRECT first while it answers; connected VPNs, fastest first, are the fallback (D48).
+
+    DIRECT drops to the end only after the main process's real direct DoH probe failed
+    (`latency_errors['direct']`). Without a connected VPN DIRECT is the only route.
+    """
     state = dns_ai_route_state() if state is None else state
     up = state.get('vpn_up')
     labels = [label for label, available in (('warp-socks', primary_up), ('opera-http', secondary_up))
@@ -232,7 +236,10 @@ def dns_ai_route_labels(primary_up, secondary_up, state=None):
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value < float('inf'):
             return float('inf')
         return value
-    return sorted(labels, key=rank) if labels else ['direct']
+    labels = sorted(labels, key=rank)
+    errors = state.get('latency_errors')
+    direct_failed = isinstance(errors, dict) and bool(errors.get('direct'))
+    return labels + ['direct'] if direct_failed else ['direct'] + labels
 
 
 VPN_ROUTE_MODES = ("warp", "opera")

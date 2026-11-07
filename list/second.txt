@@ -9,6 +9,7 @@ autodesk360.com
 spaceship.com
 revved.com
 spaceship-cdn.com
+duck.ai
 b-cdn.net
 telegram.me
 bbci.co.uk

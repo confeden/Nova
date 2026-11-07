@@ -1220,6 +1220,9 @@ class RedirectService:
         # An unattributed SYN is left alone rather than risk a proxy -> proxy loop.
         if pid is None:
             return {"app_family": "dns-ai-direct"}
+        # Nova's own direct DoH probe must stay direct, or it would measure the proxy's fallback.
+        if pid == dns_ai_route_state().get("owner_pid"):
+            return {"app_family": "dns-ai-direct"}
         root = os.path.dirname(os.path.dirname(self.map.path))
         for filename in ("NovaDivertTcpProxy.pid", "NovaWfpTcpProxy.pid"):
             try:
