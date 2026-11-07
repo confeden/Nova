@@ -13,10 +13,12 @@
 //! cargo run -p nova-cli -- learn       watch the learner converge, offline
 //! cargo run -p nova-cli -- budget      show the background exploration schedule
 //! cargo run -p nova-cli -- cloudflare-classify   one JSON request on stdin -> one JSON verdict on stdout
+//! cargo run -p nova-cli -- render-fractal       versioned JSON viewport -> binary grayscale PGM
 //! ```
 
 mod cloudflare_cmd;
 mod corpus;
+mod render_cmd;
 mod validate;
 
 use std::time::Instant;
@@ -38,6 +40,9 @@ fn main() {
     // Python caller gets nothing but the one JSON line on stdout it asked for.
     if command == "cloudflare-classify" {
         std::process::exit(cloudflare_cmd::run());
+    }
+    if command == "render-fractal" {
+        std::process::exit(render_cmd::run());
     }
 
     let Some(root) = Corpus::find_root() else {
@@ -67,7 +72,7 @@ fn main() {
         "budget" => budget(),
         other => {
             eprintln!(
-                "unknown command {other:?}; try inspect | import | evolve | mine | learn | budget | cloudflare-classify"
+                "unknown command {other:?}; try inspect | import | evolve | mine | learn | budget | cloudflare-classify | render-fractal"
             );
             std::process::exit(2);
         }

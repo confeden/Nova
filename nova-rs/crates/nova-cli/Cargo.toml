@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 nova-core = { workspace = true }
+nova-render = { workspace = true }
 nova-learn = { workspace = true }
 nova-zapret = { workspace = true }
 nova-cloudflare = { workspace = true }

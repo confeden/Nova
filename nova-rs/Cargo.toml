@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/nova-core",
+    "crates/nova-render",
     "crates/nova-learn",
     "crates/nova-cloudflare",
     "crates/nova-health",
@@ -14,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.44.2"
+version = "1.45.0"
 edition = "2024"
 rust-version = "1.90"
 authors = ["Brent"]
@@ -23,6 +24,7 @@ repository = "https://github.com/confeden/Nova"
 
 [workspace.dependencies]
 nova-core = { path = "crates/nova-core" }
+nova-render = { path = "crates/nova-render" }
 nova-config = { path = "crates/nova-config" }
 nova-zapret = { path = "crates/nova-zapret" }
 nova-probe = { path = "crates/nova-probe" }

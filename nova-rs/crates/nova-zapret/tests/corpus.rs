@@ -167,7 +167,7 @@ fn unmodelled_options_stay_within_the_reviewed_set() {
 
 #[test]
 fn no_profile_uses_a_desync_mode_the_bundled_binary_rejects() {
-    // Modes listed by `winws v72.12 --help`, plus the three undocumented
+    // Modes listed by `winws v72.12 --help`, plus the four undocumented
     // backward-compatible aliases confirmed accepted via --dry-run.
     const ACCEPTED: &[&str] = &[
         "synack",
@@ -190,6 +190,7 @@ fn no_profile_uses_a_desync_mode_the_bundled_binary_rejects() {
         "split",
         "split2",
         "disorder",
+        "disorder2",
     ];
 
     let mut bad = Vec::new();

@@ -58,6 +58,7 @@ def _data_path(*parts):
 
 
 from tgrelay.udp_transport import UdpEndpoint, get_udp_upstream_attempts, open_udp_endpoint  # noqa: E402
+from nova_routing_profiles import dns_ai_route_state, dns_ai_route_labels, is_dns_ai_endpoint
 
 
 LOG = logging.getLogger("nova.wfp.udp_proxy")
@@ -659,6 +660,9 @@ class NovaWfpUdpProxy:
     @staticmethod
     def _app_family_from_app_id(app_id: str) -> str:
         lower = str(app_id or "").replace("/", "\\").lower()
+        process_name = lower.rsplit("\\", 1)[-1]
+        if process_name.startswith("dns-ai") and process_name.endswith(".exe"):
+            return "dns_ai"
         if any(token in lower for token in ("telegram.exe", "ayugram.exe", "novagram.exe", "telegram desktop")):
             return "telegram"
         if any(token in lower for token in ("discord.exe", "discordcanary.exe", "discordptb.exe", "discord\\update.exe", "discordcanary\\update.exe", "discordptb\\update.exe")):
@@ -719,6 +723,12 @@ class NovaWfpUdpProxy:
     def build_attempts_for_target(self, host: str, port: int, app_family: str = "", preferred_egress: int = 0):
         now = time.monotonic()
         upstream_attempts = [dict(attempt) for attempt in get_udp_upstream_attempts() if isinstance(attempt, dict)]
+        dns_state = dns_ai_route_state()
+        if (str(app_family).lower() == "dns_ai" and dns_state) or is_dns_ai_endpoint(host, port):
+            labels = dns_ai_route_labels(True, True, dns_state)
+            # The secondary's HTTP CONNECT cannot carry UDP. Reject QUIC/DoQ there so the client
+            # retries encrypted DNS over TCP through the fastest VPN, without a direct UDP escape.
+            return [a for a in upstream_attempts if a.get("label") == labels[0]]
         if not upstream_attempts:
             upstream_attempts = []
         direct_attempts = [

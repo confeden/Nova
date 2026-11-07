@@ -157,6 +157,9 @@ ENTRIES = (
     # проблеме (I19). Они живут в profiles/.runtime.
     E("masque-ready.json", "runtime", "nova-go.exe (masque socks)", "nova.pyw",
       "сигнал готовности MASQUE: транспорт, точка входа, SNI. Без ключей"),
+    E("dns-ai-route.json", "runtime", "nova.pyw", "NovaWFP/proxy, NovaDivert",
+      "системный DNS-AI, доступность слотов VPN и задержки проверенных DoH-запросов; "
+      "обновляется во время работы, не содержит адреса выхода или ключей"),
     E("vless-ready.json", "runtime", "nova-xray.exe", "nova.pyw",
       "сигнал готовности VLESS: pid помощника и версия Xray. Без ключей и без адреса узла"),
     E("vless-ready-secondary.json", "runtime", "nova-xray.exe (резервный слот)", "nova.pyw",

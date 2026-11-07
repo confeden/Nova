@@ -1,0 +1,389 @@
+{
+  "reference": "Unmodified Nova Android Kotlin 2.2.10/JVM sources with an alpha-field and Canvas-command sink. Vector raster antialiasing is platform-specific.",
+  "sources_sha256": {
+    "NovaTexturePatterns.kt": "531c362182be818aaa1fda578a8d6463f5fa71faf2eaff2571019d7b948cf3df",
+    "NovaMatrixRain.kt": "cf172aa5e8b1b7ac03bd08b0f706ec8737ef9d30e983d04bab910bbd7f3d591c"
+  },
+  "cases": [
+    {
+      "texture": "basalt",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "4ba041a45a3e1e7408a3b132c5bb1703788a6fb78dc86b4e543407f0c93f5025",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "basalt",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "521eb49f7982adad132a5f0b7d75dba736af8bb1da06c0b28a9cf32d957b527c",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "marble",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "a9099a1f3e80d2bde4f69c4a54ed01e8a447ead381fddf518bcbb56d3f576e5d",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "marble",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "235be9c6660165dde40ee60eb79b1b728e5f9a7f7a1fb8c333a4eb08771918cd",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "wood",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "a4e4c8efe80f8522489c92751fcab0c070065a3ef1fdd876ec0452c0105452a6",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "wood",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "7149ae4357870d5c0b38deafdeeefb62e0e686ad0276e16885c3ccf05ce56242",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "sand",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "ade0995799b81624e1a78f818c832d3cea3f02481d127703dace8cd8e66fd57f",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "sand",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "16fa2d41a8e5939276082298d840497f31ba24f8255864d098cbaeffb5b1736f",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "grass",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "475ead01dd6a0ae27502505f2df6f99b894553921481c37b946ed15ae00f4dc6",
+      "events_sha256": "a5f830a608cae19d7db2f72ad37be967d7c5f97385c5e00660f1aea6929e4c4a",
+      "event_count": 5
+    },
+    {
+      "texture": "grass",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "c698aa44211a6eeeff8598906470887e57a000c7c885f2df696cdaf4e89afc03",
+      "events_sha256": "12e1f4b73a306232a64b32471649094f05d0adcf0ac927d92560a996777e1013",
+      "event_count": 5
+    },
+    {
+      "texture": "cracks",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "9caeaf3570b1665b9618c70640aecf5c049ec854ea0c65c175a9ee3734155459",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "cracks",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "7a616da14cd9343851d9f02572f9f075b391e9ec8b984baee09638306c994794",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "water",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "d5a2d675546b03a03ded62ac25f87693fd3f55217032f0e68434ddf909278f17",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "water",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "2810c65c92cfc10cf170540e2890269eb7e0e3a26cab0f1b4f80d1b9961a467d",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "smoke",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "a00fa4689cad680ccb5e3359b2e1f7b32da0ca667e4a850efd4bc3141513c12f",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "smoke",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "e8353c2353643500a541dcd648ea7502fc54ba06c3b6ae1d13525b0a1180d5ab",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "starfield",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "add924316ef6f8ac72b07aa6671dcaf6177d4f92516b70579ebab76b3ab3e8a5",
+      "events_sha256": "9605522d6279af44fa8cbc2c9013ca40f3fdf307e52cfb9233364a9b7631aa12",
+      "event_count": 16709
+    },
+    {
+      "texture": "starfield",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "a9bbdf679319e5729c8a8599a6df85d588d620cb0e84c7615464de1b3417c3e3",
+      "events_sha256": "a33809505c7ca1a9ab9d5a31ad2feebc8f2c331173363c90f11558f8e4d9fbdf",
+      "event_count": 21742
+    },
+    {
+      "texture": "slime",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "1e94206eaf423ad158d29d26eb64bbc4c5d0adf2e5c60f6f41b7cfec9707e9ab",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "slime",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "1986a41111ba8701929d42aa204357fdeb855edb10818fecfa25088b2ebe5ec0",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "shards",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "24ddaa4710480313757f965c38d60208a334556cb244f830d5006a893edd8da7",
+      "events_sha256": "48700d49d928c03f6f40eddae184f50cabc023073b0209c384e2a28366399e59",
+      "event_count": 6
+    },
+    {
+      "texture": "shards",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "24ddaa4710480313757f965c38d60208a334556cb244f830d5006a893edd8da7",
+      "events_sha256": "8254fcb97a45f5a6938350838f48d441fe63b28343548da1854eef7959c8b210",
+      "event_count": 6
+    },
+    {
+      "texture": "splatter",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "2e0180f7f8900afe9f76208315a9e1f8a0b26bc271e66dabfd8657186fc31acc",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "splatter",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "ac66e144d15d5ab1aec9c7203bc85df5cdf10c80eecf6d8f183ad50f062d446f",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "lightning",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "17450d38377979e200f6967088b58b99d92b5909d154608dc3c431a776837155",
+      "events_sha256": "718c1ec71d27a3e28f189678694f53bee757ea04a407e293961389a303ec73fd",
+      "event_count": 12
+    },
+    {
+      "texture": "lightning",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "4fb81d1d3254f72b40169dd19752702c4860258f7348d21ea28969f614e00b1f",
+      "events_sha256": "fc2a06bcc71a2f08b65458376b46f2e81dddc972612a751ebb7f124ae378d5fe",
+      "event_count": 12
+    },
+    {
+      "texture": "snow",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "b32f8652f2f4300c48bd314cd2ca3ee13df8d062973595f858ac0742e7cb8cf7",
+      "events_sha256": "3dbc8790681935f03187bffaaa2d3965cf507a0e53ce3fb080d2fbeeef7cb428",
+      "event_count": 1131
+    },
+    {
+      "texture": "snow",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "0f30fa12b2040506223a56f9a218091f6cd0bdc6771ed46945e596ddc9871e23",
+      "events_sha256": "b4f8ddb7ef59cabb4f3d6dfe453ef3443a406ebd9f76183b2c6d8dadcde77fcc",
+      "event_count": 1131
+    },
+    {
+      "texture": "fractal",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "da28ab36ec4004820fb00eecb2f24bc98bc86f79894e43eca2dc107c4f15ab98",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "fractal",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "7ef6bdc318a9de6b03f7475271f3953891545b523bbc497e9a405cb1ae01cf98",
+      "events_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "event_count": 0
+    },
+    {
+      "texture": "matrix",
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "base_sha256": "24ddaa4710480313757f965c38d60208a334556cb244f830d5006a893edd8da7",
+      "events_sha256": "7d8ca3603a882396706ee9ebf865cec090ddad61c435541ad396a6f5a02ac508",
+      "event_count": 4994
+    },
+    {
+      "texture": "matrix",
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "base_sha256": "24ddaa4710480313757f965c38d60208a334556cb244f830d5006a893edd8da7",
+      "events_sha256": "50e020c74827fb1812f915a5056f1dc849d58c2fccb71cdd9c5f2fc1a7e09d7e",
+      "event_count": 4963
+    }
+  ],
+  "rain_cases": [
+    {
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "time": 0,
+      "alpha_scale": 1,
+      "event_count": 335,
+      "events_sha256": "9a067cb73681ccde097ca6e1547017404f219d18515739e21d24454ee890ae48"
+    },
+    {
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "time": 7.5,
+      "alpha_scale": 0.18,
+      "event_count": 359,
+      "events_sha256": "d1c644ccc6be8efac7b8419bd5f68ba1b0471abf1fbe8038d81f7d476082c181"
+    },
+    {
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "time": 65,
+      "alpha_scale": 0.6,
+      "event_count": 459,
+      "events_sha256": "be9fcbc981e8e047c5599704b9c90273d2db1b4d2098597adf7eba75d9699313"
+    },
+    {
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "time": 3600,
+      "alpha_scale": 1,
+      "event_count": 383,
+      "events_sha256": "1ae90136859bed5f7caa2a3beeda82d8443b755ece644b70951d23e2ade2c91f"
+    },
+    {
+      "width": 80,
+      "height": 60,
+      "variant": 0,
+      "time": 86400,
+      "alpha_scale": 0.18,
+      "event_count": 292,
+      "events_sha256": "f0d5e5c4638931795a7bae3187123306d7667313deac8f477b8151f92c9b442a"
+    },
+    {
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "time": 0,
+      "alpha_scale": 1,
+      "event_count": 270,
+      "events_sha256": "a99d49599b7047f20fca87ca9a9bfc24b6f2f206d9c41bfd02c3d2d548cd6755"
+    },
+    {
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "time": 7.5,
+      "alpha_scale": 0.18,
+      "event_count": 243,
+      "events_sha256": "8cf78f0208a19f95dc65c24e05c4387bdbb8ae1fdac4dd159fe714b0273f2648"
+    },
+    {
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "time": 65,
+      "alpha_scale": 0.6,
+      "event_count": 257,
+      "events_sha256": "d807fc357c5a45b1fd0ab2c476ba6f461364ad7a411af05ab40256d603282937"
+    },
+    {
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "time": 3600,
+      "alpha_scale": 1,
+      "event_count": 260,
+      "events_sha256": "aedfbb4b57f6aa388add6541b3d0f773a1aa5c65d1d1ae386d5d641c7c45cc73"
+    },
+    {
+      "width": 60,
+      "height": 80,
+      "variant": 197,
+      "time": 86400,
+      "alpha_scale": 0.18,
+      "event_count": 434,
+      "events_sha256": "76a47774013188417053f6474f367c115879d170f16ac5b40fb49c94bc3467b2"
+    }
+  ]
+}

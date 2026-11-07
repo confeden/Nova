@@ -225,6 +225,11 @@ def ensure_pyinstaller() -> None:
         import webview  # noqa: F401
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pywebview"])
+    try:
+        import h2.connection  # noqa: F401
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "h2>=4.4.1,<5"],
+                              creationflags=CREATE_NO_WINDOW)
 
 
 def locate_iscc() -> str | None:
@@ -883,6 +888,7 @@ def require_paths(base_dir: Path) -> None:
     ensure_nova_engine(base_dir)
     ensure_nova_go(base_dir)
     ensure_nova_xray(base_dir)
+    ensure_nova_proxy(base_dir)
 
 
 def tls_terminator_build_env(base_env=None) -> dict:
@@ -1390,6 +1396,24 @@ def ensure_nova_xray(base_dir: Path) -> None:
     print(f"[Go] nova-xray.exe обновлён: {target} (sha256 {digest})")
 
 
+def ensure_nova_proxy(base_dir: Path) -> None:
+    """Build the pinned general-purpose protocol core; fail rather than ship missing support."""
+    version = read_version(base_dir / "nova.pyw")
+    go = shutil.which("go")
+    if not go:
+        raise RuntimeError("Для сборки ядра профилей требуется Go")
+    source = base_dir / "nova-proxy"
+    target = base_dir / "bin" / "nova-proxy.exe"
+    with tempfile.TemporaryDirectory(prefix="nova-proxy-build-") as temporary:
+        built = Path(temporary) / target.name
+        build_nova_go(source, built, version, go, package=".", what="nova-proxy")
+        smoke_test_nova_go(built, version)
+        digest = sha256_file(built)
+        install_binary(built, target)
+    if sha256_file(target) != digest:
+        raise RuntimeError("nova-proxy.exe не совпадает с собранным ядром")
+
+
 def build_embedded_assets_module(base_dir: Path) -> Path:
     ensure_clean_dir(PYI_ASSET_DIR)
 
@@ -1540,6 +1564,7 @@ def build_pyinstaller_dist(base_dir: Path, release_dir: Path) -> Path:
         "--hidden-import=nova_vless",
         "--hidden-import=nova_subscriptions",
         "--hidden-import=nova_ping",
+        "--hidden-import=h2.connection",
         "--hidden-import=nova_captcha_window",
         "--hidden-import=webview",
         "--hidden-import=webview.platforms.edgechromium",

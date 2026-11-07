@@ -30,7 +30,7 @@ import os
 import re
 import threading
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
@@ -80,7 +80,7 @@ DEFAULT_KEEP = 120
 # And a ceiling over all of them together. Every profile is a file the «Профили» window stats on
 # each refresh, and of public nodes roughly one in five is reachable at all — past this the list
 # costs more to look at than it is worth.
-MAX_TOTAL_VLESS = 600
+MAX_TOTAL_VLESS = 20000
 
 CONNECT_TIMEOUT_S = 12.0
 READ_TIMEOUT_S = 45.0
@@ -131,6 +131,9 @@ DEFAULT_SOURCES = (
 
 # The registry's own shape. Bumped when the meaning of a stored field changes, which lets a record
 # written by an older Nova be corrected on load instead of being trusted.
+NOVA_LIST_URL = "https://raw.githubusercontent.com/confeden/nova_updates/main/Github%20list/nova-list.json"
+NOVA_LIST_ID = "nova-list"
+
 _SHAPE = 2
 
 # Re-entrant, and every read-modify-write of the registry is held across both halves. Two writers
@@ -208,17 +211,21 @@ def normalize_record(record):
     stale_shape = _as_int(record.get("shape"), 0) < _SHAPE
     if stale_shape:
         identities = []
+    builtin = url == NOVA_LIST_URL or record.get("id") == NOVA_LIST_ID
+    if builtin:
+        url = NOVA_LIST_URL
     return {
         "shape": _SHAPE,
-        "id": str(record.get("id") or make_id(url)),
+        "id": NOVA_LIST_ID if builtin else str(record.get("id") or make_id(url)),
         "url": url,
-        "name": str(record.get("name") or "").strip(),
-        "kind": kind,
+        "name": "Nova list" if builtin else str(record.get("name") or "").strip(),
+        "kind": KIND_AUTO if builtin else kind,
+        "builtin": builtin,
         "enabled": bool(record.get("enabled", True)),
         "interval_hours": interval,
         # `keep` meant "how many VLESS profiles in total" in the old shape and "how many of mine"
         # in this one, so a stored value from then is not the same quota and goes back to default.
-        "keep": DEFAULT_KEEP if stale_shape
+        "keep": MAX_NODES if builtin else DEFAULT_KEEP if stale_shape
                 else max(1, min(MAX_NODES, _as_int(record.get("keep"), DEFAULT_KEEP))),
         "etag": str(record.get("etag") or ""),
         "last_modified": str(record.get("last_modified") or ""),
@@ -231,6 +238,13 @@ def normalize_record(record):
         # (rule 2 of plan_sync), so this list is the whole reason the file is state, not a cache.
         "identities": identities[:MAX_NODES],
     }
+
+
+def _with_builtin(rows):
+    rows = [r for r in rows if r is not None]
+    if not any(r["id"] == NOVA_LIST_ID for r in rows):
+        rows.append(normalize_record({"id": NOVA_LIST_ID, "url": NOVA_LIST_URL}))
+    return rows
 
 
 def load(base_dir):
@@ -250,7 +264,7 @@ def load(base_dir):
     if not isinstance(rows, list):
         # First run: the shipped sources are offered rather than an empty list, because a window
         # that says "no subscriptions" leaves the owner to find a link themselves.
-        return [normalize_record(dict(src, id=make_id(src["url"]))) for src in DEFAULT_SOURCES]
+        return _with_builtin([normalize_record(dict(src, id=make_id(src["url"]))) for src in DEFAULT_SOURCES])
     out = []
     seen = set()
     for row in rows:
@@ -259,12 +273,12 @@ def load(base_dir):
             continue
         seen.add(record["id"])
         out.append(record)
-    return out
+    return _with_builtin(out)
 
 
 def save(base_dir, records):
     """Write the registry atomically. Returns the normalized list that was written."""
-    rows = [r for r in (normalize_record(row) for row in records or []) if r is not None]
+    rows = _with_builtin([normalize_record(row) for row in records or []])
     payload = {"v": 1, "written_at": int(_now()), "subscriptions": rows}
     path = subscriptions_path(base_dir)
     # No 0o600 here, and the omission is deliberate rather than forgotten. The file lives in
@@ -320,6 +334,8 @@ def add(base_dir, url, name="", kind=KIND_AUTO, interval_hours=DEFAULT_INTERVAL_
 
 
 def remove(base_dir, sub_id):
+    if sub_id == NOVA_LIST_ID:
+        raise ValueError("Nova list — встроенная подписка, удалить её нельзя")
     with _LOCK:
         return save(base_dir, [r for r in load(base_dir) if r.get("id") != sub_id])
 
@@ -386,7 +402,7 @@ def due(records, now=None, grace_sec=0.0):
         interval = max(MIN_INTERVAL_HOURS, _as_int(record.get("interval_hours"), DEFAULT_INTERVAL_HOURS))
         wait = interval * 3600.0
         streak = max(0, _as_int(record.get("fail_streak"), 0))
-        if streak:
+        if streak and not record.get("builtin"):
             wait = min(24 * 3600.0, wait * (2 ** min(streak, 5)))
         checked = _as_float(record.get("last_checked_at"), 0.0)
         if checked and (now - checked) < (wait - float(grace_sec)):
@@ -437,7 +453,7 @@ def mirror_urls(url):
     if not parts:
         return (url,)
     user, repo, ref, path = parts
-    quoted = quote(path, safe="/._-~")
+    quoted = quote(unquote(path), safe="/._-~")
     # The measured order, not the order the owner happened to paste: `raw.githubusercontent.com` is
     # unreachable from here without a bypass (G48), so putting a pasted raw link first would cost
     # three TCP timeouts before the mirror that works. A pasted githack link is already first.
@@ -660,15 +676,56 @@ def refresh(base_dir, record, *, proxies=(), direct=True, log=None, fetcher=None
         say("[Подписки] «%s» не менялась (304), профилей: %d." % (title, record["node_count"]))
         return "unchanged", record, {}
 
+    if record["builtin"]:
+        try:
+            document = json.loads(result.body.decode("utf-8-sig"))
+            metadata = document["nova_list"]
+            curated = document["proxies"]
+            if (not isinstance(metadata, dict) or metadata["version"] != 1 or metadata.get("complete") is not True
+                    or not isinstance(curated, list) or metadata["count"] != len(curated)):
+                raise ValueError("invalid Nova list manifest")
+        except (ValueError, KeyError, TypeError):
+            record["fail_streak"] += 1
+            record["last_status"] = "неверный формат Nova list; сохранены прежние профили"
+            say(f'[Подписки] {record["last_status"]}.')
+            return "failed", record, {}
+        if not curated:
+            outcome = _apply_vless(base_dir, record, [], say, title)
+            record["etag"], record["last_modified"] = result.etag, result.last_modified
+            record["fail_streak"] = 0
+            return outcome, record, {"parsed": 0}
+
     record["etag"] = result.etag
     record["last_modified"] = result.last_modified
     record["fail_streak"] = 0
 
+    import nova_proxy
     nodes, stats = ([], {})
     if nova_vless is not None and record["kind"] in (KIND_AUTO, KIND_VLESS):
-        nodes, stats = nova_vless.parse_many(result.body, limit=MAX_NODES)
+        text = nova_vless.decode_subscription_body(result.body)
+        structured = nova_proxy.is_document(text)
+        if structured:
+            nodes, stats = nova_proxy.parse_many(text, limit=MAX_NODES)
+        else:
+            nodes, stats = nova_vless.parse_many(result.body, limit=MAX_NODES)
+            links = nova_proxy.share_links(text)
+            if links:
+                extra, more = nova_proxy.parse_many('\n'.join(links), limit=MAX_NODES)
+                nodes.extend(extra)
+                stats['modern_parsed'] = more.get('parsed', 0)
+                stats['modern_skipped'] = more.get('skipped', 0)
+
+    if record["builtin"] and len(nodes) != metadata["count"]:
+        record["etag"], record["last_modified"] = "", ""
+        record["fail_streak"] += 1
+        record["last_status"] = "ядро прочитало Nova list не полностью; прежние профили сохранены"
+        say(f'[Подписки] {record["last_status"]}.')
+        return "failed", record, stats
 
     if nodes:
+        skipped = stats.get('skipped', 0) + stats.get('modern_skipped', 0)
+        if skipped:
+            say(f'[Подписки] «{title}»: ядро не приняло {skipped} профилей; остальные будут импортированы.')
         outcome = _apply_vless(base_dir, record, nodes, say, title)
         return outcome, record, stats
 
@@ -707,19 +764,17 @@ def refresh(base_dir, record, *, proxies=(), direct=True, log=None, fetcher=None
 def _apply_vless(base_dir, record, nodes, say, title):
     """The VLESS half of `refresh`: diff against what this subscription brought last time.
 
-    Only this subscription's own nodes are counted and touched. `record["identities"]` is the
-    ownership record -- what it brought last time -- so a profile the owner pasted by hand, or one
-    another subscription brought, is neither removed by this refresh nor charged against its quota.
+    Only this subscription's stamped files are counted and touched. The registry remembers its
+    previous identities; matching a manual profile must never transfer ownership to the subscription.
     """
-    owned_before = set(record["identities"])
     existing_owned = []
     total_vless = 0
     for listed in nova_profiles.list_profiles(base_dir):
-        if listed.get("kind") != nova_profiles.KIND_VLESS:
+        if listed.get("kind") not in (nova_profiles.KIND_VLESS, nova_profiles.KIND_PROXY):
             continue
         total_vless += 1
         identity = listed.get("fingerprint") or ""
-        if identity in owned_before:
+        if listed.get('subscription') == record['id']:
             existing_owned.append((listed["id"], identity))
 
     by_identity = {}
@@ -747,9 +802,13 @@ def _apply_vless(base_dir, record, nodes, say, title):
         removed += 1
 
     candidates = []
+    import nova_proxy
     for identity in plan["add"]:
         node = by_identity.get(identity)
         if node is None:
+            continue
+        if isinstance(node, nova_proxy.ProxyNode):
+            candidates.append(nova_proxy.candidate(node))
             continue
         candidates.append({
             "kind": nova_profiles.KIND_VLESS,
@@ -766,12 +825,9 @@ def _apply_vless(base_dir, record, nodes, say, title):
     # Ownership follows what is on disk, not what the answer held: a node the quota left out was
     # never written, and claiming it would let the next refresh "remove" a file that never existed
     # while letting the node itself be re-added for ever.
-    removed_ids = set(plan["remove"])
-    record["identities"] = sorted(
-        {identity for pid, identity in existing_owned if pid not in removed_ids}
-        | {identity for identity in plan["add"] if identity in by_identity}
-    )[:MAX_NODES]
-    record["node_count"] = plan["keep"] + added
+    record['identities'] = sorted({r['fingerprint'] for r in nova_profiles.list_profiles(base_dir)
+                                   if r.get('subscription') == record['id'] and r.get('fingerprint')})[:MAX_NODES]
+    record['node_count'] = len(record['identities'])
     if len(nodes) > len(record["identities"]):
         say("[Подписки] «%s»: из %d узлов взято %d — предел этой подписки %d." %
             (title, len(nodes), len(record["identities"]), record["keep"]))

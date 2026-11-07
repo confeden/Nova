@@ -17,7 +17,7 @@ CONNECT), so it cannot leave the tunnel. Only the country (and Cloudflare's `col
 exit address is parsed to validate the answer and then dropped -- it is never returned, logged or
 written, because temp/ travels with problem reports (I19).
 
-Stdlib only, no Nova globals: tests run it against local fake proxies.
+No Nova globals: country probes use stdlib; optional HTTP/2 DoH uses hyper-h2.
 """
 
 import socket
@@ -224,9 +224,52 @@ def _read_http_response(sock, deadline):
     return data
 
 
+def _http2_body(conn, host, path, deadline):
+    import h2.config
+    import h2.connection
+    import h2.events
+    import h2.exceptions
+
+    client = h2.connection.H2Connection(config=h2.config.H2Configuration(header_encoding='utf-8'))
+    client.initiate_connection()
+    client.send_headers(1, [(':method', 'GET'), (':scheme', 'https'), (':authority', host), (':path', path),
+                            ('accept', 'application/dns-message'), ('user-agent', _USER_AGENT)], end_stream=True)
+    conn.settimeout(deadline.timeout())
+    conn.sendall(client.data_to_send())
+    body = bytearray()
+    status = None
+    try:
+        while True:
+            conn.settimeout(deadline.timeout())
+            data = conn.recv(65536)
+            if not data:
+                raise ProbeError(f'{host}: incomplete HTTP/2 response')
+            for event in client.receive_data(data):
+                if isinstance(event, h2.events.ResponseReceived) and event.stream_id == 1:
+                    status = dict(event.headers).get(':status')
+                elif isinstance(event, h2.events.DataReceived):
+                    client.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                    if event.stream_id == 1:
+                        body.extend(event.data)
+                        if len(body) > 65535:
+                            raise ProbeError(f'{host}: oversized DNS response')
+                elif isinstance(event, h2.events.StreamEnded) and event.stream_id == 1:
+                    if status != '200':
+                        raise ProbeError(f'{host}: HTTP {status}')
+                    return bytes(body)
+                elif isinstance(event, (h2.events.StreamReset, h2.events.ConnectionTerminated)):
+                    raise ProbeError(f'{host}: HTTP/2 stream terminated')
+            pending = client.data_to_send()
+            if pending:
+                conn.settimeout(deadline.timeout())
+                conn.sendall(pending)
+    except h2.exceptions.H2Error as error:
+        raise ProbeError(f'{host}: invalid HTTP/2 response ({type(error).__name__})') from None
+
+
 def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, proxy_host="127.0.0.1",
-                    target_port=443, use_tls=True, ssl_context=None):
-    """GET `path` on `target_host` through a local proxy; returns the body text. Raises ProbeError.
+                    target_port=443, use_tls=True, ssl_context=None, binary=False, http2=False):
+    """GET through a local proxy; return text or binary body. Raises ProbeError.
 
     `proxy_kind` is "socks5" or "http". `use_tls=False` exists for tests with a plain fake server.
     """
@@ -255,11 +298,21 @@ def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, pr
         conn = raw
         if use_tls:
             context = ssl_context or ssl.create_default_context()
+            if http2:
+                context.set_alpn_protocols(['h2'])
             try:
                 raw.settimeout(deadline.timeout())
                 conn = context.wrap_socket(raw, server_hostname=str(target_host))
             except (OSError, ssl.SSLError) as exc:
                 raise ProbeError(f"TLS до {target_host}: {exc.__class__.__name__}") from None
+        if http2:
+            if use_tls and conn.selected_alpn_protocol() != 'h2':
+                raise ProbeError(f'{target_host}: HTTP/2 was not negotiated')
+            try:
+                body = _http2_body(conn, target_host, path, deadline)
+                return body if binary else body.decode('utf-8', 'replace')
+            except OSError as error:
+                raise ProbeError(f'{target_host}: HTTP/2 {type(error).__name__}') from None
         request = (
             f"GET {path} HTTP/1.1\r\nHost: {target_host}\r\nUser-Agent: {_USER_AGENT}\r\n"
             "Accept: */*\r\nConnection: close\r\n\r\n"
@@ -286,7 +339,7 @@ def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, pr
         raise ProbeError(f"{target_host}: HTTP {code}")
     if b"transfer-encoding: chunked" in head.lower():
         body = _dechunk(body)
-    return body.decode("utf-8", "replace")
+    return body if binary else body.decode("utf-8", "replace")
 
 
 def probe_exit_country(proxy_kind, proxy_port, *, budget=12.0, proxy_host="127.0.0.1", sources=SOURCES,

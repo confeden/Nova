@@ -31,9 +31,11 @@ import math
 import os
 import re
 import stat
+import subprocess
 import threading
 import time
 import zlib
+import nova_proxy
 
 __all__ = [
     # layout constants
@@ -45,7 +47,7 @@ __all__ = [
     "MODE_AUTO", "MODE_GROUP", "MODE_PROFILE", "BACKEND_AWG", "BACKEND_MASQUE", "BACKEND_VLESS",
     "BACKEND_WARP_CLI",
     "ORIGIN_BUNDLED", "ORIGIN_GENERATED", "ORIGIN_IMPORTED", "ORIGIN_SUBSCRIPTION",
-    "KIND_AWG", "KIND_MASQUE", "KIND_VLESS",
+    "KIND_AWG", "KIND_MASQUE", "KIND_VLESS", "KIND_PROXY",
     "AUTO_GENERATED_LEAD_LIMIT", "AUTO_PROTON_LIMIT", "MASQUE_DEFAULT_PORTS",
     "WARNING_AWG3", "is_fatal_issue",
     "ISSUE_NO_INTERFACE", "ISSUE_NO_PEER", "ISSUE_NO_PRIVATE_KEY", "ISSUE_BAD_PRIVATE_KEY",
@@ -94,7 +96,7 @@ GROUP_MASQUE = "MASQUE"
 # folder per backend is what keeps "choose this profile" from meaning "start the wrong program".
 GROUP_VLESS = "VLESS"
 GROUP_CUSTOM = "Custom"
-GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_MASQUE, GROUP_VLESS, GROUP_CUSTOM)
+GROUPS = (GROUP_MASQUE, GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_VLESS, GROUP_CUSTOM)
 RUNTIME_DIRNAME = ".runtime"
 RELAY_KEY_FILENAME = "opera_relay.key"
 LEGACY_AWG_DIRNAME = "awg"
@@ -137,6 +139,7 @@ ORIGIN_SUBSCRIPTION = "subscription"
 KIND_AWG = "awg"
 KIND_MASQUE = "masque"
 KIND_VLESS = "vless"
+KIND_PROXY = "proxy"
 
 AUTO_GENERATED_LEAD_LIMIT = 12
 AUTO_PROTON_LIMIT = 10
@@ -178,7 +181,7 @@ _RUNTIME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # spaces are all legal inside it -- the fragment holds the node name ("Test NL", flags and
 # all) and `extra=` holds JSON. Cutting at whitespace truncated exactly those names. A
 # second link on the same line ends the first, so a pasted pair is two candidates.
-VLESS_URI_RE = re.compile(r"(?i)vless://(?:(?!vless://)[^\r\n])+")
+VLESS_URI_RE = re.compile(r"(?i)vless://(?:(?!(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic|anytls|vpn)://)[^\r\n])+")
 
 # --------------------------------------------------------------------------------------------
 # Issue texts (user-visible, Russian)
@@ -1048,7 +1051,7 @@ def _origin_for(group, name, masque_source=""):
         return ORIGIN_GENERATED if _GENERATED_PROTON_NAME_RE.fullmatch(name) else ORIGIN_IMPORTED
     if group == GROUP_MASQUE:
         return ORIGIN_IMPORTED if str(masque_source or "").lower().startswith("import") else ORIGIN_GENERATED
-    if group == GROUP_VLESS:
+    if group in (GROUP_VLESS, GROUP_CUSTOM):
         # A node that came from a subscription is shown apart from one the owner pasted, because
         # only the first is the subscription's to remove on the next refresh.
         return ORIGIN_SUBSCRIPTION if str(masque_source or "") == ORIGIN_SUBSCRIPTION else ORIGIN_IMPORTED
@@ -1107,6 +1110,8 @@ def _vless_file_info(path, obj, encoding_issue):
         "issues": issues,
         "fingerprint": node.identity if node is not None else "",
         "masque_source": source,
+        "subscription": str(obj.get('subscription') or '') if isinstance(obj, dict) else '',
+        "engine": nova_proxy.vless_engine(node),
     }
 
 
@@ -1117,6 +1122,16 @@ def _json_file_info(path, group):
     except ValueError:
         obj = None
     encoding_issue = _file_encoding_issue(data)
+    if isinstance(obj, dict) and obj.get('type') == KIND_PROXY:
+        try:
+            node = nova_proxy.from_payload(obj)
+            return dict(kind=KIND_PROXY, protocol=node.protocol, identity=node.identity,
+                        endpoint=node.endpoint, valid=not bool(encoding_issue),
+                        issues=[encoding_issue] if encoding_issue else [], fingerprint=node.identity,
+                        masque_source=str(obj.get('source') or ''), subscription=str(obj.get('subscription') or ''), engine=node.engine)
+        except ValueError as error:
+            return dict(kind=KIND_PROXY, identity=path, endpoint='', valid=False,
+                        issues=[str(error)], fingerprint='', masque_source='')
     # The file's own `type` decides, not the folder: a VLESS profile dropped into Custom is still a
     # VLESS profile, and starting it as a WireGuard config would fail with an unreadable message.
     if _looks_like_vless_profile(obj):
@@ -1253,6 +1268,9 @@ def list_profiles(base_dir):
                 "name": stem,
                 "path": path,
                 "kind": info["kind"],
+                "protocol": info.get("protocol") or info["kind"],
+                "engine": info.get('engine') or ('xray' if info['kind'] == KIND_VLESS else ''),
+                "subscription": info.get('subscription') or '',
                 "origin": _origin_for(group, stem, info["masque_source"]),
                 "identity": info["identity"],
                 "endpoint": info["endpoint"],
@@ -1398,7 +1416,7 @@ def resolve_effective_selection(sel, profiles):
         group = _match_group(normalized.get("group", ""))
         if not group:
             return {"mode": MODE_AUTO, "group": "", "profile_id": "", "reason": REASON_UNKNOWN_GROUP}
-        members = [r for r in records if r.get("group") == group and r.get("valid") and not _is_legacy_seed_copy(r)]
+        members = [r for r in nova_proxy.group_records(records, group) if r.get("valid") and not _is_legacy_seed_copy(r)]
         effective = {
             "mode": MODE_GROUP,
             "group": group,
@@ -1422,7 +1440,8 @@ def resolve_effective_selection(sel, profiles):
 # Attempt plans
 
 
-_BACKEND_BY_KIND = {KIND_MASQUE: BACKEND_MASQUE, KIND_VLESS: BACKEND_VLESS}
+# "vless" remains the persisted userspace-proxy backend identifier for compatibility.
+_BACKEND_BY_KIND = {KIND_MASQUE: BACKEND_MASQUE, KIND_VLESS: BACKEND_VLESS, KIND_PROXY: BACKEND_VLESS}
 
 
 def _attempt(record):
@@ -1702,13 +1721,13 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
     shared seeds everyone got with the installer (owner's rule: switch to personal profiles whenever
     a switch happens at all). A .conf dropped into the Cloudflare folder by hand stays in the seeds'
     round-robin, as it always did: its identity may well be a seed's. `preferred_id` is the last profile that carried traffic: it goes first
-    in its own segment, and when it is an own profile its segment goes first, so a restart comes
-    back to the same kind of connection.
+    before the regular Auto ladder. Without a remembered profile MASQUE leads auto.
 
-    auto:    own Cloudflare (healthy, by rtt, <=12) -> MASQUE (skipped after repeated failures)
+    auto:    MASQUE (skipped after repeated failures) -> own Cloudflare (healthy, by rtt, <=12)
              -> Proton (<=10, connect queue) -> shared Cloudflare seeds (identity round-robin)
              -> own Cloudflare that failed -> warp-cli. The segment holding an own `preferred_id`
-             moves to the front. Custom and VLESS are never part of auto: both hold profiles whose
+             moves just after MASQUE. A valid remembered profile precedes the entire ladder, including
+             an imported profile; otherwise Custom and VLESS are not guessed in primary Auto, because they hold profiles whose
              quality Nova cannot vouch for -- a Custom conf is the owner's, a VLESS node is a
              stranger's -- and a dead one in the automatic ladder would cost every connect its
              timeout. They are reached by choosing the group or the profile.
@@ -1726,7 +1745,7 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
     valid = [r for r in records if r.get("valid") and not _is_legacy_seed_copy(r)]
 
     def members(group):
-        return [r for r in valid if r.get("group") == group]
+        return nova_proxy.group_records(valid, group)
 
     if effective["mode"] == MODE_PROFILE:
         record = next((r for r in records if r["id"] == effective["profile_id"]), None)
@@ -1743,7 +1762,7 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
             country = effective.get("country", "")
             group_members = [r for r in members(group) if not country or record_country(r) == country]
             ordered = _front(_proton_order(group_members, stats, now), preferred)
-        elif group == GROUP_VLESS:
+        elif group in (GROUP_VLESS, GROUP_CUSTOM):
             ordered = _front(_vless_order(members(group), stats, now), preferred)
         else:
             ordered = _front(_stats_order(members(group), stats), preferred)
@@ -1755,15 +1774,19 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
     proton_head = proton[:AUTO_PROTON_LIMIT]
     if not _contains_preferred(proton_head, preferred) and _contains_preferred(proton, preferred):
         proton_head = _front(proton, preferred)[:AUTO_PROTON_LIMIT]
-    personal = [_front(lead, preferred), _front(masque, preferred), _front(proton_head, preferred)]
+    personal = [_front(lead, preferred), _front(proton_head, preferred)]
     for index, segment in enumerate(personal):
         if _contains_preferred(segment, preferred):
             personal.insert(0, personal.pop(index))
             break
-    ordered = [r for segment in personal for r in segment]
+    ordered = _front(masque, preferred) + [r for segment in personal for r in segment]
     ordered += pool  # the round-robin already put a preferred seed first among the seeds
     ordered += _front(rest, preferred)
     plan = [_attempt(r) for r in ordered]
+    remembered = next((r for r in valid if r["id"] == preferred), None)
+    if remembered is not None:
+        # Auto resumes the exact profile that carried traffic; the normal ladder follows a failure.
+        plan = [_attempt(remembered)] + [a for a in plan if a["profile"]["id"] != preferred]
     plan.append({"backend": BACKEND_WARP_CLI, "profile": None})
     return plan
 
@@ -2238,6 +2261,8 @@ def parse_import_text(text, source_name=""):
     written to `profiles/Custom/`. Nothing is written here.
     """
     text = _coerce_text(text)
+    if _nova_vless is not None:
+        text = _nova_vless.decode_subscription_body(text)
     if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -2246,6 +2271,23 @@ def parse_import_text(text, source_name=""):
     stem = _source_stem(source_name)
     if len(text) > _MAX_IMPORT_TEXT_CHARS:
         return [_invalid_candidate(stem or "Импорт", [ISSUE_TEXT_TOO_LARGE])]
+
+    # The full native document is parsed in one batch, never one subprocess per link.
+    structured = nova_proxy.is_document(text)
+    proxy_links = nova_proxy.share_links(text)
+    native_candidates = []
+    if structured or proxy_links:
+        body = text if structured else '\n'.join(proxy_links)
+        try:
+            nodes, _stats = nova_proxy.parse_many(body)
+            native_candidates = [nova_proxy.candidate(node) for node in nodes]
+            if _stats.get('skipped'):
+                native_candidates.append(_invalid_candidate('Не распознаны ядром',
+                    [f"Пропущено профилей: {_stats['skipped']} — конфигурация не принята ядром"], kind=KIND_PROXY))
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            return [_invalid_candidate(stem or 'Импорт', [str(error)], kind=KIND_PROXY)]
+        if structured:
+            return native_candidates
 
     found = []
     consumed = []
@@ -2290,7 +2332,7 @@ def parse_import_text(text, source_name=""):
             found.append((offset, _conf_candidate(block, stem)))
 
     found.sort(key=lambda item: item[0])
-    return [candidate for _offset, candidate in found]
+    return [candidate for _offset, candidate in found] + native_candidates
 
 
 # nova-go keeps `<profile>.pending` (a key enrolled but not yet written into the profile) next to
@@ -2414,7 +2456,18 @@ def import_candidates(base_dir, candidates, *, source=ORIGIN_IMPORTED, subscript
                 # The preview may have renamed it; the link keeps its own remark either way.
                 fresh = dict(fresh, name=name)
             ext = ".json"
-            group = GROUP_VLESS
+            group = GROUP_CUSTOM
+        elif kind == KIND_PROXY and text.strip():
+            try:
+                node = nova_proxy.from_payload(_loads_strict_json(text))
+                fresh = nova_proxy.candidate(node)
+                if name:
+                    fresh['name'] = name
+                fresh['text'] = nova_proxy.payload(node, source, subscription).decode('utf-8')
+            except ValueError as error:
+                results.append(dict(name=name, status='invalid', id='', issues=[str(error)]))
+                continue
+            ext = '.json'
         else:
             issues = list(candidate.get("issues") or []) or [ISSUE_UNKNOWN_KIND]
             results.append({"name": name, "status": "invalid", "id": "", "issues": issues})

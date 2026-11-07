@@ -166,8 +166,8 @@ def delete_windivert_if_nova(nova_bin_dir, log_func=None):
     the service, which is exactly what the WinDivert DLL itself does after loading the driver."""
     if not service_points_into(WINDIVERT_SERVICE, nova_bin_dir):
         return False
-    run_sc("stop", WINDIVERT_SERVICE, timeout=6)
-    _wait_stopped(WINDIVERT_SERVICE, 4.0)
+    # DeleteService only marks the registration; never unload a shared running driver.
+    # Other applications may hold handles even when ImagePath points at Nova's copy.
     rc, out = run_sc("delete", WINDIVERT_SERVICE, timeout=6)
     ok = rc == 0 or "1072" in out
     if ok:
@@ -177,11 +177,21 @@ def delete_windivert_if_nova(nova_bin_dir, log_func=None):
     return ok
 
 
-def kill_images_in_dir(image_names, directory):
+def windivert_repair_allowed(nova_bin_dir, state):
+    """A live driver may be shared. Only repair a missing or stopped Nova registration."""
+    if state.get("running") or state.get("pending_delete"):
+        return False
+    if state.get("missing") and not state.get("registry_exists"):
+        return True
+    return bool(state.get("stopped") and service_points_into(WINDIVERT_SERVICE, nova_bin_dir))
+
+
+def kill_images_in_dir(image_names, directory, root_pid=None):
     """Terminate processes whose image name is in image_names AND whose file lies in directory.
     Returns how many were terminated."""
+    import fnmatch
     wanted = {str(n).lower() for n in image_names if n}
-    if not wanted or not directory:
+    if (not wanted or not directory) and root_pid is None:
         return 0
     try:
         import ctypes
@@ -198,12 +208,20 @@ def kill_images_in_dir(image_names, directory):
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     PROCESS_TERMINATE = 0x0001
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     INVALID = wintypes.HANDLE(-1).value
 
-    pids = []
+    entries = {}
     snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
     if not snap or snap == INVALID:
         return 0
@@ -212,24 +230,61 @@ def kill_images_in_dir(image_names, directory):
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            if entry.szExeFile.lower() in wanted:
-                pids.append(int(entry.th32ProcessID))
+            entries[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), entry.szExeFile.lower())
             ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snap)
 
+    # Retain handles through selection and termination: a recycled PID must never become a target.
+    candidates = {pid for pid, (_, name) in entries.items()
+                  if any(fnmatch.fnmatchcase(name, pattern) for pattern in wanted)}
+    descendants = set()
+    if root_pid is not None:
+        frontier = {int(root_pid)}
+        while frontier:
+            children = {pid for pid, (parent, _) in entries.items()
+                        if parent in frontier and pid not in descendants and pid != root_pid}
+            descendants.update(children)
+            frontier = children
+        candidates.update(descendants)
+        candidates.add(int(root_pid))
+    handles = {}
     killed = 0
-    for pid in pids:
+    for pid in candidates:
         handle = kernel32.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             continue
         try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+                continue
             buf = ctypes.create_unicode_buffer(32768)
             size = wintypes.DWORD(len(buf))
             if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
                 continue
-            if path_in_dir(buf.value, directory) and kernel32.TerminateProcess(handle, 1):
-                killed += 1
+            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            handles[pid] = (handle, created, buf.value)
+            handle = None
         finally:
+            if handle:
+                kernel32.CloseHandle(handle)
+    try:
+        owned = {int(root_pid)} if root_pid in handles else set()
+        frontier = set(owned)
+        while frontier:
+            children = {pid for pid in descendants if pid in handles and pid not in owned
+                        and entries[pid][0] in frontier
+                        and handles[pid][1] >= handles[entries[pid][0]][1]}
+            owned.update(children)
+            frontier = children
+        for pid, (handle, _, image) in handles.items():
+            if pid == os.getpid() or pid == root_pid:
+                continue
+            by_path = (any(fnmatch.fnmatchcase(entries[pid][1], pattern) for pattern in wanted)
+                       and path_in_dir(image, directory))
+            if (pid in owned or by_path) and kernel32.TerminateProcess(handle, 1):
+                killed += 1
+    finally:
+        for handle, _, _ in handles.values():
             kernel32.CloseHandle(handle)
     return killed

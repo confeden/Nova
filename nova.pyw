@@ -16,6 +16,12 @@
 # ------------------------------------------------------------
 import subprocess, sys, importlib, logging, os
 
+if "--dev-log" in sys.argv:
+    _dev_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+    os.makedirs(_dev_log_dir, exist_ok=True)
+    _dev_boot_stream = open(os.path.join(_dev_log_dir, "nova_dev_boot.log"), "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = _dev_boot_stream
+
 # В оконной сборке (.pyw, PyInstaller --noconsole) sys.stderr равен None, а
 # StreamHandler подставляет его и ЗАПОМИНАЕТ в self.stream НА МОМЕНТ СОЗДАНИЯ
 # (`if stream is None: stream = sys.stderr` в CPython). Дальше каждая запись
@@ -84,6 +90,7 @@ _REQUIRED = [
     ("PIL", "Pillow"),
     ("pystray", "pystray"),
     ("cryptography", "cryptography"),
+    ("h2", "h2>=4.4.1,<5"),
 ]
 
 _pip_upgraded = False
@@ -296,7 +303,7 @@ if getattr(sys, 'frozen', False):
 from nova_platform import is_windows_admin
 from nova_foreign_services import (NOVA_WARP_DISPLAY_NAME, NOVA_WARP_SERVICE, delete_windivert_if_nova,
                                    kill_images_in_dir, official_warp_service_running, official_warp_svc_path,
-                                   release_legacy_warp_service)
+                                   release_legacy_warp_service, service_points_into, windivert_repair_allowed)
 from nova_routing_profiles import AI_APP_DOMAINS, SPOTIFY_DOMAINS, VPN_ROUTE_MODES, drop_family_names, get_default_app_routing_profiles, match_app_by_process_path
 from nova_privacy import mask_provider_ip, redact_user_path, redact_user_paths_in_text
 from nova_route_flap import hold_route, FlapPenalty, OPERA_HOLD, WARP_HOLD, WARP_PENALTY_SETTINGS
@@ -320,6 +327,8 @@ import nova_latency
 import nova_issuance
 import nova_wg_probe
 import nova_vless
+import nova_proxy
+import nova_profile_probe
 import nova_subscriptions
 import nova_list_sync
 import nova_ai_region
@@ -328,6 +337,8 @@ import nova_ping
 import nova_boot_timeline as boot_timeline
 import nova_win_routes
 import nova_dns_ai
+import nova_shutdown
+from PIL import ImageTk
 from nova_routing_backends import (
     build_app_transport_decisions,
     get_selected_routing_backend_info,
@@ -395,7 +406,8 @@ def apply_path_safeguard():
 apply_path_safeguard()
 
 
-SESSION_CONSOLE_LOG_PATH = get_default_session_console_log_path()
+SESSION_CONSOLE_LOG_PATH = (os.path.join(_dev_log_dir, "nova_console.log")
+                            if "--dev-log" in sys.argv else get_default_session_console_log_path())
 SESSION_CONSOLE_LOG = SessionConsoleLogWriter(SESSION_CONSOLE_LOG_PATH)
 
 
@@ -456,7 +468,7 @@ def install_requirements_visually():
             sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
             root.geometry(f"{w}x{h}+{int((sw-w)/2)}+{int((sh-h)/2)}")
             lbl = tk.Label(root, text="Настройка окружения...\nУстановка зависимостей, подождите.", 
-                           fg="white", bg="#2b2b2b", font=("Arial", 10))
+                           fg="white", bg="#2b2b2b", font=("Segoe UI Semibold", 10))
             lbl.pack(expand=True)
             root.update()
         except:
@@ -532,198 +544,16 @@ def safe_trace(msg):
 safe_trace("=== NOVA SCRIPT STARTED ===")
 
 def restart_nova():
-    """Перезапускает Nova надежно (без зависания на долгой остановке)."""
-    def _restart_timeout(name, default):
-        try:
-            return max(0.0, float(os.environ.get(name, str(default)) or default))
-        except:
-            return float(default)
-
-    def do_restart():
-        try:
-            if getattr(restart_nova, "_in_progress", False):
-                return
-            restart_nova._in_progress = True
-
-            # 0. Сохраняем геометрию окна ДО остановки (on_closing не вызывается при restart)
-            # Заодно запоминаем, было ли окно лога открыто: перезапуск не должен
-            # его показывать, если пользователь его закрыл.
-            _log_was_open = False
-            try:
-                _root = globals().get('root')
-                _log_window = globals().get('log_window')
-                _save_ws = globals().get('save_window_state')
-                if _root and _save_ws:
-                    _state = {}
-                    try: _state['main_geometry'] = _root.geometry()
-                    except: pass
-                    try:
-                        import tkinter as _tk
-                        if _log_window and _tk.Toplevel.winfo_exists(_log_window):
-                            _state['log_size'] = _log_window.geometry()
-                            # withdraw() оставляет окно существующим, поэтому
-                            # winfo_exists недостаточно — спрашиваем состояние.
-                            _log_was_open = str(_log_window.state()) == "normal"
-                    except: pass
-                    if _state:
-                        _save_ws(**_state)
-            except: pass
-            restart_nova._log_was_open = bool(_log_was_open)
-
-            # 1. Остановка логики
-            save_visited_domains_func = globals().get('save_visited_domains')
-            if save_visited_domains_func:
-                try: save_visited_domains_func()
-                except: pass
-
-            log_func = globals().get('log_print', print)
-            log_func("[Restart] Остановка сервисов...")
-            
-            stop_func = globals().get('stop_nova_service')
-            if stop_func:
-                # Best-effort stop with timeout: never block full restart forever.
-                stop_done = threading.Event()
-                stop_error = {"err": None}
-                stop_wait = _restart_timeout("NOVA_RESTART_STOP_WAIT_SEC", 6.0)
-
-                def _stop_worker():
-                    try:
-                        # Full cleanup in worker to avoid relaunch races with stale processes.
-                        stop_func(silent=False, wait_for_cleanup=True)
-                    except Exception as e:
-                        stop_error["err"] = e
-                    finally:
-                        stop_done.set()
-
-                threading.Thread(target=_stop_worker, daemon=True).start()
-                if not stop_done.wait(timeout=stop_wait):
-                    log_func(f"[Restart] Таймаут остановки (>{stop_wait:g}с). Продолжаем перезапуск принудительно.")
-                elif stop_error["err"] is not None:
-                    log_func(f"[Restart] Ошибка остановки: {stop_error['err']}")
-
-                # WinDivert can briefly remain in SCM "marked for deletion" after
-                # winws/NovaDivert handles close. Starting a new Nova immediately
-                # turns that normal Windows delay into noisy repair logs.
-                try:
-                    query_wd_state = globals().get("_query_windivert_service_state")
-                    if callable(query_wd_state):
-                        wd_wait = _restart_timeout("NOVA_RESTART_WINDIVERT_WAIT_SEC", 2.0)
-                        wd_deadline = time.time() + wd_wait
-                        while time.time() < wd_deadline:
-                            wd_state = query_wd_state() or {}
-                            if not wd_state.get("pending_delete"):
-                                break
-                            time.sleep(0.25)
-                except:
-                    pass
-            
-            # 2. Освобождение мьютекса
-            try:
-                kernel32 = ctypes.windll.kernel32
-                app_mut = globals().get('app_mutex')
-                if app_mut:
-                    kernel32.CloseHandle(app_mut)
-                    globals()['app_mutex'] = None
-                    log_func("[Restart] Mutex освобожден")
-            except: pass
-            
-            time.sleep(0.3)
-            
-            # 3. Перезапуск процесса
-            log_func("[Restart] Запуск новой копии...")
-            
-            try:
-                base_dir = get_base_dir()
-            except:
-                base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-
-            # --show-log передавался безусловно, поэтому любой перезапуск
-            # (в том числе автоматический, по смене стратегии) заново открывал
-            # окно лога, даже если пользователь его закрыл. Передаём флаг только
-            # когда окно действительно было открыто.
-            restart_args = ["--restart", "--force-instance"]
-            if getattr(restart_nova, "_log_was_open", False):
-                restart_args.insert(0, "--show-log")
-            # --debug has to survive a self-restart. Without this dev-run.cmd's
-            # flag was dropped by the first automatic restart — and Nova restarts
-            # itself on a strategy change, so in practice the process a developer
-            # ends up looking at almost never had it. IS_DEBUG_MODE went False
-            # there, every debug-gated line stopped being printed, and the result
-            # reads exactly like a logging bug: the console log simply lacks lines
-            # the code plainly writes. Only the CLI form is carried; when debug
-            # came from the marker file the new process finds that file itself.
-            if _has_debug_cli_flag():
-                restart_args.append("--debug")
-            
-            # Formulate the definitive launch command
-            is_nuitka = "__compiled__" in dir() or globals().get("__compiled__") is not None
-            is_frozen = getattr(sys, 'frozen', False)
-            is_exe = sys.argv[0].lower().endswith(".exe")
-            
-            if is_nuitka or is_frozen or is_exe:
-                # Compiled EXE mode (Nuitka or PyInstaller)
-                # IMPORTANT: sys.executable in Nuitka onefile points to temp/nuitka_runtime/python.exe
-                # which is NOT the real Nova.exe. Use sys.argv[0] instead.
-                exe_path = os.path.abspath(sys.argv[0])
-                cmd = [exe_path] + restart_args
-            else:
-                # Script mode (.py / .pyw)
-                exe_path = os.path.abspath(sys.executable)
-                script_path = os.path.abspath(sys.argv[0])
-                cmd = [exe_path, script_path] + restart_args
-
-            if IS_DEBUG_MODE: log_func(f"[Restart] Command: {cmd}")
-
-            try:
-                # Nuclear detachment on Windows
-                # We do NOT use stdout/stderr pipes here to avoid blocking
-                # We do NOT use CREATE_NO_WINDOW for the GUI app
-                subprocess.Popen(
-                    cmd,
-                    cwd=base_dir,
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                    close_fds=True,
-                    start_new_session=True
-                )
-                launched = True
-            except Exception as e:
-                log_func(f"[Restart] Popen failed: {e}")
-                # Last ditch fallback: OS shell 'start'
-                try:
-                    cmd_line = subprocess.list2cmdline(cmd)
-                    os.system(f'start "" {cmd_line}')
-                    launched = True
-                except: pass
-
-            if not launched:
-                raise RuntimeError("Не удалось запустить новую копию")
-            
-            time.sleep(1.0) # Give Windows a second to register the new process group
-            os._exit(0)
-        except Exception as e:
-            try:
-                log_func = globals().get('log_print', print)
-                log_func(f"[Restart] Ошибка перезапуска: {e}")
-            except:
-                print(f"Restart failed: {e}")
-            # Сервисы уже остановлены, а новой копии нет: без этого надпись
-            # «ПЕРЕЗАПУСК» оставалась бы навсегда при кнопке «ПОДКЛЮЧИТЬ».
-            try:
-                _root = globals().get('root')
-                _status = globals().get('status_label')
-                if _root and _status:
-                    _fail = globals().get('COLOR_TEXT_FAIL', "#FF4444")
-                    _root.after(0, lambda: _status.config(text="ОСТАНОВЛЕНО", fg=_fail))
-            except:
-                pass
-        finally:
-            try:
-                restart_nova._in_progress = False
-            except:
-                pass
-
-    import threading, time
-    threading.Thread(target=do_restart, daemon=True).start()
+    """Use the same bounded native teardown as exit; capture Tk state on its owner thread."""
+    app_root = globals().get('root')
+    close = globals().get('on_closing')
+    if app_root is None or not callable(close):
+        globals().get('log_print', print)("[Restart] Интерфейс ещё не готов к перезапуску.")
+        return
+    if threading.current_thread() is threading.main_thread():
+        close(restart=True)
+    else:
+        app_root.after(0, lambda: close(restart=True))
 
 # === FIX: Force Hide Console (Safeguard) ===
 # Проверяем, запущено ли как скомпилированный EXE
@@ -807,7 +637,7 @@ try:
     _splash_root.geometry(f"{_w}x{_h}+{(_sw-_w)//2}+{(_sh-_h)//2}")
     _splash_label = tk.Label(
         _splash_root, text="Nova \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0430\u2026",
-        fg="#e0e0e0", bg="#1a1a2e", font=("Segoe UI", 13)
+        fg="#e0e0e0", bg="#1a1a2e", font=("Segoe UI Semibold", 13)
     )
     _splash_label.pack(expand=True)
     _splash_root.update()
@@ -1826,6 +1656,7 @@ try:
             self.wireproxy_awg_path = os.path.join(self.bin_dir, "wireproxy-awg.exe")
             self.nova_go_path = os.path.join(self.bin_dir, "nova-go.exe")
             self.nova_xray_path = os.path.join(self.bin_dir, "nova-xray.exe")
+            self.nova_proxy_path = os.path.join(self.bin_dir, "nova-proxy.exe")
             self.temp_dir = os.path.join(get_base_dir(), "temp")
             self.warp_connect_profile_path = os.path.join(self.temp_dir, "warp-connect-profile.json")
             self.warp_bootstrap_profiles_path = os.path.join(get_base_dir(), "strat", WARP_STRATEGIES_FILENAME)
@@ -1865,6 +1696,7 @@ try:
             self.vless_log_path = os.path.join(self.temp_dir, "nova-xray.log")
             # Full profile id ("AWG Cloudflare/WARPv1_11") of the backend that carries traffic.
             self.active_profile_id = ""
+            self.active_profile_protocol = ""
             self.last_plan_reason = ""
             self._selection_restart_lock = threading.Lock()
             self._selection_restart_pending = False
@@ -2060,10 +1892,12 @@ try:
             the honest question — and anything else falls back to 443, which covers Proton and
             MASQUE and says nothing about a UDP-only WARP endpoint (which ICMP answers instead).
             """
+            if nova_proxy.uses_udp_transport(record):
+                return None
             host, port = self._split_endpoint_host_port(record.get("endpoint"))
             if not host:
                 return None
-            if record.get("kind") == nova_profiles.KIND_VLESS and port:
+            if record.get("kind") in (nova_profiles.KIND_VLESS, nova_profiles.KIND_PROXY) and port:
                 return (host, (port,))
             return (host, (443,))
 
@@ -2518,7 +2352,7 @@ try:
             (`_note_awg_check_pid`), so a secondary-slot tunnel on 1379/1380 is never reaped here.
             """
             listing = ""
-            for image in ("wireproxy-awg.exe", "nova-xray.exe"):
+            for image in ("wireproxy-awg.exe", "nova-xray.exe", "nova-proxy.exe"):
                 try:
                     listing += subprocess.run(
                         ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
@@ -2667,6 +2501,7 @@ try:
                 self.masque_active_profile_name = ""
                 self.vless_active_profile_name = ""
                 self.active_profile_id = ""
+                self.active_profile_protocol = ""
                 self.awg_runtime_config_path = ""
                 # The rendered Xray configuration carries the node's user id, so it is deleted with
                 # the tunnel rather than left in profiles/.runtime until the next start of the same
@@ -2747,11 +2582,11 @@ try:
                 # умер» on a working MASQUE tunnel.
                 budget = max(budget, self.MASQUE_PROBE_BUDGET_SEC)
             elif getattr(self, "active_backend", "") == "vless":
-                # Xray dials the node on every new SOCKS flow -- a TLS/REALITY handshake to a
-                # stranger's server abroad, not the local hop wireproxy has already built. The start
-                # path grants 12 s for the same reason; a 4 s watchdog probe on the same tunnel
-                # would read a slow-but-alive node as «трафик умер».
+                # Imported servers can carry HTTPS while rejecting Cloudflare or literal-IP HTTP.
+                # Use the startup probe here too, including the final check before recovery, so
+                # Cloudflare reachability cannot tear down an otherwise working profile.
                 budget = max(budget, self.VLESS_PROBE_BUDGET_SEC)
+                return bool(nova_profile_probe.probe_port(use_port, budget=budget)["ok"])
 
             try:
                 if _env_bool_global("NOVA_WARP_PROBE_LEGACY_CURL", False):
@@ -3041,7 +2876,9 @@ try:
             if not isinstance(profile, dict):
                 return False
             backend = attempt.get("backend")
-            if not self._profile_backend_binary_present(backend):
+            available = (os.path.isfile((self.nova_proxy_path if (profile.get("engine") == "mihomo" or profile.get("kind") == nova_profiles.KIND_PROXY and profile.get("engine") != "xray") else self.nova_xray_path))
+                         if backend == nova_profiles.BACKEND_VLESS else self._profile_backend_binary_present(backend))
+            if not available:
                 return False
             profile_id = str(profile.get("id") or profile.get("name") or "").strip()
             started = time.monotonic()
@@ -3054,6 +2891,7 @@ try:
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if ok:
                 self.active_profile_id = profile_id
+                self.active_profile_protocol = nova_proxy.protocol_of(profile)
             interrupted = is_closing or (
                 abort_generation is not None and self._selection_generation != abort_generation
             )
@@ -3251,13 +3089,13 @@ try:
                         return "connected"
                 elif backend == nova_profiles.BACKEND_VLESS:
                     vless_idx += 1
-                    if not self._profile_backend_binary_present(backend):
+                    if not os.path.isfile((self.nova_proxy_path if (profile.get("engine") == "mihomo" or profile.get("kind") == nova_profiles.KIND_PROXY and profile.get("engine") != "xray") else self.nova_xray_path)):
                         if backend not in missing_logged:
                             missing_logged.add(backend)
-                            self.log_func("[RU] [Diag] VLESS пропущен: nova-xray.exe не найден.")
+                            self.log_func("[RU] [Diag] Профиль пропущен: ядро не найдено.")
                         continue
                     if vless_total > 1:
-                        self.log_func(f"[Profiles] VLESS профиль {vless_idx}/{vless_total}: {profile_name}.")
+                        self.log_func(f"[Profiles] Прокси-профиль {vless_idx}/{vless_total}: {profile_name}.")
                     else:
                         self.log_func(f"[Profiles] VLESS профиль: {profile_name}.")
                     if self._run_profile_attempt(attempt, abort_generation=generation, explicit=explicit):
@@ -3580,39 +3418,12 @@ try:
         VLESS_READY_TIMEOUT_SEC = 12.0
 
         def _render_vless_runtime_config(self, profile):
-            """Write the Xray configuration for a profile; returns its path, or "" on failure.
-
-            It goes to `profiles/.runtime/` rather than `temp/` because it carries the node's user
-            id, which is a credential, and `temp/` is what gets attached to a problem report (I19).
-            """
+            """Write the selected core's private runtime config without exposing credentials in temp."""
             try:
-                node = nova_profiles.vless_node_of_record(profile)
-                if node is None:
-                    return ""
-                reason = nova_vless.validate(node)
-                if reason:
-                    self.log_func(f"[RU] [VLESS] Профиль {profile.get('name') or ''}: {reason}.")
-                    return ""
-                config = nova_vless.build_xray_config(node, int(self.port))
-                # Xray's own log has to be asked for in the configuration: the helper cannot
-                # redirect it afterwards, because the logger captured stderr at its own start.
-                config["log"] = {"loglevel": "warning", "error": self.vless_log_path.replace("\\", "/")}
-                path = nova_profiles.runtime_config_path(get_base_dir(), str(profile.get("id") or ""))
-                path = os.path.splitext(path)[0] + ".json"
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                payload = json.dumps(config, ensure_ascii=False).encode("utf-8")
-                tmp = path + ".tmp"
-                with open(tmp, "wb") as handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp, path)
+                _engine, path = nova_proxy.prepare_runtime(profile, int(self.port), base=get_base_dir())
                 return path
-            except Exception as e:
-                # Not debug-only: without this line a profile that never got a configuration written
-                # looks exactly like a node that did not answer, and the stats record it as the
-                # node's failure. The reason is local, and the log has to say so.
-                self.log_func(f"[RU] [VLESS] Не удалось подготовить конфигурацию: {type(e).__name__}: {e}")
+            except (OSError, ValueError) as error:
+                self.log_func(f"[RU] [Profiles] Не удалось подготовить конфигурацию: {type(error).__name__}")
                 return ""
 
         def _start_vless_backend(self, profile, abort_generation=None, explicit=True):
@@ -3628,8 +3439,9 @@ try:
             profile_id = str(profile.get("id") or profile.get("name") or "vless").strip()
             previous_config = str(getattr(self, "vless_runtime_config_path", "") or "")
             try:
-                if not os.path.exists(self.nova_xray_path):
-                    self.log_func("[RU] [Diag] VLESS пропущен: nova-xray.exe не найден.")
+                engine = (self.nova_proxy_path if (profile.get("engine") == "mihomo" or profile.get("kind") == nova_profiles.KIND_PROXY and profile.get("engine") != "xray") else self.nova_xray_path)
+                if not os.path.exists(engine):
+                    self.log_func("[RU] [Diag] Профиль пропущен: ядро не найдено.")
                     return False
                 config_path = self._render_vless_runtime_config(profile)
                 if not config_path:
@@ -3652,11 +3464,11 @@ try:
                 time.sleep(0.3)
 
                 if self.is_port_open(self.port):
-                    self.log_func(f"[RU] [VLESS] Порт {self.port} занят. Очищаем старый экземпляр...")
+                    self.log_func(f"[RU] [Profiles] Порт {self.port} занят. Очищаем старый экземпляр...")
                     self._kill_awg_proxy_orphans()
                     self._wait_local_port_closed(self.port, timeout=4.0)
                     if self.is_port_open(self.port):
-                        self.log_func(f"[RU] [VLESS] Порт {self.port} всё ещё занят. Пропускаем профиль {profile_id}.")
+                        self.log_func(f"[RU] [Profiles] Порт {self.port} всё ещё занят. Пропускаем профиль {profile_id}.")
                         # The config is already on disk and carries the node's user id, and the reset
                         # below only deletes the path recorded on the manager -- which is still the
                         # previous profile's, because this one has not been spawned yet (I19).
@@ -3669,7 +3481,7 @@ try:
                     os.remove(self.vless_ready_path)
                 os.makedirs(self.temp_dir, exist_ok=True)
                 cmd = [
-                    self.nova_xray_path, "run",
+                    engine, "run",
                     "--config", config_path,
                     "--ready-file", self.vless_ready_path,
                     "--parent-pid", str(os.getpid()),
@@ -3700,25 +3512,25 @@ try:
                     exit_code = proc.poll()
                     if exit_code is not None:
                         # Xray refuses a configuration it cannot build; its own reason is in the log.
-                        self.log_func(f"[RU] [VLESS] Профиль {profile_id}: помощник завершился с кодом {exit_code}.")
+                        self.log_func(f"[RU] [Profiles] Профиль {profile_id}: помощник завершился с кодом {exit_code}.")
                         return False
                     # The port opens the moment the inbound binds, before anything is proven, so the
                     # probe through it is the only readiness that means "traffic passes".
-                    if self.is_port_open(self.port) and self._test_awg_backend_ready(self.port, timeout=4):
+                    if self.is_port_open(self.port) and nova_profile_probe.probe_port(self.port, budget=8)["ok"]:
                         self.is_connected = True
                         self.mark_bootstrap(True)
                         self._remember_successful_awg_profile(profile_id)
                         endpoint = str(profile.get("endpoint") or "?")
-                        self.log_func(f"[RU] [Diag] VLESS профиль сработал: {profile_id} ({endpoint}).")
+                        self.log_func(f"[RU] [Diag] Прокси-профиль сработал: {profile_id} ({endpoint}).")
                         return True
                     time.sleep(0.4)
                 self.log_func(
-                    f"[RU] [VLESS] Профиль {profile_id} не поднялся: трафик не пошёл за "
+                    f"[RU] [Profiles] Профиль {profile_id} не поднялся: трафик не пошёл за "
                     f"{int(ready_budget)} с."
                 )
             except Exception as e:
                 if IS_DEBUG_MODE:
-                    self.log_func(f"[RU] [VLESS] Ошибка запуска профиля {profile_id}: {e}")
+                    self.log_func(f"[RU] [Profiles] Ошибка запуска профиля {profile_id}: {e}")
             self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
             return False
 
@@ -3870,7 +3682,7 @@ try:
             return choice
 
         def get_vpn_label(self):
-            """Primary slot name for the main-window pill: CF AWG, CF MASQUE, PROTON NL, AWG, CF WARP.
+            """Primary slot name: built-in backend or the imported profile's actual protocol.
 
             While nothing carries traffic it names the pending choice (АВТО, CF MASQUE, ...).
             """
@@ -3880,7 +3692,9 @@ try:
                              or getattr(self, "vless_active_profile_name", "") or "")
             connected = bool(getattr(self, "is_connected", False))
             choice = self.get_primary_choice()
-            return nova_vpn_slots.primary_indicator_label(backend, profile_id, connected, choice.get("kind"))
+            return nova_vpn_slots.primary_indicator_label(
+                backend, profile_id, connected, choice.get("kind"),
+                protocol=getattr(self, "active_profile_protocol", ""))
 
         def _normalize_warp_port_specs(self, ports_raw):
             specs = []
@@ -6367,10 +6181,17 @@ try:
                     and getattr(wm, "active_backend", "") in getattr(wm, "USERSPACE_BACKENDS", ())
                 ):
                     # The live profile: a second helper with the same key would break the tunnel.
-                    result.update(self._probe_socks_port(int(wm.port)))
+                    if record.get("kind") in (nova_profiles.KIND_VLESS, nova_profiles.KIND_PROXY):
+                        result.update(nova_profile_probe.probe_port(int(wm.port), budget=self.TEST_PROBE_BUDGET_SEC))
+                    else:
+                        result.update(self._probe_socks_port(int(wm.port)))
                     result["message"] = ("работает (активный профиль)" if result["ok"]
                                          else "активный профиль не пропускает трафик")
-                    record_it = True
+                    record_it = result.pop("_record", True)
+                elif record.get("kind") in (nova_profiles.KIND_VLESS, nova_profiles.KIND_PROXY):
+                    result.update(nova_profile_probe.test_record(
+                        record, base, should_stop=lambda: is_closing, note_pid=_note_awg_check_pid))
+                    record_it = result.pop("_record", False)
                 elif record.get("kind") == nova_profiles.KIND_MASQUE:
                     result.update(self._test_masque_profile(record))
                     record_it = result.pop("_record", True)
@@ -7381,16 +7202,11 @@ try:
                 return self._await_ready(proc, profile_id, still_current)
 
         def _start_vless(self, record, profile_id, still_current):
-            wm = globals().get("warp_manager")
-            xray = str(getattr(wm, "nova_xray_path", "") or "") if wm is not None else ""
-            if not xray or not os.path.exists(xray):
-                self.log_func("[VPN] Дополнительный VPN: nova-xray.exe не найден.")
+            xray = nova_proxy.engine_for_record(record, get_base_dir())
+            if not os.path.exists(xray):
+                self.log_func("[VPN] Дополнительный VPN: ядро профиля не найдено.")
                 return False
-            node = nova_profiles.vless_node_of_record(record)
-            if node is None or nova_vless.validate(node):
-                return False
-            config = nova_vless.build_xray_config(node, self.SOCKS_PORT, http_port=self.HTTP_PORT)
-            config["log"] = {"loglevel": "warning", "error": self._xray_log_path.replace("\\", "/")}
+            config = nova_proxy.config_for_record(record, self.SOCKS_PORT, self.HTTP_PORT)
             cfg_path = self._runtime_path(profile_id, ".json")
             os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
             tmp = cfg_path + ".tmp"
@@ -7434,7 +7250,7 @@ try:
                 if is_local_port_open_quick(self.SOCKS_PORT, timeout=0.3):
                     # The port opens when the listener binds, before anything is proven; the payload
                     # probe through it is what says traffic passes (O5).
-                    if probe_socks5_payload(self.SOCKS_PORT, budget=self.PROBE_BUDGET_SEC):
+                    if nova_profile_probe.probe_port(self.SOCKS_PORT, budget=self.PROBE_BUDGET_SEC)["ok"]:
                         if not is_local_port_open_quick(self.HTTP_PORT, timeout=0.3):
                             # Both listeners or neither: the slot is consumed through the HTTP
                             # CONNECT port by tcp_proxy.py, the Telegram relay and the app transport
@@ -7675,17 +7491,21 @@ try:
 
         @staticmethod
         def _ring(choice, last):
-            """secondary_attempts, minus the Proton step of «Авто» when no Proton profile exists yet."""
+            """Auto skips missing/invalid saved nodes and empty profile groups."""
             attempts = nova_vpn_slots.secondary_attempts(choice, last)
             if choice.get("mode") != nova_vpn_slots.SECONDARY_AUTO:
                 return attempts
-            have = False
-            with contextlib.suppress(Exception):
-                have = any(str(r.get("group") or "") == nova_profiles.GROUP_PROTON
-                           for r in nova_profiles.list_profiles(get_base_dir()))
-            if have:
-                return attempts
-            return [a for a in attempts if a[0] != nova_vpn_slots.SECONDARY_PROFILE] or attempts
+            records = []
+            try:
+                records = nova_profiles.list_profiles(get_base_dir())
+            except (OSError, ValueError) as error:
+                _profiles_log(f"[VPN] Не удалось прочитать профили для Auto: {type(error).__name__}.")
+            valid = [r for r in records if r.get("valid", True)]
+            ids = {str(r.get("id") or "") for r in valid}
+            groups = {str(r.get("group") or "") for r in valid}
+            return [a for a in attempts if a[0] != nova_vpn_slots.SECONDARY_PROFILE
+                    or a[1] in ids or a[1] in groups
+                    or a[1] == "Custom" and "VLESS" in groups]
 
         def apply_now(self, reason=""):
             """The choice changed in the UI: switch at once, keeping a reserve that already fits."""
@@ -7695,6 +7515,10 @@ try:
             with self._lock:
                 choice = nova_vpn_slots.secondary_choice(load_routing_settings())
                 current = {"kind": self.kind, "region": self.region, "entry": self.entry}
+                if choice["mode"] == nova_vpn_slots.SECONDARY_AUTO:
+                    remembered = nova_vpn_slots.load_last(get_base_dir()).get("secondary")
+                    if remembered:
+                        current = remembered
                 previous_profile = dict(self.profile_choice)
                 self.mode = choice["mode"]
                 self.profile_choice = {"group": choice.get("profile_group", ""),
@@ -7706,8 +7530,11 @@ try:
                 generation = self._generation
                 attempt = self._attempts[0]
                 if attempt[0] == nova_vpn_slots.SECONDARY_PROFILE:
-                    # The reserve is "the same" only when it is the same choice, not the same kind:
-                    # switching from one imported group to another must really switch.
+                    if self.mode == nova_vpn_slots.SECONDARY_AUTO:
+                        target = str(attempt[1])
+                        self.profile_choice = ({"group": target.partition("/")[0], "profile": target}
+                                               if "/" in target else {"group": target, "profile": ""})
+                    # Compare the actual Auto attempt, not the stale manual settings block.
                     same = (self.kind == nova_vpn_slots.SECONDARY_PROFILE
                             and previous_profile == self.profile_choice)
                 else:
@@ -7723,7 +7550,7 @@ try:
             if same and self.is_up():
                 if attempt[0] == nova_vpn_slots.SECONDARY_OPERA and opm is not None:
                     with contextlib.suppress(Exception):
-                        opm.failover.set_allow_alternate(self.mode == nova_vpn_slots.SECONDARY_AUTO)
+                        opm.failover.set_allow_alternate(False)
                 self.log_func(f"[VPN] Дополнительный VPN: {self.label()} уже работает — переподключение не нужно.")
                 return True
             self._activate(generation, attempt, str(reason or "выбор изменён"))
@@ -7785,9 +7612,11 @@ try:
                     elif kind == nova_vpn_slots.SECONDARY_TOR:
                         self.entry = nova_vpn_slots.normalize_tor_entry(value)
                     elif self.mode == nova_vpn_slots.SECONDARY_AUTO:
-                        # A step of the «Авто» ring: the group, not a pinned node; the trial back to
-                        # Opera that _advance_locked scheduled must survive the switch.
-                        self.profile_choice = {"group": str(value or ""), "profile": ""}
+                        # A saved successful node is exact; later ring steps walk whole groups.
+                        # Preserve the return-to-Opera trial scheduled by _advance_locked.
+                        target = str(value or "")
+                        self.profile_choice = ({"group": target.partition("/")[0], "profile": target}
+                                               if "/" in target else {"group": target, "profile": ""})
                     else:
                         self._reset_trial()
                     self._attempt_started = time.time()
@@ -7814,16 +7643,14 @@ try:
                             self.profile_runner().apply(choice, lambda g=generation: self._still_current(g))
                     elif kind == nova_vpn_slots.SECONDARY_OPERA:
                         region = self.region
-                        auto_note = (" — при сбое допускается US"
-                                     if self.mode == nova_vpn_slots.SECONDARY_AUTO and region == "EU" else "")
-                        self.log_func(f"[VPN] Дополнительный VPN: Opera {region} ({reason}){auto_note}.")
+                        self.log_func(f"[VPN] Дополнительный VPN: Opera {region} ({reason}).")
                         self._stop_tor_unless_needed()
                         if opm is not None and self._still_current(generation):
                             country = _opera_region_to_country(region)
                             restart = str(getattr(opm, "country", "") or "").upper() != country
                             opm.configure_country(country)
                             with contextlib.suppress(Exception):
-                                opm.failover.set_allow_alternate(self.mode == nova_vpn_slots.SECONDARY_AUTO)
+                                opm.failover.set_allow_alternate(False)
                             if restart:
                                 with contextlib.suppress(Exception):
                                     opm.stop()
@@ -7904,11 +7731,11 @@ try:
                             daemon=True, name="NovaSecondaryProfileWalk").start()
                     if self.mode != nova_vpn_slots.SECONDARY_AUTO:
                         return
-                    # «Авто» on Proton: the group walks its own nodes, and when none carried traffic
-                    # for PROFILE_AUTO_FAIL_SEC the ring moves on (Tor). Opera is tried back below.
+                    # Auto walks the saved node or group, then advances after sustained failure.
                     since = max(self._attempt_started, self._last_good)
                     if not up and since and now - since >= self.PROFILE_AUTO_FAIL_SEC:
-                        self._advance_locked(now, self._generation, f"Proton не отвечает {int(now - since)} с")
+                        target = self.profile_choice.get("group") or "профиль"
+                        self._advance_locked(now, self._generation, f"{target} не отвечает {int(now - since)} с")
                         return
                 if self.mode != nova_vpn_slots.SECONDARY_AUTO:
                     return
@@ -7958,7 +7785,7 @@ try:
             try:
                 opm.configure_country(_opera_region_to_country(self.region))
                 with contextlib.suppress(Exception):
-                    opm.failover.set_allow_alternate(True)
+                    opm.failover.set_allow_alternate(False)
                 opm.start()
             except Exception as e:
                 safe_trace(f"[VPN] Opera trial start failed: {e}")
@@ -8012,18 +7839,25 @@ try:
                         entry = nova_vpn_slots.normalize_tor_entry(attempt_entry)
                 key = (self.kind, entry)
             else:
-                key = (self.kind, self.region)
+                opm = globals().get("opera_proxy_manager")
+                region = nova_vpn_slots.normalize_opera_region(getattr(opm, "country", ""), self.region)
+                key = (self.kind, region)
             if key == self._remembered_key:
                 return
             self._remembered_key = key
             base = get_base_dir()
 
             def _save():
-                with contextlib.suppress(Exception):
+                try:
                     if key[0] == nova_vpn_slots.SECONDARY_TOR:
                         nova_vpn_slots.remember_secondary(base, key[0], entry=key[1])
                     else:
                         nova_vpn_slots.remember_secondary(base, key[0], region=key[1])
+                except OSError as error:
+                    with self._lock:
+                        if self._remembered_key == key:
+                            self._remembered_key = None
+                    self.log_func(f"[VPN] Не удалось сохранить последний дополнительный VPN: {type(error).__name__}.")
 
             threading.Thread(target=_save, daemon=True, name="NovaVpnRemember").start()
 
@@ -8067,6 +7901,15 @@ try:
             self._primary_key = None
             self._primary_country = ""
             self._country_key = None
+            self._primary_measured_at = 0.0
+            self._secondary_key = None
+            self._secondary_country = ""
+            self._secondary_measured_at = 0.0
+            self._secondary_probe_due = 0.0
+            self._secondary_probe_running = False
+            self._secondary_probe_failures = 0
+            self._last_auto_countries = None
+            self._dns_ai_routes = nova_dns_ai.RouteLatencyMonitor()
             self._probe_due = 0.0
             self._probe_failures = 0
             self._probe_running = False
@@ -8113,6 +7956,119 @@ try:
             live = self._live_key()
             with self._lock:
                 return self._primary_country if live is not None and self._country_key == live else ""
+
+        def primary_measured_foreign(self):
+            live = self._live_key()
+            with self._lock:
+                age = time.time() - self._primary_measured_at
+                return bool(live is not None and self._country_key == live
+                            and self._primary_measured_at > 0
+                            and 0 <= age <= nova_vpn_slots.EGRESS_FOREIGN_TRUST_SEC
+                            and nova_vpn_slots.is_foreign_country(self._primary_country))
+
+        @staticmethod
+        def _secondary_live_key():
+            ctl = get_secondary_vpn_controller(create=False)
+            if not bool(globals().get("is_service_active", False)) or ctl is None or not ctl.running:
+                return None
+            kind = ctl.serving_kind()
+            if kind == nova_vpn_slots.SECONDARY_PROFILE:
+                helper = ctl.profile_runner(create=False)
+                proc = getattr(helper, "_process", None)
+            elif kind == nova_vpn_slots.SECONDARY_TOR:
+                helper = globals().get("tor_manager")
+                if helper is None:
+                    return None
+                return (kind, id(helper), getattr(helper, "_generation", 0))
+            else:
+                helper = globals().get("opera_proxy_manager")
+                proc = getattr(helper, "process", None)
+            if proc is None or proc.poll() is not None:
+                return None
+            return (kind, id(helper), proc.pid)
+
+        def secondary_country(self):
+            live = self._secondary_live_key()
+            with self._lock:
+                age = time.time() - self._secondary_measured_at
+                if (live is None or live != self._secondary_key or self._route_secondary_up is False
+                        or self._secondary_measured_at <= 0
+                        or not 0 <= age <= nova_vpn_slots.EGRESS_FOREIGN_TRUST_SEC):
+                    return ""
+                return self._secondary_country
+
+        def secondary_foreign(self):
+            return nova_vpn_slots.is_foreign_country(self.secondary_country())
+
+        def dns_ai_route_snapshot(self):
+            routes = {}
+            installed = bool(globals().get("_nrpt_state", {}).get("system_dns_ai"))
+            if installed and globals().get("is_service_active", False):
+                primary = self._live_key()
+                secondary = self._secondary_live_key()
+                with self._lock:
+                    primary_up = self._route_primary_up is not False
+                    secondary_up = self._route_secondary_up is not False
+                if primary is not None and primary_up:
+                    wm = globals().get("warp_manager")
+                    routes["warp-socks"] = (primary, "socks5", int(wm.port))
+                if secondary is not None and secondary_up:
+                    ports = nova_vpn_slots.secondary_ports(secondary[0])
+                    kind = "socks5" if ports.get("socks_port") else "http"
+                    routes["opera-http"] = (secondary, kind, ports.get("socks_port") or ports["http_port"])
+            self._dns_ai_routes.refresh(routes)
+            return self._dns_ai_routes.snapshot(routes)
+
+        def _refresh_secondary_exit(self, up, now):
+            key = self._secondary_live_key() if up else None
+            with self._lock:
+                if key != self._secondary_key:
+                    self._secondary_key = key
+                    self._secondary_country = ""
+                    self._secondary_measured_at = 0.0
+                    self._secondary_probe_due = now + 2.0
+                    self._secondary_probe_failures = 0
+                if key is None or self._secondary_probe_running or now < self._secondary_probe_due:
+                    return
+                self._secondary_probe_running = True
+            threading.Thread(target=self._probe_secondary_worker, args=(key,), daemon=True,
+                             name="NovaSecondaryExit").start()
+
+        def _probe_secondary_worker(self, key):
+            try:
+                ports = nova_vpn_slots.secondary_ports(key[0])
+                kind = "socks5" if ports.get("socks_port") else "http"
+                port = ports.get("socks_port") or ports["http_port"]
+                try:
+                    result = nova_exit_probe.probe_exit_country(kind, port, budget=12.0)
+                except nova_exit_probe.ProbeError:
+                    with self._lock:
+                        if key != self._secondary_key:
+                            return
+                        first = self._secondary_probe_failures == 0
+                        self._secondary_probe_failures += 1
+                        delay = self.EXIT_BACKOFF_SEC[min(self._secondary_probe_failures - 1,
+                                                         len(self.EXIT_BACKOFF_SEC) - 1)]
+                        self._secondary_probe_due = time.time() + delay
+                    if first:
+                        self.log_func("[VPN] Страна дополнительного VPN не определилась; повторим проверку позже.")
+                    return
+                country = nova_vpn_slots.normalize_country(result.get("country"))
+                if key != self._secondary_live_key():
+                    return
+                with self._lock:
+                    if key != self._secondary_key:
+                        return
+                    changed = country != self._secondary_country
+                    self._secondary_country = country
+                    self._secondary_measured_at = time.time()
+                    self._secondary_probe_due = time.time() + self.EXIT_REFRESH_SEC
+                    self._secondary_probe_failures = 0
+                if changed:
+                    self.log_func(f"[VPN] Дополнительный VPN выходит из {country} (проверено по IP).")
+            finally:
+                with self._lock:
+                    self._secondary_probe_running = False
 
         def ensure_started(self):
             with self._lock:
@@ -8164,6 +8120,7 @@ try:
                     self._primary_key = key
                     self._primary_country = country
                     self._country_key = key if country else None
+                    self._primary_measured_at = 0.0
                     self._probe_due = now + 2.0
                     self._probe_failures = 0
             if primary_up and key and now >= self._probe_due:
@@ -8178,13 +8135,12 @@ try:
             secondary_label = ""
             with contextlib.suppress(Exception):
                 secondary_label = ctl.label() if ctl is not None else "EU"
-            secondary_country = ""
-            with contextlib.suppress(Exception):
-                secondary_country = ctl.secondary_country() if ctl is not None else ""
             if route_secondary is not None:
                 secondary_up = bool(active and route_secondary)
             else:
                 secondary_up = bool(active and ctl is not None and ctl.is_up())
+            self._refresh_secondary_exit(secondary_up, now)
+            secondary_country = self.secondary_country() if secondary_up else ""
             country = self.primary_country() if primary_up else ""
             state = nova_vpn_slots.make_egress_state(
                 primary_up=primary_up, primary_kind=primary_kind, primary_label=primary_label,
@@ -8201,7 +8157,9 @@ try:
                     safe_trace(f"[VPN] vpn-egress.json write failed: {e}")
 
             foreign = bool(primary_up and state["primary"]["foreign"])
-            if self._last_foreign is not None and foreign != self._last_foreign:
+            auto_countries = (self.primary_measured_foreign(), self.secondary_foreign())
+            if ((self._last_foreign is not None and foreign != self._last_foreign)
+                    or (self._last_auto_countries is not None and auto_countries != self._last_auto_countries)):
                 pm = globals().get("pac_manager")
                 if pm is not None:
                     with contextlib.suppress(Exception):
@@ -8210,6 +8168,13 @@ try:
                         pm.generate_pac(warp_override=route_primary, opera_override=route_secondary)
                         pm.refresh_system_options()
             self._last_foreign = foreign
+            self._last_auto_countries = auto_countries
+            dns_routes = self.dns_ai_route_snapshot()
+            if globals().get("_nrpt_state", {}).get("system_dns_ai"):
+                save_json_safe(os.path.join(get_base_dir(), "temp", "dns-ai-route.json"), {
+                    "active": True, "servers": sorted(NOVA_DNS_AI_SERVERS),
+                    "owner_pid": os.getpid(), "updated": time.time(), **dns_routes,
+                })
 
             if primary_up and not self._prev_primary_up:
                 base = get_base_dir()
@@ -8273,16 +8238,16 @@ try:
                     self._probe_due = time.time() + self.EXIT_REFRESH_SEC
                     self._primary_country = country
                     self._country_key = key
+                    self._primary_measured_at = time.time()
                     log_now = (key, country) != self._logged_exit
                     if log_now:
                         self._logged_exit = (key, country)
                 if log_now:
                     if nova_vpn_slots.is_foreign_country(country):
-                        self.log_func(f"[VPN] Основной VPN ({label}) выходит из {country}: список EU идёт через него, "
-                                      "дополнительный VPN — в резерве.")
+                        self.log_func(f"[VPN] Основной VPN ({label}) выходит из {country} (проверено по IP).")
                     else:
                         self.log_func(f"[VPN] Основной VPN ({label}) выходит из {country or 'неизвестной страны'}: "
-                                      "список EU остаётся на дополнительном VPN.")
+                                      "зарубежный выход не подтверждён.")
             finally:
                 with self._lock:
                     self._probe_running = False
@@ -8758,6 +8723,21 @@ try:
                     ru_route_parts.append(last_resort)
                 ru_route = "; ".join(ru_route_parts)
 
+                browser_auto = pac_config.get("mode") == "hybrid" and not pac_config.get("tor_pending")
+                if browser_auto:
+                    main_slots, second_slots = nova_vpn_slots.browser_auto_slots(
+                        primary_up=warp_active, secondary_up=secondary_active,
+                        primary_foreign=bool(slots_runtime and slots_runtime.primary_measured_foreign()),
+                        secondary_foreign=bool(slots_runtime and slots_runtime.secondary_foreign()),
+                    )
+                    ru_route, eu_route = (
+                        nova_vpn_slots.route_chain(
+                            slots, primary_up=warp_active, secondary_up=secondary_active,
+                            primary_tokens=primary_route, secondary_tokens=secondary_route,
+                            last_resort=closed_route,
+                        ) for slots in (main_slots, second_slots)
+                    )
+
                 # YouTube: RU-list order while the primary exits abroad. With a Russian (or not yet
                 # measured) exit the primary reaches Google from inside the DPI, which drops YouTube
                 # ClientHellos per flow -- 10 s stalls on a third of new connections (G81) -- so the
@@ -8775,6 +8755,9 @@ try:
                     secondary_tokens=secondary_route,
                     last_resort=last_resort,
                 )
+
+                if browser_auto:
+                    youtube_route = ru_route
 
                 # Browser Discord traffic also uses plain PAC fallbacks.
                 # App Discord traffic is routed separately from browser PAC.
@@ -8917,6 +8900,11 @@ try:
                                 ai_second_domains, _verdicts, _unblockers)
                     except Exception:
                         ai_region_direct = set()
+                if browser_auto:
+                    # List membership keeps its fail-closed route even with a DNS unblocker.
+                    ai_second_route = eu_route
+                    ai_region_direct = set()
+                    ai_unlock_guard = ""
                 ai_region_direct_js = "{" + ",".join(f'"{d}":1' for d in sorted(ai_region_direct)) + "}"
                 ai_unlock_guard = (
                     '    if (matchDomain(ai_region_direct, host)) return "DIRECT";\n'
@@ -8984,6 +8972,7 @@ try:
                             f'    if (matchDomain({_list_name}, host)) return "{_route}";\n'
                         )
 
+                wininet_empty_route = "PROXY 127.0.0.1:1" if browser_auto else "DIRECT"
                 pac_content = f"""
     function FindProxyForURL(url, host) {{
     host = (host || "").toLowerCase();
@@ -9221,7 +9210,7 @@ function FindProxyForURLEx(url, host) {{
         if (/^SOCKS5\\s/i.test(token)) continue;
         out.push(token);
     }}
-    return out.length ? out.join("; ") : "DIRECT";
+    return out.length ? out.join("; ") : "{wininet_empty_route}";
 }}
 """
                 pac_temp_path = f"{self.pac_file}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -9277,6 +9266,8 @@ function FindProxyForURLEx(url, host) {{
                         eu_note = f"через дополнительный VPN ({secondary_name})"
                     else:
                         eu_note = "зарубежного выхода сейчас нет"
+                    if browser_auto:
+                        eu_note = "Auto: дополнительный первым; резерв только с подтверждённым зарубежным выходом"
                     self.log_func(f"[PAC] EU маршрут: {eu_route} ({eu_note})")
 
                 # RU route for logging (includes RU + Discord)
@@ -10246,12 +10237,7 @@ function FindProxyForURLEx(url, host) {{
                 pass
             # Kill by name as fallback
             try:
-                subprocess.run(
-                    ["taskkill", "/F", "/IM", "opera-proxy*"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
+                kill_images_in_dir(("opera-proxy*",), get_bin_dir())
             except:
                 pass
             # Reset all state
@@ -10436,12 +10422,7 @@ function FindProxyForURLEx(url, host) {{
                 # FIX: Force kill any orphan processes of our bundled proxy BEFORE checking the port.
                 # This prevents adopting zombie processes from previous crashes as "external proxies".
                 try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/IM", "opera-proxy*"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
+                    kill_images_in_dir(("opera-proxy*",), get_bin_dir())
                 except:
                     pass
 
@@ -10525,9 +10506,9 @@ function FindProxyForURLEx(url, host) {{
                 # discover из РФ часто отдаёт адреса, на которые не дозвониться.
                 for _published in self._published_endpoints()[:2]:
                     attempts.append(("feed", _published, 6.5, None))
+                attempts.append(("discover", None, 6.5, None))
                 for _api_proxy in api_bootstrap_proxies:
                     attempts.append(("discover-api-proxy", None, 6.5, _api_proxy))
-                attempts.append(("discover", None, 6.5, None))
 
                 for attempt_mode, override_endpoint, ready_timeout, base_proxy in attempts:
                     # "fastest" реально качает данные через каждый выданный эндпоинт и
@@ -10707,12 +10688,7 @@ function FindProxyForURLEx(url, host) {{
             # Failsafe cleanup for orphaned proxy processes.
             if owned_before_stop:
                 try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/IM", "opera-proxy*"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
+                    kill_images_in_dir(("opera-proxy*",), get_bin_dir())
                 except:
                     pass
 
@@ -11892,17 +11868,7 @@ function FindProxyForURLEx(url, host) {{
         except:
             pass
         if os.name == "nt":
-            try:
-                result = subprocess.run(
-                    ["taskkill", "/F", "/IM", "sing-box.exe", "/T"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    timeout=5,
-                )
-                killed = killed or (result.returncode == 0)
-            except:
-                pass
+            killed = bool(kill_images_in_dir(("sing-box.exe",), get_bin_dir())) or killed
         if killed and log_func:
             with contextlib.suppress(Exception):
                 log_func("[Cleanup] Удалены stale legacy helper-процессы.")
@@ -12264,15 +12230,6 @@ function FindProxyForURLEx(url, host) {{
                     with contextlib.suppress(Exception):
                         normalize_start(os.path.join(get_bin_dir(), "WinDivert64.sys"), self.log_func)
 
-                if state.get("disabled") and not state.get("running"):
-                    with contextlib.suppress(Exception):
-                        subprocess.run(
-                            ["sc", "config", "windivert", "start=", "demand"],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            timeout=6,
-                        )
 
                 needs_destructive_repair = bool(
                     state.get("pending_delete")
@@ -14515,8 +14472,10 @@ function FindProxyForURLEx(url, host) {{
             normalized["secondary"] = nova_vpn_slots.normalize_secondary_block(data.get("secondary"))
             normalized["secondary_profile"] = nova_vpn_slots.normalize_secondary_profile_block(
                 data.get("secondary_profile"))
-            routes = data.get("routes") or {}
+            routes = data.get("routes")
             if isinstance(routes, dict):
+                normalized["routes"].update({k: v for k, v in routes.items()
+                                             if k not in DEFAULT_ROUTING_SETTINGS["routes"]})
                 for route_key in ROUTING_GROUP_KEYS:
                     if route_key in routes:
                         normalized["routes"][route_key] = _normalize_group_route_mode(
@@ -14524,13 +14483,6 @@ function FindProxyForURLEx(url, host) {{
                             routes.get(route_key),
                             normalized["routes"][route_key],
                         )
-                # Installations made before 1.31.2 carry "warp" because that was
-                # the shipped default, not because anyone picked it. Move them
-                # over once — load_routing_settings persists the result, so the
-                # version stops matching and the setting stays the user's own
-                # from then on.
-                if normalized["routes"].get("telegram") == "warp" and _routing_predates_telegram_auto(data.get("version")):
-                    normalized["routes"]["telegram"] = "auto"
             else:
                 normalized["routes"]["browser"] = _browser_mode_from_legacy_pac(data.get("pac"))
                 apps = data.get("apps") or {}
@@ -14547,7 +14499,7 @@ function FindProxyForURLEx(url, host) {{
                                 normalized["routes"][route_key],
                             )
             for alias_key, route_key in ROUTING_GROUP_ALIASES.items():
-                if alias_key in data.get("routes", {}) and route_key in normalized["routes"]:
+                if isinstance(routes, dict) and alias_key in routes and route_key in normalized["routes"]:
                     normalized["routes"][route_key] = _normalize_group_route_mode(
                         route_key,
                         data["routes"].get(alias_key),
@@ -14555,12 +14507,13 @@ function FindProxyForURLEx(url, host) {{
                     )
             system_payload = data.get("system") or {}
             if isinstance(system_payload, dict):
+                normalized["system"].update(system_payload)
                 normalized["system"]["suppress_game_overlay"] = bool(
                     system_payload.get("suppress_game_overlay", normalized["system"]["suppress_game_overlay"])
                 )
-                # Разблокировка ИИ больше не выключается: она работает по умолчанию и
-                # молчит только тогда, когда DNS-AI уже обслуживает машину (D19).
-                normalized["system"]["ai_unlock"] = True
+                normalized["system"]["ai_unlock"] = bool(
+                    system_payload.get("ai_unlock", normalized["system"]["ai_unlock"])
+                )
                 normalized["system"]["vpn_autoconnect"] = bool(
                     system_payload.get("vpn_autoconnect", normalized["system"].get("vpn_autoconnect", True))
                 )
@@ -15213,6 +15166,11 @@ function FindProxyForURLEx(url, host) {{
         mode = dns_ai_system_mode()
         _nrpt_state["dns_ai_mode"] = mode
         _nrpt_state["system_dns_ai"] = bool(mode)
+        route_state = os.path.join(get_base_dir(), "temp", "dns-ai-route.json")
+        runtime = globals().get("vpn_slots_runtime")
+        routes = runtime.dns_ai_route_snapshot() if runtime is not None else {}
+        save_json_safe(route_state, {"active": bool(mode), "servers": sorted(NOVA_DNS_AI_SERVERS),
+                                     "owner_pid": os.getpid(), "updated": time.time(), **routes})
         return mode
 
     def _nrpt_existing_rules(log_func=None):
@@ -15775,7 +15733,7 @@ function FindProxyForURLEx(url, host) {{
         except: return "light"
 
     APPEARANCE_FILE = os.path.join(get_base_dir(), "appearance.json")
-    APPEARANCE = nova_appearance.load_preferences(APPEARANCE_FILE)
+    APPEARANCE = nova_appearance.startup_preferences(APPEARANCE_FILE)
     SYSTEM_THEME = "dark"
     SETTINGS_THEME = nova_appearance.settings_theme(APPEARANCE["theme"])
     LOG_THEME = nova_appearance.log_theme(APPEARANCE["theme"])
@@ -17015,43 +16973,6 @@ function FindProxyForURLEx(url, host) {{
         sizegrip.place(relx=1.0, rely=1.0, anchor="se", x=0, y=0) 
         log_window.sizegrip = sizegrip # Save reference
         
-        def open_website():
-            """Открывает официальный сайт Nova"""
-            try:
-                import webbrowser
-                webbrowser.open("https://nova-app.eu/")
-            except Exception as e:
-                print(f"[Log] Ошибка открытия сайта: {e}")
-
-        def open_telegram_chat():
-            """Открывает чат Telegram"""
-            try:
-                import webbrowser
-                webbrowser.open("https://t.me/nova_txt")
-            except Exception as e:
-                print(f"[Log] Ошибка открытия ссылки: {e}")
-        
-        # Кнопка-текст "Перейти в чат"
-        chat_button = tk.Label(bottom_frame, text="Telegram чат ↗", fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"], 
-                              font=("Segoe UI", 11, "bold"), cursor="hand2", padx=10, pady=2)
-        chat_button.pack(side=tk.RIGHT, padx=(5, 10), pady=2)
-        chat_button.bind("<Button-1>", lambda e: open_telegram_chat())
-        chat_button.bind("<Enter>", lambda e: chat_button.config(fg=LOG_THEME["button_hover_fg"], bg=LOG_THEME["button_hover"]))
-        chat_button.bind("<Leave>", lambda e: chat_button.config(fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"]))
-
-        # Тонкий вертикальный разделитель
-        separator = tk.Frame(bottom_frame, width=1, height=14, bg=LOG_THEME["grip"])
-        separator.pack(side=tk.RIGHT, padx=5, pady=6)
-
-        # Кнопка-текст "Перейти на сайт"
-        site_button = tk.Label(bottom_frame, text="Сайт ↗", fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"], 
-                              font=("Segoe UI", 11, "bold"), cursor="hand2", padx=10, pady=2)
-        site_button.pack(side=tk.RIGHT, padx=(10, 5), pady=2)
-        site_button.bind("<Button-1>", lambda e: open_website())
-        site_button.bind("<Enter>", lambda e: site_button.config(fg=LOG_THEME["button_hover_fg"], bg=LOG_THEME["button_hover"]))
-        site_button.bind("<Leave>", lambda e: site_button.config(fg=LOG_THEME["button_fg"], bg=LOG_THEME["panel"]))
-
-
         # Используем Frame для компоновки текста и кастомного скроллбара
         content_frame = tk.Frame(log_window, bg=LOG_THEME["bg"])
         content_frame.pack(fill=tk.BOTH, expand=True)
@@ -17366,7 +17287,7 @@ function FindProxyForURLEx(url, host) {{
         try: sys.__stdout__.write(message + '\n')
         except: pass
         if root:
-            root.after(0, lambda m=message: _safe_log_insert(m))
+            _safe_log_insert(message)
 
     def _build_log_entry(string):
         """Filter, tag and mask one raw line. None means the line is dropped."""
@@ -17420,21 +17341,19 @@ function FindProxyForURLEx(url, host) {{
             log_text_widget.configure(state=tk.DISABLED)
         except: pass
 
-    def _safe_log_insert(string):
-        global early_log_buffer
-        entry = _build_log_entry(string)
-        if entry is None:
-            return
-        text, tag = entry
+    ui_log_pump = nova_desktop_ui.UiLogPump()
 
+    def _deliver_log_rows(rows):
         if log_window and tk.Toplevel.winfo_exists(log_window):
-            _insert_log_batch([(time.strftime("%H:%M:%S"), text, tag)])
+            _insert_log_batch(rows)
         else:
-            # Buffer until log_window exists. Stamped here rather than at flush
-            # time: flushing used to stamp every buffered line with the moment the
-            # window opened, collapsing the whole startup history onto one second.
-            if len(early_log_buffer) < 500:
-                early_log_buffer.append((time.strftime("%H:%M:%S"), text, tag))
+            early_log_buffer.extend(rows[:max(0, 500 - len(early_log_buffer))])
+
+    def _safe_log_insert(string):
+        entry = _build_log_entry(string)
+        if entry is not None:
+            text, tag = entry
+            ui_log_pump.put((time.strftime("%H:%M:%S"), text, tag))
 
     class RedirectText(object):
         def write(self, string):
@@ -17443,11 +17362,8 @@ function FindProxyForURLEx(url, host) {{
                     _session_console_log_write(_session_console_log_lines(string))
             except:
                 pass
-            try:
-                if root:
-                    root.after(0, lambda: self._safe_write(string))
-            except (NameError, AttributeError):
-                pass # Root not created yet
+            if globals().get("root") is not None:
+                self._safe_write(string)
 
         def _safe_write(self, string):
             if should_ignore(string): return
@@ -17456,14 +17372,7 @@ function FindProxyForURLEx(url, host) {{
             text, tag = entry
             if "could not read" in text.lower():
                 tag = "error"
-            if log_window and tk.Toplevel.winfo_exists(log_window):
-                # Through _insert_log_batch, not a bare insert: this path used to
-                # write straight into the widget without touching its state, and
-                # _safe_log_insert leaves it DISABLED — so from the first log_print()
-                # onwards every print()/safe_trace() line was silently rejected by Tk
-                # and never appeared in the window. The console log file kept them,
-                # which is why the loss was invisible.
-                _insert_log_batch([(time.strftime("%H:%M:%S"), text, tag)])
+            ui_log_pump.put((time.strftime("%H:%M:%S"), text, tag))
 
         def flush(self): pass
     
@@ -25307,24 +25216,25 @@ function FindProxyForURLEx(url, host) {{
                 extra = "OpenService error 5"
                 state["text"] = f"{state['text']}\n{extra}".strip()
 
+        if state["pending_delete"]:
+            # DeleteService after load is WinDivert's normal lifetime, not a broken device.
+            # A NO_INSTALL open distinguishes a usable shared driver from a genuinely stuck unload.
+            state["registration_pending_delete"] = True
+            device_probe = globals().get("_probe_windivert_minimal_open_error")
+            if callable(device_probe) and device_probe() == 0:
+                state.update(pending_delete=False, running=True, stopped=False, missing=False,
+                             exists=True, driver_bad_state=False)
         return state
 
     def _probe_windivert_config_state(driver_image_path, timeout=4):
-        rc, out, err = _run_hidden_sc(
-            "config", "windivert",
-            "type=", "kernel",
-            "start=", "demand",
-            "binPath=", driver_image_path,
-            timeout=timeout
-        )
-        msg = "\n".join(part for part in [out.strip(), err.strip()] if part).strip()
+        access = _probe_windivert_service_access()
         return {
-            "configurable": rc == 0,
-            "missing": _is_sc_service_missing_text(msg),
-            "pending_delete": _is_windivert_pending_delete_text(msg),
-            "access_denied": ("5" in msg and "access is denied" in msg.lower()) or ("отказано" in msg.lower()),
-            "returncode": rc,
-            "message": msg,
+            "configurable": access["accessible"],
+            "missing": access["missing"],
+            "pending_delete": access["pending_delete"],
+            "access_denied": access["access_denied"],
+            "returncode": access["error_code"],
+            "message": access["message"],
         }
 
     def _wait_for_windivert_pending_delete_clear(driver_image_path, timeout=45.0, poll_interval=1.0):
@@ -25375,6 +25285,8 @@ function FindProxyForURLEx(url, host) {{
             return False
 
     def _write_windivert_registry(driver_image_path):
+        if not windivert_repair_allowed(get_bin_dir(), _query_windivert_service_state()):
+            raise RuntimeError("WinDivert is active or belongs to another application")
         import winreg
 
         reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
@@ -25390,10 +25302,6 @@ function FindProxyForURLEx(url, host) {{
             winreg.SetValueEx(key, "ErrorControl", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(key, "ImagePath", 0, winreg.REG_EXPAND_SZ, driver_image_path)
             winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "WinDivert")
-            try:
-                winreg.DeleteValue(key, "DeleteFlag")
-            except OSError:
-                pass
         finally:
             winreg.CloseKey(key)
 
@@ -25419,7 +25327,7 @@ function FindProxyForURLEx(url, host) {{
             dll.WinDivertClose.argtypes = [wintypes.HANDLE]
             dll.WinDivertClose.restype = wintypes.BOOL
             ctypes.set_last_error(0)
-            handle = dll.WinDivertOpen(b"false", 0, 0, 0)
+            handle = dll.WinDivertOpen(b"false", 0, 0, 0x10)  # WINDIVERT_FLAG_NO_INSTALL
             if handle in (None, 0, ctypes.c_void_p(-1).value):
                 return ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
             return 0
@@ -25441,6 +25349,11 @@ function FindProxyForURLEx(url, host) {{
         if _windivert_registration_reset_attempted:
             if log_func:
                 log_func("[Repair] Повторный сброс регистрации WinDivert пропущен: попытка уже выполнялась в этом цикле запуска.")
+            return False
+
+        if not windivert_repair_allowed(get_bin_dir(), _query_windivert_service_state()):
+            if log_func:
+                log_func("[Repair] Сброс общей службы WinDivert пропущен: драйвер используется или принадлежит другой программе.")
             return False
 
         if not _repair_lock.acquire(timeout=10.0):
@@ -25468,15 +25381,7 @@ function FindProxyForURLEx(url, host) {{
             ):
                 with contextlib.suppress(Exception):
                     _terminate_helper_pid(os.path.join(get_base_dir(), "temp", pid_name))
-            for image_name in ("winws.exe", "winws_test.exe"):
-                with contextlib.suppress(Exception):
-                    subprocess.run(
-                        ["taskkill", "/F", "/IM", image_name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                        timeout=4,
-                    )
+            kill_images_in_dir(("winws.exe", "winws_test.exe"), get_bin_dir())
 
             _run_hidden_sc("stop", "windivert", timeout=6)
             delete_rc, delete_out, delete_err = _run_hidden_sc("delete", "windivert", timeout=6)
@@ -25543,6 +25448,10 @@ function FindProxyForURLEx(url, host) {{
             _repair_lock.release()
 
     def _normalize_windivert_start_mode(driver_image_path, log_func=None):
+        if not windivert_repair_allowed(get_bin_dir(), _query_windivert_service_state()):
+            if log_func:
+                log_func("[Repair] Настройки общей службы WinDivert сохранены без изменений.")
+            return False
         last_state = {}
         for attempt in range(2):
             try:
@@ -25576,34 +25485,9 @@ function FindProxyForURLEx(url, host) {{
         return False
 
     def _clear_windivert_delete_flag(log_func=None):
-        try:
-            import winreg
-
-            reg_path = r"SYSTEM\CurrentControlSet\Services\WinDivert"
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                reg_path,
-                0,
-                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE | getattr(winreg, "KEY_WOW64_64KEY", 0)
-            )
-            try:
-                try:
-                    delete_flag_val = winreg.QueryValueEx(key, "DeleteFlag")[0]
-                except OSError:
-                    return False
-
-                if int(delete_flag_val or 0) != 0:
-                    winreg.DeleteValue(key, "DeleteFlag")
-                    if log_func:
-                        log_func("[Repair] Удалён реестровый DeleteFlag для WinDivert.")
-                    return True
-                return False
-            finally:
-                winreg.CloseKey(key)
-        except Exception as e:
-            if log_func:
-                log_func(f"[Repair] Не удалось снять DeleteFlag: {e}")
-            return False
+        # DeleteFlag is part of WinDivert's shared-driver lifetime contract.
+        # Clearing it makes Nova's registration survive the last client indefinitely.
+        return False
 
     def repair_windivert_driver(log_func=None, exit_code=None, pending_delete_timeout=45.0):
         """
@@ -25654,6 +25538,10 @@ function FindProxyForURLEx(url, host) {{
             driver_image_path = f"\\??\\{driver_path}"
 
             initial_state = _query_windivert_service_state()
+            if not windivert_repair_allowed(get_bin_dir(), initial_state):
+                if log_func:
+                    log_func("[Repair] Общая служба WinDivert занята или принадлежит другой программе: ремонт пропущен.")
+                return False
             if _windivert_unrecoverable_reason == "pending_delete_stuck":
                 if initial_state["pending_delete"]:
                     if log_func:
@@ -25687,8 +25575,8 @@ function FindProxyForURLEx(url, host) {{
 
             # 1. Kill any WinWS remnants that might be holding the driver
             try:
-                subprocess.run(["taskkill", "/F", "/IM", "winws.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"], creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                kill_images_in_dir(('winws.exe',), get_bin_dir())
+                kill_images_in_dir(('winws_test.exe',), get_bin_dir())
             except:
                 pass
 
@@ -26278,7 +26166,7 @@ function FindProxyForURLEx(url, host) {{
                 return
 
             if not manifest.get("available"):
-                native_message_box(f"У вас уже актуальная версия Nova ({CURRENT_VERSION}).", "Nova - Обновление", 0x40)
+                native_message_box("У вас уже актуальная версия Nova.", "Nova - Обновление", 0x40)
                 return
 
             answer = native_message_box(
@@ -28127,14 +28015,7 @@ function FindProxyForURLEx(url, host) {{
         # 0.8s was previously proven insufficient; 1.2s is required for stable re-attach.
         # On a cold start (driver not loaded), sc stop returns non-zero instantly → skip wait.
         _driver_was_running = False
-        try:
-             if not restart_mode:
-                 _sc_result = subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
-                 _driver_was_running = (_sc_result.returncode == 0)
-        except subprocess.TimeoutExpired:
-            _windivert_stuck = True
-            _driver_was_running = True
-        except: pass
+        # WinDivertOpen attaches to the shared driver; no global stop on startup.
 
         try:
             _windivert_state = _query_windivert_service_state()
@@ -28208,21 +28089,11 @@ function FindProxyForURLEx(url, host) {{
 
         # Kill old winws process
         try:
-            subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME],
-                           creationflags=subprocess.CREATE_NO_WINDOW,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            kill_images_in_dir((WINWS_FILENAME,), get_bin_dir())
         except subprocess.TimeoutExpired:
             _windivert_stuck = True
         except: pass
         
-        if not restart_mode:
-            try:
-                subprocess.run(["sc", "stop", "windivert"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=subprocess.CREATE_NO_WINDOW, timeout=2)
-            except subprocess.TimeoutExpired:
-                _windivert_stuck = True
-            except: pass
 
         if not restart_mode and _env_bool_global("NOVA_WARP_EARLY_START", True):
             try:
@@ -29471,45 +29342,24 @@ function FindProxyForURLEx(url, host) {{
             try:
                 # FIX: Hide debug message unless in debug mode
                 if not silent and IS_DEBUG_MODE: print("[Debug] Убиваем дочерние процессы...")
-                subprocess.run(["taskkill", "/F", "/IM", WINWS_FILENAME], 
-                             creationflags=subprocess.CREATE_NO_WINDOW, 
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                kill_images_in_dir((WINWS_FILENAME,), get_bin_dir())
                 # При HotSwap-паузе тоже убиваем winws_test.exe, иначе он держит WinDivert занятым.
                 if kill_test_instances:
-                    subprocess.run(["taskkill", "/F", "/IM", "winws_test.exe"],
-                                 creationflags=subprocess.CREATE_NO_WINDOW,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    kill_images_in_dir(('winws_test.exe',), get_bin_dir())
                 if not restart_mode:
                     _kill_singbox_processes_best_effort()
-                    subprocess.run(["taskkill", "/F", "/IM", "wireproxy-awg.exe", "/T"],
-                                 creationflags=subprocess.CREATE_NO_WINDOW,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    # Nova-owned names by construction: MASQUE helper and generator jobs,
-                    # Tor and its pluggable transport.
-                    for _nova_helper_name in ("nova-go.exe", "nova-tor.exe", "nova-lyrebird.exe"):
-                        subprocess.run(["taskkill", "/F", "/IM", _nova_helper_name, "/T"],
-                                     creationflags=subprocess.CREATE_NO_WINDOW,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    for _nwfp_service_name in _novawfp_service_image_names():
-                        subprocess.run(["taskkill", "/F", "/IM", _nwfp_service_name, "/T"],
-                                     creationflags=subprocess.CREATE_NO_WINDOW,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    kill_images_in_dir(("wireproxy-awg.exe", "nova-go.exe", "nova-tor.exe",
+                                        "nova-lyrebird.exe", *_novawfp_service_image_names()), get_bin_dir())
                     if managed_opera_owned:
                         try:
-                            subprocess.run(["taskkill", "/F", "/IM", "opera-proxy*"],
-                                         creationflags=subprocess.CREATE_NO_WINDOW,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            kill_images_in_dir(("opera-proxy*",), get_bin_dir())
                         except:
                             pass
             except: pass
             
-            # FIX: Force Driver Stop to release resources (but do not delete, to avoid startup delay/lock)
-            try:
-                if force_driver_stop:
-                    time.sleep(0.2)  # Даём ОС время закрыть дескрипторы файла после taskkill winws
-                    subprocess.run(["sc", "stop", "windivert"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
-            except: pass
-            
+            # Mark only our registration for natural removal; foreign handles stay valid.
+            delete_windivert_if_nova(get_bin_dir(), log_print if not silent else None)
+
             if not silent: 
                 log_print("[Service] Все процессы завершены.")
                 print("Готово.\n")
@@ -29660,16 +29510,21 @@ function FindProxyForURLEx(url, host) {{
         toggle_queue.put("start")
         return "queued"
 
-    def on_closing():
+    def on_closing(restart=False):
         global is_closing, process, is_service_active, nova_service_status, SERVICES_RUNNING, SERVICE_RUN_ID
+        if is_closing:
+            return
         
-        # Захватываем геометрию в главном потоке ДО уничтожения/скрытия окна
+        # Capture all Tk state before the worker starts.
+        restart_nova._in_progress = restart
         main_geo = None
         log_geo = None
+        show_log = False
         try:
             main_geo = root.geometry()
             if log_window and tk.Toplevel.winfo_exists(log_window):
                 log_geo = log_window.geometry()
+                show_log = str(log_window.state()) == "normal"
         except: pass
         
         # === VISUAL SPEEDUP: Hide windows immediately ===
@@ -29685,10 +29540,6 @@ function FindProxyForURLEx(url, host) {{
         except Exception:
             pass
         
-        # Ensure tray icon is removed
-        try: cleanup_tray()
-        except: pass
-
         # FIX: Set shutdown flags FIRST so that workers/watchdogs cannot resurrect services during exit.
         is_closing = True
         is_service_active = False
@@ -29699,205 +29550,119 @@ function FindProxyForURLEx(url, host) {{
         except:
             pass
         
-        def _heavy_cleanup():
-            """All potentially-blocking cleanup. Runs in a thread with hard timeout."""
+        appearance_state = dict(globals().get('APPEARANCE') or {})
+        scene = globals().get('main_scene')
+
+        def _save_exit_state():
+            if scene is not None and appearance_state:
+                scene.flush_preferences(appearance_state)
+            state = {}
+            if main_geo:
+                state["main_geometry"] = main_geo
+            if log_geo:
+                state["log_size"] = log_geo
+            if state:
+                save_window_state(**state)
+            if dns_manager:
+                dns_manager.save_cache()
+            save_visited_domains()
+            save_ip_history()
+            save_exclude_auto_checked()
+            flush_learning_data()
+            pending = []
+            while not check_queue.empty():
+                try:
+                    pending.append(check_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if pending:
+                save_json_safe(PENDING_CHECKS_FILE, pending)
+
+        def _stop_owned_warp_service():
+            if service_points_into(NOVA_WARP_SERVICE, get_bin_dir()):
+                result = subprocess.run(
+                    ["sc", "stop", NOVA_WARP_SERVICE], timeout=2,
+                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.returncode not in (0, 1060, 1062):
+                    raise RuntimeError(f"sc stop {NOVA_WARP_SERVICE}: {result.returncode}")
+
+        def _kill_owned_children():
+            # One native snapshot, validated image paths and retained process handles.
+            # No /IM, PowerShell process scans, or per-image service waits.
             try:
-                # Restore Proxy first!
+                service_images = (("warp-svc.exe",) if service_points_into(NOVA_WARP_SERVICE, get_bin_dir()) else ())
+                return kill_images_in_dir(service_images, get_bin_dir(), root_pid=os.getpid())
+            except Exception as error:
+                log_print(f"[Выход] Не удалось завершить дочерние процессы: {error}")
+
+        exit_done = threading.Event()
+        restart_error = []
+
+        def _exit_worker():
+            started = time.monotonic()
+            try:
+                _kill_owned_children()
+                tasks = {"состояние": _save_exit_state, "трей": cleanup_tray,
+                         "DNS-правила": lambda: remove_nrpt_dns_unblock_on_exit(log_func=log_print, silent=False),
+                         "служба WARP": _stop_owned_warp_service}
+                if not restart:
+                    tasks["WinDivert"] = lambda: delete_windivert_if_nova(get_bin_dir(), log_print)
                 if pac_manager:
-                    pac_manager.restore_system_proxy()
-                    pac_manager.stop_server()
-            except: pass
+                    tasks["системный прокси"] = pac_manager.restore_system_proxy
+                # Registry/WinHTTP and NRPT restoration must finish even on a cold PowerShell start.
+                critical = {"системный прокси", "DNS-правила"}
+                if restart:
+                    critical.update(("состояние", "служба WARP"))
+                failures = {}
+                pending = nova_shutdown.run_cleanup(tasks, timeout=1.0 if restart else 4.0, log=log_print,
+                                                    required=critical, required_timeout=12.0, failures=failures)
+                _kill_owned_children()
+                if restart:
+                    failed = critical.intersection(pending | set(failures))
+                    if failed:
+                        raise RuntimeError("Не завершена подготовка: " + ", ".join(sorted(failed)))
+                    command = nova_shutdown.restart_command(
+                        sys.argv, sys.executable, compiled=getattr(sys, 'frozen', False) or '__compiled__' in globals(),
+                        debug=_has_debug_cli_flag(), show_log=show_log)
+                    # The replacement must never enter the final child-process sweep.
+                    app_mut = globals().get('app_mutex')
+                    if app_mut:
+                        if not ctypes.windll.kernel32.CloseHandle(app_mut):
+                            raise ctypes.WinError()
+                        globals()['app_mutex'] = None
+                    nova_shutdown.launch_restart(command, get_base_dir())
+                    log_print(f"[Restart] Новая копия запущена за {time.monotonic() - started:.2f} с.")
+            except Exception as error:
+                if restart:
+                    restart_error.append(str(error))
+                log_print(f"[Выход] Ошибка завершения: {error}")
+            finally:
+                log_print(f"[Выход] Очистка завершена за {time.monotonic() - started:.2f} с.")
+                exit_done.set()
 
+        def _poll_exit():
+            global is_closing
+            if not exit_done.is_set():
+                root.after(25, _poll_exit)
+                return
+            if restart_error:
+                if not globals().get('app_mutex'):
+                    globals()['app_mutex'] = ctypes.windll.kernel32.CreateMutexW(None, False, "Nova_Unique_Mutex_Lock")
+                is_closing = False
+                restart_nova._in_progress = False
+                root.deiconify()
+                btn_toggle.config(text="ПОДКЛЮЧИТЬ", state=tk.NORMAL)
+                status_label.config(text="ОСТАНОВЛЕНО", fg=COLOR_TEXT_FAIL)
+                messagebox.showerror("Перезапуск Nova", restart_error[0], parent=root)
+                return
             try:
-                remove_nrpt_dns_unblock_on_exit(silent=True)
-            except: pass
+                root.destroy()
+            finally:
+                SESSION_CONSOLE_LOG.close()
+                os._exit(0)
 
-            try:
-                if warp_manager:
-                    warp_manager.stop_service()
-            except: pass
-
-            try:
-                # close(), not stop(): it also releases the Job Object, and this thread
-                # already runs under the 5 s join below.
-                tm = get_tor_manager(create=False)
-                if tm is not None:
-                    tm.close()
-            except Exception:
-                pass
-
-            try:
-                for _, relay_manager in _iter_public_relay_managers():
-                    if relay_manager:
-                        relay_manager.stop()
-            except:
-                pass
-
-            try:
-                if 'novawfp_tcp_proxy_manager' in globals() and novawfp_tcp_proxy_manager:
-                    novawfp_tcp_proxy_manager.stop()
-            except:
-                pass
-
-            try:
-                if 'novawfp_udp_proxy_manager' in globals() and novawfp_udp_proxy_manager:
-                    novawfp_udp_proxy_manager.stop()
-            except:
-                pass
-
-            try:
-                if 'novawfp_observer_manager' in globals() and novawfp_observer_manager:
-                    novawfp_observer_manager.stop()
-            except:
-                pass
-            
-            try:
-                if opera_proxy_manager:
-                    opera_proxy_manager.stop()
-            except:
-                pass
-            
-            # Save state
-            try:
-                state_to_save = {}
-                if main_geo: state_to_save["main_geometry"] = main_geo
-                if log_geo: state_to_save["log_size"] = log_geo
-                if state_to_save:
-                    save_window_state(**state_to_save)
-            except: pass
-            
-            try:
-                if dns_manager: dns_manager.save_cache()
-                save_visited_domains()
-                save_ip_history()
-                save_exclude_auto_checked()
-                flush_learning_data()
-            except: pass
-
-            try:
-                remove_nrpt_dns_unblock_on_exit(silent=False)
-            except: pass
-            
-            try:
-                queue_list = []
-                while not check_queue.empty():
-                    try: queue_list.append(check_queue.get_nowait())
-                    except: break
-                if queue_list:
-                    with open(PENDING_CHECKS_FILE, "w", encoding="utf-8") as f:
-                        json.dump(queue_list, f)
-            except: pass
-        
-        def _force_kill_all():
-            """Kill every child process. Fast, no waits."""
-            def _kill_python_script_markers(markers):
-                try:
-                    temp_dir = os.path.join(get_base_dir(), "temp")
-                    for pid_name in ["NovaWfpTcpProxy.pid", "NovaWfpUdpProxy.pid", "NovaDivertObserver.pid", "NovaDivertTcpProxy.pid", "NovaDivertUdpProxy.pid", "NovaDivertRedirect.pid"]:
-                        _terminate_helper_pid(os.path.join(temp_dir, pid_name))
-                    # The loop above leaves the default allowlist in place, and
-                    # that allowlist is python.exe and friends because every
-                    # helper used to be a script. The TLS terminator is a native
-                    # binary, so it has to name itself or it survives cleanup.
-                    _terminate_helper_pid(
-                        os.path.join(temp_dir, "NovaTlsTerminator.pid"),
-                        allowed_image_names=(TLS_TERMINATOR_FILENAME,),
-                    )
-                    with contextlib.suppress(Exception):
-                        os.remove(os.path.join(temp_dir, "tls_terminator.json"))
-                except:
-                    pass
-
-            def _wait_for_sc_stopped(service_name, timeout=5.0):
-                deadline = time.time() + max(1.0, float(timeout))
-                while time.time() < deadline:
-                    try:
-                        result = subprocess.run(
-                            ["sc", "query", service_name],
-                            capture_output=True,
-                            timeout=4,
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                        )
-                        text = ((result.stdout or b"") + b"\n" + (result.stderr or b"")).decode("utf-8", errors="ignore").upper()
-                        if result.returncode != 0 and any(marker in text for marker in ["1060", "DOES NOT EXIST"]):
-                            return True
-                        if "STOPPED" in text or "1062" in text or "NOT STARTED" in text:
-                            return True
-                    except:
-                        pass
-                    time.sleep(0.25)
-                return False
-
-            for svc_name in [NOVA_WARP_SERVICE, "windivert"]:
-                try:
-                    subprocess.run(["sc", "stop", svc_name],
-                                   creationflags=subprocess.CREATE_NO_WINDOW,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
-                except:
-                    pass
-                try:
-                    _wait_for_sc_stopped(svc_name, timeout=4.5)
-                except:
-                    pass
-
-            _kill_singbox_processes_best_effort()
-
-            for proc_name in [WINWS_FILENAME, "winws.exe", "winws_test.exe", "wireproxy-awg.exe",
-                              "nova-go.exe", "nova-xray.exe", "nova-tor.exe", "nova-lyrebird.exe",
-                              "opera-proxy.windows-amd64.exe", "opera-proxy.exe", "opera-proxy*",
-                              TLS_TERMINATOR_FILENAME, *_novawfp_service_image_names()]:
-                try:
-                    subprocess.run(["taskkill", "/F", "/IM", proc_name],
-                                   creationflags=subprocess.CREATE_NO_WINDOW,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-                except: pass
-            _kill_python_script_markers([
-                r"NovaWFP\proxy\tcp_proxy.py",
-                r"NovaWFP\proxy\udp_proxy.py",
-                r"NovaWFP/proxy/tcp_proxy.py",
-                r"NovaWFP/proxy/udp_proxy.py",
-                r"resources\NovaWFP\proxy\tcp_proxy.py",
-                r"resources\NovaWFP\proxy\udp_proxy.py",
-                r"resources/NovaWFP/proxy/tcp_proxy.py",
-                r"resources/NovaWFP/proxy/udp_proxy.py",
-                r"resources\NovaDivert\windivert_redirect.py",
-                r"resources\NovaDivert\windivert_observer.py",
-                r"resources/NovaDivert/windivert_redirect.py",
-                r"resources/NovaDivert/windivert_observer.py",
-            ])
-
-            time.sleep(0.2) # Даём ОС время закрыть дескрипторы файла после taskkill winws/warp
-
-            if process:
-                try:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                                   creationflags=subprocess.CREATE_NO_WINDOW,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-                except: pass
-
-            # Leave shared names as found: our warp-svc by path (the official client's keeps running),
-            # the WinDivert registration that points at our driver (other WinDivert programs install
-            # their own), a CloudflareWARP an older Nova took over (nova_foreign_services).
-            try: kill_images_in_dir(("warp-svc.exe", "warp-cli.exe"), get_bin_dir())
-            except: pass
-            try: delete_windivert_if_nova(get_bin_dir())
-            except: pass
-            try: release_legacy_warp_service(get_bin_dir())
-            except: pass
-        
-        # Run heavy cleanup in thread with HARD 5-second timeout
-        cleanup_thread = threading.Thread(target=_heavy_cleanup, daemon=True)
-        cleanup_thread.start()
-        cleanup_thread.join(timeout=5)
-        
-        # Force-kill all child processes (always, even if cleanup succeeded)
-        try: _force_kill_all()
-        except: pass
-
-        # Немедленно закрываем окно и выходим
-        try: root.destroy()
-        except: pass
-        os._exit(0)
+        threading.Thread(target=_exit_worker, name="NovaExit", daemon=True).start()
+        root.after(25, _poll_exit)
 
     # === HOT SWAP COOLDOWN ===
     _hot_swap_last_call = [0]  # Mutable container for closure
@@ -30159,9 +29924,9 @@ function FindProxyForURLEx(url, host) {{
         
         threading.Thread(target=_bg_tasks_worker, daemon=True).start()
 
-    _ROUND_RECT_IMG_CACHE = {}
-    _GRADIENT_PILL_IMG_CACHE = {}
-    _ROUND_OUTLINE_IMG_CACHE = {}
+    _ROUND_RECT_IMG_CACHE = nova_desktop_ui.ImageCache()
+    _GRADIENT_PILL_IMG_CACHE = nova_desktop_ui.ImageCache()
+    _ROUND_OUTLINE_IMG_CACHE = nova_desktop_ui.ImageCache()
 
     def create_round_rect_img(width, height, radius, color, alpha=255):
         """Генерирует изображение закругленного прямоугольника с поддержкой Alpha-канала"""
@@ -30287,6 +30052,7 @@ function FindProxyForURLEx(url, host) {{
             self.normal_font = nova_appearance.font_roles(APPEARANCE["theme"])["action"]
             self.hover_font = self.normal_font
             
+            self._image_cache = {}
             self.bg_image = None # Ссылка для предотвращения GC
             self.bg_id = canvas.create_image(x, y, anchor="center")
             self.outline_image = None
@@ -30301,9 +30067,15 @@ function FindProxyForURLEx(url, host) {{
                 canvas.tag_bind(item, "<Leave>", self._on_leave)
         
         def _update_image(self, color):
-            self.bg_image = create_round_rect_img(self.width, self.height, self.radius, color)
+            key = (self.width, self.height, self.radius, color, OUTLINE_ACCENT_COLOR)
+            if key not in self._image_cache:
+                if len(self._image_cache) >= 8:
+                    self._image_cache.pop(next(iter(self._image_cache)))
+                self._image_cache[key] = (
+                    create_round_rect_img(self.width, self.height, self.radius, color),
+                    create_round_outline_img(self.width, self.height, self.radius, OUTLINE_ACCENT_COLOR, thickness=2, alpha=240))
+            self.bg_image, self.outline_image = self._image_cache[key]
             self.canvas.itemconfig(self.bg_id, image=self.bg_image)
-            self.outline_image = create_round_outline_img(self.width, self.height, self.radius, OUTLINE_ACCENT_COLOR, thickness=2, alpha=240)
             self.canvas.itemconfig(self.outline_id, image=self.outline_image)
             self.canvas.tag_raise(self.outline_id, self.bg_id)
             if hasattr(self, "text_id"):
@@ -30324,12 +30096,12 @@ function FindProxyForURLEx(url, host) {{
         def config(self, **kwargs):
             if "text" in kwargs: 
                 self.canvas.itemconfig(self.text_id, text=nova_desktop_ui.action_text(kwargs["text"]))
-            if "state" in kwargs:
+            if "state" in kwargs and kwargs["state"] != self.state_val:
                 self.state_val = kwargs["state"]
                 color = self.normal_color if self.state_val == "normal" else self.disabled_color
                 self._update_image(color)
                 self.canvas.itemconfig(self.text_id, fill=self.base_fg if self.state_val == "normal" else SETTINGS_THEME["muted"])
-            if "bg" in kwargs:
+            if "bg" in kwargs and kwargs["bg"] != self.normal_color:
                 self.normal_color = kwargs["bg"]
                 if self.state_val == "normal":
                     self._update_image(self.normal_color)
@@ -30373,7 +30145,10 @@ function FindProxyForURLEx(url, host) {{
             self.bg_id = canvas.create_image(x, y, anchor="center") # Placeholder
             self.bg_image = None
             self.text_items = []
-            
+            self.glow_id = canvas.create_image(x, y, anchor="center", state="hidden")
+            self.glow_image = None
+            self._glow_key = None
+
             self._draw_text()
             self._draw_bg()
             
@@ -30382,13 +30157,25 @@ function FindProxyForURLEx(url, host) {{
                 self.canvas.delete(item)
             self.text_items = []
             if not self.text_val:
+                self.canvas.itemconfigure(self.glow_id, state="hidden")
                 return
+            self._rendered_font = self.font_spec
             text = self.formatter(self.text_val) if self.formatter is not None else self.text_val
             width = max(self.canvas.winfo_width(), self.canvas.winfo_reqwidth()) - round(48 * UI_SCALE)
             text = nova_desktop_ui.fit_caption(text, width, self.tk_font.measure)
             anchor = "e" if self.anchor in ("e", "se", "ne") else "w" if self.anchor in ("w", "sw", "nw") else "center"
             self.text_items.append(self.canvas.create_text(
                 self.x, self.y, text=text, font=self.font_spec, fill=self.fg, anchor=anchor))
+            if self.formatter is nova_desktop_ui.status_text:
+                pixels = abs(self.font_spec[1]) if self.font_spec[1] < 0 else self.font_spec[1] * float(self.canvas.tk.call("tk", "scaling"))
+                key = (text, pixels, self.fg)
+                if key != self._glow_key:
+                    self.glow_image = ImageTk.PhotoImage(nova_desktop_ui.status_glow(text, pixels, self.fg), master=self.canvas)
+                    self._glow_key = key
+                bounds = self.canvas.bbox(self.text_items[0])
+                self.canvas.coords(self.glow_id, (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2)
+                self.canvas.itemconfigure(self.glow_id, image=self.glow_image, state="normal")
+                self.canvas.tag_lower(self.glow_id, self.text_items[0])
             self._apply_bindings()
 
         def _draw_bg(self):
@@ -30425,13 +30212,19 @@ function FindProxyForURLEx(url, host) {{
                 self.canvas.tag_lower(self.bg_id, self.text_items[0])
 
         def config(self, **kwargs):
-            redraw = False
-            if "text" in kwargs:
+            redraw = self.font_spec != getattr(self, "_rendered_font", None)
+            if "text" in kwargs and self.text_val != kwargs["text"]:
                 self.text_val = kwargs["text"]
                 redraw = True
-            if "fg" in kwargs:
+            if "fg" in kwargs and self.fg != kwargs["fg"]:
                 self.fg = kwargs["fg"]
                 redraw = True
+            if self.formatter is nova_desktop_ui.status_text:
+                scene = globals().get("main_scene")
+                if scene is not None:
+                    state = "connected" if self.text_val == "АКТИВНО : РАБОТАЕТ" else (
+                        "connecting" if self.text_val in ("ПОДКЛЮЧЕНИЕ", "ПЕРЕЗАПУСК", "ПЕРЕЗАПУСК ЯДРА...") else "stopped")
+                    scene.set_connection_state(state)
             
             if redraw:
                 self._draw_text()
@@ -30467,6 +30260,8 @@ function FindProxyForURLEx(url, host) {{
                 self.canvas.itemconfig(self.bg_id, state=state)
             except:
                 pass
+            if self.glow_image is not None:
+                self.canvas.itemconfig(self.glow_id, state=state)
             for item in self.text_items:
                 try:
                     self.canvas.itemconfig(item, state=state)
@@ -30880,8 +30675,9 @@ function FindProxyForURLEx(url, host) {{
         def pack(self, **kwargs): pass
 
     class CanvasButton:
-        def __init__(self, canvas, x, y, text, font, command, anchor="se", fg="#555555", bg_color=None):
+        def __init__(self, canvas, x, y, text, font, command, anchor="se", fg="#555555", bg_color=None, icon=None):
             self.canvas = canvas
+            self.x, self.y, self.anchor = x, y, anchor
             self.command = command
             self.fg = fg
             self.hover_fg = get_lighter_hex(fg, 0.28)
@@ -30893,7 +30689,10 @@ function FindProxyForURLEx(url, host) {{
             self.base_font = tuple(font)
             font_family = self.base_font[0]
             font_size = self.base_font[1] if len(self.base_font) > 1 else 9
-            self.hover_font = (font_family, font_size, "bold")
+            self.hover_font = self.base_font
+            self.icon_id = None
+            if icon:
+                self.icon_id = canvas.create_text(x, y, text=icon, font=("Segoe UI Emoji", 12), fill=fg, anchor="w")
             self.text_id = canvas.create_text(x, y, text=text, font=self.base_font, fill=fg, anchor=anchor)
             self.bg_id = canvas.create_image(x, y, anchor="center")
             self.outline_id = canvas.create_image(x, y, anchor="center", state="hidden")
@@ -30905,6 +30704,11 @@ function FindProxyForURLEx(url, host) {{
             self.canvas.tag_bind(self.text_id, "<ButtonRelease-1>", self._on_release)
             self.canvas.tag_bind(self.text_id, "<Enter>", lambda e: self._set_hover(True))
             self.canvas.tag_bind(self.text_id, "<Leave>", lambda e: self._set_hover(False))
+            if self.icon_id is not None:
+                self.canvas.tag_bind(self.icon_id, "<ButtonPress-1>", self._on_press)
+                self.canvas.tag_bind(self.icon_id, "<ButtonRelease-1>", self._on_release)
+                self.canvas.tag_bind(self.icon_id, "<Enter>", lambda e: self._set_hover(True))
+                self.canvas.tag_bind(self.icon_id, "<Leave>", lambda e: self._set_hover(False))
 
         def _on_press(self, event=None):
             self._pressed = True
@@ -30928,6 +30732,21 @@ function FindProxyForURLEx(url, host) {{
         def _draw_bg(self):
             bbox = self.canvas.bbox(self.text_id)
             if not bbox: return
+            if self.icon_id is not None:
+                icon_box = self.canvas.bbox(self.icon_id)
+                icon_width = icon_box[2] - icon_box[0]
+                text_width = bbox[2] - bbox[0]
+                gap = round(6 * UI_SCALE)
+                total_width = icon_width + gap + text_width
+                left = self.x - total_width / 2
+                if self.anchor in ("w", "nw", "sw"):
+                    left = self.x
+                elif self.anchor in ("e", "ne", "se"):
+                    left = self.x - total_width
+                self.canvas.itemconfig(self.text_id, anchor="w")
+                self.canvas.coords(self.icon_id, left, self.y)
+                self.canvas.coords(self.text_id, left + icon_width + gap, self.y)
+                bbox = self.canvas.bbox(self.icon_id, self.text_id)
             x1, y1, x2, y2 = bbox
             
             w = max((x2 - x1) + self.padding_x * 2, getattr(self, "minimum_width", 0))
@@ -30949,6 +30768,8 @@ function FindProxyForURLEx(url, host) {{
             self.canvas.tag_lower(self.bg_id, self.text_id)
             self.canvas.tag_raise(self.outline_id, self.bg_id)
             self.canvas.tag_raise(self.text_id, self.outline_id)
+            if self.icon_id is not None:
+                self.canvas.tag_raise(self.icon_id, self.text_id)
             
             # Привязываем события к фону
             self.canvas.tag_bind(self.bg_id, "<ButtonPress-1>", self._on_press)
@@ -30978,12 +30799,15 @@ function FindProxyForURLEx(url, host) {{
             state = "normal" if visible else "hidden"
             try: self.canvas.itemconfig(self.text_id, state=state)
             except: pass
+            if self.icon_id is not None:
+                self.canvas.itemconfig(self.icon_id, state=state)
             try: self.canvas.itemconfig(self.bg_id, state=state)
             except: pass
             try: self.canvas.itemconfig(self.outline_id, state="hidden")
             except: pass
 
         def move_to(self, x, y, anchor):
+            self.x, self.y, self.anchor = x, y, anchor
             self.canvas.coords(self.text_id, x, y)
             self.canvas.itemconfig(self.text_id, anchor=anchor)
             self._draw_bg()
@@ -31007,6 +30831,8 @@ function FindProxyForURLEx(url, host) {{
             if "fg" in kwargs:
                 self.fg = kwargs["fg"]
                 self.canvas.itemconfig(self.text_id, fill=self.fg)
+                if self.icon_id is not None:
+                    self.canvas.itemconfig(self.icon_id, fill=self.fg)
                 self._draw_bg()
             if "bg" in kwargs:
                 self.bg_color = kwargs["bg"]
@@ -31223,7 +31049,8 @@ function FindProxyForURLEx(url, host) {{
         except Exception: pass
         try: apply_window_icon(root)
         except: pass
-        root.resizable(True, True)
+        # The main window has one size (owner): stretching it is not offered.
+        root.resizable(False, False)
         UI_SCALE = nova_desktop_ui.display_scale(root)
         MIN_MAIN_WIDTH = round(nova_desktop_ui.MIN_WIDTH * UI_SCALE)
         MIN_MAIN_HEIGHT = round(nova_desktop_ui.MIN_HEIGHT * UI_SCALE)
@@ -31320,10 +31147,9 @@ function FindProxyForURLEx(url, host) {{
                 m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", str(geom).strip())
                 if m:
                     old_size = (int(m.group(1)), int(m.group(2)))
-                    if old_size in ((360, 270), (640, 600)):
-                        w_try, h_try = MIN_MAIN_WIDTH, MIN_MAIN_HEIGHT
-                    else:
-                        w_try, h_try = max(MIN_MAIN_WIDTH, old_size[0]), max(MIN_MAIN_HEIGHT, old_size[1])
+                    # Fixed size: a size saved by an older, stretchable build is ignored,
+                    # only the position is restored.
+                    w_try, h_try = MIN_MAIN_WIDTH, MIN_MAIN_HEIGHT
                     x_try, y_try = int(m.group(3)), int(m.group(4))
                     probe_x = x_try + max(20, w_try // 2)
                     probe_y = y_try + 20
@@ -31340,10 +31166,6 @@ function FindProxyForURLEx(url, host) {{
                 else:
                     # Legacy format fallback (size only)
                     m2 = re.match(r"(\d+)x(\d+)", str(geom))
-                    if m2:
-                        old_size = (int(m2.group(1)), int(m2.group(2)))
-                        if old_size not in ((360, 270), (640, 600)):
-                            w, h = max(MIN_MAIN_WIDTH, old_size[0]), max(MIN_MAIN_HEIGHT, old_size[1])
                     root.geometry(f"{w}x{h}")
                     geom_applied = True
             except:
@@ -31388,7 +31210,7 @@ function FindProxyForURLEx(url, host) {{
         status_label.bind("<Button-1>", start_move)
         status_label.bind("<B1-Motion>", do_move)
         btn_toggle = RoundedButton(main_canvas, *initial_layout["action"], round(232 * UI_SCALE), round(48 * UI_SCALE),
-                                   round(SETTINGS_THEME["radius"] * UI_SCALE), COLOR_BLUEBERRY_YOGURT,
+                                   round(24 * UI_SCALE), COLOR_BLUEBERRY_YOGURT,
                                    "ПОДКЛЮЧИТЬ", toggle_service,
                                    fg=nova_desktop_ui.action_foreground(APPEARANCE["theme"]))
         log_fg = SETTINGS_THEME["text"]
@@ -31414,11 +31236,13 @@ function FindProxyForURLEx(url, host) {{
         MAIN_ROW_3 = MAIN_ROW_1
         MAIN_CORNER_FONT = main_fonts["control"]
         btn_logs = CanvasButton(main_canvas, w * 5 / 6 - 8, MAIN_ROW_1, "Журнал",
-                                MAIN_CORNER_FONT, toggle_log_window, anchor="center", fg=log_fg, bg_color=log_bg)
+                                MAIN_CORNER_FONT, toggle_log_window, anchor="center", fg=log_fg, bg_color=log_bg, icon="✍")
         btn_settings = None
         btn_profiles = None
         refresh_update_button()
 
+        ui_jobs = nova_desktop_ui.UiJobs(root)
+        ui_log_pump.start(root, _deliver_log_rows)
         routing_settings_window_ref = {
             "win": None,
             "last_toggle_ts": 0.0,
@@ -31478,8 +31302,10 @@ function FindProxyForURLEx(url, host) {{
                 self._render()
 
             def set_selected(self, selected):
-                self._selected = bool(selected)
-                self._render()
+                selected = bool(selected)
+                if self._selected != selected:
+                    self._selected = selected
+                    self._render()
 
             def _on_enter(self, _event=None):
                 self._hover = True
@@ -31798,15 +31624,18 @@ function FindProxyForURLEx(url, host) {{
             except:
                 pass
 
-        def toggle_routing_settings_window():
+        def toggle_routing_settings_window(precreate=False):
             now_ts = time.time()
             last_toggle_ts = float(routing_settings_window_ref.get("last_toggle_ts") or 0.0)
-            if now_ts - last_toggle_ts < 0.18:
+            if not precreate and now_ts - last_toggle_ts < 0.18:
                 return
-            routing_settings_window_ref["last_toggle_ts"] = now_ts
+            if not precreate:
+                routing_settings_window_ref["last_toggle_ts"] = now_ts
             existing = routing_settings_window_ref.get("win")
             try:
                 if existing and existing.winfo_exists():
+                    if precreate:
+                        return
                     if str(existing.state()) != "withdrawn":
                         _close_routing_settings_window()
                         return
@@ -31815,7 +31644,24 @@ function FindProxyForURLEx(url, host) {{
             except:
                 routing_settings_window_ref["win"] = None
 
-            saved = load_routing_settings()
+            if routing_settings_window_ref.get("building"):
+                return
+            routing_settings_window_ref["building"] = True
+
+            def _collect():
+                return (load_routing_settings(), nova_vpn_slots.primary_choice_from_selection(
+                    nova_profiles.load_selection(get_base_dir()))["kind"])
+
+            def _ready(value, error):
+                routing_settings_window_ref["building"] = False
+                if error is not None:
+                    log_print(f"[UI] Не удалось подготовить настройки: {error}")
+                    return
+                _build_routing_settings_window(value[0], value[1], precreate)
+
+            ui_jobs.submit(_collect, _ready, "NovaSettingsData")
+
+        def _build_routing_settings_window(saved, initial_primary, precreate):
             current_modes = {
                 key: get_routing_group_mode(key, saved)
                 for key, _label in routing_group_rows
@@ -31856,11 +31702,6 @@ function FindProxyForURLEx(url, host) {{
             ).pack(fill="x", pady=(0, 6))
 
             pills_by_group = {}
-            try:
-                initial_primary = nova_vpn_slots.primary_choice_from_selection(
-                    nova_profiles.load_selection(get_base_dir()))["kind"]
-            except Exception:
-                initial_primary = nova_vpn_slots.PRIMARY_AUTO
             primary_state = {"value": initial_primary, "initial": initial_primary}
             primary_pills = {}
             secondary_state = {"value": nova_vpn_slots.secondary_pill_key(get_secondary_vpn_choice(saved))}
@@ -32177,21 +32018,23 @@ function FindProxyForURLEx(url, host) {{
             btn_save_popup.set_selected(True)
             btn_save_popup.pack(side="right", padx=(0, 6))
 
-            def _refresh_popup_state():
-                try:
-                    latest = load_routing_settings()
-                except:
-                    latest = DEFAULT_ROUTING_SETTINGS
+            def _refresh_popup_state(latest=None, current_primary=None):
+                if latest is None:
+                    def _collect():
+                        return (load_routing_settings(), nova_vpn_slots.primary_choice_from_selection(
+                            nova_profiles.load_selection(get_base_dir()))["kind"])
+                    def _ready(value, error):
+                        if error is not None:
+                            log_print(f"[UI] Не удалось обновить настройки: {error}")
+                        elif win.winfo_exists():
+                            _refresh_popup_state(*value)
+                    ui_jobs.submit(_collect, _ready, "NovaSettingsRefresh")
+                    return
                 for key, _label in routing_group_rows:
                     current_modes[key] = get_routing_group_mode(key, latest)
                     _refresh_group_pills(key)
                 secondary_state["value"] = nova_vpn_slots.secondary_pill_key(get_secondary_vpn_choice(latest))
                 _refresh_secondary_pills()
-                try:
-                    current_primary = nova_vpn_slots.primary_choice_from_selection(
-                        nova_profiles.load_selection(get_base_dir()))["kind"]
-                except Exception:
-                    current_primary = nova_vpn_slots.PRIMARY_AUTO
                 primary_state["value"] = current_primary
                 primary_state["initial"] = current_primary
                 _refresh_primary_pills()
@@ -32206,10 +32049,11 @@ function FindProxyForURLEx(url, host) {{
                 _refresh_vpn_autoconnect_pills()
 
             win._refresh_state = _refresh_popup_state
-            _refresh_popup_state()
+            _refresh_popup_state(saved, initial_primary)
 
             win.update_idletasks()
-            root.after_idle(lambda w=win: _show_new_routing_settings_window(w))
+            if not precreate:
+                root.after_idle(lambda w=win: _show_new_routing_settings_window(w))
             root.bind("<Configure>", _align_routing_settings_window_to_main, add="+")
 
         # «Профили». The window lives in resources/nova_profiles_ui.py and sees Nova only
@@ -32261,20 +32105,8 @@ function FindProxyForURLEx(url, host) {{
             return True
 
         def _default_reserve_profile_group():
-            """The imported group a bare «Свой» falls back to: VLESS first, then Custom.
-
-            VLESS first because that group refills itself from subscriptions, so it is the one that
-            still has candidates a week later; Custom holds only what the owner put there by hand.
-            Returns "" when neither has a usable profile -- the runner then says so in the log.
-            """
-            try:
-                records = nova_profiles.list_profiles(get_base_dir())
-            except Exception:
-                return nova_profiles.GROUP_VLESS
-            for group in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM):
-                if any(r.get("group") == group and r.get("valid") for r in records):
-                    return group
-            return nova_profiles.GROUP_VLESS
+            """All imported protocols share one logical group; old ids remain valid."""
+            return nova_profiles.GROUP_CUSTOM
 
         def _apply_secondary_vpn_choice(mode, region=None, entry=None, source="меню",
                                         profile_group=None, profile_id=None):
@@ -32328,8 +32160,9 @@ function FindProxyForURLEx(url, host) {{
                 stats = nova_profiles.load_stats(base)
             except Exception:
                 return out
-            for group in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM):
-                chosen = next((x for x in wanted if x.partition("/")[0] == group), "")
+            for group in (nova_profiles.GROUP_CUSTOM,):
+                chosen = next((x for x in wanted if x.partition("/")[0] == group
+                               or group == nova_profiles.GROUP_CUSTOM and x.partition("/")[0] == nova_profiles.GROUP_VLESS), "")
                 sel = {"version": 1, "mode": nova_profiles.MODE_GROUP, "group": group}
                 try:
                     plan = nova_profiles.build_attempt_plan(records, sel, stats=stats)
@@ -32360,8 +32193,12 @@ function FindProxyForURLEx(url, host) {{
             data = {"primary": {"kind": nova_vpn_slots.PRIMARY_AUTO, "country": "", "profile": ""},
                     "countries": [], "secondary": get_secondary_vpn_choice(), "reissue_busy": False,
                     "imported": {}}
+            if data["secondary"].get("profile_group") == nova_profiles.GROUP_VLESS:
+                data["secondary"]["profile_group"] = nova_profiles.GROUP_CUSTOM
             with contextlib.suppress(Exception):
                 data["primary"] = nova_vpn_slots.primary_choice_from_selection(nova_profiles.load_selection(base))
+                if data["primary"].get("kind") == nova_vpn_slots.PRIMARY_VLESS:
+                    data["primary"]["kind"] = nova_vpn_slots.PRIMARY_CUSTOM
             with contextlib.suppress(Exception):
                 data["countries"] = nova_vpn_slots.order_countries(
                     nova_profiles.proton_countries(nova_profiles.list_profiles(base)))
@@ -32381,15 +32218,30 @@ function FindProxyForURLEx(url, host) {{
                 data["reissue_busy"] = bool(jobs is not None and jobs._pipeline_lock.locked())
             return data
 
+        vpn_popup_cache = {}
+
+        def _cached_vpn_menu(slot, data, x_root, y_root):
+            cached = vpn_popup_cache.get(slot)
+            if cached and cached[0] == APPEARANCE["theme"] and cached[1] == data:
+                _popup_vpn_menu(cached[2], x_root, y_root)
+                return True
+            return False
+
+        def _remember_vpn_menu(slot, data, menu):
+            old = vpn_popup_cache.get(slot)
+            if old is not None:
+                old[2].destroy()
+            vpn_popup_cache[slot] = (APPEARANCE["theme"], data, menu)
+
         def _vpn_menu_options():
             return {
                 "tearoff": 0,
                 "bg": SETTINGS_THEME["bg"],
                 "fg": SETTINGS_THEME["text"],
-                "activebackground": SETTINGS_THEME["pill_on_bg"],
-                "activeforeground": SETTINGS_THEME["pill_on_fg"],
+                "activebackground": SETTINGS_THEME["accent"],
+                "activeforeground": nova_desktop_ui.action_foreground(APPEARANCE["theme"]),
                 "selectcolor": SETTINGS_THEME["pill_on_fg"],
-                "disabledforeground": SETTINGS_THEME["muted"],
+                "disabledforeground": SETTINGS_THEME["value"],
                 "font": nova_appearance.font_roles(APPEARANCE["theme"])["control"],
             }
 
@@ -32415,11 +32267,11 @@ function FindProxyForURLEx(url, host) {{
             frame.pack(fill="both", expand=True, padx=8, pady=8)
             query = tk.StringVar()
             entry = tk.Entry(frame, textvariable=query, bg=theme["panel"], fg=theme["text"],
-                             insertbackground=theme["text"], relief="flat", font=("Segoe UI", 9),
+                             insertbackground=theme["text"], relief="flat", font=("Segoe UI Semibold", 9),
                              highlightthickness=1, highlightbackground=theme["border"],
                              highlightcolor=theme["pill_on_bg"])
             entry.pack(fill="x", pady=(0, 4))
-            count = tk.Label(frame, bg=theme["bg"], fg=theme["muted"], font=("Segoe UI", 8), anchor="w")
+            count = tk.Label(frame, bg=theme["bg"], fg=theme["muted"], font=("Segoe UI Semibold", 8), anchor="w")
             count.pack(fill="x", pady=(0, 4))
             box = tk.Frame(frame, bg=theme["bg"])
             box.pack(fill="both", expand=True)
@@ -32427,7 +32279,7 @@ function FindProxyForURLEx(url, host) {{
             lb = tk.Listbox(box, yscrollcommand=scroll.set, activestyle="none", exportselection=False,
                             bg=theme["panel"], fg=theme["text"], selectbackground=theme["pill_on_bg"],
                             selectforeground=theme["pill_on_fg"], highlightthickness=0, relief="flat",
-                            font=("Segoe UI", 9), width=60, height=22)
+                            font=("Segoe UI Semibold", 9), width=60, height=22)
             scroll.config(command=lb.yview)
             scroll.pack(side="right", fill="y")
             lb.pack(side="left", fill="both", expand=True)
@@ -32484,6 +32336,8 @@ function FindProxyForURLEx(url, host) {{
             return top
 
         def _show_primary_vpn_menu(data, x_root, y_root):
+            if _cached_vpn_menu("primary", data, x_root, y_root):
+                return
             primary = data.get("primary") or {}
             kind = primary.get("kind") or nova_vpn_slots.PRIMARY_AUTO
             if kind == nova_vpn_slots.PRIMARY_PROTON:
@@ -32493,15 +32347,15 @@ function FindProxyForURLEx(url, host) {{
             else:
                 current = kind
             var = tk.StringVar(value=current)
-            menu = tk.Menu(root, **_vpn_menu_options())
+            menu = nova_desktop_ui.ThemedMenu(root, work_area=get_monitor_work_area, **_vpn_menu_options())
             menu.add_command(label="Основной VPN", state="disabled")
             menu.add_separator()
-            for choice in (nova_vpn_slots.PRIMARY_AUTO, nova_vpn_slots.PRIMARY_CF_AWG, nova_vpn_slots.PRIMARY_CF_MASQUE):
+            for choice in (nova_vpn_slots.PRIMARY_AUTO, nova_vpn_slots.PRIMARY_CF_MASQUE, nova_vpn_slots.PRIMARY_CF_AWG):
                 menu.add_radiobutton(
                     label=nova_vpn_slots.PRIMARY_MENU_LABELS[choice], variable=var, value=choice,
                     command=lambda c=choice: _run_ui_worker(_apply_primary_vpn_choice, "NovaPrimaryVpnSwitch", c, "", "меню"),
                 )
-            proton_menu = tk.Menu(menu, **_vpn_menu_options())
+            proton_menu = nova_desktop_ui.ThemedMenu(menu, **_vpn_menu_options())
             proton_menu.add_radiobutton(
                 label="Любая страна (ближайшая)", variable=var, value=f"{nova_vpn_slots.PRIMARY_PROTON}:",
                 command=lambda: _run_ui_worker(_apply_primary_vpn_choice, "NovaPrimaryVpnSwitch",
@@ -32520,11 +32374,10 @@ function FindProxyForURLEx(url, host) {{
                 proton_menu.add_command(label="Профилей Proton ещё нет — выпустятся сами", state="disabled")
             menu.add_cascade(label=nova_vpn_slots.PRIMARY_MENU_LABELS[nova_vpn_slots.PRIMARY_PROTON], menu=proton_menu)
             imported = data.get("imported") or {}
-            for group_name, imported_kind in ((nova_profiles.GROUP_VLESS, nova_vpn_slots.PRIMARY_VLESS),
-                                              (nova_profiles.GROUP_CUSTOM, nova_vpn_slots.PRIMARY_CUSTOM)):
+            for group_name, imported_kind in ((nova_profiles.GROUP_CUSTOM, nova_vpn_slots.PRIMARY_CUSTOM),):
                 info = imported.get(group_name) or {}
                 rows = list(info.get("rows") or [])
-                sub = tk.Menu(menu, **_vpn_menu_options())
+                sub = nova_desktop_ui.ThemedMenu(menu, **_vpn_menu_options())
                 sub.add_radiobutton(
                     # «Auto», not «Любой профиль группы»: Nova measures the head of the group and
                     # starts with the node that answered fastest, then measures the rest once the
@@ -32568,9 +32421,12 @@ function FindProxyForURLEx(url, host) {{
                 command=_confirm_reissue_personal,
             )
             menu._nova_var = var  # the variable must outlive this function
+            _remember_vpn_menu("primary", data, menu)
             _popup_vpn_menu(menu, x_root, y_root)
 
         def _show_secondary_vpn_menu(data, x_root, y_root):
+            if _cached_vpn_menu("secondary", data, x_root, y_root):
+                return
             choice = data.get("secondary") or {}
             mode = choice.get("mode") or nova_vpn_slots.SECONDARY_AUTO
             if mode == nova_vpn_slots.SECONDARY_OPERA:
@@ -32582,7 +32438,7 @@ function FindProxyForURLEx(url, host) {{
             else:
                 current = "auto"
             var = tk.StringVar(value=current)
-            menu = tk.Menu(root, **_vpn_menu_options())
+            menu = nova_desktop_ui.ThemedMenu(root, work_area=get_monitor_work_area, **_vpn_menu_options())
             menu.add_command(label="Дополнительный VPN", state="disabled")
             menu.add_separator()
             menu.add_radiobutton(
@@ -32597,7 +32453,7 @@ function FindProxyForURLEx(url, host) {{
                                                             nova_vpn_slots.SECONDARY_OPERA, r, None, "меню"),
                 )
             proton_group = nova_profiles.GROUP_PROTON
-            proton_menu = tk.Menu(menu, **_vpn_menu_options())
+            proton_menu = nova_desktop_ui.ThemedMenu(menu, **_vpn_menu_options())
             proton_menu.add_radiobutton(
                 label="Любая страна (ближайшая)", variable=var, value=f"profile:{proton_group}",
                 command=lambda: _run_ui_worker(
@@ -32617,7 +32473,7 @@ function FindProxyForURLEx(url, host) {{
             if not proton_by_country:
                 proton_menu.add_command(label="Профилей Proton ещё нет — выпустятся сами", state="disabled")
             menu.add_cascade(label="Proton", menu=proton_menu)
-            tor_menu = tk.Menu(menu, **_vpn_menu_options())
+            tor_menu = nova_desktop_ui.ThemedMenu(menu, **_vpn_menu_options())
             for entry_key, entry_label in nova_vpn_slots.TOR_ENTRIES:
                 tor_menu.add_radiobutton(
                     label=entry_label, variable=var, value=f"tor:{entry_key}",
@@ -32626,9 +32482,9 @@ function FindProxyForURLEx(url, host) {{
                 )
             menu.add_cascade(label="Tor", menu=tor_menu)
             imported = data.get("imported") or {}
-            own_menu = tk.Menu(menu, **_vpn_menu_options())
+            own_menu = nova_desktop_ui.ThemedMenu(menu, **_vpn_menu_options())
             has_any = False
-            for group_name in (nova_profiles.GROUP_VLESS, nova_profiles.GROUP_CUSTOM):
+            for group_name in (nova_profiles.GROUP_CUSTOM,):
                 info = imported.get(group_name) or {}
                 rows = list(info.get("rows") or [])
                 if rows:
@@ -32675,6 +32531,7 @@ function FindProxyForURLEx(url, host) {{
             menu.add_command(label="Обновить мосты Tor",
                              command=lambda: _run_ui_worker(_refresh_tor_bridges_now, "NovaTorBridges"))
             menu._nova_var = var
+            _remember_vpn_menu("secondary", data, menu)
             _popup_vpn_menu(menu, x_root, y_root)
 
         def _refresh_tor_bridges_now():
@@ -32685,11 +32542,10 @@ function FindProxyForURLEx(url, host) {{
         def _popup_vpn_menu(menu, x_root, y_root):
             try:
                 menu.tk_popup(int(x_root), int(y_root))
-            except Exception:
-                pass
+            except tk.TclError as error:
+                log_print(f"[UI] Не удалось открыть меню VPN: {error}")
             finally:
-                with contextlib.suppress(Exception):
-                    menu.grab_release()
+                menu.grab_release()
 
         def _confirm_reissue_personal():
             try:
@@ -32715,25 +32571,17 @@ function FindProxyForURLEx(url, host) {{
                 return
             vpn_menu_request["busy"] = True
 
-            def _worker():
-                try:
-                    data = _gather_vpn_menu_data()
-                except Exception:
-                    data = {}
+            def _show(data, error):
+                vpn_menu_request["busy"] = False
+                if error is not None:
+                    log_print(f"[UI] Не удалось подготовить меню VPN: {error}")
+                    return
+                if slot_key == "primary":
+                    _show_primary_vpn_menu(data, x_root, y_root)
+                elif slot_key == "secondary":
+                    _show_secondary_vpn_menu(data, x_root, y_root)
 
-                def _show():
-                    vpn_menu_request["busy"] = False
-                    if slot_key == "primary":
-                        _show_primary_vpn_menu(data, x_root, y_root)
-                    elif slot_key == "secondary":
-                        _show_secondary_vpn_menu(data, x_root, y_root)
-
-                try:
-                    root.after(0, _show)
-                except Exception:
-                    vpn_menu_request["busy"] = False
-
-            _run_ui_worker(_worker, "NovaVpnMenuData")
+            ui_jobs.submit(_gather_vpn_menu_data, _show, "NovaVpnMenuData")
 
         def _route_browsers_through_tor_worker(enable, tor_entry=None):
             """Browser row <-> "tor" through apply_routing_settings_live: one path for PAC and Tor."""
@@ -32966,7 +32814,7 @@ function FindProxyForURLEx(url, host) {{
             main_canvas,
             w / 2,
             MAIN_ROW_2,
-            "Настройки",
+            "⚙ Настройки",
             MAIN_CORNER_FONT,
             toggle_routing_settings_window,
             anchor="center",
@@ -32979,7 +32827,7 @@ function FindProxyForURLEx(url, host) {{
             main_canvas,
             w / 6 + 8,
             MAIN_ROW_3,
-            "Профили",
+            "📑 Профили",
             MAIN_CORNER_FONT,
             toggle_profiles_window_ui,
             anchor="center",
@@ -33022,7 +32870,88 @@ function FindProxyForURLEx(url, host) {{
             anchor="e",
             bg_color=log_bg,
         )
-        dns_ai_indicator_pill.set_regions([])
+        dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", SETTINGS_THEME["muted"], "dns_ai")])
+        dns_ai_install_state = {"busy": False, "menu": None}
+
+        def _install_dns_ai():
+            if dns_ai_install_state["busy"]:
+                return
+            dns_ai_install_state["busy"] = True
+            log_print("[DNS-AI] Настройка шифрованного DNS Windows 11…")
+
+            def _work():
+                result = nova_dns_ai.install_system_dns()
+                try:
+                    refresh_nrpt_for_system_dns(log_print)
+                except Exception as error:
+                    log_print(f"[DNS-AI] DNS установлен, но правила Nova не обновились: {error}")
+                return result
+
+            def _done(value, error):
+                dns_ai_install_state["busy"] = False
+                if error is not None:
+                    log_print(f"[DNS-AI] Установка не завершена: {error}")
+                    messagebox.showerror("DNS-AI", str(error), parent=root)
+                    return
+                dns_ai_watch_state["next_check_ts"] = 0.0
+                apply_dns_ai_indicator_state(True, False, True)
+                log_print("[DNS-AI] В Windows настроен DNS over HTTPS без открытого DNS.")
+
+            ui_jobs.submit(_work, _done, "NovaDnsAiInstall")
+
+        def _open_dns_ai_menu(_key, x_root, y_root):
+            old = dns_ai_install_state["menu"]
+            if old is not None:
+                old.destroy()
+            menu = nova_desktop_ui.ThemedMenu(root, work_area=get_monitor_work_area, **_vpn_menu_options())
+            dns_ai_install_state["menu"] = menu
+            installed = bool(_nrpt_state.get("system_dns_ai"))
+            menu.add_command(label="⇄ DNS-AI", state="disabled")
+            menu.add_separator()
+            if dns_ai_install_state["busy"]:
+                menu.add_command(label="Настройка DNS over HTTPS…", state="disabled")
+            elif installed:
+                menu.add_command(label="DNS-AI уже обслуживает систему", state="disabled")
+            elif nova_dns_ai.is_windows_11():
+                menu.add_command(label="Установить в Windows 11 (DoH)", command=_install_dns_ai)
+            else:
+                menu.add_command(label="Системная установка доступна в Windows 11", state="disabled")
+            menu.add_command(label="https://dns.dns-ai.ru/dns-query", state="disabled")
+            _popup_vpn_menu(menu, x_root, y_root)
+
+        dns_ai_indicator_pill.set_click_handler(_open_dns_ai_menu)
+
+        def _open_main_link(url):
+            def _open():
+                import webbrowser
+                try:
+                    if not webbrowser.open(url):
+                        log_print("[UI] Не удалось открыть ссылку в браузере.")
+                except OSError as error:
+                    log_print(f"[UI] Не удалось открыть ссылку: {error}")
+            _run_ui_worker(_open, "NovaOpenLink")
+
+        footer_links = []
+
+        def _footer_link_hover(index, hovered):
+            nova_desktop_ui.set_link_hover(footer_links[index], hovered, SETTINGS_THEME["accent"])
+            if index == 1:
+                nova_desktop_ui.set_link_hover(footer_heart, hovered, "#ff7777", underline=False)
+            main_canvas.configure(cursor="hand2" if hovered else "")
+
+        for index, (caption, url) in enumerate((("Telegram чат", "https://t.me/nova_txt"),
+                                               ("Благодарности", "https://nova.gratis/donate"))):
+            link = CanvasLabel(main_canvas, 0, 0, caption, main_fonts["caption"],
+                               fg=SETTINGS_THEME["value"], outline_width=0)
+            link.bind("<Button-1>", lambda event, target=url: _open_main_link(target))
+            link.bind("<Enter>", lambda event, i=index: _footer_link_hover(i, True))
+            link.bind("<Leave>", lambda event, i=index: _footer_link_hover(i, False))
+            footer_links.append(link)
+        footer_heart = CanvasLabel(main_canvas, 0, 0, "♥", ("Segoe UI Semibold", 11),
+                                   fg="#ef4444", anchor="e", outline_width=0)
+        footer_heart.bind("<Button-1>", lambda event: _open_main_link("https://nova.gratis/donate"))
+        footer_heart.bind("<Enter>", lambda event: _footer_link_hover(1, True))
+        footer_heart.bind("<Leave>", lambda event: _footer_link_hover(1, False))
 
         appearance_window_ref = {"view": None}
 
@@ -33058,7 +32987,11 @@ function FindProxyForURLEx(url, host) {{
             global LOG_COLOR_TEXT_NORMAL, LOG_COLOR_TEXT_INFO
             global update_button_default_fg, update_button_available_fg
             previous_settings, previous_log = dict(SETTINGS_THEME), dict(LOG_THEME)
+            previous_theme = APPEARANCE["theme"]
             APPEARANCE.update(preferences)
+            if APPEARANCE["theme"] == previous_theme:
+                main_scene.set_appearance(APPEARANCE)
+                return
             SETTINGS_THEME.update(nova_appearance.settings_theme(APPEARANCE["theme"]))
             LOG_THEME.update(nova_appearance.log_theme(APPEARANCE["theme"]))
             COLOR_BG = SETTINGS_THEME["bg"]
@@ -33073,7 +33006,7 @@ function FindProxyForURLEx(url, host) {{
             main_canvas.configure(bg=COLOR_BG)
             main_scene.set_appearance(APPEARANCE)
             fonts = nova_appearance.font_roles(APPEARANCE["theme"])
-            btn_toggle.radius = round(SETTINGS_THEME["radius"] * UI_SCALE)
+            btn_toggle.radius = round(btn_toggle.height / 2)
             btn_toggle.disabled_color = SETTINGS_THEME["pill_off_bg"]
             btn_toggle.normal_font = fonts["action"]
             btn_toggle.hover_font = btn_toggle.normal_font
@@ -33081,7 +33014,7 @@ function FindProxyForURLEx(url, host) {{
                               fg=nova_desktop_ui.action_foreground(APPEARANCE["theme"]))
             main_canvas.itemconfig(btn_toggle.text_id, font=btn_toggle.normal_font)
             status_label.font_spec = fonts["status"]
-            status_label.tk_font.configure(family=fonts["status"][0], size=fonts["status"][1], weight="bold")
+            status_label.tk_font.configure(family=fonts["status"][0], size=fonts["status"][1], weight="normal")
             btn_update.font_spec = fonts["caption"]
             btn_update.tk_font.configure(family=fonts["caption"][0], size=fonts["caption"][1], weight="normal")
             btn_update.config(fg=SETTINGS_THEME["accent"])
@@ -33104,6 +33037,9 @@ function FindProxyForURLEx(url, host) {{
                 button.hover_fg = SETTINGS_THEME["accent"]
                 main_canvas.itemconfig(button.text_id, font=button.base_font)
                 button.config(fg=SETTINGS_THEME["text"], bg=SETTINGS_THEME["panel"])
+            for link in footer_links:
+                link.font_spec = fonts["caption"]
+                link.config(fg=SETTINGS_THEME["value"])
             profiles_view = nova_profiles_ui.get_profiles_window(profiles_ui_ctx)
             for child in root.winfo_children():
                 if profiles_view is not None and child is profiles_view.win:
@@ -33124,9 +33060,15 @@ function FindProxyForURLEx(url, host) {{
                                    ("clickable_cmd", SETTINGS_THEME["accent"])):
                     log_text_widget.tag_config(tag, foreground=color)
 
-        def toggle_appearance_window():
+        def toggle_appearance_window(precreate=False):
             view = appearance_window_ref["view"]
             if view is not None and view.top.winfo_exists():
+                if precreate:
+                    return
+                if view.top.state() != "withdrawn":
+                    view.top.withdraw()
+                    return
+                view.top.deiconify()
                 view.top.lift()
                 view.top.focus_set()
                 return
@@ -33139,9 +33081,9 @@ function FindProxyForURLEx(url, host) {{
                 win.geometry(f"+{x}+{y}")
                 apply_window_icon(win)
             appearance_window_ref["view"] = nova_desktop_ui.AppearanceWindow(
-                root, APPEARANCE, apply_appearance, place_window=_place_appearance)
+                root, APPEARANCE, apply_appearance, place_window=_place_appearance, show=not precreate)
 
-        btn_appearance = CanvasButton(main_canvas, w - round(24 * UI_SCALE), initial_layout["header_y"], "Оформление", MAIN_CORNER_FONT,
+        btn_appearance = CanvasButton(main_canvas, w - round(24 * UI_SCALE), initial_layout["header_y"], "🎨 Оформление", MAIN_CORNER_FONT,
                                       toggle_appearance_window, anchor="e", fg=log_fg, bg_color=log_bg)
 
         def layout_main_scene(event=None):
@@ -33163,6 +33105,12 @@ function FindProxyForURLEx(url, host) {{
                 button.minimum_height = round(32 * UI_SCALE)
                 x = round(20 * UI_SCALE) + (width - round(40 * UI_SCALE)) * (index + 0.5) / 3
                 button.move_to(x, layout["footer_y"], "center")
+            right = width - round(24 * UI_SCALE)
+            footer_heart.move_to(right, layout["links_y"], "e")
+            gratitude_right = right - footer_heart.tk_font.measure("♥") - round(5 * UI_SCALE)
+            footer_links[1].move_to(gratitude_right, layout["links_y"], "e")
+            telegram_right = gratitude_right - footer_links[1].tk_font.measure(footer_links[1].text_val) - round(28 * UI_SCALE)
+            footer_links[0].move_to(telegram_right, layout["links_y"], "e")
             region_indicator_pill.slot_width = layout["slot_width"]
             region_indicator_pill.move_to(layout["slot_x"], layout["slot_y"])
             dns_ai_indicator_pill.move_to(width - layout["slot_x"], layout["route_heading_y"])
@@ -33198,7 +33146,7 @@ function FindProxyForURLEx(url, host) {{
                 pass
             regions = []
 
-            # Primary VPN: CF AWG, CF MASQUE, PROTON NL, AWG (Custom), CF WARP; the pending choice while down.
+            # Primary VPN: CF AWG, CF MASQUE, PROTON NL, imported protocol, CF WARP; the pending choice while down.
             vpn_text = str(vpn_label or "АВТО")
             if warp_ok:
                 regions.append((vpn_text, INDICATOR_WARP, "primary"))
@@ -33263,11 +33211,11 @@ function FindProxyForURLEx(url, host) {{
                 # не гасит. Серый - уже про работу самой Nova: подмену делает
                 # её каскад NRPT, а его без разблокировки не бывает.
                 if system_dns_ai:
-                    dns_ai_indicator_pill.set_regions([("DNS-AI", INDICATOR_DNS_AI)])
+                    dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", INDICATOR_DNS_AI, "dns_ai")])
                 elif ai_unlock_enabled and rules_applied:
-                    dns_ai_indicator_pill.set_regions([("DNS-AI", INDICATOR_PENDING)])
+                    dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", INDICATOR_PENDING, "dns_ai")])
                 else:
-                    dns_ai_indicator_pill.set_regions([])
+                    dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", INDICATOR_PENDING, "dns_ai")])
             except:
                 pass
 
@@ -33600,6 +33548,9 @@ function FindProxyForURLEx(url, host) {{
         # Отдельно от launch_background_tasks и позже неё: это работа для Tk-потока,
         # и она не должна конкурировать с первой отрисовкой.
         root.after(2500, lambda: root.after_idle(precreate_log_window))
+        root.after(3500, lambda: root.after_idle(lambda: toggle_routing_settings_window(precreate=True)))
+        root.after(4500, lambda: root.after_idle(lambda: nova_profiles_ui.precreate_profiles_window(profiles_ui_ctx)))
+        root.after(5500, lambda: root.after_idle(lambda: toggle_appearance_window(precreate=True)))
         
         check_scan_status_loop() 
         

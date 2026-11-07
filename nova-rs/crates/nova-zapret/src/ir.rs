@@ -142,7 +142,7 @@ impl DesyncMode {
             "fake" => Self::Fake,
             "fakeknown" => Self::FakeKnown,
             "multisplit" | "split" | "split2" => Self::MultiSplit,
-            "multidisorder" | "disorder" => Self::MultiDisorder,
+            "multidisorder" | "disorder" | "disorder2" => Self::MultiDisorder,
             "fakedsplit" => Self::FakedSplit,
             "fakeddisorder" => Self::FakedDisorder,
             "hostfakesplit" => Self::HostFakeSplit,

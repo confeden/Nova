@@ -23,6 +23,7 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
         sys.path.insert(0, str(_root))
 
 APP_ROOT = REPO_ROOT.parent if REPO_ROOT.name.lower() == "resources" else REPO_ROOT
+from nova_routing_profiles import is_dns_ai_endpoint, dns_ai_route_labels
 
 # `temp/` надо считать опубликованным: его прикладывают к отчётам о проблеме.
 # Имя пользователя Windows внутри пути программы опознаёт человека, а для
@@ -696,6 +697,8 @@ class NovaWfpTcpProxy:
     def _app_family_from_app_id(app_id: str) -> str:
         lower = str(app_id or "").replace("/", "\\").lower()
         process_name = lower.rsplit("\\", 1)[-1]
+        if process_name.startswith("dns-ai") and process_name.endswith(".exe"):
+            return "dns_ai"
         if process_name in {"pathofexilesteam.exe", "pathofexile_x64steam.exe"}:
             return "games-steam-direct"
         if any(token in lower for token in ("telegram.exe", "ayugram.exe", "novagram.exe", "telegram desktop")):
@@ -1045,6 +1048,20 @@ class NovaWfpTcpProxy:
         route_scope: str = "",
     ) -> List[dict]:
         app_family = str(app_family or "").strip().lower()
+        if app_family == "dns_ai" or is_dns_ai_endpoint(target_host, target_port):
+            # Live DoH latency owns this order; site preferences and old DIRECT caches do not.
+            labels = dns_ai_route_labels(self._warp_socks_available(),
+                                          self._attempt_by_label("opera-http") is not None)
+            healthy = [label for label in labels if not self._route_label_is_bad(
+                target_host, target_port, label, route_scope=route_scope)]
+            attempts = []
+            for label in healthy or labels:
+                attempt = self._attempt_by_label(label)
+                if attempt:
+                    attempt = dict(attempt)
+                    attempt["timeout"] = min(float(attempt.get("timeout") or 3), 2.0)
+                    attempts.append(attempt)
+            return attempts
         if app_family == "games-steam-direct":
             direct_attempt = self._attempt_by_label("direct")
             return [direct_attempt] if direct_attempt else []
@@ -2301,19 +2318,28 @@ class NovaWfpTcpProxy:
 
     async def run(self):
         self.server = await asyncio.start_server(self._handle_client, self.host, self.port)
+        ipv6_server = None
+        if self.host == "0.0.0.0" and socket.has_ipv6:
+            try:
+                ipv6_server = await asyncio.start_server(self._handle_client, "::", self.port, family=socket.AF_INET6)
+            except OSError as error:
+                self.log_func(f"[DNS-AI] IPv6-прокси недоступен: {error}")
         self.log_func(f"[NovaWFP][Proxy] listening on {self.host}:{self.port}")
         self._schedule_startup_prewarm()
-        async with self.server:
+        async with contextlib.AsyncExitStack() as servers:
+            await servers.enter_async_context(self.server)
+            if ipv6_server is not None:
+                await servers.enter_async_context(ipv6_server)
             serve_task = asyncio.create_task(self.server.serve_forever())
             stop_task = asyncio.create_task(self.stop_event.wait())
             keepalive_task = asyncio.create_task(self._warp_keepalive_loop())
             done, pending = await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
             keepalive_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError):
                 await keepalive_task
             for task in pending:
                 task.cancel()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
             if stop_task in done:
                 self.server.close()

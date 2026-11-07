@@ -5,7 +5,6 @@
 abuseipdb.com
 accounts.google.com
 soundcloud.cloud
-nova-app.eu
 activatica.org
 phncdn.com
 adguard-mail.com

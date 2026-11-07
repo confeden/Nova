@@ -21,7 +21,7 @@ for _path in (os.path.join(BASE_DIR, "resources"), BASE_DIR, APP_DIR):
     if _path and _path not in sys.path:
         sys.path.insert(0, _path)
 
-from nova_routing_profiles import match_app_by_process_path
+from nova_routing_profiles import match_app_by_process_path, dns_ai_route_state, is_dns_ai_endpoint
 from nova_transport_plans import _get_app_route_mode
 
 # Лог пишется удержанным handle с потолком по размеру: open+close на каждую
@@ -108,6 +108,7 @@ APP_FAMILY = {
     "OBS": "obs",
     "Spotify": "spotify",
     "AI Apps": "ai_apps",
+    "DNS-AI": "dns_ai",
 }
 
 
@@ -548,7 +549,7 @@ class ProcessResolver:
         # и опознаётся дальше (`_app_family_from_app_id` ищет в нём подстроки
         # вроде `telegram desktop`).
         path = redact_user_path(path)
-        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "GamesDirect", "OBS", "Spotify", "AI Apps"}:
+        if app not in {"Discord", "Telegram", "WhatsApp", "Games", "GamesDirect", "OBS", "Spotify", "AI Apps", "DNS-AI"}:
             app = None
         with self._lock:
             self._cache[pid] = {"ts": now, "path": path, "app": app}
@@ -774,6 +775,63 @@ def _parse_ipv4_udp(packet):
     }
 
 
+def _parse_tcp_packet(packet):
+    if packet and packet[0] >> 4 == 6:
+        # DNS-AI native DoH can choose either family. Fragmented/extended IPv6 is left intact.
+        if len(packet) < 60 or packet[6] != IPPROTO_TCP:
+            return None
+        return {"ihl": 40, "src_ip": socket.inet_ntop(socket.AF_INET6, packet[8:24]),
+                "dst_ip": socket.inet_ntop(socket.AF_INET6, packet[24:40]),
+                "src_port": int.from_bytes(packet[40:42], "big"),
+                "dst_port": int.from_bytes(packet[42:44], "big"), "flags": packet[53]}
+    return _parse_ipv4_tcp(packet)
+
+
+def _rewrite_tcp_packet(packet, **changes):
+    if packet[0] >> 4 != 6:
+        return _rewrite_ipv4_tcp(packet, **changes)
+    data = bytearray(packet)
+    for key, start in (("src_ip", 8), ("dst_ip", 24)):
+        if changes.get(key) is not None:
+            data[start:start + 16] = socket.inet_pton(socket.AF_INET6, changes[key])
+    for key, start in (("src_port", 40), ("dst_port", 42)):
+        if changes.get(key) is not None:
+            data[start:start + 2] = int(changes[key]).to_bytes(2, "big")
+    data[56:58] = b"\x00\x00"
+    return bytes(data)
+
+
+def _tcp_owner_pid(parsed):
+    """Resolve SYN ownership before static capture; never recapture our proxy's direct fallback."""
+    v6 = ":" in parsed["src_ip"]
+    family, row_size = (socket.AF_INET6, 56) if v6 else (socket.AF_INET, 24)
+    size = wintypes.ULONG(0)
+    api = ctypes.WinDLL("iphlpapi", use_last_error=True).GetExtendedTcpTable
+    api.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.ULONG), wintypes.BOOL,
+                    wintypes.ULONG, wintypes.ULONG, wintypes.ULONG]
+    api(None, ctypes.byref(size), False, family, 5, 0)
+    for _ in range(3):
+        table = ctypes.create_string_buffer(size.value)
+        rc = api(table, ctypes.byref(size), False, family, 5, 0)
+        if rc == 122:
+            continue
+        if rc:
+            raise OSError(rc, "GetExtendedTcpTable")
+        raw = table.raw
+        for index in range(int.from_bytes(raw[:4], "little")):
+            row = raw[4 + index * row_size:4 + (index + 1) * row_size]
+            address = socket.inet_ntop(family, row[:16] if v6 else row[4:8])
+            offset = 20 if v6 else 8
+            remote_offset, remote_port_offset = (24, 44) if v6 else (12, 16)
+            remote = socket.inet_ntop(family, row[remote_offset:remote_offset + (16 if v6 else 4)])
+            if (address == parsed["src_ip"] and int.from_bytes(row[offset:offset + 2], "big") == parsed["src_port"]
+                    and remote == parsed["dst_ip"]
+                    and int.from_bytes(row[remote_port_offset:remote_port_offset + 2], "big") == parsed["dst_port"]):
+                return int.from_bytes(row[-4:], "little")
+        return None
+    raise OSError("TCP owner table kept changing")
+
+
 def _rewrite_ipv4_tcp(packet, *, src_ip=None, src_port=None, dst_ip=None, dst_port=None):
     data = bytearray(packet)
     ihl = (data[0] & 0x0F) * 4
@@ -947,6 +1005,8 @@ class RedirectService:
             return None
         pid = int(data.ProcessId)
         process_path, app = self.resolver.resolve(pid)
+        if app == "DNS-AI" and not dns_ai_route_state():
+            return None
         if app not in APP_FAMILY:
             return None
         direct_bypass = app == "GamesDirect"
@@ -976,7 +1036,7 @@ class RedirectService:
                 "timestamp": time.time(),
             }
         remote_ip = self._format_addr(data.RemoteAddr)
-        if ":" in remote_ip:
+        if ":" in remote_ip and app != "DNS-AI":
             return None
         remote_port = int(data.RemotePort)
         if not _is_global_target(remote_ip):
@@ -1144,6 +1204,40 @@ class RedirectService:
         with self._flow_lock:
             return dict(self._tuple_to_flow.get(key) or {})
 
+    def _dns_ai_meta(self, parsed):
+        if not is_dns_ai_endpoint(parsed["dst_ip"], parsed["dst_port"]):
+            return None
+        session = self._lookup_session("tcp", parsed["src_ip"], parsed["src_port"])
+        if (session.get("app_family") == "dns_ai" and session.get("remote_ip") == parsed["dst_ip"]
+                and session.get("remote_port") == parsed["dst_port"]):
+            return session
+        try:
+            pid = _tcp_owner_pid(parsed)
+        except OSError as error:
+            if self._should_log("dns_ai_owner_error"):
+                self.log(f"[DNS-AI] Не удалось определить владельца DNS-соединения: {error}")
+            return {"app_family": "dns-ai-direct"}
+        # An unattributed SYN is left alone rather than risk a proxy -> proxy loop.
+        if pid is None:
+            return {"app_family": "dns-ai-direct"}
+        root = os.path.dirname(os.path.dirname(self.map.path))
+        for filename in ("NovaDivertTcpProxy.pid", "NovaWfpTcpProxy.pid"):
+            try:
+                with open(os.path.join(root, "temp", filename), encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Proxy PID record must be an object")
+                    if int(payload.get("pid") or 0) == pid:
+                        return {"app_family": "dns-ai-direct"}
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                if self._should_log("dns_ai_pid_error"):
+                    self.log(f"[DNS-AI] Не удалось прочитать PID прокси: {error}")
+                return {"app_family": "dns-ai-direct"}
+        return {"app": "DNS-AI", "app_family": "dns_ai", "pid": pid,
+                "exe": "", "preferred_egress": 1}
+
     def _lookup_session(self, protocol, local_ip, local_port):
         local_port = int(local_port)
         local_ip_key = str(local_ip).lower()
@@ -1155,6 +1249,8 @@ class RedirectService:
             for (session_proto, _session_ip, session_port), meta in self._sessions.items():
                 try:
                     if str(session_proto or "").strip().lower() != protocol:
+                        continue
+                    if (":" in str(_session_ip)) != (":" in local_ip_key):
                         continue
                     if int(session_port) == local_port:
                         return dict(meta)
@@ -1297,14 +1393,14 @@ class RedirectService:
                 modified = packet
                 recalc = False
                 send_addr = addr
-                parsed = _parse_ipv4_tcp(packet)
+                parsed = _parse_tcp_packet(packet)
                 if parsed:
                     parsed["protocol"] = "tcp"
                     # Proxy -> app: restore original source so the client sees the real remote endpoint.
                     if int(parsed["src_port"]) in {self.tcp_proxy_port, self.telegram_relay_port}:
                         meta = self._lookup_session("tcp", parsed["dst_ip"], parsed["dst_port"])
                         if meta:
-                            modified = _rewrite_ipv4_tcp(
+                            modified = _rewrite_tcp_packet(
                                 packet,
                                 src_ip=meta["remote_ip"],
                                 src_port=meta["remote_port"],
@@ -1331,8 +1427,13 @@ class RedirectService:
                         tcp_flags = int(parsed.get("flags") or 0)
                         opens_flow = bool(tcp_flags & TCP_FLAG_SYN) and not (tcp_flags & TCP_FLAG_ACK)
                         meta = self._lookup_flow(parsed)
+                        dns_ai_meta = self._dns_ai_meta(parsed)
+                        if dns_ai_meta is not None:
+                            meta = dns_ai_meta
+                        elif meta.get("app_family") == "dns_ai" and not dns_ai_route_state():
+                            meta = {}
                         direct_app_flow = bool(
-                            meta and meta.get("app_family") == "games-steam-direct"
+                            meta and meta.get("app_family") in {"games-steam-direct", "dns-ai-direct"}
                         )
                         if direct_app_flow:
                             meta = {}
@@ -1384,7 +1485,7 @@ class RedirectService:
                             # unreliable on some Windows stacks and leaves
                             # clients stuck in SYN-SENT.
                             proxy_host = str(parsed.get("src_ip") or "").strip() or "127.0.0.1"
-                            modified = _rewrite_ipv4_tcp(
+                            modified = _rewrite_tcp_packet(
                                 packet,
                                 dst_ip=proxy_host,
                                 dst_port=service_port,

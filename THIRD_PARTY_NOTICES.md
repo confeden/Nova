@@ -10,6 +10,30 @@ of a third-party license text is included, it is stored under
 
 ## Open-source components with bundled notice texts
 
+Python HTTP/2 support for DNS-AI latency checks: hyper-h2 4.4.1, hpack 4.2.0 and
+hyperframe 6.1.0, MIT licenses. Local license texts: `licenses/third_party/hyper-h2.txt`.
+Upstream: `https://github.com/python-hyper/h2`, `https://github.com/python-hyper/hpack`,
+`https://github.com/python-hyper/hyperframe`.
+
+`bin/nova-proxy.exe`
+Standalone Nova protocol helper, GPL-3.0, source and license in `nova-proxy/`.
+Embeds Mihomo v1.19.33 — `https://github.com/MetaCubeX/mihomo` — GPL-3.0.
+Local license: `licenses/third_party/GPL-3.0.txt`; dependency license/notice texts:
+`licenses/third_party/mihomo-dependencies.txt`.
+
+`bin/nova-engine.exe` appearance renderer
+- tiny-skia and tiny-skia-path — `https://github.com/linebender/tiny-skia` —
+  BSD-3-Clause — `licenses/third_party/tiny-skia-BSD-3-Clause.txt`,
+  `licenses/third_party/tiny-skia-path-BSD-3-Clause.txt`
+- ttf-parser — `https://github.com/harfbuzz/ttf-parser` — MIT —
+  `licenses/third_party/ttf-parser-MIT.txt`
+- Droid Sans Mono, unmodified AOSP font embedded in the renderer —
+  `https://android.googlesource.com/platform/frameworks/base/+/android-8.0.0_r1/data/fonts/` —
+  Apache-2.0 — `licenses/third_party/DroidSansMono-Apache-2.0.txt`
+- Nova Matrix Kana, a renamed halfwidth-katakana subset of Noto Sans CJK JP
+  (glyph outlines and hinting retained) — `https://github.com/notofonts/noto-cjk` —
+  SIL OFL 1.1 — `licenses/third_party/NovaMatrixKana-OFL-1.1.txt`
+
 `bin/WinDivert.dll`, `bin/WinDivert64.sys`
 Upstream: `https://github.com/basil00/WinDivert`
 License family used for notice purposes: LGPL-3.0

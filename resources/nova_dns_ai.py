@@ -39,9 +39,17 @@ AG Unlocker. Поэтому Legacy определяется по владель�
 
 import contextlib
 import ipaddress
+import base64
+import json
 import re
 import subprocess
 import time
+import sys
+import threading
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+import nova_exit_probe
 
 # Что вернул `detect_mode`. Пустая строка - DNS-AI машину не обслуживает.
 MODE_NATIVE = "native"
@@ -51,8 +59,227 @@ MODE_STUB = "stub"
 # это открытый UDP/53, а сервис на нём не отвечает (G74 / D18): такая машина
 # DNS-AI не обслуживает, и разблокировку ставит Nova.
 DOH_TEMPLATE = "https://dns.dns-ai.ru/dns-query"
+INSTALL_SERVERS = ("194.87.196.13", "45.151.102.219", "2a00:b700:5::3:62", "2a12:5940:d4ef::219")
 DOH_CACHE_SECONDS = 60.0
 _doh_cache = {"ts": 0.0, "value": False}
+
+
+def measure_route_latency(kind, port, budget=4.0):
+    """Time an authenticated DoH query through this VPN, including the server response."""
+    query = (b'\x4e\x56\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+             b'\x07example\x03com\x00\x00\x01\x00\x01')
+    encoded = base64.urlsafe_b64encode(query).decode('ascii').rstrip('=')
+    started = time.monotonic()
+    body = nova_exit_probe.fetch_via_proxy(kind, port, 'dns.dns-ai.ru', '/dns-query?dns=' + encoded,
+                                          budget=budget, binary=True, http2=True)
+    if (len(body) < 12 or body[:2] != query[:2] or not body[2] & 0x80 or body[3] & 0x0f):
+        raise nova_exit_probe.ProbeError('DNS-AI did not return a valid successful DNS response')
+    return round((time.monotonic() - started) * 1000, 2)
+
+
+class RouteLatencyMonitor:
+    """Bounded background samples tied to the exact live helper, with no system DNS changes."""
+
+    def __init__(self, probe=measure_route_latency, clock=time.monotonic):
+        self._probe, self._clock = probe, clock
+        self._lock = threading.Lock()
+        self._routes, self._samples = {}, {}
+        self._due = 0.0
+        self._running = False
+
+    def refresh(self, routes):
+        routes = dict(routes)
+        now = self._clock()
+        with self._lock:
+            if routes != self._routes:
+                self._samples = {label: sample for label, sample in self._samples.items()
+                                 if self._routes.get(label) == routes.get(label)}
+                self._routes = routes
+                self._due = 0.0
+            if not routes or self._running or now < self._due:
+                return
+            self._running = True
+        threading.Thread(target=self._sample, args=(routes,), daemon=True, name='NovaDnsAiLatency').start()
+
+    def _sample(self, routes):
+        def measure(item):
+            label, (_key, kind, port) = item
+            try:
+                return label, (self._probe(kind, port), '')
+            except nova_exit_probe.ProbeError as error:
+                return label, (None, str(error))
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = dict(pool.map(measure, routes.items()))
+            now = self._clock()
+            with self._lock:
+                for label, (ms, error) in results.items():
+                    if self._routes.get(label) == routes[label]:
+                        old = self._samples.get(label)
+                        if error and (old is None or old[2] != error):
+                            logging.getLogger(__name__).warning('DNS-AI: замер через %s не прошёл: %s', label, error)
+                        self._samples[label] = (ms, now, error)
+                self._due = now + 30.0 if self._routes == routes else 0.0
+        finally:
+            with self._lock:
+                self._running = False
+
+    def snapshot(self, routes):
+        now = self._clock()
+        with self._lock:
+            samples = {label: sample for label, sample in self._samples.items()
+                       if self._routes.get(label) == routes.get(label) and label in routes
+                       and 0 <= now - sample[1] <= 90.0}
+        return {'vpn_up': {label: label in routes for label in ('warp-socks', 'opera-http')},
+                'latency_ms': {label: sample[0] for label, sample in samples.items() if sample[0] is not None},
+                'latency_errors': {label: sample[2] for label, sample in samples.items() if sample[2]}}
+
+
+def is_windows_11():
+    if sys.platform != "win32":
+        return False
+    version = sys.getwindowsversion()
+    return version.build >= 22000 and version.product_type == 1
+
+
+def _run_dns_setup(script, timeout=45):
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        capture_output=True, timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    if result.returncode:
+        # The script emits only its own error message, never account/adapter metadata.
+        message = result.stdout.decode("utf-8-sig", "replace").strip()
+        raise RuntimeError(message or "Windows не смогла применить настройки DNS over HTTPS.")
+    return result.stdout.decode("utf-8-sig", "strict").strip()
+
+
+_DNS_SETUP_HEADER = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+"""
+
+_DNS_SNAPSHOT = r"""
+foreach ($cmd in @('Get-DnsClientDohServerAddress','Add-DnsClientDohServerAddress',
+    'Set-DnsClientDohServerAddress','Remove-DnsClientDohServerAddress','Set-DnsClientServerAddress')) {
+    $null = Get-Command $cmd -ErrorAction Stop
+}
+$routes = @(Get-NetRoute -ErrorAction Stop | Where-Object { $_.DestinationPrefix -in @('0.0.0.0/0','::/0') } |
+    Select-Object -ExpandProperty InterfaceIndex -Unique)
+$interfaces = @()
+foreach ($adapter in @(Get-NetAdapter -Physical | Where-Object {
+    $_.Status -eq 'Up' -and $_.InterfaceIndex -in $routes })) {
+    $families = @()
+    foreach ($dns in @(Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex)) {
+        $v6 = [int]$dns.AddressFamily -eq 23
+        $component = if ($v6) { 'ms_tcpip6' } else { 'ms_tcpip' }
+        if (-not (Get-NetAdapterBinding -InterfaceDescription $adapter.InterfaceDescription -ComponentID $component).Enabled) { continue }
+        $branch = if ($v6) { 'Tcpip6' } else { 'Tcpip' }
+        $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $branch + '\Parameters\Interfaces\' + $adapter.InterfaceGuid
+        $property = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+        $families += @{ family=[int]$dns.AddressFamily; servers=@($dns.ServerAddresses);
+            static=([bool]([string]$property.NameServer).Trim()) }
+    }
+    if ($families.Count) { $interfaces += @{ index=[int]$adapter.InterfaceIndex; families=$families } }
+}
+if (-not $interfaces.Count) { throw 'Нет активного физического адаптера с маршрутом в Интернет.' }
+$known = @(Get-DnsClientDohServerAddress)
+$doh = @()
+foreach ($server in $servers) {
+    $previous = $known | Where-Object { $_.ServerAddress -eq $server } | Select-Object -First 1
+    $doh += @{ server=$server; exists=($null -ne $previous); template=[string]$previous.DohTemplate;
+        auto=[bool]$previous.AutoUpgrade; fallback=[bool]$previous.AllowFallbackToUdp }
+}
+@{ interfaces=$interfaces; doh=$doh } | ConvertTo-Json -Depth 8 -Compress
+"""
+
+_DNS_APPLY = r"""
+foreach ($entry in $state.doh) {
+    $params = @{ ServerAddress=$entry.server; DohTemplate=$template; AutoUpgrade=$true; AllowFallbackToUdp=$false }
+    if ($entry.exists) { $null = Set-DnsClientDohServerAddress @params }
+    else { $null = Add-DnsClientDohServerAddress @params }
+}
+foreach ($adapter in $state.interfaces) {
+    foreach ($family in $adapter.families) {
+        $dns = Get-DnsClientServerAddress -InterfaceIndex $adapter.index |
+            Where-Object { [int]$_.AddressFamily -eq [int]$family.family }
+        if ($null -eq $dns) { throw 'Сетевой адаптер изменился во время настройки DNS.' }
+        $addresses = if ([int]$family.family -eq 23) { @($servers[2],$servers[3]) } else { @($servers[0],$servers[1]) }
+        $dns | Set-DnsClientServerAddress -ServerAddresses $addresses
+        $actual = Get-DnsClientServerAddress -InterfaceIndex $adapter.index |
+            Where-Object { [int]$_.AddressFamily -eq [int]$family.family }
+        if ((@($actual.ServerAddresses) -join ',') -ne ($addresses -join ',')) {
+            throw 'Windows не подтвердила новые адреса DNS.'
+        }
+    }
+}
+$known = @(Get-DnsClientDohServerAddress)
+foreach ($server in $servers) {
+    $entry = $known | Where-Object { $_.ServerAddress -eq $server } | Select-Object -First 1
+    if ($null -eq $entry -or $entry.DohTemplate -ne $template -or -not $entry.AutoUpgrade -or $entry.AllowFallbackToUdp) {
+        throw 'Windows не подтвердила обязательное шифрование DNS.'
+    }
+}
+Clear-DnsClientCache
+Write-Output 'OK'
+"""
+
+_DNS_ROLLBACK = r"""
+$errors = @()
+foreach ($adapter in $state.interfaces) {
+    foreach ($family in $adapter.families) {
+        try {
+            $dns = Get-DnsClientServerAddress -InterfaceIndex $adapter.index |
+                Where-Object { [int]$_.AddressFamily -eq [int]$family.family }
+            if ($null -eq $dns) { throw 'Адаптер отсутствует при восстановлении DNS.' }
+            if ($family.static) { $dns | Set-DnsClientServerAddress -ServerAddresses @($family.servers) }
+            else { $dns | Set-DnsClientServerAddress -ResetServerAddresses }
+        } catch { $errors += $_.Exception.Message }
+    }
+}
+$known = @(Get-DnsClientDohServerAddress)
+foreach ($entry in $state.doh) {
+    try {
+        if ($entry.exists) {
+            Set-DnsClientDohServerAddress -ServerAddress $entry.server -DohTemplate $entry.template `
+                -AutoUpgrade ([bool]$entry.auto) -AllowFallbackToUdp ([bool]$entry.fallback)
+        } elseif ($known.ServerAddress -contains $entry.server) {
+            Remove-DnsClientDohServerAddress -ServerAddress $entry.server -Confirm:$false
+        }
+    } catch { $errors += $_.Exception.Message }
+}
+if ($errors.Count) { throw ($errors -join '; ') }
+Clear-DnsClientCache
+"""
+
+
+def install_system_dns():
+    """Configure active physical adapters. Roll back exact static/DHCP settings on any failure."""
+    if not is_windows_11():
+        raise RuntimeError("Системный DNS-AI с DoH доступен только в Windows 11.")
+    servers = "$servers = @(" + ",".join("'%s'" % address for address in INSTALL_SERVERS) + ")\n"
+    header = _DNS_SETUP_HEADER + servers
+    # Capture before any mutation, in Python memory so an apply-process timeout can also roll back.
+    snapshot = json.loads(_run_dns_setup(header + _DNS_SNAPSHOT, timeout=20))
+    if not isinstance(snapshot, dict) or not snapshot.get("interfaces") or not snapshot.get("doh"):
+        raise RuntimeError("Не удалось сохранить прежние настройки DNS.")
+    state = json.dumps(snapshot, ensure_ascii=True).replace("'", "''")
+    setup = header + "$state = ConvertFrom-Json '" + state + "'\n$template = '" + DOH_TEMPLATE + "'\n"
+    # Convert PowerShell errors to UTF-8 stdout; stderr is CLIXML on some Windows versions.
+    def wrapped(script):
+        return setup + "try {\n" + script + "\n} catch { Write-Output $_.Exception.Message; exit 1 }"
+    try:
+        _run_dns_setup(wrapped(_DNS_APPLY))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        try:
+            _run_dns_setup(wrapped(_DNS_ROLLBACK))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as rollback_error:
+            raise RuntimeError(f"Не удалось применить DNS-AI: {error}. Восстановление DNS не завершено: {rollback_error}") from error
+        raise RuntimeError(f"Не удалось применить DNS-AI; прежние настройки восстановлены: {error}") from error
+    _doh_cache.update(ts=0.0, value=False)
+    return {"interfaces": len(snapshot["interfaces"]), "encrypted": True}
 
 # Имя процесса резолвера. Оно одно и то же и для службы `DnsAiClient` (она
 # запускает тот же файл с аргументом `service`), и для портативного запуска;

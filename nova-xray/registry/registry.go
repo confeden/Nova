@@ -1,10 +1,7 @@
-// Package registry регистрирует протоколы и транспорты, нужные Nova.
+// Package registry registers client protocols and transports for Xray-native profiles.
 //
-// Вместо main/distro/all — только клиентская часть: серверные входящие,
-// wireguard, hysteria и shadowsocks Nova не использует. Экономия по размеру
-// небольшая (JSON-загрузчик всё равно тянет конфигурационные типы всех
-// протоколов), но набор зарегистрированного соответствует тому, что реально
-// может прийти в ссылке vless://.
+// Mihomo handles the broader subscription ecosystem in a separate helper.
+// Native Xray outbounds retain their original transport and obfuscation options.
 //
 // Любой транспорт, который умеет отдавать генератор конфигурации
 // (VlessXrayConfig.kt), обязан быть здесь — иначе ядро примет конфигурацию,
@@ -23,11 +20,18 @@ import (
 	// берёт только SOCKS5. Без этой строки ядро примет конфигурацию с таким входящим и упадёт
 	// при запуске — то же правило, что и для транспортов ниже.
 	_ "github.com/xtls/xray-core/proxy/http"
+	_ "github.com/xtls/xray-core/proxy/hysteria"
+	_ "github.com/xtls/xray-core/proxy/shadowsocks"
+	_ "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	_ "github.com/xtls/xray-core/proxy/socks"
+	_ "github.com/xtls/xray-core/proxy/trojan"
 	_ "github.com/xtls/xray-core/proxy/vless/outbound"
+	_ "github.com/xtls/xray-core/proxy/vmess/outbound"
+	_ "github.com/xtls/xray-core/proxy/wireguard"
 
 	_ "github.com/xtls/xray-core/transport/internet/grpc"
 	_ "github.com/xtls/xray-core/transport/internet/httpupgrade"
+	_ "github.com/xtls/xray-core/transport/internet/hysteria"
 	_ "github.com/xtls/xray-core/transport/internet/kcp"
 	_ "github.com/xtls/xray-core/transport/internet/reality"
 	_ "github.com/xtls/xray-core/transport/internet/splithttp"

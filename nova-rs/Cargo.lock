@@ -38,6 +38,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -130,6 +142,12 @@ dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
 ]
+
+[[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "bytes"
@@ -466,6 +484,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,12 +524,13 @@ dependencies = [
 
 [[package]]
 name = "nova-cli"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "nova-cloudflare",
  "nova-core",
  "nova-health",
  "nova-learn",
+ "nova-render",
  "nova-zapret",
  "rand",
  "serde",
@@ -514,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "nova-cloudflare"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "nova-core",
  "serde",
@@ -524,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "nova-core"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -532,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "nova-health"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "nova-core",
  "serde",
@@ -541,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "nova-learn"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "nova-core",
  "rand",
@@ -553,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "nova-probe"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "nova-core",
  "serde",
@@ -561,12 +586,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-render"
+version = "1.45.0"
+dependencies = [
+ "serde",
+ "tiny-skia",
+ "ttf-parser",
+]
+
+[[package]]
 name = "nova-tgrelay"
-version = "1.44.2"
+version = "1.45.0"
 
 [[package]]
 name = "nova-tgrelay-net"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "aes",
  "ctr",
@@ -584,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "nova-tls"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "boring",
  "brotli",
@@ -598,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "nova-zapret"
-version = "1.44.2"
+version = "1.45.0"
 dependencies = [
  "nova-core",
  "rand",
@@ -874,6 +908,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "strict-num"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -913,6 +953,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "tiny-skia"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "bytemuck",
+ "cfg-if",
+ "log",
+ "tiny-skia-path",
+]
+
+[[package]]
+name = "tiny-skia-path"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
 ]
 
 [[package]]
@@ -971,6 +1036,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typenum"

@@ -56,7 +56,7 @@ __all__ = [
     "EGRESS_STATE_FILENAME", "egress_state_path", "make_egress_state", "normalize_egress_state",
     "write_egress_state", "read_egress_state", "EgressStateCache",
     "eu_route_slots", "ru_route_slots", "secondary_pac_tokens", "secondary_http_attempt",
-    "YOUTUBE_ROUTE_FOLLOWERS", "youtube_route_slots", "route_chain",
+    "YOUTUBE_ROUTE_FOLLOWERS", "youtube_route_slots", "route_chain", "browser_auto_slots",
     "LAST_FILENAME", "last_path", "load_last", "remember_primary", "remember_secondary",
 ]
 
@@ -139,7 +139,7 @@ PRIMARY_VLESS = "vless"
 PRIMARY_CF_WARP = "cf_warp"
 
 # What the settings row and the slot menu offer, in order.
-PRIMARY_CHOICES = (PRIMARY_AUTO, PRIMARY_CF_AWG, PRIMARY_CF_MASQUE, PRIMARY_PROTON,
+PRIMARY_CHOICES = (PRIMARY_AUTO, PRIMARY_CF_MASQUE, PRIMARY_CF_AWG, PRIMARY_PROTON,
                    PRIMARY_VLESS, PRIMARY_CUSTOM)
 # Kinds whose group holds profiles Nova cannot vouch for: reachable by naming them, never by «Авто».
 PRIMARY_IMPORTED_CHOICES = (PRIMARY_VLESS, PRIMARY_CUSTOM)
@@ -151,7 +151,7 @@ PRIMARY_MENU_LABELS = {
     PRIMARY_VLESS: "VLESS",
     # The same words as the tab in «Профили» (owner's request 2026-09-20): one group, one name.
     # The folder on disk and every stored id stay "Custom" — only what is shown changed.
-    PRIMARY_CUSTOM: "Custom AWG",
+    PRIMARY_CUSTOM: "Custom profiles",
 }
 PRIMARY_PILL_LABELS = {
     PRIMARY_AUTO: "Авто",
@@ -166,8 +166,8 @@ _PRIMARY_INDICATOR = {
     PRIMARY_CF_AWG: "CF AWG",
     PRIMARY_CF_MASQUE: "CF MASQUE",
     PRIMARY_PROTON: "PROTON",
-    PRIMARY_CUSTOM: "AWG",
-    PRIMARY_VLESS: "VLESS",
+    PRIMARY_CUSTOM: "CUSTOM",
+    PRIMARY_VLESS: "CUSTOM",
     PRIMARY_CF_WARP: "CF WARP",
 }
 
@@ -251,7 +251,8 @@ def selection_for_primary(kind, country="", profile=""):
     profile_id = str(profile or "").strip()
     if profile_id:
         prefix, sep, _name = profile_id.partition("/")
-        if sep and prefix.strip().lower() == group.lower():
+        if sep and (prefix.strip().lower() == group.lower()
+                    or kind == PRIMARY_CUSTOM and prefix.strip().lower() == _GROUP_VLESS.lower()):
             return {"version": 1, "mode": "profile", "group": group, "profile": profile_id}
     selection = {"version": 1, "mode": "group", "group": group}
     code = normalize_country(country)
@@ -260,24 +261,29 @@ def selection_for_primary(kind, country="", profile=""):
     return selection
 
 
-def primary_indicator_label(backend, profile_id, connected, choice_kind=PRIMARY_AUTO):
+def primary_indicator_label(backend, profile_id, connected, choice_kind=PRIMARY_AUTO, protocol=""):
     """What the main-window pill names: the backend that carries traffic, else the pending choice.
 
     `backend` is WarpManager.active_backend ("awg", "masque", "vless", "cloudflare"); `profile_id`
-    the full `group/name`. A Proton exit names its country when the profile name carries one.
+    the full `group/name`. `protocol` names the successful imported record, not the helper engine.
+    A Proton exit names its country when the profile name carries one.
     """
     backend = str(backend or "").strip().lower()
     if connected:
         if backend == "masque":
+            if str(profile_id or "").partition("/")[0].lower() == _GROUP_CUSTOM.lower():
+                return "MASQUE"
             return _PRIMARY_INDICATOR[PRIMARY_CF_MASQUE]
         if backend == "vless":
-            return _PRIMARY_INDICATOR[PRIMARY_VLESS]
+            return str(protocol or "VLESS").strip().upper()
         if backend == "awg":
             group, sep, name = str(profile_id or "").partition("/")
             kind = primary_kind_of_group(group) if sep else PRIMARY_CF_AWG
             if kind == PRIMARY_PROTON:
                 country = proton_country_of(name)
                 return f"PROTON {country}" if country else "PROTON"
+            if kind == PRIMARY_CUSTOM:
+                return "AWG"
             return _PRIMARY_INDICATOR.get(kind or PRIMARY_CF_AWG, "CF AWG")
         if backend in ("cloudflare", "warp-cli"):
             return _PRIMARY_INDICATOR[PRIMARY_CF_WARP]
@@ -401,7 +407,8 @@ def normalize_secondary_profile_block(block):
         group = prefix.strip() if sep else ""
     if profile:
         prefix, sep, _name = profile.partition("/")
-        if not sep or prefix.strip().lower() != group.lower():
+        if not sep or (prefix.strip().lower() != group.lower()
+                       and not (group == _GROUP_CUSTOM and prefix == _GROUP_VLESS)):
             # A profile id that does not live in the named group is not this group's choice.
             profile = ""
     return {"group": group, "profile": profile}
@@ -443,12 +450,8 @@ def secondary_choice_for_pill(pill_key, current=None):
 def secondary_attempts(choice, last=None):
     """The order the secondary slot walks: [(kind, region_or_entry_or_profile), ...].
 
-    Named choices are a list of one (I1). «Авто» starts with the last secondary that carried
-    traffic, then Opera in the configured region -- Opera's own controller may fall back EU -> US
-    inside that attempt, which is allowed in auto only -- then our own Proton group (D35), then Tor: the
-    remembered entry when there is one, otherwise Tor's own «Авто» walk. Any other imported profile
-    is a named choice only and never joins the «Авто» ring (D25); its own walk over the group's nodes happens one level down, inside
-    the runner, exactly the way a named Opera may still fall back EU -> US inside its attempt.
+    Named choices are a list of one (I1). Auto tries the exact last successful region/node first,
+    then Opera EU/US/AS, Proton, Tor and Custom, omitting an identical attempt already tried.
     """
     choice = choice if isinstance(choice, dict) else {}
     mode = normalize_secondary_mode(choice.get("mode"))
@@ -462,12 +465,18 @@ def secondary_attempts(choice, last=None):
         return [(SECONDARY_TOR, entry)]
     last = last if isinstance(last, dict) else {}
     last_kind = str(last.get("kind") or "").strip().lower()
-    opera_region = normalize_opera_region(last.get("region"), region) if last_kind == SECONDARY_OPERA else region
-    tor_entry = normalize_tor_entry(last.get("entry")) if last_kind == SECONDARY_TOR else TOR_ENTRY_AUTO
-    ring = [(SECONDARY_OPERA, opera_region), (SECONDARY_PROFILE, _GROUP_PROTON), (SECONDARY_TOR, tor_entry)]
-    for i, (kind, _value) in enumerate(ring):
-        if kind == last_kind:
-            return ring[i:] + ring[:i]
+    ring = [(SECONDARY_OPERA, r) for r in ("EU", "US", "AS")]
+    ring += [(SECONDARY_PROFILE, _GROUP_PROTON), (SECONDARY_TOR, TOR_ENTRY_AUTO),
+             (SECONDARY_PROFILE, _GROUP_CUSTOM)]
+    remembered = None
+    if last_kind == SECONDARY_OPERA:
+        remembered = (SECONDARY_OPERA, normalize_opera_region(last.get("region")))
+    elif last_kind == SECONDARY_TOR:
+        remembered = (SECONDARY_TOR, normalize_tor_entry(last.get("entry")))
+    elif last_kind == SECONDARY_PROFILE and str(last.get("profile") or "").strip():
+        remembered = (SECONDARY_PROFILE, str(last["profile"]).strip())
+    if remembered is not None:
+        return [remembered] + [a for a in ring if a != remembered]
     return ring
 
 
@@ -665,6 +674,19 @@ def eu_route_slots(primary_foreign):
 def ru_route_slots():
     """RU-list traffic (blocked by DPI, not by geography): the primary first, the secondary behind it."""
     return ["primary", "secondary"]
+
+
+def browser_auto_slots(*, primary_up, secondary_up, primary_foreign, secondary_foreign):
+    """Main/second lists in browser Auto; an unmeasured exit cannot be the only route."""
+    if primary_up and secondary_up:
+        main = ["primary"] + (["secondary"] if secondary_foreign else [])
+        second = ["secondary"] + (["primary"] if primary_foreign else [])
+        return main, second
+    if primary_up and primary_foreign:
+        return ["primary"], ["primary"]
+    if secondary_up and secondary_foreign:
+        return ["secondary"], ["secondary"]
+    return [], []
 
 
 # Names that must leave by googlevideo.com's exit even though they are not YouTube: Google binds a

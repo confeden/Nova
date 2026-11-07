@@ -14,6 +14,9 @@ from pathlib import Path
 import random
 import tempfile
 from functools import lru_cache
+import nova_fractal
+import nova_android_fractal
+import nova_android_textures
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
@@ -232,8 +235,9 @@ TEXTURES = {
 }
 
 DEFAULT_PREFERENCES = {
-    'theme': 'aurora', 'texture': 'none', 'texture_intensity': 0.18,
-    'variant': 0, 'temperature': 0,
+    'theme': 'dnsai', 'texture': 'marble', 'texture_intensity': 0.30,
+    'variant': 0, 'temperature': 0, 'immersion': True,
+    'random_texture_on_start': False,
 }
 
 
@@ -253,11 +257,13 @@ def _preferences(values):
     theme = values.get('theme')
     texture = values.get('texture')
     return {
-        'theme': theme if isinstance(theme, str) and theme in THEMES else 'aurora',
-        'texture': texture if isinstance(texture, str) and texture in TEXTURES else 'none',
-        'texture_intensity': _number(values.get('texture_intensity'), 0.18, 0, 0.6),
+        'theme': theme if isinstance(theme, str) and theme in THEMES else DEFAULT_PREFERENCES['theme'],
+        'texture': texture if isinstance(texture, str) and texture in TEXTURES else DEFAULT_PREFERENCES['texture'],
+        'texture_intensity': _number(values.get('texture_intensity'), DEFAULT_PREFERENCES['texture_intensity'], 0, 0.6),
         'variant': int(_number(values.get('variant'), 0, 0, 2 ** 31 - 1)),
         'temperature': int(_number(values.get('temperature'), 0, -100, 100)),
+        'immersion': values.get('immersion', DEFAULT_PREFERENCES['immersion']) is True,
+        'random_texture_on_start': values.get('random_texture_on_start', False) is True,
     }
 
 
@@ -273,15 +279,41 @@ def load_preferences(path):
         return dict(DEFAULT_PREFERENCES)
 
 
+def startup_preferences(path, choose=None):
+    """Choose once per process startup; persist the last texture before rendering."""
+    prefs = load_preferences(path)
+    if not prefs['random_texture_on_start']:
+        return prefs
+    candidates = [key for key in TEXTURES if key not in ('none', prefs['texture'])]
+    if not candidates:
+        return prefs
+    next_prefs = dict(prefs, texture=(choose or random.SystemRandom().choice)(candidates))
+    try:
+        save_preferences(path, next_prefs)
+    except OSError as error:
+        logging.getLogger(__name__).error('Cannot persist startup texture; keeping saved texture: %s', error)
+        return prefs
+    return next_prefs
+
+
 def save_preferences(path, prefs):
     """Save atomically. Write errors propagate so callers can show a useful error."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open('r', encoding='utf-8-sig') as stream:
+            previous = json.load(stream)
+    except FileNotFoundError:
+        previous = {}
+    if not isinstance(previous, dict) or not isinstance(prefs, dict):
+        raise ValueError('Appearance preferences must be an object')
+    merged = dict(previous, **prefs)
+    merged.update(_preferences(merged))
     descriptor, temporary = tempfile.mkstemp(prefix=destination.name + '.', suffix='.tmp',
                                               dir=str(destination.parent))
     try:
         with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as stream:
-            json.dump(_preferences(prefs), stream, ensure_ascii=False, indent=2)
+            json.dump(merged, stream, ensure_ascii=False, indent=2)
             stream.write('\n')
             stream.flush()
             os.fsync(stream.fileno())
@@ -326,17 +358,17 @@ def _veil(target, base):
 
 
 def font_roles(theme_id='aurora'):
-    """Keep compact UI text readable; reserve each theme's face for display roles."""
-    display = THEMES.get(theme_id, THEMES['aurora'])['font_family']
+    """Use the native Semibold face consistently; logs keep a monospace face."""
+    display = 'Segoe UI Semibold'
     body = 'Segoe UI Semibold'
     return {
-        'brand': (display, 20, 'bold'),
-        'title': (display, 16, 'bold'),
+        'brand': (display, 20),
+        'title': (display, 16),
         'body': (body, 10),
         'control': (body, 9),
         'action': ('Segoe UI Semibold', 11),
-        'status': (display, 12, 'bold'),
-        'section': (body, 9, 'bold'),
+        'status': (display, 12),
+        'section': (body, 9),
         'caption': (body, 9),
         'mono': ('Consolas', 9),
     }
@@ -426,60 +458,7 @@ def _voronoi(width, height, rng, cell=70, generations=1):
 
 
 def _mandelbrot(width, height, rng):
-    centres = [(-0.743643887037151, 0.131825904205330, 7),
-               (-1.401155189092, 0, 6.5), (0.25, 0, 6),
-               (-0.77568377, 0.13646737, 4.5), (-1.25066, 0.02012, 4),
-               (-0.1011, 0.9563, 3.8), (-0.16070135, 1.0375665, 4.5)]
-
-    def orbit(cr, ci, limit):
-        q = (cr - 0.25) ** 2 + ci * ci
-        if q * (q + cr - 0.25) <= 0.25 * ci * ci or (cr + 1) ** 2 + ci * ci <= 0.0625:
-            return -1.5
-        zr, zi = 0.0, 0.0
-        for count in range(limit):
-            rr, ii = zr * zr, zi * zi
-            if rr + ii > 1e4:
-                return count + 1 - math.log2(math.log(math.sqrt(rr + ii)))
-            zi = 2 * zr * zi + ci
-            zr = rr - ii + cr
-        return -1.0 - (math.atan2(zi, zr) / math.tau + 0.5)
-
-    aspect_x, aspect_y = width / min(width, height), height / min(width, height)
-    for attempt in range(8):
-        re, im, max_depth = rng.choice(centres)
-        depth = rng.uniform(3, max_depth)
-        scale = 10 ** -depth
-        re += rng.uniform(-0.4, 0.4) * scale
-        im += rng.uniform(-0.4, 0.4) * scale
-        angle = rng.random() * math.tau
-        cosine, sine = math.cos(angle), math.sin(angle)
-        limit = min(420, round(180 + 50 * depth))
-        inside = rich = 0
-        for _ in range(80):
-            x, y = rng.uniform(-0.5, 0.5) * scale * aspect_x, rng.uniform(-0.5, 0.5) * scale * aspect_y
-            value = orbit(re + x * cosine - y * sine, im + x * sine + y * cosine, limit)
-            inside += value < 0
-            rich += value > 12
-        if inside < 44 and rich >= 18:
-            break
-    pixels = bytearray(width * height)
-    for y in range(height):
-        py = (y / max(1, height - 1) - 0.5) * scale * aspect_y
-        for x in range(width):
-            px = (x / max(1, width - 1) - 0.5) * scale * aspect_x
-            nu = orbit(re + px * cosine - py * sine, im + px * sine + py * cosine, limit)
-            if nu < 0:
-                tone = 0.025 + 0.07 * (0.5 + 0.5 * math.sin(math.tau * -(nu + 1) * 3))
-            else:
-                prox = min(1, max(0, (nu - 1.5) / 88.5))
-                prox = prox * prox * (3 - 2 * prox)
-                wide = 0.5 + 0.5 * math.sin(math.tau * nu * 0.055)
-                fine = (nu * 0.22) % 1
-                line = max(0, 1 - abs(fine - 0.2) / 0.2)
-                tone = 0.05 + (0.12 + 0.55 * prox) * (0.25 + 0.75 * wide) + 0.12 * line * prox
-            distance = math.hypot(x / width - 0.5, y / height - 0.5)
-            pixels[y * width + x] = max(0, min(255, round(tone * 255 * (1 - 0.28 * distance))))
-    return Image.frombytes('L', (width, height), bytes(pixels))
+    return Image.frombytes('L', (width, height), nova_fractal.render_mask(width, height, rng))
 
 
 def _draw_branch(draw, rng, start, end, depth, width, tone=220, branches=True):
@@ -503,10 +482,12 @@ def _draw_branch(draw, rng, start, end, depth, width, tone=220, branches=True):
 
 @lru_cache(maxsize=4)
 def _texture_mask(texture, width, height, variant):
+    if texture != 'fractal' and os.environ.get('NOVA_ANDROID_TEXTURES') != '0':
+        return Image.frombytes('L', (width, height), nova_android_textures.render_mask(texture, width, height, variant))
     seed = 0x4E4F5641 + list(TEXTURES).index(texture) * 7919 + variant * 6700417
     rng = random.Random(seed)
     if texture == 'fractal':
-        return _mandelbrot(width, height, rng)
+        return Image.frombytes('L', (width, height), nova_android_fractal.render_mask(width, height, variant))
     field = _noise(width, height, rng)
     noise = list(field.getdata())
     if texture in ('basalt', 'cracks'):
@@ -659,11 +640,16 @@ def _render_background(width, height, theme_id, texture_id, intensity, variant, 
     ambient = ambient.filter(ImageFilter.GaussianBlur(35)).resize((width, height), Image.Resampling.BILINEAR)
     image = Image.composite(Image.new('RGB', image.size, theme['accent']), image, ambient)
     if texture_id != 'none' and intensity > 0:
-        longest = 220 if texture_id == 'fractal' else 420
+        longest = 1440
         scale = min(1, longest / max(width, height))
         mask = _texture_mask(texture_id, max(8, round(width * scale)), max(8, round(height * scale)), variant)
         mask = mask.resize((width, height), Image.Resampling.BILINEAR).point(lambda value: round(value * intensity))
         image = Image.composite(Image.new('RGB', image.size, theme['accent']), image, mask)
+    return _temperature(image, temperature)
+
+
+def _temperature(image, temperature):
+    width, height = image.size
     if temperature:
         tint = '#FFA84A' if temperature > 0 else '#60AAFF'
         strength = abs(temperature) / 100 * 36
@@ -671,6 +657,36 @@ def _render_background(width, height, theme_id, texture_id, intensity, variant, 
         mask.putdata([round(strength * (1 - 0.65 * y / max(1, height - 1))) for y in range(height)])
         image = Image.composite(Image.new('RGB', image.size, tint), image, mask.resize(image.size))
     return image
+
+
+def render_fractal_background(width, height, theme_id, intensity, variant, temperature, source, crop):
+    """Reevaluate the same Android complex viewport at display resolution while zooming."""
+    image = render_background(width, height, theme_id, 'none', 0, 0, 0)
+    if intensity <= 0:
+        return _temperature(image, temperature)
+    ratio = min(1.0, 1440 / max(width, height))
+    mw, mh = max(8, round(width * ratio)), max(8, round(height * ratio))
+    pixels = nova_android_fractal.render_mask(mw, mh, variant, source=source, crop=crop)
+    mask = Image.frombytes('L', (mw, mh), pixels)
+    if mask.size != image.size:
+        mask = mask.resize(image.size, Image.Resampling.LANCZOS)
+    mask = mask.point(lambda value: round(value * intensity))
+    image = Image.composite(Image.new('RGB', image.size, THEMES[theme_id]['accent']), image, mask)
+    return _temperature(image, temperature)
+
+
+def render_matrix_background(width, height, theme_id, intensity, variant, temperature, source, crop, elapsed):
+    image = render_background(width, height, theme_id, 'none', 0, 0, 0)
+    if intensity <= 0:
+        return _temperature(image, temperature)
+    ratio = min(1.0, 1440 / max(width, height))
+    mw, mh = max(8, round(width * ratio)), max(8, round(height * ratio))
+    pixels = nova_android_textures.render_matrix(mw, mh, variant, elapsed, source, crop, intensity)
+    mask = Image.frombytes('L', (mw, mh), pixels)
+    if mask.size != image.size:
+        mask = mask.resize(image.size, Image.Resampling.LANCZOS)
+    image = Image.composite(Image.new('RGB', image.size, THEMES[theme_id]['accent']), image, mask)
+    return _temperature(image, temperature)
 
 
 def render_background(width, height, theme_id='aurora', texture_id='none', intensity=0.18,
@@ -684,6 +700,9 @@ def render_background(width, height, theme_id='aurora', texture_id='none', inten
     intensity = round(_number(intensity, 0.18, 0, 0.6), 3)
     variant = int(_number(variant, 0, 0, 2 ** 31 - 1))
     temperature = int(_number(temperature, 0, -100, 100))
+    if texture_id == 'matrix' and os.environ.get('NOVA_ANDROID_TEXTURES') != '0':
+        return render_matrix_background(width, height, theme_id, intensity, variant, temperature,
+                                        (width, height), (0., 0., 1., 1.), 0.)
     return _render_background(width, height, theme_id, texture_id, intensity, variant, temperature).copy()
 
 

@@ -1,0 +1,13 @@
+[package]
+name = "nova-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bounded, deterministic CPU rendering kernels for the Nova desktop."
+
+[dependencies]
+serde.workspace = true
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+ttf-parser = "0.25.1"

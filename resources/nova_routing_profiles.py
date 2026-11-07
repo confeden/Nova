@@ -1,5 +1,10 @@
 from dataclasses import dataclass
 from functools import lru_cache
+import ipaddress
+import json
+import logging
+from pathlib import Path
+import time
 
 
 @dataclass(frozen=True)
@@ -161,6 +166,8 @@ def match_app_by_process_path(process_path):
     if not path_value:
         return None
     process_name = path_value.replace("/", "\\").rsplit("\\", 1)[-1]
+    if process_name.startswith("dns-ai") and process_name.endswith(".exe"):
+        return "DNS-AI"
     if process_name in {"pathofexilesteam.exe", "pathofexile_x64steam.exe"}:
         return "GamesDirect"
     for profile in get_default_app_routing_profiles().values():
@@ -168,6 +175,64 @@ def match_app_by_process_path(process_path):
             if marker and marker in path_value:
                 return profile.display_name
     return None
+
+
+_dns_ai_cache = {"checked": 0.0, "state": {}}
+
+
+def dns_ai_route_state():
+    """Consume the main process's detection, without registry/PowerShell on packet threads."""
+    now = time.monotonic()
+    if now - _dns_ai_cache["checked"] >= 1.0:
+        root = Path(__file__).resolve().parent
+        if root.name.lower() == "resources":
+            root = root.parent
+        try:
+            state = json.loads((root / "temp" / "dns-ai-route.json").read_text(encoding="utf-8-sig"))
+            if not isinstance(state, dict):
+                raise ValueError("DNS-AI routing state must be an object")
+            if not isinstance(state.get("servers", []), list):
+                raise ValueError("DNS-AI routing servers must be a list")
+        except FileNotFoundError:
+            state = {}
+        except (OSError, ValueError) as error:
+            logging.getLogger(__name__).warning("Cannot read DNS-AI routing state: %s", error)
+            state = {}
+        _dns_ai_cache.update(checked=now, state=state)
+    state = _dns_ai_cache["state"]
+    updated = state.get("updated")
+    if (not state.get("active") or not isinstance(updated, (int, float))
+            or not 0 <= time.time() - updated <= 30):
+        return {}
+    return state
+
+
+def is_dns_ai_endpoint(host, port):
+    if int(port) not in (53, 443, 853):
+        return False
+    state = dns_ai_route_state()
+    if not state:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        return any(address == ipaddress.ip_address(server) for server in state.get("servers", ()))
+    except ValueError:
+        return str(host).lower().rstrip(".") == "dns.dns-ai.ru"
+
+
+def dns_ai_route_labels(primary_up, secondary_up, state=None):
+    """Prefer the lowest measured DoH latency; DIRECT is allowed only with neither VPN up."""
+    state = dns_ai_route_state() if state is None else state
+    up = state.get('vpn_up')
+    labels = [label for label, available in (('warp-socks', primary_up), ('opera-http', secondary_up))
+              if available and (not isinstance(up, dict) or up.get(label, False))]
+    latency = state.get('latency_ms') or {}
+    def rank(label):
+        value = latency.get(label)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value < float('inf'):
+            return float('inf')
+        return value
+    return sorted(labels, key=rank) if labels else ['direct']
 
 
 VPN_ROUTE_MODES = ("warp", "opera")

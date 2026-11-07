@@ -53,6 +53,7 @@ import socket
 import ssl
 import threading
 import time
+import urllib.request
 from urllib.parse import unquote, urlsplit
 
 import requests
@@ -133,6 +134,7 @@ JUNK_SIZE_FLOOR = 30
 JUNK_SIZE_CEILING = 150
 
 NODES_SOURCE_LIVE = "live"
+NODES_SOURCE_FEED = "github"
 NODES_SOURCE_BUNDLED = "bundled"
 
 # --- Relay -----------------------------------------------------------------------------------
@@ -411,11 +413,15 @@ def load_bundled_nodes(path):
     """Shipped `proton_nodes.json` -> nodes. Raises OSError / ValueError when unusable."""
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
+    return _nodes_from_payload(data)
+
+
+def _nodes_from_payload(data):
     raw_nodes = data.get("nodes") if isinstance(data, dict) else None
     if not isinstance(raw_nodes, list):
         raise ValueError("в proton_nodes.json нет списка nodes")
     nodes = []
-    for item in raw_nodes:
+    for item in raw_nodes[:2048]:
         if not isinstance(item, dict):
             continue
         entry_ip = _text(item.get("entry_ip"))
@@ -434,6 +440,35 @@ def load_bundled_nodes(path):
             0.0,
         ))
     return nodes
+
+
+def fetch_published_nodes(log=None, timeout=2.5):
+    """Public node facts only; device certificate/key registration remains mandatory."""
+    urls = (
+        "https://raw.githubusercontent.com/confeden/nova_updates/main/nova_pc/proton_nodes.json",
+        "https://confeden.github.io/nova_updates/nova_pc/proton_nodes.json",
+    )
+    for url in urls:
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "NovaPC"})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                raise ValueError("feed too large")
+            payload = json.loads(body.decode("utf-8-sig"))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid feed")
+            generated = float(payload.get("generated_at", 0)) / 1000
+            if not 0 <= time.time() - generated <= 14 * 86400:
+                raise ValueError("stale feed")
+            nodes = _nodes_from_payload(payload)
+            if nodes:
+                return nodes
+        except (OSError, ValueError, TypeError):
+            continue
+    if log:
+        log(f"{LOG_PREFIX} опубликованный список недоступен — проверяю прежний и встроенный набор")
+    return []
 
 
 def conf_filename(name):
@@ -1263,6 +1298,8 @@ def _cooldown_text(cooldown):
 
 def _nodes_refresh_window(account):
     source = _text((account or {}).get("nodes_source"))
+    if source == NODES_SOURCE_FEED:
+        return 3600
     return LIVE_NODES_REFRESH_S if source == NODES_SOURCE_LIVE else BUNDLED_NODES_REFRESH_S
 
 
@@ -1669,6 +1706,8 @@ def _reuse_set(summary, account, names, cert_expires_at, warning):
 
 
 def _source_text(source):
+    if source == NODES_SOURCE_FEED:
+        return "список GitHub"
     return "живой список" if source == NODES_SOURCE_LIVE else "встроенный список"
 
 
@@ -1830,8 +1869,14 @@ def _issue(base_dir, group_dir, summary, emit, scrub, proxies, count, force, pro
                 emit(f"{LOG_PREFIX} живой список серверов пуст или не пришёл")
         summary["route"] = client.last_route_label
         summary["relay_outdated"] = client.relay_outdated
+        from_feed = False
+        if not nodes:
+            nodes = fetch_published_nodes(log=emit)
+            from_feed = bool(nodes)
         if nodes:
-            summary["nodes_source"] = NODES_SOURCE_LIVE
+            summary["nodes_source"] = NODES_SOURCE_FEED if from_feed else NODES_SOURCE_LIVE
+            if from_feed:
+                emit(f"{LOG_PREFIX} список API недоступен — беру опубликованные узлы GitHub")
             emit(f"{LOG_PREFIX} получено {len(nodes)} бесплатных узлов, стран: "
                  f"{len({n['country'] for n in nodes})}")
         else:

@@ -32,13 +32,14 @@ Candidates carry private keys in `text`: nothing here logs a candidate or a reco
 """
 
 import inspect
+import nova_proxy
 import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 __all__ = [
     "open_profiles_window", "toggle_profiles_window", "close_profiles_window", "get_profiles_window",
@@ -57,7 +58,7 @@ GROUP_PROTON = "AWG Proton"
 GROUP_MASQUE = "MASQUE"
 GROUP_VLESS = "VLESS"
 GROUP_CUSTOM = "Custom"
-PROFILE_GROUPS = (GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_MASQUE, GROUP_VLESS, GROUP_CUSTOM)
+PROFILE_GROUPS = (GROUP_MASQUE, GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_CUSTOM)
 # Profile kinds, likewise repeated (nova_profiles.KIND_*): the file's own type, not its folder,
 # decides which helper starts it and therefore which group an import lands in.
 KIND_AWG = "awg"
@@ -71,13 +72,12 @@ TAB_TOR = "tor"
 # list panel with rows of its own.
 TAB_SUBS = "subscriptions"
 TABS = (
+    (GROUP_MASQUE, "MASQUE"),
     (GROUP_CLOUDFLARE, "AWG Cloudflare"),
     (GROUP_PROTON, "AWG Proton"),
-    (GROUP_MASQUE, "MASQUE"),
-    (GROUP_VLESS, "VLESS"),
     # The group's folder, its id prefix and everything stored under it stay "Custom"; only the
     # caption says what is in it, because «Custom» alone told the owner nothing.
-    (GROUP_CUSTOM, "Custom AWG"),
+    (GROUP_CUSTOM, "Custom profiles"),
     (TAB_SUBS, "Подписки"),
     (TAB_TOR, "Tor"),
 )
@@ -373,7 +373,7 @@ def _normalize_test_result(result):
     # "skipped": the check did not run (it would cut the live tunnel or could not pass beside it),
     # so it says nothing about the profile.
     return {"ok": bool(result.get("ok")), "ms": ms, "message": str(result.get("message") or "").strip(),
-            "skipped": bool(result.get("skipped")) and not result.get("ok")}
+            "skipped": (bool(result.get("skipped")) or result.get('status') in ('inconclusive', 'cancelled', 'local_error')) and not result.get("ok")}
 
 
 def format_latency(measurement):
@@ -455,7 +455,9 @@ def format_row_text(record, *, live=False, outcome="не проверялся", 
     profile is never both: the two slots are separate helpers on separate ports.
     """
     marker = "● " if live else ("◆ " if reserve else pad)
-    parts = [str(record.get("name") or record.get("id") or "")]
+    parts = [nova_proxy.display_name(record)]
+    if record.get('group') in IMPORTED_GROUPS:
+        parts.append(nova_proxy.protocol_of(record))
     endpoint = str(record.get("endpoint") or "").strip()
     if endpoint and endpoint != parts[0]:
         parts.append(endpoint)
@@ -467,6 +469,17 @@ def format_row_text(record, *, live=False, outcome="не проверялся", 
         if warnings:
             parts.append("⚠ " + (_WARNING_AWG3_MARK if _WARNING_AWG3_MARK in warnings[0] else warnings[0]))
     return marker + "  ·  ".join(parts)
+
+
+def profile_row_values(record, *, live=False, reserve=False, outcome="не проверялся", is_fatal=None):
+    marker = "● " if live else ("◆ " if reserve else "")
+    fatal, warnings = _issue_split(record, is_fatal)
+    if not record.get('valid', True):
+        outcome = "ошибка: " + (fatal[0] if fatal else (warnings[0] if warnings else "профиль не читается"))
+    elif warnings:
+        outcome += " · ⚠ " + warnings[0]
+    return (marker + nova_proxy.display_name(record), nova_proxy.protocol_of(record),
+            str(record.get('endpoint') or ''), outcome)
 
 
 def format_list_header(group, records, loaded=True):
@@ -544,6 +557,8 @@ def format_subscription_row(record, now=None, pad="   ", refreshing=False):
     interval = _as_hours(entry.get("interval_hours"))
     count = max(0, int(_num(entry.get("node_count"))))
     parts = [title, host or "?"]
+    if entry.get("builtin"):
+        parts.append("встроенная")
     if not enabled:
         parts.append("выключена")
     else:
@@ -606,13 +621,13 @@ def format_selection_text(effective, selection=None):
         text = f"Группа «{group}»: Nova перебирает только её профили"
     else:
         # Both imported groups are out of «Авто» (D25), and the line used to name only one of them.
-        text = "Авто: Nova сама выбирает профиль из своих групп; VLESS и Custom AWG — только вручную"
+        text = "Авто: Nova сама выбирает профиль из своих групп; Custom profiles — только вручную"
     if reason:
         text += f" — {reason}"
     return text
 
 
-_BACKEND_NAMES = {"awg": "AWG", "masque": "MASQUE", "vless": "VLESS",
+_BACKEND_NAMES = {"awg": "AWG", "masque": "MASQUE", "vless": "Профиль",
                   "cloudflare": "WARP", "warp-cli": "WARP"}
 
 
@@ -1059,6 +1074,142 @@ def _registry(root):
     return ref
 
 
+class ProfileTable(ttk.Treeview):
+    """Fixed native column headings with the window's existing single-row selection API."""
+
+    COLUMNS = ('profile', 'protocol', 'endpoint', 'ping')
+    HEADINGS = ('Профиль и дата', 'Протокол', 'Адрес и порт', 'Ping')
+
+    def __init__(self, master, theme, font):
+        self._style = ttk.Style(master)
+        self._style_name = f'NovaProfiles{id(self)}.Treeview'
+        self._colors = dict(bg=theme['panel'], fg=theme['text'], selectbackground=theme['pill_on_bg'],
+                            selectforeground=theme['pill_on_fg'], font=font)
+        self._rows, self._texts = [], {}
+        self._profile_columns = None
+        self._column_widths = None
+        super().__init__(master, columns=self.COLUMNS, show='headings', height=12,
+                         selectmode='browse', style=self._style_name)
+        scale = max(1, float(self.tk.call('tk', 'scaling')) * .75)
+        for key, label, width, minimum in zip(self.COLUMNS, self.HEADINGS, (210, 88, 220, 120), (110, 70, 120, 85)):
+            self.heading(key, text=label, anchor='w')
+            self.column(key, width=round(width * scale), minwidth=round(minimum * scale),
+                        stretch=key in ('profile', 'endpoint'), anchor='w')
+        # Vista's native header ignores background colours. Clone only these two
+        # drawable elements from clam; leave the application's ttk theme intact.
+        heading_elements = []
+        for part in ('cell', 'border'):
+            name = f'NovaProfiles{id(self)}.heading.{part}'
+            if name not in self._style.element_names():
+                self._style.element_create(name, 'from', 'clam', 'Treeheading.' + part)
+            heading_elements.append(name)
+        self._style.layout(self._style_name + '.Heading', [
+            (heading_elements[0], {'sticky': 'nswe'}),
+            (heading_elements[1], {'sticky': 'nswe', 'children': [
+                ('Treeheading.padding', {'sticky': 'nswe', 'children': [('Treeheading.text', {'sticky': 'we'})]})]})])
+        self._apply_style()
+
+    def _apply_style(self):
+        c = self._colors
+        linespace = int(self.tk.call('font', 'metrics', c['font'], '-linespace'))
+        self._style.configure(self._style_name, background=c['bg'], fieldbackground=c['bg'],
+                              foreground=c['fg'], font=c['font'], borderwidth=0,
+                              rowheight=max(22, round(linespace * 1.4)))
+        self._style.configure(self._style_name + '.Heading', background=c['bg'], foreground=c['fg'],
+                              font=(c['font'][0], c['font'][1], 'bold'), relief='flat')
+        self._style.map(self._style_name, background=[('selected', c['selectbackground'])],
+                        foreground=[('selected', c['selectforeground'])])
+
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        changed = False
+        for option in tuple(kw):
+            if option in self._colors:
+                self._colors[option] = kw.pop(option)
+                changed = True
+        if changed:
+            self._apply_style()
+        return super().configure(**kw) if kw else None
+
+    config = configure
+
+    def cget(self, key):
+        return self._colors[key] if key in self._colors else super().cget(key)
+
+    def keys(self):
+        return list(super().keys()) + list(self._colors)
+
+    def bind(self, sequence=None, func=None, add=None):
+        return super().bind('<<TreeviewSelect>>' if sequence == '<<ListboxSelect>>' else sequence, func, add)
+
+    def profile_columns(self, enabled):
+        if enabled == self._profile_columns:
+            return
+        if not enabled:
+            self._column_widths = [self.column(key, 'width') for key in self.COLUMNS]
+        elif self._column_widths:
+            for key, width in zip(self.COLUMNS, self._column_widths):
+                self.column(key, width=width)
+        self._profile_columns = enabled
+        super().configure(show='headings' if enabled else '',
+                          displaycolumns=self.COLUMNS if enabled else ('profile',))
+
+    def insert(self, index, text):
+        position = len(self._rows) if index == 'end' else int(index)
+        iid = super().insert('', position, values=(text, '', '', ''))
+        self._rows.insert(position, iid)
+        self._texts[iid] = text
+
+    def set_values(self, index, values):
+        self.item(self._rows[index], values=values)
+
+    def delete(self, first, last=None):
+        start = int(first)
+        end = len(self._rows) if last == 'end' else int(last) + 1 if last is not None else start + 1
+        removed = self._rows[start:end]
+        if removed:
+            super().delete(*removed)
+        for iid in removed:
+            del self._texts[iid]
+        del self._rows[start:end]
+
+    def get(self, first, last=None):
+        if last is None:
+            return self._texts[self._rows[int(first)]]
+        end = len(self._rows) if last == 'end' else int(last) + 1
+        return tuple(self._texts[iid] for iid in self._rows[int(first):end])
+
+    def size(self):
+        return len(self._rows)
+
+    def curselection(self):
+        selected = set(self.selection())
+        return tuple(i for i, iid in enumerate(self._rows) if iid in selected)
+
+    def selection_set(self, first, last=None):
+        end = len(self._rows) if last == 'end' else int(last) + 1 if last is not None else int(first) + 1
+        super().selection_set(self._rows[int(first):end])
+        self.focus(self._rows[int(first)])
+
+    def selection_clear(self, first, last=None):
+        end = len(self._rows) if last == 'end' else int(last) + 1 if last is not None else int(first) + 1
+        super().selection_remove(self._rows[int(first):end])
+
+    def see(self, index):
+        super().see(self._rows[int(index)])
+
+    def itemconfigure(self, index, **kw):
+        color = kw['fg']
+        tag = 'tone-' + color
+        self.tag_configure(tag, foreground=color)
+        self.item(self._rows[int(index)], tags=(tag,))
+
+    def itemcget(self, index, option):
+        tag = self.item(self._rows[int(index)], 'tags')[0]
+        return str(self.tag_configure(tag, 'foreground')) if option == 'fg' else ''
+
+
 class ProfilesWindow:
     """One «Профили» window per Tk root. Create through `open_profiles_window(ctx)`."""
 
@@ -1070,6 +1221,11 @@ class ProfilesWindow:
         self.tones = dict(_TONES_DARK if self.dark else _TONES_LIGHT)
         self.base_dir = os.fspath(getattr(ctx, "base_dir", "") or "")
         self.current_tab = _registry(self.root).get("last_tab") or GROUP_CLOUDFLARE
+        if self.current_tab == GROUP_VLESS:
+            self.current_tab = GROUP_CUSTOM
+        self._sort_mode = _registry(self.root).get('profile_sort', 'ping')
+        self._profile_check_queue = []
+        self._profile_check_active = set()
 
         self._results = queue.Queue()
         self._inflight = 0
@@ -1347,6 +1503,8 @@ class ProfilesWindow:
 
         top = self.listbox.yview()[0]
         repaint(self.win)
+        self.listbox.configure(bg=self.theme['panel'], fg=self.theme['text'], font=self.font_text,
+                               selectbackground=self.theme['pill_on_bg'], selectforeground=self.theme['pill_on_fg'])
         if self._row_signature:
             for index, (_row_id, _text, tone) in enumerate(self._row_signature[1]):
                 self.listbox.itemconfigure(index, fg=self._tone_color(tone))
@@ -1369,14 +1527,19 @@ class ProfilesWindow:
         t = self.theme
         self.list_header = self._label(panel)
         self.list_header.pack(fill="x", pady=(0, 6))
+        self.sort_row = tk.Frame(panel, bg=self.theme['bg'])
+        sort_label = self._label(self.sort_row)
+        sort_label.configure(text='Сортировка:')
+        sort_label.pack(side='left', padx=(0, 6))
+        self.sort_pills = {}
+        for key, caption in (('protocol', 'По протоколу'), ('ping', 'По ping'), ('name', 'По алфавиту')):
+            pill = self._make_pill(self.sort_row, caption, lambda k=key: self._set_sort(k), min_width=60)
+            pill.pack(side='left', padx=(0, 4))
+            self.sort_pills[key] = pill
         box = tk.Frame(panel, bg=t["panel"], highlightthickness=1, highlightbackground=t["border"],
                        highlightcolor=t["border"], bd=0)
         box.pack(fill="both", expand=True)
-        self.listbox = tk.Listbox(
-            box, height=12, width=62, activestyle="none", exportselection=False, selectmode="browse",
-            bg=t["panel"], fg=t["text"], selectbackground=t["pill_on_bg"], selectforeground=t["pill_on_fg"],
-            highlightthickness=0, relief="flat", bd=0, font=self.font_text,
-        )
+        self.listbox = ProfileTable(box, t, self.font_text)
         self.scrollbar = ThemedScrollbar(box, self.listbox.yview, t, self.dark)
         self.listbox.configure(yscrollcommand=self.scrollbar.set)
         self.scrollbar.pack(side="right", fill="y", pady=2)
@@ -1609,7 +1772,6 @@ class ProfilesWindow:
     def show(self):
         if not self.alive():
             return
-        self._render_all()
         self.refresh_now()
         try:
             self.win.update_idletasks()
@@ -1860,6 +2022,8 @@ class ProfilesWindow:
         return {"mode": mode, "group": group if mode != "auto" else "", "profile_id": profile, "reason": ""}
 
     def _render_all(self):
+        if self.current_tab != GROUP_CUSTOM:
+            self.sort_row.pack_forget()
         if not self.alive():
             return
         selection, effective = self._selection_pair()
@@ -1876,7 +2040,13 @@ class ProfilesWindow:
             self._render_job_line()
 
     def _records_for(self, group):
-        return [r for r in self._snapshot.get("profiles") or [] if isinstance(r, dict) and r.get("group") == group]
+        records = nova_proxy.group_records([r for r in self._snapshot.get('profiles') or [] if isinstance(r, dict)], group)
+        return nova_proxy.sort_records(records, self._sort_mode, self._snapshot.get('stats')) if group == GROUP_CUSTOM else records
+
+    def _set_sort(self, mode):
+        self._sort_mode = mode
+        _registry(self.root)['profile_sort'] = mode
+        self._render_list()
 
     def _is_fatal_fn(self):
         module = sys.modules.get("nova_profiles")
@@ -1894,6 +2064,12 @@ class ProfilesWindow:
 
     def _render_list(self):
         group = self.current_tab
+        if group == GROUP_CUSTOM:
+            self.sort_row.pack(fill='x', before=self.listbox.master, pady=(0, 6))
+            for key, pill in self.sort_pills.items():
+                pill.set_selected(key == self._sort_mode)
+        else:
+            self.sort_row.pack_forget()
         records = self._records_for(group)
         self._set_label(self.list_header, format_list_header(group, records, self._snapshot.get("loaded")))
         live_id, connected = self._live_profile_id()
@@ -1901,6 +2077,7 @@ class ProfilesWindow:
         stats = self._snapshot.get("stats") or {}
         is_fatal = self._is_fatal_fn()
         rows = []
+        columns = {}
         for record in records:
             pid = record.get("id")
             probing = pid in self._latency_active
@@ -1911,6 +2088,8 @@ class ProfilesWindow:
             reserve = bool(reserve_id) and pid == reserve_id
             text = format_row_text(record, live=live, outcome=outcome, pad=self._marker_pad,
                                    is_fatal=is_fatal, reserve=reserve)
+            columns[pid] = profile_row_values(record, live=live, outcome=outcome,
+                                              is_fatal=is_fatal, reserve=reserve)
             if not record.get("valid", True):
                 tone = "fail"
             elif probing:
@@ -1926,7 +2105,7 @@ class ProfilesWindow:
             else:
                 tone = "normal"
             rows.append((pid, text, tone))
-        self._fill_listbox(group, rows)
+        self._fill_listbox(group, rows, columns=columns)
 
     def _latency_of(self, profile_id, stats):
         """This window's own measurement of a profile, or the one Nova recorded while connecting.
@@ -1967,10 +2146,11 @@ class ProfilesWindow:
             rows.append((sub_id, text, tone))
         self._fill_listbox(TAB_SUBS, rows)
 
-    def _fill_listbox(self, key, rows):
+    def _fill_listbox(self, key, rows, columns=None):
         """Draw `[(row_id, text, tone)]`, keeping the scroll position and the selection."""
         signature = (key, tuple(rows))
         lb = self.listbox
+        lb.profile_columns(columns is not None)
         height = min(12, max(4, len(rows)))
         if int(lb.cget("height")) != height:
             lb.configure(height=height)
@@ -1982,6 +2162,8 @@ class ProfilesWindow:
             lb.delete(0, "end")
             for index, (_row_id, text, tone) in enumerate(rows):
                 lb.insert("end", text)
+                if columns is not None:
+                    lb.set_values(index, columns[_row_id])
                 lb.itemconfigure(index, fg=self._tone_color(tone))
             self._row_ids = [row_id for row_id, _text, _tone in rows]
             self._row_signature = signature
@@ -2115,6 +2297,8 @@ class ProfilesWindow:
     def select_profile(self, profile_id):
         """Select a row by id (switches to its group tab)."""
         group = str(profile_id or "").partition("/")[0]
+        if group == GROUP_VLESS:
+            group = GROUP_CUSTOM
         if group not in PROFILE_GROUPS:
             return False
         self._selected_ids[group] = profile_id
@@ -2253,6 +2437,9 @@ class ProfilesWindow:
         if record is None:
             self._notice("Выберите профиль в списке", "warn")
             return
+        self._begin_profile_check(record)
+
+    def _begin_profile_check(self, record):
         pid = str(record.get("id"))
         if not record.get("valid", True):
             self._notice(f"Профиль «{record.get('name')}» с ошибками: {self._first_issue(record)}", "fail")
@@ -2297,6 +2484,8 @@ class ProfilesWindow:
         if self._tests.get(token.profile_id) is not token:
             return
         self._tests.pop(token.profile_id, None)
+        self._profile_check_active.discard(token.profile_id)
+        self._pump_profile_checks()
         normalized = _normalize_test_result(result)
         name = token.profile_id.partition("/")[2] or token.profile_id
         if normalized["skipped"]:
@@ -2324,12 +2513,14 @@ class ProfilesWindow:
                 continue
             expired = True
             self._tests.pop(pid, None)
+            self._profile_check_active.discard(pid)
             self._inflight = max(0, self._inflight - 1)
             self._test_results[pid] = ({"ok": False, "ms": None, "message": "нет ответа"}, time.time())
             self._notice(f"«{pid.partition('/')[2] or pid}»: проверка не ответила за "
                          f"{int(TEST_RESULT_TIMEOUT_S // 60)} мин", "fail")
             self._log(f"[Profiles] Проверка профиля «{pid}» не вернула результат за {int(TEST_RESULT_TIMEOUT_S)} с.")
         if expired and self.alive() and self.current_tab in PROFILE_GROUPS:
+            self._pump_profile_checks()
             self._render_list()
 
     def _on_folder(self):
@@ -2450,6 +2641,9 @@ class ProfilesWindow:
         if record is None:
             self._notice("Выберите подписку в списке", "warn")
             return
+        if record.get("builtin"):
+            self._notice("Nova list — встроенная подписка, удалить её нельзя", "warn")
+            return
         sub_id = str(record.get("id") or "")
         title = str(record.get("name") or sub_id)
         count = int(_num(record.get("node_count")))
@@ -2518,6 +2712,8 @@ class ProfilesWindow:
         now = time.time()
         targets = {}
         for record in records or []:
+            if nova_proxy.uses_udp_transport(record):
+                continue  # A closed TCP port says nothing about a QUIC/WireGuard profile.
             pid = str(record.get("id") or "")
             endpoint = str(record.get("endpoint") or "").strip()
             if not pid or not endpoint:
@@ -2533,7 +2729,7 @@ class ProfilesWindow:
             if not host:
                 host, port = endpoint, ""
             ports = LATENCY_FALLBACK_PORTS
-            if record.get("kind") == "vless" and port.isdigit():
+            if record.get("kind") in ('vless', nova_proxy.KIND) and port.isdigit():
                 # The node's own port is the one its traffic uses, so it is also the honest probe.
                 ports = (int(port),)
             targets[pid] = (host, ports)
@@ -2676,6 +2872,23 @@ class ProfilesWindow:
             self._notice(f"Отвечают {reachable} из {len(measured)}", "ok" if reachable else "warn")
         self._render_all()
 
+    def _pump_profile_checks(self):
+        while self._profile_check_queue and len(self._profile_check_active) < 3:
+            record = self._profile_check_queue.pop(0)
+            pid = str(record.get('id') or '')
+            if pid in self._tests:
+                continue
+            self._begin_profile_check(record)
+            if pid in self._tests:
+                self._profile_check_active.add(pid)
+            else:
+                self._profile_check_queue.clear()
+                break
+        pill = self.action_pills.get(GROUP_CUSTOM, {}).get('test_list')
+        if pill is not None:
+            set_pill_text(pill, 'Остановить' if self._profile_check_queue or self._profile_check_active
+                          else ACTION_LABELS['test_list'])
+
     def _on_test_list(self):
         """«Проверить список»: measure every profile of the tab, cheaply.
 
@@ -2693,6 +2906,21 @@ class ProfilesWindow:
         records = self._records_for(group)
         if not records:
             self._notice(f"В группе «{group}» нет профилей", "warn")
+            return
+        modern = [r for r in records if r.get('kind') in (KIND_VLESS, nova_proxy.KIND) and r.get('valid', True)]
+        if group == GROUP_CUSTOM and modern:
+            if self._profile_check_queue or self._profile_check_active:
+                self._profile_check_queue.clear()
+                self._notice('Очередь остановлена; текущие проверки завершатся', 'muted')
+                self._pump_profile_checks()
+                return
+            self._profile_check_queue = list(modern)
+            self._pump_profile_checks()
+            self._notice(f'HTTPS-проверка {len(modern)} профилей через отдельные локальные прокси', 'muted')
+            # WireGuard keys are not mass-probed: that would disrupt live single-session peers.
+            remaining = [r for r in records if r.get('kind') not in (KIND_VLESS, nova_proxy.KIND)]
+            if remaining:
+                self._start_latency_sweep(remaining, reason='список', force=True, limit=LATENCY_LIST_LIMIT)
             return
         if not callable(getattr(self.ctx, "measure_latency", None)):
             self._notice("Проверка списка недоступна в этой сборке Nova", "warn")
@@ -2862,6 +3090,8 @@ class ProfilesWindow:
                 # The renamed profile's own group, not «Custom»: renaming a VLESS node used to move
                 # the cursor on the Custom tab, where the node is not.
                 target = str(record.get("group") or "") or new_id.partition("/")[0] or GROUP_CUSTOM
+                if target == GROUP_VLESS:
+                    target = GROUP_CUSTOM
                 self._selected_ids[target] = new_id
                 self._reveal_ids[target] = new_id
             final = new_id.partition("/")[2] or new_name
@@ -3096,7 +3326,7 @@ class ImportPreview:
         groups = []
         for row in self.rows:
             candidate = row.get("candidate") if isinstance(row, dict) else None
-            group = GROUP_VLESS if (candidate or {}).get("kind") == KIND_VLESS else GROUP_CUSTOM
+            group = GROUP_CUSTOM
             if group not in groups:
                 groups.append(group)
         where = " и ".join(f"«{g}»" for g in groups) or f"«{GROUP_CUSTOM}»"
@@ -3284,6 +3514,18 @@ def get_profiles_window(ctx):
     ref = _registry(ctx.root)
     view = ref.get("view")
     return view if view is not None and view.alive() else None
+
+
+def precreate_profiles_window(ctx):
+    """Build and populate offscreen; all filesystem/status reads use the existing worker."""
+    ref = _registry(ctx.root)
+    view = ref.get("view")
+    if view is None or not view.alive():
+        view = ProfilesWindow(ctx)
+        ref["view"] = view
+        _bind_root_alignment(ctx.root, ref)
+        view.refresh_now()
+    return view
 
 
 def open_profiles_window(ctx):
