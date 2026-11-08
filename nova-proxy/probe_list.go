@@ -34,7 +34,18 @@ var probeTargets = []string{"https://www.google.com/generate_204", "https://www.
 
 // No executor, listener, TUN, DNS manager, environment proxy or DIRECT fallback.
 // The adapter carries only this request; target TLS always validates certificates.
-func probeNode(proxy map[string]any, targets []string, budget time.Duration, roots *tls.Config) (result probeResult) {
+// bulkTarget serves exactly ?bytes=N. A 204 is a few hundred bytes; Russian TSPU lets
+// those through and freezes TCP to foreign hosting after 12-40 KB, so a node that
+// answers 204 can still be unable to load a single page from the caller's network.
+const bulkTarget = "https://speed.cloudflare.com/__down?bytes="
+
+func probeNode(proxy map[string]any, targets []string, budget time.Duration, roots *tls.Config) probeResult {
+	return probeNodeBulk(proxy, targets, budget, roots, 0)
+}
+
+// probeNodeBulk is probeNode plus, when bulk > 0, a download of bulk bytes through the
+// same node inside the same budget; a short or stalled body fails with stage "bulk".
+func probeNodeBulk(proxy map[string]any, targets []string, budget time.Duration, roots *tls.Config, bulk int) (result probeResult) {
 	result.Stage = "invalid"
 	defer func() {
 		if recover() != nil {
@@ -112,8 +123,13 @@ func probeNode(proxy map[string]any, targets []string, budget time.Duration, roo
 		if err == nil {
 			response.Body.Close()
 			if response.StatusCode == http.StatusNoContent {
-				result.OK, result.MS, result.Stage = true, time.Since(started).Milliseconds(), "ok"
+				ms := time.Since(started).Milliseconds()
 				done()
+				if bulk > 0 && !probeBulk(ctx, client, bulk) {
+					result.Stage = "bulk"
+					return
+				}
+				result.OK, result.MS, result.Stage = true, ms, "ok"
 				return
 			}
 		}
@@ -122,18 +138,44 @@ func probeNode(proxy map[string]any, targets []string, budget time.Duration, roo
 	return
 }
 
+func probeBulk(ctx context.Context, client *http.Client, bulk int) bool {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, bulkTarget+strconv.Itoa(bulk), nil)
+	if err != nil {
+		return false
+	}
+	request.Header.Set("User-Agent", "NovaList/1")
+	response, err := client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false
+	}
+	got, _ := io.Copy(io.Discard, io.LimitReader(response.Body, int64(bulk)))
+	return got >= int64(bulk)
+}
+
 func probeList(args []string) error {
 	flags := flag.NewFlagSet("probe-list", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	workers := flags.Int("workers", 32, "bounded concurrency")
 	seconds := flags.Int("timeout", 9, "per-node total budget")
-	if flags.Parse(args) != nil || *workers < 1 || *workers > 64 || *seconds < 1 || *seconds > 60 {
+	bulk := flags.Int("bulk", 0, "also download this many bytes through the node (0 = 204 only)")
+	// Some nodes answer only Cloudflare/gstatic and reset everything else; with -google
+	// the node must reach www.google.com itself instead of any one of the three targets.
+	google := flags.Bool("google", false, "require the www.google.com 204")
+	if flags.Parse(args) != nil || *workers < 1 || *workers > 64 || *seconds < 1 || *seconds > 60 || *bulk < 0 || *bulk > 4<<20 {
 		return errors.New("invalid probe bounds")
 	}
 	data, err := io.ReadAll(io.LimitReader(os.Stdin, maxInput+1))
 	var request ImportResult
 	if err != nil || len(data) > maxInput || json.Unmarshal(data, &request) != nil || len(request.Proxies) > 20000 {
 		return errors.New("invalid probe request")
+	}
+	targets := probeTargets
+	if *google {
+		targets = probeTargets[:1]
 	}
 	jobs := make(chan int)
 	var wait sync.WaitGroup
@@ -145,7 +187,7 @@ func probeList(args []string) error {
 		go func() {
 			defer wait.Done()
 			for index := range jobs {
-				result := probeNode(request.Proxies[index], probeTargets, time.Duration(*seconds)*time.Second, nil)
+				result := probeNodeBulk(request.Proxies[index], targets, time.Duration(*seconds)*time.Second, nil, *bulk)
 				result.Index = index
 				output.Lock()
 				if err := encoder.Encode(result); err != nil {
