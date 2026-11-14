@@ -80,6 +80,39 @@ class WinDivertRecoveryTests(unittest.TestCase):
             self.assertTrue(state["disabled"])
             self.assertTrue(state["pending_delete"])
 
+    def test_running_driver_with_disabled_start_but_no_delete_flag_is_usable(self):
+        # Field report 1.46: RUNNING + Start=4 without DeleteFlag made Auto skip observer and redirect.
+        ns = _load_functions("_query_windivert_service_state")
+        ns.update(re=re, _run_hidden_sc=lambda *args: (0, "STATE : 4 RUNNING", ""),
+                  _is_windivert_pending_delete_text=lambda text: False,
+                  _is_sc_service_missing_text=lambda text: False,
+                  _is_windivert_disabled_text=lambda text: False,
+                  _probe_windivert_service_access=lambda: {
+                      "pending_delete": False, "missing": False, "access_denied": False},
+                  _probe_windivert_minimal_open_error=lambda: 0)
+        values = {"Start": 4}
+
+        def query(key, name):
+            if name not in values:
+                raise OSError(name)
+            return values[name], 4
+
+        registry = types.SimpleNamespace(
+            HKEY_LOCAL_MACHINE=0, KEY_READ=0,
+            OpenKey=mock.Mock(return_value=object()), CloseKey=mock.Mock(), QueryValueEx=query)
+        with mock.patch.dict(sys.modules, winreg=registry):
+            state = ns["_query_windivert_service_state"]()
+            self.assertFalse(state["disabled"])
+            self.assertTrue(state["registration_disabled"])
+            self.assertTrue(state["running"])
+            ns["_probe_windivert_minimal_open_error"] = lambda: 2
+            state = ns["_query_windivert_service_state"]()
+            self.assertTrue(state["disabled"])
+            ns["_probe_windivert_minimal_open_error"] = lambda: 0
+            ns["_run_hidden_sc"] = lambda *args: (0, "STATE : 1 STOPPED", "")
+            state = ns["_query_windivert_service_state"]()
+            self.assertTrue(state["disabled"])
+
     def test_invalid_name_detector_is_narrow(self):
         ns = _load_functions("_is_windivert_invalid_name_open_failure")
         detect = ns["_is_windivert_invalid_name_open_failure"]

@@ -26064,6 +26064,15 @@ function FindProxyForURLEx(url, host) {{
                 state["registration_disabled"] = state["disabled"]
                 state.update(pending_delete=False, disabled=False, running=True, stopped=False,
                              missing=False, exists=True, driver_bad_state=False)
+        elif state["disabled"] and state["running"] and not state["missing"]:
+            # Start=4 on a driver that is already loaded (some other program or an old cleanup
+            # disabled the registration): the loaded driver keeps working and WinDivertOpen
+            # reaches the device without touching the service. Judge it by the device, not by
+            # the registry flag, or Auto skips the observer and the redirect for nothing.
+            device_probe = globals().get("_probe_windivert_minimal_open_error")
+            if callable(device_probe) and device_probe() == 0:
+                state["registration_disabled"] = True
+                state["disabled"] = False
         return state
 
     def _probe_windivert_config_state(driver_image_path, timeout=4):
