@@ -215,6 +215,9 @@ GAMES_BULK_HTTP_PORTS = (80, 443)
 # Сколько миллисекунд соединение должно продержаться без единого байта в ответ,
 # чтобы считать маршрут мёртвым, а не просто оборванным клиентом.
 ROUTE_DEAD_MIN_MS = 2500
+# DNS-AI over DIRECT: the client sent and nothing came back for this long -> the direct path is swallowing it.
+DNS_AI_DIRECT_STALL_SECONDS = 3.0
+DNS_AI_STALL_MIN_UNANSWERED = 120
 TG_WS_CF_FIRST_MEDIA_DCS = {
     int(item)
     for item in str(os.environ.get("NOVA_TG_WS_CF_FIRST_MEDIA_DCS", "5") or "")
@@ -637,9 +640,19 @@ def parse_redirect_context(payload: bytes) -> Optional[NOVA_WFP_REDIRECT_CONTEXT
     return ctx
 
 
-async def _bridge_streams(reader1, writer1, reader2, writer2, initial_up: int = 0, initial_down: int = 0):
+async def _bridge_streams(reader1, writer1, reader2, writer2, initial_up: int = 0, initial_down: int = 0,
+                          stall_after: float = 0.0, stall_info: Optional[dict] = None):
+    """Relay both directions until one side closes.
+
+    `stall_after` > 0 also ends the bridge when the client has sent something that the upstream has not answered
+    with a single byte for that many seconds (`stall_info["stalled"]` is set): a TLS handshake that completes and a
+    path that then swallows the requests, which neither the connect-time attempt loop nor the byte counters can see
+    once the server flight has been relayed (G145). The caller marks the route bad, so the client's retry takes the next one."""
     counters = {"client_to_upstream": int(initial_up), "upstream_to_client": int(initial_down)}
     started = time.monotonic()
+    marks = {"client_to_upstream": started if initial_up else 0.0,
+             "upstream_to_client": started if initial_down else 0.0}
+    unanswered = {"bytes": 0 if initial_down else int(initial_up)}     # what the client sent since the upstream last said anything
 
     async def _pipe(src, dst, counter_key: str):
         try:
@@ -648,20 +661,42 @@ async def _bridge_streams(reader1, writer1, reader2, writer2, initial_up: int = 
                 if not data:
                     break
                 counters[counter_key] += len(data)
+                marks[counter_key] = time.monotonic()
+                if counter_key == "client_to_upstream":
+                    unanswered["bytes"] += len(data)
+                else:
+                    unanswered["bytes"] = 0
                 dst.write(data)
                 await dst.drain()
         finally:
             with contextlib.suppress(Exception):
                 dst.close()
 
+    async def _watch_stall():
+        while True:
+            await asyncio.sleep(0.5)
+            sent, answered = marks["client_to_upstream"], marks["upstream_to_client"]
+            # A bare TLS Finished (about 64 bytes) needs no answer: only real requests count.
+            if (sent > answered and unanswered["bytes"] >= DNS_AI_STALL_MIN_UNANSWERED
+                    and time.monotonic() - sent >= stall_after):
+                if stall_info is not None:
+                    stall_info["stalled"] = True
+                return
+
     tasks = [
         asyncio.create_task(_pipe(reader1, writer2, "client_to_upstream")),
         asyncio.create_task(_pipe(reader2, writer1, "upstream_to_client")),
     ]
+    if stall_after and stall_after > 0:
+        tasks.append(asyncio.create_task(_watch_stall()))
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    if stall_info is not None and stall_info.get("stalled"):
+        for stream in (writer1, writer2):
+            with contextlib.suppress(Exception):
+                stream.close()
     for task in pending:
         task.cancel()
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
     for task in done:
         with contextlib.suppress(Exception):
@@ -2293,6 +2328,9 @@ class NovaWfpTcpProxy:
                 writer.write(first_down)
                 await writer.drain()
 
+            dns_ai_direct = str(route_label) == "direct" and (
+                app_family == "dns_ai" or is_dns_ai_endpoint(target_host, int(target_port)))
+            stall_info = {}
             sent_bytes, received_bytes, duration_ms = await _bridge_streams(
                 reader,
                 writer,
@@ -2300,7 +2338,18 @@ class NovaWfpTcpProxy:
                 upstream_writer,
                 initial_up=len(initial_data),
                 initial_down=len(first_down),
+                stall_after=DNS_AI_DIRECT_STALL_SECONDS if dns_ai_direct else 0.0,
+                stall_info=stall_info,
             )
+            if stall_info.get("stalled"):
+                # DNS-AI over the direct path: the handshake went through, the requests were swallowed. The
+                # next connection of the client (a browser's DoH retries at once) takes a connected VPN (D48).
+                self._bad_route_cache_put(target_host, int(target_port), "direct", route_scope=route_scope,
+                                          all_ports=True)
+                self.log_func(
+                    f"[NovaWFP][Proxy] route-stalled target={target_host}:{target_port} route=direct "
+                    f"family=dns_ai up={sent_bytes} down={received_bytes}; direct deprioritized for the host"
+                )
             self.log_func(
                 f"[NovaWFP][Proxy] closed={peer_label} target={target_host}:{target_port}{target_note} route={route_label} "
                 f"duration_ms={duration_ms} up={sent_bytes} down={received_bytes}"

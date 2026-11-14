@@ -8785,7 +8785,7 @@ try:
             dns_routes = self.dns_ai_route_snapshot()
             if globals().get("_nrpt_state", {}).get("system_dns_ai") and get_dns_ai_effective_choice() == "dns_ai":
                 save_json_safe(os.path.join(get_base_dir(), "temp", "dns-ai-route.json"), {
-                    "active": True, "servers": sorted(NOVA_DNS_AI_SERVERS),
+                    "active": True, "servers": globals().get("_dns_ai_route_servers", lambda: sorted(NOVA_DNS_AI_SERVERS))(),
                     "owner_pid": os.getpid(), "updated": time.time(), **dns_routes,
                 })
 
@@ -9642,8 +9642,15 @@ try:
                         )
 
                 wininet_empty_route = "PROXY 127.0.0.1:1" if browser_auto else "DIRECT"
+                # Адрес Cloudflare для клиента WinINET: цепочка без единого понятного ему токена (только
+                # живой SOCKS5) -> DIRECT; закрытый слот и цепочки с PROXY/DIRECT остаются как есть (G144).
+                _cf_tokens = [t.strip() for t in str(ru_route).split(";") if t.strip()]
+                _cf_live_socks = any(t.upper().startswith("SOCKS5") and t != closed_route for t in _cf_tokens)
+                _cf_other = any(not t.upper().startswith("SOCKS5") for t in _cf_tokens)
+                cf_ip_route_wininet = "DIRECT" if (_cf_live_socks and not _cf_other) else ru_route
+                dns_ai_route = "DIRECT" if (ru_route == closed_route or not _cf_tokens) else f"DIRECT; {ru_route}"
                 pac_content = f"""
-    function FindProxyForURL(url, host) {{
+    function FindProxyForURL(url, host, wininet) {{
     host = (host || "").toLowerCase();
     if (host.length > 1 && host.charAt(host.length - 1) === ".") {{
         host = host.substring(0, host.length - 1);
@@ -9673,6 +9680,13 @@ try:
     // a chain WinINET cannot use, which collapsed to the closed port and cut NovaGram off (2026-11-14).
     if (/^kws\\d+(-\\d+)?\\./.test(host) || /\\.nova-app\\.eu$/.test(host)) {{
         return "DIRECT";
+    }}
+    // DNS-AI (dns./cf./ru.dns-ai.ru), как DoH-адрес, указанный в самом браузере: сначала напрямую -- по
+    // стратегии winws, которую Nova держит для этих имён, -- и только если соединение не поднялось, через
+    // VPN, пока он подключён. cf.dns-ai.ru стоит за Cloudflare и в «Авто» попадал в ветку Cloudflare-адресов:
+    // только VPN, а WinINET-клиенту и вовсе закрытый порт (G144).
+    if (host === "dns-ai.ru" || /\\.dns-ai\\.ru$/.test(host)) {{
+        return "{dns_ai_route}";
     }}
     var pac_mode = {json.dumps(pac_mode)};
     var pac_full_route = {json.dumps(pac_full_route)};
@@ -9802,7 +9816,11 @@ var ai_region_direct = {ai_region_direct_js};
             }}
         }}
 {telegram_ip_priority}        if (matchIpEntries(host, cloudflare_ips)) {{
-            return "{ru_route}";
+            // Клиент, который ходит на адрес, а не на имя (NovaGram: WSS-релей на CF-адреса из своего DoH,
+            // Qt спрашивает PAC про IP), хоста не называет, и список по имени ему не помогает. Когда
+            // цепочка состоит только из SOCKS5, WinINET (wininet=true) не получит из неё ни одного
+            // токена и уйдёт на закрытый порт: Telegram «Напрямую» оставался без связи (G144).
+            return wininet ? "{cf_ip_route_wininet}" : "{ru_route}";
         }}
         for (var i = 0; i < ru_ips.length; i++) {{
             var entry = ru_ips[i];
@@ -9879,7 +9897,7 @@ var ai_region_direct = {ai_region_direct_js};
 // выброшен, PROXY сохранён; не осталось ничего — DIRECT, как и было до G97. Закрытый порт
 // (прибитый слот лежит) остаётся закрытым и для них.
 function FindProxyForURLEx(url, host) {{
-    var parts = String(FindProxyForURL(url, host) || "DIRECT").split(";");
+    var parts = String(FindProxyForURL(url, host, true) || "DIRECT").split(";");
     var out = [];
     for (var i = 0; i < parts.length; i++) {{
         var token = parts[i].replace(/^\\s+|\\s+$/g, "");
@@ -15737,6 +15755,14 @@ function FindProxyForURLEx(url, host) {{
         for address in addresses
     )
 
+    def _dns_ai_route_servers():
+        """Адреса, чьи TCP/UDP-потоки пакетный слой ведёт по маршруту DNS-AI (сначала напрямую, VPN - запас): свои
+        адреса сервиса и Cloudflare-адреса cf.dns-ai.ru, куда ходит DoH браузера мимо PAC и системного DNS (G145)."""
+        servers = set(NOVA_DNS_AI_SERVERS)
+        with contextlib.suppress(Exception):
+            servers.update(nova_dns_ai.entrance_route_addresses())
+        return sorted(servers)
+
     # Список имён - тот, что разблокирует сервис; он задан владельцем целиком, а
     # не собран здесь по замерам. Формы с ведущей точкой не используются: сервис
     # перечисляет хосты поимённо (ab/api/webrtc/ws.chatgpt.com, www.claude.ai),
@@ -15877,7 +15903,7 @@ function FindProxyForURLEx(url, host) {{
         route_state = os.path.join(get_base_dir(), "temp", "dns-ai-route.json")
         runtime = globals().get("vpn_slots_runtime")
         routes = runtime.dns_ai_route_snapshot() if runtime is not None else {}
-        save_json_safe(route_state, {"active": bool(mode), "servers": sorted(NOVA_DNS_AI_SERVERS),
+        save_json_safe(route_state, {"active": bool(mode), "servers": _dns_ai_route_servers(),
                                      "owner_pid": os.getpid(), "updated": time.time(), **routes})
         return mode
 
@@ -16469,7 +16495,6 @@ function FindProxyForURLEx(url, host) {{
     # log_window.state() call: it is read from the <Configure> handler, which fires
     # for every pixel of a main-window drag.
     log_window_shown = False
-    _log_align_bound = False
     auto_scroll_enabled = True
     app_mutex = None
     early_log_buffer = []  # Buffer for logs before log_window is created
@@ -17270,11 +17295,8 @@ function FindProxyForURLEx(url, host) {{
         global cached_log_size
         if not log_window or not root: return
         if event and event.widget != root: return
-        # Event-driven calls only matter while the window is visible. A hidden log
-        # window was being re-measured and re-positioned for every <Configure> of the
-        # main window — i.e. on every pixel of a drag — for nothing. Explicit calls
-        # (event is None) still run: show_log_window() needs them.
-        if event is not None and not log_window_shown: return
+        # Called when the window opens, never from a <Configure> of the main window (see where the
+        # log window is created): the position is computed once, not while the main window is dragged.
 
         try:
             # Получаем геометрию основного окна
@@ -17589,15 +17611,9 @@ function FindProxyForURLEx(url, host) {{
                     # save_window_state(log_size=geom) # Оптимизация: сохраняем только при выходе
 
         log_window.bind('<Configure>', save_log_size)
-        # add="+" is load-bearing: a plain root.bind() replaces every other handler
-        # for that sequence on root, and two exist by the time the log window is first
-        # created — the main-window geometry save and the routing-settings alignment.
-        # Opening the log used to silently unbind both. The flag keeps a re-created
-        # window from stacking duplicate handlers.
-        global _log_align_bound
-        if not _log_align_bound:
-            root.bind('<Configure>', align_log_window_to_main, add="+")
-            _log_align_bound = True
+        # The side window is placed once, when it opens (align_log_window_to_main() above). It is not
+        # re-placed on every <Configure> of the main window: that re-measured and re-positioned it, and
+        # flipped its side near a screen edge, on every pixel of a drag, and the main window jittered.
         
         # === НОВОЕ: Кнопка Telegram внизу (добавляем ПЕРЕД контентом) ===
         bottom_frame = tk.Frame(log_window, bg=LOG_THEME["panel"], height=21)  # 150% от высоты строки
@@ -32685,8 +32701,11 @@ function FindProxyForURLEx(url, host) {{
         except: pass
 
         def start_move(event):
-            root._drag_start_x = event.x
-            root._drag_start_y = event.y
+            # Pointer and window origin in SCREEN coordinates at the press. do_move used
+            # winfo_x() + (event.x - start): winfo_x() lags the geometry just set, and event.x is
+            # relative to a window that is itself moving, so the window shook while it was dragged by its body.
+            root._drag_start_pointer = (event.x_root, event.y_root)
+            root._drag_start_origin = (root.winfo_x(), root.winfo_y())
             # Monitor bounds are queried dynamically in do_move to handle multi-monitor transitions correctly
             
             # === НОВОЕ: При клике на главное окно поднимаем лог на передний план (если открыт) ===
@@ -32697,17 +32716,13 @@ function FindProxyForURLEx(url, host) {{
 
 
         def do_move(event):
-            # Calculate new main positions
-            x = root.winfo_x() + (event.x - root._drag_start_x)
-            y = root.winfo_y() + (event.y - root._drag_start_y)
-            
-            # 1. Update Main Window immediately
-            root.geometry(f"+{x}+{y}")
-            
-            # 2. Update Log Window immediately (Synchronous Sync)
-            # This makes the log window feel "glued" to the main window
-            if log_window and log_window.state() == "normal":
-                align_log_window_to_main(forced_main_geom=(x, y, root.winfo_width(), root.winfo_height()))
+            start = getattr(root, "_drag_start_pointer", None)
+            origin = getattr(root, "_drag_start_origin", None)
+            if start is None or origin is None:
+                return
+            # Only the main window moves. Side windows (log, settings, appearance, profiles) are placed
+            # when they open and stay where they are: nothing is recalculated during the drag.
+            root.geometry(f"+{origin[0] + event.x_root - start[0]}+{origin[1] + event.y_root - start[1]}")
 
         root.bind("<Button-1>", start_move)
         root.bind("<B1-Motion>", do_move)
@@ -33180,29 +33195,6 @@ function FindProxyForURLEx(url, host) {{
                     existing.after(80, lambda w=existing: w.winfo_exists() and w.attributes("-topmost", False))
                 except:
                     pass
-            except:
-                pass
-
-        def _align_routing_settings_window_to_main(event=None, forced_main_geom=None, cached_mon_bounds=None):
-            try:
-                existing = routing_settings_window_ref.get("win")
-                if not existing or not existing.winfo_exists() or str(existing.state()) == "withdrawn":
-                    return
-                if event and getattr(event, "widget", None) not in (None, root):
-                    return
-                existing.update_idletasks()
-                popup_w = max(360, existing.winfo_width(), existing.winfo_reqwidth())
-                popup_h = max(existing.winfo_height(), existing.winfo_reqheight())
-                pos_x, pos_y = _compute_settings_popup_geometry(
-                    popup_w,
-                    popup_h,
-                    forced_main_geom=forced_main_geom,
-                    cached_mon_bounds=cached_mon_bounds,
-                )
-                target_geometry = f"{popup_w}x{popup_h}+{pos_x}+{pos_y}"
-                if existing.geometry() != target_geometry:
-                    existing.geometry(target_geometry)
-                _sync_settings_owner(existing)
             except:
                 pass
 
@@ -33719,7 +33711,6 @@ function FindProxyForURLEx(url, host) {{
             win.update_idletasks()
             if not precreate:
                 root.after_idle(lambda w=win: _show_new_routing_settings_window(w))
-            root.bind("<Configure>", _align_routing_settings_window_to_main, add="+")
 
         # «Профили». The window lives in resources/nova_profiles_ui.py and sees Nova only
         # through this context (DESIGN.md §10). Status getters are called on the window's

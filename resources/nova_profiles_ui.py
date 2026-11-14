@@ -3507,32 +3507,9 @@ class ImportPreview:
 
 # --------------------------------------------------------------------------------------------
 # Entry points
-
-
-def _bind_root_alignment(root, ref):
-    if ref.get("configure_bound"):
-        return
-
-    def on_configure(event):
-        if getattr(event, "widget", None) is not root:
-            return
-        view = ref.get("view")
-        if view is None or ref.get("align_pending") or not view.is_visible():
-            return
-        ref["align_pending"] = True
-
-        def align():
-            ref["align_pending"] = False
-            if view.is_visible():
-                view.place()
-
-        try:
-            root.after_idle(align)
-        except tk.TclError:
-            ref["align_pending"] = False
-
-    root.bind("<Configure>", on_configure, add="+")
-    ref["configure_bound"] = True
+#
+# The window is placed when it is shown (ProfilesWindow.show -> place). It is NOT re-placed on every <Configure>
+# of Nova's main window: that recalculated its side on every pixel of a drag and made the main window shake.
 
 
 def get_profiles_window(ctx):
@@ -3549,7 +3526,6 @@ def precreate_profiles_window(ctx):
     if view is None or not view.alive():
         view = ProfilesWindow(ctx)
         ref["view"] = view
-        _bind_root_alignment(ctx.root, ref)
         view.refresh_now()
     return view
 
@@ -3568,7 +3544,6 @@ def open_profiles_window(ctx):
         return view
     view = ProfilesWindow(ctx)
     ref["view"] = view
-    _bind_root_alignment(root, ref)
     view.show()
     return view
 

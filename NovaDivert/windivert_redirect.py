@@ -219,6 +219,11 @@ def _current_route_mode_for_app(app):
         return "auto"
 
 
+def _is_novagram_exe(exe):
+    """True for NovaGram.exe (the Telegram client that ships its own relay), by the process image path."""
+    return str(exe or "").replace("/", "\\").rstrip("\\").lower().endswith("\\novagram.exe")
+
+
 def _app_redirect_enabled(app):
     route_mode = _current_route_mode_for_app(app)
     if route_mode == "direct":
@@ -1449,6 +1454,19 @@ class RedirectService:
                         direct_app_flow = bool(
                             meta and meta.get("app_family") in {"games-steam-direct", "dns-ai-direct"}
                         )
+                        if (
+                            meta
+                            and meta.get("app_family") == "telegram"
+                            and _is_novagram_exe(meta.get("exe"))
+                            and not self._is_telegram_target(parsed["dst_ip"])
+                        ):
+                            # NovaGram's own infrastructure: the WSS relay on Cloudflare worker zones, its DoH
+                            # (1.1.1.1), the nova-app.eu hosts. With the Telegram row on «Авто» these were
+                            # redirected as a Telegram process and the proxy took `direct` away from them, so
+                            # the relay timed out and NovaGram lost its connection (G146). Telegram's own
+                            # addresses (MTProto) stay on the Telegram policy.
+                            direct_app_flow = True
+                            self.state.count("novagram_offlist_tcp_direct")
                         if direct_app_flow:
                             meta = {}
                         if (

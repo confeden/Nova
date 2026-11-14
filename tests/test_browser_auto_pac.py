@@ -239,3 +239,67 @@ for (const c of cases) {
     assert result.returncode == 0, result.stderr
     # The bare site and other names keep their list routes.
     assert 'nova-app.eu' not in hosts
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+def test_wininet_client_reaching_cloudflare_by_address_is_not_closed(render):
+    """NovaGram asks the PAC about the Cloudflare ADDRESS its own DoH returned, not about the kws<N> name
+    (G144). With a SOCKS5-only main slot the WinINET entry point used to collapse that to the closed port;
+    browsers (FindProxyForURL) keep the list route."""
+    render.cf['on'] = True
+    cases = [dict(label='main up, second down', pac=render(True, False, True), expect_ex='DIRECT', expect_base=MAIN),
+             dict(label='main up, second up', pac=render(True, True, True), expect_ex='DIRECT', expect_base=MAIN),
+             dict(label='both down', pac=render(False, False), expect_ex='PROXY 127.0.0.1:1', expect_base=None)]
+    script = """
+const vm = require('vm');
+const cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const n = s => s.split('.').reduce((a, x) => a * 256 + Number(x), 0);
+const inNet = (ip, net, mask) => /^\d+\.\d+\.\d+\.\d+$/.test(ip) && ((n(ip) & n(mask)) >>> 0) === ((n(net) & n(mask)) >>> 0);
+const out = [];
+for (const c of cases) {
+  const ctx = {isPlainHostName: h => !h.includes('.'), isInNet: inNet, dnsResolve: () => '104.21.80.254',
+               shExpMatch: () => false};
+  vm.createContext(ctx); vm.runInContext(c.pac, ctx);
+  const ip = '104.21.80.254';
+  out.push([c.label, ctx.FindProxyForURLEx('https://' + ip + '/', ip), ctx.FindProxyForURL('https://' + ip + '/', ip)]);
+}
+console.log(JSON.stringify(out));
+"""
+    result = subprocess.run(['node', '-e', script], input=json.dumps(cases), capture_output=True, text=True,
+                            timeout=30, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    assert result.returncode == 0, result.stderr
+    for (label, ex, base), case in zip(json.loads(result.stdout), cases):
+        assert ex == case['expect_ex'], f"{label}: Ex={ex}"
+        if case['expect_base']:
+            assert base == case['expect_base'], f"{label}: base={base}"
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+def test_dns_ai_hosts_go_direct_first_then_vpn(render):
+    """dns./cf./ru.dns-ai.ru: DIRECT (winws strategy) first, the VPN chain only as the reserve; cf.dns-ai.ru sits
+    behind Cloudflare and used to fall into the Cloudflare branch (VPN only, closed port for WinINET)."""
+    render.cf['on'] = True
+    up = render(True, False, True)
+    down = render(False, False)
+    script = """
+const vm = require('vm');
+const cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const out = [];
+for (const pac of cases) {
+  const ctx = {isPlainHostName: h => !h.includes('.'), isInNet: () => false, dnsResolve: () => '104.21.80.254',
+               shExpMatch: () => false};
+  vm.createContext(ctx); vm.runInContext(pac, ctx);
+  out.push(['cf.dns-ai.ru', 'dns.dns-ai.ru', 'ru.dns-ai.ru', 'dns-ai.ru'].map(
+      h => [ctx.FindProxyForURL('https://' + h + '/', h), ctx.FindProxyForURLEx('https://' + h + '/', h)]));
+}
+console.log(JSON.stringify(out));
+"""
+    result = subprocess.run(['node', '-e', script], input=json.dumps([up, down]), capture_output=True, text=True,
+                            timeout=30, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    assert result.returncode == 0, result.stderr
+    with_vpn, without_vpn = json.loads(result.stdout)
+    for base, ex in with_vpn:
+        assert base == 'DIRECT; ' + MAIN
+        assert ex == 'DIRECT'
+    for base, ex in without_vpn:
+        assert base == 'DIRECT' and ex == 'DIRECT'

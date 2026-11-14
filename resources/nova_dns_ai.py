@@ -420,6 +420,47 @@ def _save_entrance_cache(data):
         logging.getLogger(__name__).warning("DNS-AI: адреса входов не сохранены (%s)", error)
 
 
+_ROUTE_ENTRANCE_TTL = 600.0
+_route_entrance = {"ts": 0.0, "addresses": [], "busy": False}
+
+
+def entrance_route_addresses(resolve=resolve_host_addresses, now=time.monotonic):
+    """Cloudflare addresses of cf.dns-ai.ru, for the packet layer (G145).
+
+    A browser with `https://cf.dns-ai.ru/dns-query` as its own secure DNS sends DoH straight to these
+    addresses, bypassing the system resolver and the PAC. Without them in the DNS-AI route state its flows were
+    plain direct ones: winws alone, no fall back to a VPN, and Chrome's DoH got reset (dns.dns-ai.ru, whose
+    addresses are listed, worked). Never blocks: the cache file and the last resolve are read at once, and a
+    stale answer is refreshed on a daemon thread."""
+    state = _route_entrance
+    if now() - state["ts"] >= _ROUTE_ENTRANCE_TTL and not state["busy"]:
+        state["busy"] = True
+
+        def refresh():
+            try:
+                found = resolve(HOST_CF)
+                state["addresses"] = [address for family in ("v4", "v6") for address in found.get(family, [])]
+            except Exception:
+                logging.getLogger(__name__).debug("DNS-AI: cf entrance not resolved", exc_info=True)
+            finally:
+                state["ts"] = now()
+                state["busy"] = False
+        threading.Thread(target=refresh, name="dns-ai-entrance", daemon=True).start()
+    cached = _load_entrance_cache().get(HOST_CF)
+    addresses = list(state["addresses"])
+    if isinstance(cached, dict):
+        addresses += [a for family in ("v4", "v6") for a in cached.get(family, []) if isinstance(a, str)]
+    out = []
+    for address in addresses:
+        try:
+            parsed = ipaddress.ip_address(str(address).split("%")[0])
+        except ValueError:
+            continue
+        if parsed.is_global and str(parsed) not in out:
+            out.append(str(parsed))
+    return sorted(out)
+
+
 def probe_address(address, host, token="", budget=4.0, method=None):
     """A real DoH query sent straight to one CDN address, with `host` as the TLS name."""
     return _probe_one_host("direct", 0, host, budget, token, method, connect_host=address)
