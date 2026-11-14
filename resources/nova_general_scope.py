@@ -39,6 +39,47 @@ GENERAL_EXCLUDED_IPSETS = (
 LEGACY_GENERAL_LIST = "general.txt"
 
 
+# Discord на TCP 443. Собственный профиль Discord ловит только 2053-8443 и UDP голоса, а
+# discord.com, gateway.discord.gg, cdn.discordapp.com лежат в main.txt (их исключает general,
+# потому что main уходит в VPN) — на 443 они шли вообще без обхода и «напрямую» не открывались.
+# Замер 2026-11-13, пять хостов Discord + discord-attachments-uploads-prd.storage.googleapis.com:
+# без winws все «000»; general, ALT11 и split2 открывают все за ~0.12 с; родная стратегия Discord,
+# перенесённая на 443, — нет. Берём стратегию Flowseal, как для YouTube (ALT11, D62).
+DISCORD_WEB_STRATEGY_KEYS = ("discord_web", "youtube", "general")
+
+
+def discord_web_strategy(strategies):
+    """TCP-половина (до первого --new) стратегии для Discord на 443; [] если подходящей нет."""
+    for key in DISCORD_WEB_STRATEGY_KEYS:
+        args = (strategies or {}).get(key)
+        if isinstance(args, dict):
+            args = args.get("args")
+        if not isinstance(args, list):
+            continue
+        block = []
+        for arg in args:
+            if arg == "--new":
+                break
+            if isinstance(arg, str) and arg.strip():
+                block.append(arg.strip())
+        if any(a.startswith(("--filter-tcp", "--wf-tcp")) for a in block):
+            return block
+    return []
+
+
+def discord_web_profile_args(strategies, hostlist_path, fix_arg=None):
+    """Один профиль winws (без начального --new) для имён Discord на TCP 443; [] без стратегии."""
+    block = discord_web_strategy(strategies)
+    if not block or not hostlist_path:
+        return []
+    args = ["--hostlist=" + hostlist_path]
+    for arg in block:
+        if fix_arg is not None:
+            arg = fix_arg(arg)
+        args.append(arg.replace("--wf-tcp", "--filter-tcp", 1) if arg.startswith("--wf-tcp") else arg)
+    return args
+
+
 def _has_entries(path):
     try:
         with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:

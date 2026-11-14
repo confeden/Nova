@@ -1,0 +1,18 @@
+[package]
+name = "nova-general"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bounded native general-strategy checks on a verified physical Windows interface."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0.9"
+socket2 = "0.6.5"
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Storage_FileSystem"] }

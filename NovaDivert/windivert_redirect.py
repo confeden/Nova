@@ -137,6 +137,16 @@ _TELEGRAM_IPV6_NETWORKS = [
     ipaddress.ip_network("2001:0b28:f23f:f000::/52"),
 ]
 
+# Голосовые узлы Discord (*.discord.media) — единственные имена Discord с AAAA; адрес это IPv6-зеркало
+# диапазона Cloudflare 162.159.0.0/16 (0xa29f = 162.159), отведённого Discord. Живой замер 2026-11-13:
+# по IPv6 управляющий WebSocket голоса (:8443) сбрасывается RST через ~50 с, по IPv4 держится 260 с и
+# дольше; клиент выбирал IPv6 первым и каждые ~2 мин терял голос (Heartbeat ACK timeout -> RESUME).
+# Как и Telegram: IPv6 к этому префиксу дропается, клиент сразу уходит на IPv4.
+_DISCORD_IPV6_NETWORKS = [
+    ipaddress.ip_network("2606:4700:7::/48"),
+]
+_DROPPED_IPV6_NETWORKS = _TELEGRAM_IPV6_NETWORKS + _DISCORD_IPV6_NETWORKS
+
 
 def _data_file(*parts):
     """Файл данных верхнего уровня (`ip/`, `list/`, `temp/`) — не рядом с модулем.
@@ -1385,11 +1395,12 @@ class RedirectService:
                 if len(packet) >= 40 and (packet[0] >> 4) == 6:
                     try:
                         dst_ip = ipaddress.ip_address(packet[24:40])
-                        if any(dst_ip in net for net in _TELEGRAM_IPV6_NETWORKS):
-                            # Drop Telegram IPv6 packets to force fast fallback to IPv4
+                        if any(dst_ip in net for net in _DROPPED_IPV6_NETWORKS):
+                            # Drop Telegram/Discord-voice IPv6 packets to force fast fallback to IPv4
                             log_key = f"drop_ipv6|{dst_ip}"
                             if self._should_log(log_key):
-                                self.log(f"[NovaDivert][Redirect] Dropped Telegram IPv6 packet to {dst_ip} to force fast IPv4 fallback.")
+                                service = "Discord" if any(dst_ip in net for net in _DISCORD_IPV6_NETWORKS) else "Telegram"
+                                self.log(f"[NovaDivert][Redirect] Dropped {service} IPv6 packet to {dst_ip} to force fast IPv4 fallback.")
                             continue
                     except Exception:
                         pass

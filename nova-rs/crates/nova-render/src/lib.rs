@@ -4,11 +4,13 @@ use std::f64::consts::TAU;
 
 mod android;
 mod random;
-pub use android::android_fractal;
+pub use android::{android_fractal, smooth_fractal};
 mod texture_canvas;
 mod texture_math;
 mod textures;
 pub use textures::{TextureFrame, texture_frame, texture_mask};
+mod live;
+pub use live::{LIVE_TEXTURES, LiveFrame, live_texture};
 mod matrix_rain;
 pub use matrix_rain::matrix_rain;
 mod select;

@@ -1,0 +1,125 @@
+{
+  "textures": [
+    {
+      "id": "basalt",
+      "label_ru": "Базальт"
+    },
+    {
+      "id": "marble",
+      "label_ru": "Мрамор"
+    },
+    {
+      "id": "wood",
+      "label_ru": "Дерево"
+    },
+    {
+      "id": "sand",
+      "label_ru": "Песок"
+    },
+    {
+      "id": "grass",
+      "label_ru": "Луг"
+    },
+    {
+      "id": "cracks",
+      "label_ru": "Трещины"
+    },
+    {
+      "id": "water",
+      "label_ru": "Вода"
+    },
+    {
+      "id": "ether",
+      "label_ru": "Эфир"
+    },
+    {
+      "id": "aurora",
+      "label_ru": "Полярное сияние"
+    },
+    {
+      "id": "smoke",
+      "label_ru": "Дым"
+    },
+    {
+      "id": "starfield",
+      "label_ru": "Звёздное поле"
+    },
+    {
+      "id": "constellation",
+      "label_ru": "Созвездия"
+    },
+    {
+      "id": "slime",
+      "label_ru": "Плазма"
+    },
+    {
+      "id": "rain",
+      "label_ru": "Дождь"
+    },
+    {
+      "id": "lightning",
+      "label_ru": "Молния"
+    },
+    {
+      "id": "snow",
+      "label_ru": "Снег"
+    },
+    {
+      "id": "fractal",
+      "label_ru": "Фрактал 1"
+    },
+    {
+      "id": "fractal2",
+      "label_ru": "Фрактал 2"
+    },
+    {
+      "id": "maze",
+      "label_ru": "Лабиринт"
+    },
+    {
+      "id": "matrix",
+      "label_ru": "Matrix"
+    },
+    {
+      "id": "warp",
+      "label_ru": "WARP"
+    }
+  ],
+  "gain": {
+    "basalt": 1.2,
+    "marble": 1.3,
+    "wood": 1.4,
+    "sand": 1.2,
+    "grass": 1.3,
+    "cracks": 1.1,
+    "water": 1.0,
+    "ether": 0.65,
+    "smoke": 1.2,
+    "starfield": 1.0,
+    "constellation": 1.0,
+    "slime": 1.0,
+    "rain": 0.8,
+    "lightning": 1.3,
+    "snow": 1.5,
+    "fractal": 1.2,
+    "fractal2": 1.2,
+    "matrix": 1.2,
+    "warp": 0.8,
+    "aurora": 1.0,
+    "maze": 1.0
+  },
+  "cascades": 5,
+  "base_scene_cap": 1440,
+  "default_cascade_grid": [
+    768,
+    576
+  ],
+  "atlas": {
+    "cols": 16,
+    "rows": 8,
+    "cell": [
+      24,
+      32
+    ]
+  }
+}

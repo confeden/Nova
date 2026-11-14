@@ -2,8 +2,8 @@
 //!
 //! Run this instead of `nova.pyw` while developing the Rust side. It loads the
 //! same `strat/*.json`, `fake/` and `bin/winws.exe` the shipping app uses, drives
-//! the real engine crates, and prints what it decided and why. There is no GUI
-//! and no driver interaction, so it is safe to run while Nova itself is running.
+//! the real engine crates, and prints what it decided and why. `general-background`
+//! additionally opens scoped WinDivert handles for its own physical test connections.
 //!
 //! ```text
 //! cargo run -p nova-cli -- inspect     corpus and palette as the IR sees them
@@ -12,12 +12,18 @@
 //! cargo run -p nova-cli -- mine        breed across all pools, report new rules
 //! cargo run -p nova-cli -- learn       watch the learner converge, offline
 //! cargo run -p nova-cli -- budget      show the background exploration schedule
+//! cargo run -p nova-cli -- general-background --root PATH --parent PID   bounded Windows checks
+//! cargo run -p nova-cli -- general-capabilities   native checker protocol and candidate limit
 //! cargo run -p nova-cli -- cloudflare-classify   one JSON request on stdin -> one JSON verdict on stdout
 //! cargo run -p nova-cli -- render-fractal       versioned JSON viewport -> binary grayscale PGM
+//! cargo run -p nova-cli -- gpu-snapshot         one light-lab frame (OpenGL 3.3) -> binary PPM
+//! cargo run -p nova-cli -- gpu-bench            GPU ms and CPU time per light-lab frame
+//! cargo run -p nova-cli -- gpu-serve            persistent GPU background renderer (JSON stdin, shared memory)
 //! ```
 
 mod cloudflare_cmd;
 mod corpus;
+mod gpu_cmd;
 mod render_cmd;
 mod validate;
 
@@ -35,6 +41,14 @@ use validate::{Validator, Verdict};
 fn main() {
     let command = std::env::args().nth(1).unwrap_or_else(|| "inspect".to_owned());
 
+    if command == "general-background" {
+        std::process::exit(nova_general::run());
+    }
+    if command == "general-capabilities" {
+        println!("{}", nova_general::capabilities());
+        return;
+    }
+
     // Stateless, no Nova tree required -> dispatched before Corpus::find_root()
     // (and before the "nova engine {version} root {path}" banner below) so a
     // Python caller gets nothing but the one JSON line on stdout it asked for.
@@ -43,6 +57,12 @@ fn main() {
     }
     if command == "render-fractal" {
         std::process::exit(render_cmd::run());
+    }
+    match command.as_str() {
+        "gpu-snapshot" => std::process::exit(gpu_cmd::snapshot()),
+        "gpu-bench" => std::process::exit(gpu_cmd::bench()),
+        "gpu-serve" => std::process::exit(gpu_cmd::serve()),
+        _ => {}
     }
 
     let Some(root) = Corpus::find_root() else {
@@ -72,7 +92,7 @@ fn main() {
         "budget" => budget(),
         other => {
             eprintln!(
-                "unknown command {other:?}; try inspect | import | evolve | mine | learn | budget | cloudflare-classify | render-fractal"
+                "unknown command {other:?}; try inspect | import | evolve | mine | learn | budget | cloudflare-classify | render-fractal | gpu-snapshot | gpu-bench | gpu-serve"
             );
             std::process::exit(2);
         }

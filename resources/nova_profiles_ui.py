@@ -1779,7 +1779,14 @@ class ProfilesWindow:
             return
         self.place()
         try:
+            # Mapped fully transparent and made opaque after Tk painted every child: no visible repaint.
+            try:
+                self.win.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
             self.win.deiconify()
+            self.win.update_idletasks()
+            self.win.after(45, self._make_opaque)
         except tk.TclError:
             return
         if not self._title_bar_done:
@@ -1793,6 +1800,13 @@ class ProfilesWindow:
         # so the figures are measured then rather than on a timer nobody is watching. `force=False`
         # keeps a figure measured in the last few minutes, so re-opening costs nothing.
         self._sweep_current_tab()
+
+    def _make_opaque(self):
+        try:
+            if self.win.winfo_exists():
+                self.win.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
 
     def hide(self):
         if self._preview is not None:
@@ -2041,7 +2055,19 @@ class ProfilesWindow:
 
     def _records_for(self, group):
         records = nova_proxy.group_records([r for r in self._snapshot.get('profiles') or [] if isinstance(r, dict)], group)
-        return nova_proxy.sort_records(records, self._sort_mode, self._snapshot.get('stats')) if group == GROUP_CUSTOM else records
+        if group != GROUP_CUSTOM:
+            return records
+        return nova_proxy.sort_records(records, self._sort_mode, self._snapshot.get('stats'),
+                                       order=self._nova_list_order(records))
+
+    def _nova_list_order(self, records):
+        """{profile_id: position in the Nova list} for its never-measured rows (page order)."""
+        for sub in self._snapshot.get('subs') or ():
+            if isinstance(sub, dict) and sub.get('id') == 'nova-list':
+                position = {identity: index for index, identity in enumerate(sub.get('page_order') or ())}
+                return {r.get('id'): position[r.get('fingerprint')] for r in records
+                        if r.get('subscription') == 'nova-list' and r.get('fingerprint') in position}
+        return {}
 
     def _set_sort(self, mode):
         self._sort_mode = mode

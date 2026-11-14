@@ -26,7 +26,10 @@ except Exception:
 
 APP_NAME = "Nova"
 APP_EXE = "Nova.exe"
+# Updater-compatible name: every installed Nova up to 1.45 looks for an asset called exactly this one,
+# so each release carries a copy under it beside the versioned file people see (owner 2026-11-14).
 INSTALLER_EXE = "NovaSetup.exe"
+INSTALLER_EXE_VERSIONED = "NovaSetup-{version}.exe"
 ISS_TEMPLATE = "NovaInstaller.iss"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -124,7 +127,7 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # (which egress the reserve is, whether the primary exits abroad). Missing, they fall back to the
 # pre-1.39 routing in silence -- so it must be listed here, not merely present in the tree.
 RESOURCE_ROOT_FILES = ("nova_routing_profiles.py", "nova_transport_plans.py", "nova_privacy.py", "nova_temp_log.py",
-                       "nova_vpn_slots.py")
+                       "nova_vpn_slots.py", "nova_gpu.py", "nova_texture_thumbs.png")
 RESOURCE_SOURCE_DIR = "resources"
 ROOT_DOC_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md")
 # The proxy helpers (NovaWFP\proxy\tcp_proxy.py, udp_proxy.py) run as separate
@@ -1728,9 +1731,12 @@ def build_installer(base_dir: Path) -> None:
     print(f"[BUILD] Inno Setup installer via {iscc}")
     run_checked([iscc, str(generated_iss)], base_dir)
 
-    installer_path = release_dir / INSTALLER_EXE
+    installer_path = release_dir / INSTALLER_EXE_VERSIONED.format(version=version)
     if not installer_path.exists():
         raise RuntimeError(f"Installer was not created: {installer_path}")
+    compat_path = release_dir / INSTALLER_EXE
+    shutil.copy2(installer_path, compat_path)
+    print(f"[DONE] Updater-compatible copy: {compat_path}")
 
     try:
         safe_rmtree(staging_dir)

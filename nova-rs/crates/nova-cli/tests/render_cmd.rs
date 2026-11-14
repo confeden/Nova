@@ -69,6 +69,25 @@ fn android_rejects_invalid_crops_dimensions_and_variants() {
 }
 
 #[test]
+fn smooth_fractal_emits_rgb_and_preserves_input_bounds() {
+    let request = serde_json::json!({"version":6,"width":80,"height":60,"variant":197,
+        "source":[700,500],"crop":[0.1,0.1,0.9,0.9]});
+    let output = run(&request.to_string());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let header = b"P6\n80 60\n255\n";
+    assert!(output.stdout.starts_with(header));
+    assert_eq!(output.stdout.len(), header.len() + 80 * 60 * 3);
+    assert!(output.stdout[header.len()..].chunks(3).any(|p| p[0] != p[1] && p[1] != p[2]));
+    for (key, value) in [("width", serde_json::json!(1441)), ("crop", serde_json::json!([0,0,0,1]))] {
+        let mut invalid = request.clone();
+        invalid[key] = value;
+        let output = run(&invalid.to_string());
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn all_texture_protocols_emit_bounded_images_and_reject_bad_requests() {
     let texture = serde_json::json!({"version":4,"width":80,"height":60,"texture":"lightning","variant":197});
     let rain = serde_json::json!({"version":5,"width":80,"height":60,"variant":197,"time":65,
@@ -158,5 +177,25 @@ fn seeded_protocol_emits_a_bounded_word_receipt_and_an_image() {
         let output = run(&bad.to_string());
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn live_protocol_emits_masks_rgb_fractal_and_rejects_retired_names() {
+    for (texture, magic, channels) in [("snow", "P5", 1), ("fractal", "P6", 3)] {
+        let request = serde_json::json!({"version":7,"width":40,"height":30,"texture":texture,"variant":197,"time":12.5});
+        let output = run(&request.to_string());
+        assert!(output.status.success(), "{texture}: {}", String::from_utf8_lossy(&output.stderr));
+        let header = format!("{magic}\n40 30\n255\n");
+        assert!(output.stdout.starts_with(header.as_bytes()));
+        assert_eq!(output.stdout.len(), header.len() + 40 * 30 * channels);
+    }
+    for bad in [
+        serde_json::json!({"version":7,"width":40,"height":30,"texture":"shards","variant":0,"time":1}),
+        serde_json::json!({"version":7,"width":40,"height":30,"texture":"snow","variant":0,"time":-1}),
+        serde_json::json!({"version":7,"width":4000,"height":30,"texture":"snow","variant":0,"time":1}),
+    ] {
+        let output = run(&bad.to_string());
+        assert!(!output.status.success() && output.stdout.is_empty());
     }
 }

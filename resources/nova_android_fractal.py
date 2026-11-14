@@ -4,6 +4,8 @@ from ctypes import c_float
 from functools import lru_cache
 import math
 
+from PIL import Image
+
 import nova_native_render
 from nova_fractal import CENTRES
 
@@ -139,12 +141,88 @@ def render_python(width, height, variant, source, crop):
     return bytes(pixels)
 
 
-def render_mask(width, height, variant, source=None, crop=(0., 0., 1., 1.)):
-    source = (width, height) if source is None else source
+def _validate(width, height, variant, source, crop):
     if (not 8 <= width <= 1440 or not 8 <= height <= 1440 or not 0 <= variant <= 2147483647
             or len(source) != 2 or any(not 8 <= n <= 4096 for n in source)
             or len(crop) != 4 or any(not math.isfinite(n) or not 0 <= n <= 1 for n in crop)
             or crop[2] <= crop[0] or crop[3] <= crop[1]):
         raise ValueError("Invalid Android fractal viewport")
+
+
+def render_mask(width, height, variant, source=None, crop=(0., 0., 1., 1.)):
+    source = (width, height) if source is None else source
+    _validate(width, height, variant, source, crop)
     pixels = nova_native_render.android_fractal(width, height, variant, source, crop)
     return pixels if pixels is not None else render_python(width, height, variant, source, crop)
+
+
+def _palette(nu):
+    if nu < 0:
+        return (.035, .05, .09)
+    stops = ((.18, .22, .58), (.12, .56, .78), (.18, .72, .57),
+             (.88, .64, .30), (.56, .28, .66), (.18, .22, .58))
+    phase = (nu * .018 % 1) * 5
+    index = min(4, int(phase))
+    fraction = phase - index
+    blend = fraction * fraction * (3 - 2 * fraction)
+    brightness = .45 + .55 * smooth(1.5, 90, nu)
+    return tuple((a * (1 - blend) + b * blend) * brightness for a, b in zip(stops[index], stops[index + 1]))
+
+
+def _filtered_color(cr, ci, limit, footprint):
+    inside = _palette(-1.5)
+    q = (cr - .25) ** 2 + ci * ci
+    if q * (q + cr - .25) <= .25 * ci * ci or (cr + 1) ** 2 + ci * ci <= .0625:
+        return inside
+    zr = zi = dr = di = 0.
+    for n in range(limit):
+        rr, ii = zr * zr, zi * zi
+        if rr + ii > 1e4:
+            radius = math.sqrt(rr + ii)
+            nu = f(n + 1 - math.log(math.log(radius)) / math.log(2))
+            derivative = math.hypot(dr, di)
+            distance = .5 * math.log(radius) * radius / derivative if derivative else math.inf
+            coverage = smooth(0, 1.5, distance / footprint)
+            return tuple(a + (b - a) * coverage for a, b in zip(inside, _palette(nu)))
+        next_dr = 2 * (zr * dr - zi * di) + 1
+        di = 2 * (zr * di + zi * dr)
+        dr = next_dr
+        zi = 2 * zr * zi + ci
+        zr = rr - ii + cr
+    return inside
+
+
+def render_color_python(width, height, variant, source, crop):
+    real, imaginary, scale, cosine, sine, limit = select_view(*source, variant)
+    span = min(source)
+    ax, ay = source[0] / span, source[1] / span
+    longest = min(380, max(width, height))
+    gw, gh = max(2, longest * width // max(width, height)), max(2, longest * height // max(width, height))
+    footprint = max(scale * ax * (crop[2] - crop[0]) / (gw - 1),
+                    scale * ay * (crop[3] - crop[1]) / (gh - 1))
+    # Filter colors, including interior coverage, rather than signed escape counts.
+    channels = [[], [], []]
+    for gy in range(gh):
+        py = (crop[1] + gy / (gh - 1) * (crop[3] - crop[1]) - .5) * scale * ay
+        for gx in range(gw):
+            px = (crop[0] + gx / (gw - 1) * (crop[2] - crop[0]) - .5) * scale * ax
+            color = _filtered_color(real + px * cosine - py * sine, imaginary + px * sine + py * cosine, limit, footprint)
+            for channel, value in zip(channels, color):
+                channel.append(value * 255)
+    bands = []
+    for channel in channels:
+        band = Image.new('F', (gw, gh))
+        band.putdata(channel)
+        # PIL samples pixel centres; extend the endpoints to match the native grid.
+        sx, sy = (gw - 1) / (width - 1), (gh - 1) / (height - 1)
+        band = band.transform((width, height), Image.Transform.AFFINE,
+                              (sx, 0, .5 * (1 - sx), 0, sy, .5 * (1 - sy)), Image.Resampling.BILINEAR)
+        bands.append(band.point(lambda value: value + .5).convert('L'))
+    return Image.merge('RGB', bands).tobytes()
+
+
+def render_color(width, height, variant, source=None, crop=(0., 0., 1., 1.)):
+    source = (width, height) if source is None else source
+    _validate(width, height, variant, source, crop)
+    pixels = nova_native_render.smooth_fractal(width, height, variant, source, crop)
+    return pixels if pixels is not None else render_color_python(width, height, variant, source, crop)

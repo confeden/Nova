@@ -1322,16 +1322,14 @@ def should_issue(account, now, profiles_present, *, proxies=None):
         return False, _cooldown_text(cooldown)
     if not profiles_present:
         return True, "профилей Proton ещё нет"
-    if not isinstance(account, dict) or (
-            _account_seed(account) is None and _usable_pending(account, now) is None):
-        return True, "ключ Proton ещё не выпущен"
-    if _usable_pending(account, now) is not None:
+    if isinstance(account, dict) and _usable_pending(account, now) is not None:
+        # A key the owner's own «Перевыпустить» already registered: finishing that run writes no
+        # new registration, it only rewrites the set onto the key.
         return True, "новый ключ зарегистрирован, но набор ещё не переписан на него"
-    if needs_renewal(account, now):
-        return True, f"сертификат ключа истекает {_format_date(_opt_int(account.get('cert_expires_at'), 0))}"
-    if not _nodes_fresh(account, now):
-        return True, "список узлов Proton устарел"
-    return False, "набор Proton свежий — выпуск не нужен"
+    # Owner, 2026-11-12 (Android D40): the set is issued once per install. Certificate renewal and a
+    # stale node list no longer re-issue on their own -- only «Перевыпустить» (force=True) does.
+    # Known gap, as on Android: the key's certificate (~1 year) is not renewed automatically.
+    return False, "набор Proton уже выпущен — перевыпуск только вручную"
 
 
 def _conf_private_key(path):

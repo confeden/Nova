@@ -224,7 +224,7 @@ def _read_http_response(sock, deadline):
     return data
 
 
-def _http2_body(conn, host, path, deadline):
+def _http2_body(conn, host, path, deadline, method='GET', body=None):
     import h2.config
     import h2.connection
     import h2.events
@@ -232,11 +232,17 @@ def _http2_body(conn, host, path, deadline):
 
     client = h2.connection.H2Connection(config=h2.config.H2Configuration(header_encoding='utf-8'))
     client.initiate_connection()
-    client.send_headers(1, [(':method', 'GET'), (':scheme', 'https'), (':authority', host), (':path', path),
-                            ('accept', 'application/dns-message'), ('user-agent', _USER_AGENT)], end_stream=True)
+    headers = [(':method', method), (':scheme', 'https'), (':authority', host), (':path', path),
+               ('accept', 'application/dns-message'), ('user-agent', _USER_AGENT)]
+    if body is None:
+        client.send_headers(1, headers, end_stream=True)
+    else:
+        headers += [('content-type', 'application/dns-message'), ('content-length', str(len(body)))]
+        client.send_headers(1, headers)
+        client.send_data(1, body, end_stream=True)
     conn.settimeout(deadline.timeout())
     conn.sendall(client.data_to_send())
-    body = bytearray()
+    reply = bytearray()
     status = None
     try:
         while True:
@@ -250,13 +256,13 @@ def _http2_body(conn, host, path, deadline):
                 elif isinstance(event, h2.events.DataReceived):
                     client.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                     if event.stream_id == 1:
-                        body.extend(event.data)
-                        if len(body) > 65535:
+                        reply.extend(event.data)
+                        if len(reply) > 65535:
                             raise ProbeError(f'{host}: oversized DNS response')
                 elif isinstance(event, h2.events.StreamEnded) and event.stream_id == 1:
                     if status != '200':
                         raise ProbeError(f'{host}: HTTP {status}')
-                    return bytes(body)
+                    return bytes(reply)
                 elif isinstance(event, (h2.events.StreamReset, h2.events.ConnectionTerminated)):
                     raise ProbeError(f'{host}: HTTP/2 stream terminated')
             pending = client.data_to_send()
@@ -268,8 +274,13 @@ def _http2_body(conn, host, path, deadline):
 
 
 def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, proxy_host="127.0.0.1",
-                    target_port=443, use_tls=True, ssl_context=None, binary=False, http2=False):
-    """GET through a local proxy; return text or binary body. Raises ProbeError.
+                    target_port=443, use_tls=True, ssl_context=None, binary=False, http2=False,
+                    connect_host=None, method="GET", body=None):
+    """GET (or, over HTTP/2, POST of `body`) through a local proxy; return text or binary body. Raises ProbeError.
+
+    `connect_host` dials that address while TLS/SNI and the Host header keep `target_host`: the way a
+    DoH client that was given a server IP plus a template reaches a CDN edge. Direct only: the
+    proxy kinds always CONNECT by name.
 
     `proxy_kind` is "socks5", "http" or "direct" (no proxy: `proxy_port` is ignored and the
     target is dialled straight). `use_tls=False` exists for tests with a plain fake server.
@@ -283,7 +294,7 @@ def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, pr
     try:
         if kind == "direct":
             try:
-                raw = socket.create_connection((str(target_host), int(target_port)),
+                raw = socket.create_connection((str(connect_host or target_host), int(target_port)),
                                                timeout=min(2.0, deadline.timeout()))
             except OSError as exc:
                 raise ProbeError(f"напрямую до {target_host}: {exc.__class__.__name__}") from None
@@ -317,8 +328,8 @@ def fetch_via_proxy(proxy_kind, proxy_port, target_host, path, *, budget=8.0, pr
             if use_tls and conn.selected_alpn_protocol() != 'h2':
                 raise ProbeError(f'{target_host}: HTTP/2 was not negotiated')
             try:
-                body = _http2_body(conn, target_host, path, deadline)
-                return body if binary else body.decode('utf-8', 'replace')
+                reply = _http2_body(conn, target_host, path, deadline, method, body)
+                return reply if binary else reply.decode('utf-8', 'replace')
             except OSError as error:
                 raise ProbeError(f'{target_host}: HTTP/2 {type(error).__name__}') from None
         request = (

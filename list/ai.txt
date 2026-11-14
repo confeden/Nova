@@ -61,7 +61,6 @@ www.copilot.com
 generativelanguage.googleapis.com
 www.strava.com
 strava.com
-nova-app.eu
 cdn-1.strava.com
 graphql.strava.com
 accounts.youtube.com
@@ -88,4 +87,4 @@ clientservices.googleapis.com
 accountcapabilities-pa.googleapis.com
 optimizationguide-pa.googleapis.com
 devin.ai
-dns.dns-ai.ru
+dns-ai.ru

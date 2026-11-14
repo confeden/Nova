@@ -1,0 +1,449 @@
+{
+  "max_candidates": 12,
+  "status": "windows_measured_seed_fresh_local_evidence_required",
+  "strategies": [
+    {
+      "aliases": [
+        {
+          "name": "general (ALT11)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake,multisplit",
+            "--dpi-desync-split-seqovl=664",
+            "--dpi-desync-split-pos=1",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-repeats=8",
+            "--dpi-desync-split-seqovl-pattern=%BIN%tls_clienthello_www_sferum_ru.bin",
+            "--dpi-desync-fake-tls=%BIN%stun2.bin",
+            "--dpi-desync-fake-tls=%BIN%tls_clienthello_www_sferum_ru.bin",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake,multisplit",
+        "--dpi-desync-split-seqovl=664",
+        "--dpi-desync-split-pos=1",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-repeats=8",
+        "--dpi-desync-split-seqovl-pattern=fake/flowseal/tls_clienthello_www_sferum_ru.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/stun2.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/tls_clienthello_www_sferum_ru.bin",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c060",
+      "name": "general_bench_c060"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT10)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-fake-tls=%BIN%stun.bin",
+            "--dpi-desync-fake-tls=%BIN%tls_clienthello_4pda_to.bin",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake",
+        "--dpi-desync-repeats=6",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-fake-tls=fake/flowseal/stun.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/tls_clienthello_4pda_to.bin",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c039",
+      "name": "general_bench_c039"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general/general_M46C",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--dpi-desync=fake",
+            "--dpi-desync-fake-tls-mod=rnd",
+            "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+            "--dpi-desync-fooling=badseq",
+            "--dpi-desync-split-seqovl=1",
+            "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+            "--dpi-desync-autottl=1",
+            "--dpi-desync-ttl=6"
+          ],
+          "source": "Nova"
+        },
+        {
+          "name": "alt_1",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--dpi-desync=fake",
+            "--dpi-desync-fake-tls-mod=rnd",
+            "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+            "--dpi-desync-fooling=badseq",
+            "--dpi-desync-split-seqovl=1",
+            "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+            "--dpi-desync-autottl=1",
+            "--dpi-desync-ttl=6"
+          ],
+          "source": "Nova-active"
+        },
+        {
+          "name": "general",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--dpi-desync=fake",
+            "--dpi-desync-fake-tls-mod=rnd",
+            "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+            "--dpi-desync-fooling=badseq",
+            "--dpi-desync-split-seqovl=1",
+            "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+            "--dpi-desync-autottl=1",
+            "--dpi-desync-ttl=6"
+          ],
+          "source": "Nova-active"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake",
+        "--dpi-desync-fake-tls-mod=rnd",
+        "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+        "--dpi-desync-fooling=badseq",
+        "--dpi-desync-split-seqovl=1",
+        "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+        "--dpi-desync-autottl=1",
+        "--dpi-desync-ttl=6"
+      ],
+      "linux_bench_id": "c014",
+      "name": "general_bench_c014"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general/general_MB7A",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--dpi-desync=fake",
+            "--dpi-desync-fake-tls-mod=rnd",
+            "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+            "--dpi-desync-fooling=badsum",
+            "--dpi-desync-split-seqovl=1",
+            "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+            "--dpi-desync-autottl=1",
+            "--dpi-desync-ttl=5"
+          ],
+          "source": "Nova"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake",
+        "--dpi-desync-fake-tls-mod=rnd",
+        "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+        "--dpi-desync-fooling=badsum",
+        "--dpi-desync-split-seqovl=1",
+        "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+        "--dpi-desync-autottl=1",
+        "--dpi-desync-ttl=5"
+      ],
+      "linux_bench_id": "c019",
+      "name": "general_bench_c019"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general/general_MC03",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--dpi-desync=fake",
+            "--dpi-desync-fake-tls-mod=rnd,dupsid",
+            "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-split-seqovl=1",
+            "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+            "--dpi-desync-autottl=1",
+            "--dpi-desync-ttl=6"
+          ],
+          "source": "Nova"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake",
+        "--dpi-desync-fake-tls-mod=rnd,dupsid",
+        "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-split-seqovl=1",
+        "--dpi-desync-fake-tls=fake/tls_clienthello_yandex_kz.bin",
+        "--dpi-desync-autottl=1",
+        "--dpi-desync-ttl=6"
+      ],
+      "linux_bench_id": "c031",
+      "name": "general_bench_c031"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT4)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake,multisplit",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fooling=badseq",
+            "--dpi-desync-badseq-increment=1000",
+            "--dpi-desync-fake-tls=%BIN%stun.bin",
+            "--dpi-desync-fake-tls=%BIN%tls_clienthello_www_google_com.bin",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake,multisplit",
+        "--dpi-desync-repeats=6",
+        "--dpi-desync-fooling=badseq",
+        "--dpi-desync-badseq-increment=1000",
+        "--dpi-desync-fake-tls=fake/flowseal/stun.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/tls_clienthello_www_google_com.bin",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c057",
+      "name": "general_bench_c057"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT8)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake",
+            "--dpi-desync-fake-tls-mod=none",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fooling=badseq",
+            "--dpi-desync-badseq-increment=2",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake",
+        "--dpi-desync-fake-tls-mod=none",
+        "--dpi-desync-repeats=6",
+        "--dpi-desync-fooling=badseq",
+        "--dpi-desync-badseq-increment=2",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c013",
+      "name": "general_bench_c013"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (SIMPLE FAKE ALT2)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-fake-tls=%BIN%stun2.bin",
+            "--dpi-desync-fake-tls=%BIN%tls_clienthello_www_sferum_ru.bin",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake",
+        "--dpi-desync-repeats=6",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-fake-tls=fake/flowseal/stun2.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/tls_clienthello_www_sferum_ru.bin",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c040",
+      "name": "general_bench_c040"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT13)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake,hostfakesplit",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-hostfakesplit-mod=host=mail.ru,altorder=1",
+            "--dpi-desync-repeats=5",
+            "--dpi-desync-fake-tls=%BIN%tls_clienthello_sochi_park.bin",
+            "--dpi-desync-fake-tls=%BIN%stun2.bin",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_sochi_park.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake,hostfakesplit",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-hostfakesplit-mod=host=mail.ru,altorder=1",
+        "--dpi-desync-repeats=5",
+        "--dpi-desync-fake-tls=fake/flowseal/tls_clienthello_sochi_park.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/stun2.bin",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_sochi_park.bin"
+      ],
+      "linux_bench_id": "c055",
+      "name": "general_bench_c055"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT3)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake,hostfakesplit",
+            "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+            "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake,hostfakesplit",
+        "--dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru",
+        "--dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c054",
+      "name": "general_bench_c054"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=fake,fakedsplit",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fooling=ts",
+            "--dpi-desync-fakedsplit-pattern=0x00",
+            "--dpi-desync-fake-tls=%BIN%stun.bin",
+            "--dpi-desync-fake-tls=%BIN%tls_clienthello_www_google_com.bin",
+            "--dpi-desync-fake-http=%BIN%tls_clienthello_www_sferum_ru.bin"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=fake,fakedsplit",
+        "--dpi-desync-repeats=6",
+        "--dpi-desync-fooling=ts",
+        "--dpi-desync-fakedsplit-pattern=0x00",
+        "--dpi-desync-fake-tls=fake/flowseal/stun.bin",
+        "--dpi-desync-fake-tls=fake/flowseal/tls_clienthello_www_google_com.bin",
+        "--dpi-desync-fake-http=fake/flowseal/tls_clienthello_www_sferum_ru.bin"
+      ],
+      "linux_bench_id": "c052",
+      "name": "general_bench_c052"
+    },
+    {
+      "aliases": [
+        {
+          "name": "general (ALT9)",
+          "original_profile": [
+            "--filter-tcp=80,443",
+            "--hostlist=%LISTS%list-general.txt",
+            "--hostlist=%LISTS%list-general-user.txt",
+            "--hostlist-exclude=%LISTS%list-exclude.txt",
+            "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude.txt",
+            "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+            "--dpi-desync=hostfakesplit",
+            "--dpi-desync-repeats=4",
+            "--dpi-desync-fooling=ts,md5sig",
+            "--dpi-desync-hostfakesplit-mod=host=ozon.ru"
+          ],
+          "source": "Flowseal"
+        }
+      ],
+      "args": [
+        "--filter-tcp=443",
+        "--dpi-desync=hostfakesplit",
+        "--dpi-desync-repeats=4",
+        "--dpi-desync-fooling=ts,md5sig",
+        "--dpi-desync-hostfakesplit-mod=host=ozon.ru"
+      ],
+      "linux_bench_id": "c065",
+      "name": "general_bench_c065"
+    }
+  ],
+  "probe_hints": [
+    "amnezia.org",
+    "carnegieendowment.org",
+    "charter97.org"
+  ]
+}

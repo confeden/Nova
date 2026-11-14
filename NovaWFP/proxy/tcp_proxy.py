@@ -314,6 +314,15 @@ def _load_domain_list(name: str) -> set:
 # slot resolves it on its own side and the app reaches the real service from the slot's exit.
 DIAL_BY_SNI_FAMILIES = frozenset({"ai_apps"})
 TLS_HELLO_READ_TIMEOUT = 1.5
+# Discord «Авто»: TLS-порты, на которых первым говорит клиент. Для них ClientHello читается
+# заранее, чтобы прямой путь (winws) можно было проверить по первому байту ответа и при
+# молчании перейти на VPN, а не повиснуть на 19 секунд.
+DISCORD_VERIFY_PORTS = frozenset({443, 2053, 2083, 2087, 2096, 8443})
+
+
+def _looks_like_tls_server_handshake(data: bytes) -> bool:
+    """Первая запись ответа сервера — Handshake (0x16, версия 3.x), а не alert (0x15) и не мусор."""
+    return len(data) >= 3 and data[0] == 0x16 and data[1] == 0x03
 TLS_HELLO_MAX_BYTES = 16384 + 5
 
 
@@ -975,6 +984,25 @@ class NovaWfpTcpProxy:
                 return _vpn_slots.secondary_http_attempt(state, timeout=3.0, first_byte_timeout=2.4)
         return dict(mapping[label]) if label in mapping else None
 
+    def _ai_apps_auto_labels(self, target_host: str, target_port: int) -> List[str]:
+        """Route labels an AI app may use on «Авто»; empty means the connection is refused."""
+        state = _egress_state()
+        labels = [
+            {"primary": "warp-socks", "secondary": "opera-http"}[slot]
+            for slot in _vpn_slots.ai_apps_auto_slots_from_state(state)
+        ]
+        if not labels and _vpn_slots.ai_apps_direct_allowed(state):
+            labels = ["direct"]
+        if not labels:
+            now = time.monotonic()
+            if now - float(getattr(self, "_ai_block_logged_at", 0.0) or 0.0) >= 30.0:
+                self._ai_block_logged_at = now
+                self.log_func(
+                    f"[NovaWFP][Proxy] ai_apps: {target_host}:{target_port} закрыто — ни у main, ни у second нет "
+                    "выхода вне России/Беларуси, а DNS-AI не включён (без утечки напрямую)."
+                )
+        return labels
+
     @staticmethod
     def _primary_carries_eu_traffic() -> bool:
         """The primary tunnel is up and exits outside Russia, so EU-list traffic may take it."""
@@ -1123,6 +1151,18 @@ class NovaWfpTcpProxy:
         elif app_family == "ai_apps":
             route_mode_key = "ai_apps"
         route_mode = _get_app_route_mode(route_mode_key) if route_mode_key else "auto"
+        # Discord «Авто» = сначала напрямую (winws десинхронизирует список discord.txt, включая
+        # discord-attachments-uploads-prd.storage.googleapis.com), затем основной VPN, затем доп.
+        # Раньше ip/discord, cloudflare и list/main переводили «Авто» в warp, и звонок шёл через VPN.
+        discord_auto = route_mode_key == "discord" and route_mode == "auto"
+        if discord_auto:
+            route_mode = "direct"
+        # ИИ-приложения на «Авто» (owner 2026-11-14): только main, затем second — и только если их выход
+        # не в России/Беларуси; напрямую — лишь когда DNS-AI уже ведёт DNS. Списки main/second и
+        # Cloudflare-адреса здесь ничего не решают: имя ИИ-сервиса не должно уйти домой «по пути».
+        ai_auto = route_mode_key == "ai_apps" and route_mode == "auto" and _vpn_slots is not None
+        if ai_auto:
+            route_mode = "direct"
         games_auto_warp = route_mode_key == "games" and route_mode == "auto"
         is_eu_route_target = False
         if route_mode == "auto":
@@ -1209,6 +1249,9 @@ class NovaWfpTcpProxy:
         if (is_telegram_target or is_telegram_app) and route_mode in ("warp", "opera"):
             attempts = [PINNED_EGRESS_BY_MODE[route_mode]]
 
+        if ai_auto:
+            attempts = self._ai_apps_auto_labels(target_host, target_port)
+
         cached_label = self._route_label_cache_get(target_host, target_port, route_scope=route_scope)
         if cached_label in attempts:
             attempts = [cached_label] + [item for item in attempts if item != cached_label]
@@ -1224,7 +1267,19 @@ class NovaWfpTcpProxy:
         for label in attempts:
             attempt = self._attempt_by_label(label)
             if attempt:
-                if is_discord_target:
+                if discord_auto:
+                    # Прямой путь проверяется по первому байту (см. DISCORD_VERIFY_PORTS), поэтому
+                    # каждому шагу нужно времени больше, чем в старой цепочке «warp за 0.75 с».
+                    if label == "direct":
+                        attempt["timeout"] = min(float(attempt.get("timeout") or 8.0), 2.0)
+                        attempt["first_byte_timeout"] = min(float(attempt.get("first_byte_timeout") or 8.0), 2.5)
+                    elif label == "warp-socks":
+                        attempt["timeout"] = max(float(attempt.get("timeout") or 2.5), 2.5)
+                        attempt["first_byte_timeout"] = max(float(attempt.get("first_byte_timeout") or 1.4), 3.0)
+                    elif label == "opera-http":
+                        attempt["timeout"] = max(float(attempt.get("timeout") or 3.0), 3.0)
+                        attempt["first_byte_timeout"] = max(float(attempt.get("first_byte_timeout") or 2.4), 3.5)
+                elif is_discord_target:
                     if label == "warp-socks":
                         attempt["timeout"] = min(float(attempt.get("timeout") or 2.5), 0.75)
                         attempt["first_byte_timeout"] = min(float(attempt.get("first_byte_timeout") or 1.4), 0.9)
@@ -1454,6 +1509,7 @@ class NovaWfpTcpProxy:
         route_scope: str = "",
         bad_route_all_ports: bool = True,
         telegram_media: bool = False,
+        expect_tls_handshake: bool = False,
     ):
         last_error = None
         for attempt in route_attempts:
@@ -1483,6 +1539,10 @@ class NovaWfpTcpProxy:
                     raise TimeoutError(f"no first byte in {first_timeout:.1f}s") from exc
                 if not first_down:
                     raise OSError("upstream closed before first byte")
+                if expect_tls_handshake and not _looks_like_tls_server_handshake(first_down):
+                    # Ответ на ClientHello — не ServerHello, а TLS-alert (например 15 03 03 00 02 02 28, 7 байт):
+                    # путь «открылся», но соединение мертво. Без этой проверки такой путь считался рабочим.
+                    raise OSError(f"first reply is not a TLS handshake: {len(first_down)} bytes {first_down[:7].hex()}")
                 verify_ms = int((time.monotonic() - started) * 1000)
                 self.log_func(
                     f"[NovaWFP][Proxy] verified target={target_host}:{target_port} route={route_label} "
@@ -2154,6 +2214,14 @@ class NovaWfpTcpProxy:
                 if sni:
                     dial_host = sni
                     target_note = f"{target_note} sni={sni}"
+            discord_verify = (
+                not initial_data
+                and str(app_family or "").strip().lower() == "discord"
+                and int(target_port) in DISCORD_VERIFY_PORTS
+                and _get_app_route_mode("discord") == "auto"
+            )
+            if discord_verify:
+                initial_data = await self._read_tls_client_hello(reader)
             route_attempts = self._build_attempts_for_target(
                 target_host,
                 int(target_port),
@@ -2162,7 +2230,17 @@ class NovaWfpTcpProxy:
                 app_family=app_family,
                 route_scope=route_scope,
             )
-            if initial_data and telegram_media_tcp:
+            if initial_data and discord_verify:
+                upstream_reader, upstream_writer, route_label, route_open_ms, first_down = await self._open_verified_upstream_with_attempts(
+                    target_host,
+                    int(target_port),
+                    route_attempts,
+                    initial_data,
+                    route_scope=route_scope,
+                    bad_route_all_ports=False,
+                    expect_tls_handshake=True,
+                )
+            elif initial_data and telegram_media_tcp:
                 upstream_reader, upstream_writer, route_label, route_open_ms, first_down = await self._open_verified_upstream_with_attempts(
                     target_host,
                     int(target_port),

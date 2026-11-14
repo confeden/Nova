@@ -4,7 +4,7 @@ Nova keeps two tunnels up at once. The **primary** is one of Nova's own userspac
 127.0.0.1:1370 -- Cloudflare AWG, Cloudflare MASQUE, Proton AWG, or a profile the user imported
 (a VLESS node or an own .conf). The **secondary** is the reserve: Opera's HTTP proxy on
 127.0.0.1:1371 (region EU or US), Tor (SOCKS 1375, HTTP CONNECT 1378), or an imported profile Nova
-runs itself (SOCKS 1379, HTTP CONNECT 1380). The reserve always offers an HTTP CONNECT port,
+runs itself (SOCKS 1379, HTTP CONNECT 1373). The reserve always offers an HTTP CONNECT port,
 because that is the one thing every consumer of the slot dials.
 
 Everything the rest of Nova needs to agree on lives here, and nothing else does: the choices and
@@ -38,25 +38,27 @@ import threading
 import time
 
 __all__ = [
-    "HOME_COUNTRY", "is_foreign_country", "normalize_country", "order_countries",
-    "PRIMARY_AUTO", "PRIMARY_CF_AWG", "PRIMARY_CF_MASQUE", "PRIMARY_PROTON", "PRIMARY_CUSTOM",
+    "HOME_COUNTRY", "is_foreign_country", "AI_BLOCKED_COUNTRIES", "is_ai_safe_country",
+    "ai_apps_auto_slots", "ai_apps_auto_slots_from_state", "ai_apps_direct_allowed", "normalize_country", "order_countries",
+    "PRIMARY_AUTO", "PRIMARY_CF_AWG", "PRIMARY_CF_MASQUE", "PRIMARY_PROTON", "PRIMARY_CUSTOM", "PRIMARY_NOVA",
+    "NOVA_LIST_SUBSCRIPTION",
     "PRIMARY_VLESS", "PRIMARY_CF_WARP",
     "PRIMARY_CHOICES", "PRIMARY_IMPORTED_CHOICES", "PRIMARY_MENU_LABELS", "PRIMARY_PILL_LABELS",
     "GROUP_BY_PRIMARY", "primary_kind_of_group", "proton_country_of", "normalize_primary_country",
     "primary_choice_from_selection", "selection_for_primary", "primary_indicator_label",
     "SECONDARY_AUTO", "SECONDARY_OPERA", "SECONDARY_TOR", "SECONDARY_PROFILE", "SECONDARY_MODES",
-    "SECONDARY_MENU_LABELS", "SECONDARY_PROFILE_KEY",
+    "SECONDARY_MENU_LABELS", "SECONDARY_PROFILE_KEY", "RING_NOVA", "RING_CUSTOM_OWN", "AUTO_GROUP_BUDGET_SEC",
     "SECONDARY_PILL_CHOICES", "OPERA_REGIONS", "TOR_ENTRY_AUTO", "TOR_ENTRIES", "TOR_AUTO_ATTEMPTS",
     "normalize_tor_entry", "normalize_opera_region", "normalize_secondary_mode", "normalize_secondary_block",
     "normalize_secondary_kind", "normalize_secondary_profile_block",
     "secondary_choice", "secondary_pill_key", "secondary_choice_for_pill", "secondary_attempts",
     "secondary_indicator_label", "secondary_ports",
     "OPERA_HTTP_PORT", "TOR_SOCKS_PORT", "TOR_HTTP_PORT", "PRIMARY_SOCKS_PORT",
-    "SECONDARY_PROFILE_SOCKS_PORT", "SECONDARY_PROFILE_HTTP_PORT",
+    "SECONDARY_PROFILE_SOCKS_PORT", "SECONDARY_PROFILE_HTTP_PORT", "NOVA_PORT_BAND", "NOVA_PORTS",
     "EGRESS_STATE_FILENAME", "egress_state_path", "make_egress_state", "normalize_egress_state",
     "write_egress_state", "read_egress_state", "EgressStateCache",
     "eu_route_slots", "ru_route_slots", "secondary_pac_tokens", "secondary_http_attempt",
-    "YOUTUBE_ROUTE_FOLLOWERS", "youtube_route_slots", "route_chain", "browser_auto_slots",
+    "YOUTUBE_ROUTE_FOLLOWERS", "route_chain", "browser_auto_slots",
     "LAST_FILENAME", "last_path", "load_last", "remember_primary", "remember_secondary",
 ]
 
@@ -107,6 +109,48 @@ def is_foreign_country(value):
     return bool(country) and country != HOME_COUNTRY
 
 
+# AI apps in «Авто» (owner 2026-11-14): an exit in Russia or Belarus is not a place an AI service may
+# see; with no better exit the traffic stays home only when DNS-AI carries the lookups.
+AI_BLOCKED_COUNTRIES = ("RU", "BY")
+
+
+def is_ai_safe_country(value):
+    """True only for a known country outside AI_BLOCKED_COUNTRIES: unknown is never safe."""
+    country = normalize_country(value)
+    return bool(country) and country not in AI_BLOCKED_COUNTRIES
+
+
+def ai_apps_auto_slots(*, primary_up, primary_country, secondary_up, secondary_country, secondary_kind=""):
+    """Slots «ИИ-приложения» may use on «Авто», in order: main first, then second, each only when up
+    and its measured exit is outside Russia/Belarus. Opera and Tor are known to exit abroad, so an
+    unmeasured one of those still counts; only a measured RU/BY exit shuts it out."""
+    slots = []
+    if primary_up and is_ai_safe_country(primary_country):
+        slots.append("primary")
+    secondary_known_abroad = normalize_secondary_kind(secondary_kind) in (SECONDARY_OPERA, SECONDARY_TOR)
+    measured = normalize_country(secondary_country)
+    if secondary_up and (is_ai_safe_country(measured) if measured else secondary_known_abroad):
+        slots.append("secondary")
+    return slots
+
+
+def ai_apps_auto_slots_from_state(state):
+    """The same decision for a helper process, from the egress state it already reads."""
+    state = state if isinstance(state, dict) else {}
+    primary = state.get("primary") if isinstance(state.get("primary"), dict) else {}
+    secondary = state.get("secondary") if isinstance(state.get("secondary"), dict) else {}
+    fresh = bool(state.get("fresh"))
+    return ai_apps_auto_slots(
+        primary_up=bool(primary.get("up")) and fresh, primary_country=primary.get("country"),
+        secondary_up=bool(secondary.get("up")) and fresh, secondary_country=secondary.get("country"),
+        secondary_kind=secondary.get("kind"))
+
+
+def ai_apps_direct_allowed(state):
+    """Direct leg for AI apps on «Авто»: only while DNS-AI is the system's (or the indicator's) DNS."""
+    return bool(isinstance(state, dict) and state.get("fresh") and state.get("dns_ai"))
+
+
 def order_countries(codes):
     """Display order for exit countries (Nova Android CountryDisplayOrder), duplicates dropped."""
     seen = []
@@ -137,14 +181,23 @@ PRIMARY_CUSTOM = "custom"
 PRIMARY_VLESS = "vless"
 # warp-cli is the last step of «Авто» and never a choice; it exists so the indicator can name it.
 PRIMARY_CF_WARP = "cf_warp"
+# The built-in Nova list (owner 2026-11-12, same as Nova Android): the subscription's own nodes,
+# a Custom-group choice narrowed to `NOVA_LIST_SUBSCRIPTION`. It sits right after «Авто» and leads
+# «Авто» itself (nova_profiles.build_attempt_plan), scanned by HTTPS 204 before it is walked.
+PRIMARY_NOVA = "nova"
+NOVA_LIST_SUBSCRIPTION = "nova-list"  # nova_subscriptions.NOVA_LIST_ID
 
 # What the settings row and the slot menu offer, in order.
-PRIMARY_CHOICES = (PRIMARY_AUTO, PRIMARY_CF_MASQUE, PRIMARY_CF_AWG, PRIMARY_PROTON,
+# Owner 2026-11-14: the menu follows the «Авто» order (CF AWG > MASQUE > Proton > Custom) and has no «Nova»:
+# the built-in Nova list serves the secondary slot only. A saved primary «nova» selection still works
+# (selection_for_primary), it is just not offered any more.
+PRIMARY_CHOICES = (PRIMARY_AUTO, PRIMARY_CF_AWG, PRIMARY_CF_MASQUE, PRIMARY_PROTON,
                    PRIMARY_VLESS, PRIMARY_CUSTOM)
 # Kinds whose group holds profiles Nova cannot vouch for: reachable by naming them, never by «Авто».
 PRIMARY_IMPORTED_CHOICES = (PRIMARY_VLESS, PRIMARY_CUSTOM)
 PRIMARY_MENU_LABELS = {
     PRIMARY_AUTO: "Авто",
+    PRIMARY_NOVA: "Nova",
     PRIMARY_CF_AWG: "Cloudflare AWG",
     PRIMARY_CF_MASQUE: "Cloudflare MASQUE",
     PRIMARY_PROTON: "Proton",
@@ -155,6 +208,7 @@ PRIMARY_MENU_LABELS = {
 }
 PRIMARY_PILL_LABELS = {
     PRIMARY_AUTO: "Авто",
+    PRIMARY_NOVA: "Nova",
     PRIMARY_CF_AWG: "CF AWG",
     PRIMARY_CF_MASQUE: "MASQUE",
     PRIMARY_PROTON: "Proton",
@@ -163,6 +217,7 @@ PRIMARY_PILL_LABELS = {
 }
 _PRIMARY_INDICATOR = {
     PRIMARY_AUTO: "АВТО",
+    PRIMARY_NOVA: "NOVA",
     PRIMARY_CF_AWG: "CF AWG",
     PRIMARY_CF_MASQUE: "CF MASQUE",
     PRIMARY_PROTON: "PROTON",
@@ -222,6 +277,8 @@ def primary_choice_from_selection(selection):
     mode = str(sel.get("mode") or "").strip().lower()
     if mode == "group":
         kind = primary_kind_of_group(sel.get("group"))
+        if kind in (PRIMARY_CUSTOM, PRIMARY_VLESS) and                 str(sel.get("subscription") or "").strip().lower() == NOVA_LIST_SUBSCRIPTION:
+            return {"kind": PRIMARY_NOVA, "country": "", "profile": ""}
         if not kind:
             return {"kind": PRIMARY_AUTO, "country": "", "profile": ""}
         country = normalize_country(sel.get("country")) if kind == PRIMARY_PROTON else ""
@@ -245,6 +302,8 @@ def selection_for_primary(kind, country="", profile=""):
     belong to `kind` is ignored rather than trusted: the kind is what the caller asked for.
     """
     kind = str(kind or "").strip().lower()
+    if kind == PRIMARY_NOVA:
+        return {"version": 1, "mode": "group", "group": _GROUP_CUSTOM, "subscription": NOVA_LIST_SUBSCRIPTION}
     group = GROUP_BY_PRIMARY.get(kind)
     if kind not in PRIMARY_CHOICES or not group:
         return {"version": 1, "mode": "auto"}
@@ -310,14 +369,17 @@ SECONDARY_MENU_LABELS = {
 }
 OPERA_REGIONS = ("EU", "US", "AS")
 
-# The settings row offers six pills: the Opera region is part of the choice there.
+# The settings row follows the secondary «Авто» order (Nova > Opera > Proton > Custom > Tor, owner
+# 2026-11-14); the Opera region is part of the choice there, and «nova» is the profile mode narrowed to
+# the built-in Nova list (RING_NOVA).
 SECONDARY_PILL_CHOICES = (
     ("auto", "Авто"),
+    ("nova", "Nova"),
     ("opera:EU", "Opera EU"),
     ("opera:US", "Opera US"),
     ("opera:AS", "Opera AS"),
-    ("tor", "Tor"),
     ("profile", "Свой"),
+    ("tor", "Tor"),
 )
 
 TOR_ENTRY_AUTO = "auto"
@@ -338,14 +400,33 @@ OPERA_HTTP_PORT = 1371
 TOR_SOCKS_PORT = 1375
 TOR_HTTP_PORT = 1378
 PRIMARY_SOCKS_PORT = 1370
-# The reserve profile's own listeners. 1369-1396 is Nova's reserved local band (nova-go's
-# masque/cli_test.go says so); inside it 1379 and 1380 were the first pair nothing in the repository
-# referenced. SOCKS is what wireproxy and Xray speak natively; the HTTP CONNECT port beside it is
+# The reserve profile's own listeners. Every fixed loopback port Nova owns lives in
+# NOVA_PORT_BAND = 1369..1379 (owner, 2026-11-12). The pair here used to be 1379/1380 until Delegator's core
+# claimed 1380 for its own health endpoint, after which every helper start failed with exit 2; the HTTP
+# port moved to 1373, a hole inside the band. SOCKS is what wireproxy and Xray speak natively; the HTTP CONNECT port beside it is
 # what every consumer of the secondary slot already dials, so nothing downstream has to learn a new
 # attempt kind. wireproxy serves both from one `[http]` section (measured 2026-09-20); nova-xray
 # needs proxy/http in its registry and a second inbound.
 SECONDARY_PROFILE_SOCKS_PORT = 1379
-SECONDARY_PROFILE_HTTP_PORT = 1380
+SECONDARY_PROFILE_HTTP_PORT = 1373
+PAC_SERVER_PORT = 1369
+RELAY_PORT = 1372
+TLS_TERMINATOR_PORT = 1374
+PLANNED_WHATSAPP_RELAY_PORT = 1377  # reserved, nothing listens (nova_public_relays)
+NOVA_PORT_BAND = (1369, 1379)
+# Every fixed port, by what owns it. 1376 is the one spare. pinned by tests/test_nova_port_band.py.
+NOVA_PORTS = {
+    PAC_SERVER_PORT: "pac-server",
+    PRIMARY_SOCKS_PORT: "primary-socks",
+    OPERA_HTTP_PORT: "opera-http",
+    RELAY_PORT: "telegram-relay",
+    SECONDARY_PROFILE_HTTP_PORT: "secondary-http",
+    TLS_TERMINATOR_PORT: "tls-terminator",
+    TOR_SOCKS_PORT: "tor-socks",
+    PLANNED_WHATSAPP_RELAY_PORT: "whatsapp-relay-reserved",
+    TOR_HTTP_PORT: "tor-http",
+    SECONDARY_PROFILE_SOCKS_PORT: "secondary-socks",
+}
 
 
 def normalize_secondary_kind(value):
@@ -388,6 +469,14 @@ def normalize_secondary_block(block):
     mode = block.get("mode") if isinstance(block, dict) else block
     return {"mode": normalize_secondary_mode(mode)}
 
+
+# Ring-only targets of the secondary «Авто» profile steps. They name a slice of the Custom group:
+# the built-in Nova list, and the owner's own imported profiles without it. A named choice never
+# carries them (it says "Custom" and gets everything).
+RING_NOVA = "Nova"
+RING_CUSTOM_OWN = "Custom~own"
+# «Авто» spends at most this long on one group of profiles before it moves to the next (owner 2026-11-14).
+AUTO_GROUP_BUDGET_SEC = 120.0
 
 SECONDARY_PROFILE_KEY = "secondary_profile"
 
@@ -434,6 +523,9 @@ def secondary_pill_key(choice):
     mode = normalize_secondary_mode(choice.get("mode"))
     if mode == SECONDARY_OPERA:
         return "opera:" + normalize_opera_region(choice.get("opera_region"))
+    if mode == SECONDARY_PROFILE and str(choice.get("profile_group") or "").strip() == RING_NOVA \
+            and not str(choice.get("profile") or "").strip():
+        return "nova"
     return mode
 
 
@@ -444,6 +536,8 @@ def secondary_choice_for_pill(pill_key, current=None):
     key = str(pill_key or "").strip()
     if key.lower().startswith("opera:"):
         return SECONDARY_OPERA, normalize_opera_region(key.partition(":")[2], region)
+    if key.lower() == "nova":
+        return SECONDARY_PROFILE, region
     return normalize_secondary_mode(key), region
 
 
@@ -451,7 +545,7 @@ def secondary_attempts(choice, last=None):
     """The order the secondary slot walks: [(kind, region_or_entry_or_profile), ...].
 
     Named choices are a list of one (I1). Auto tries the exact last successful region/node first,
-    then Opera EU/US/AS, Proton, Tor and Custom, omitting an identical attempt already tried.
+    then Nova, Opera EU/US/AS, Proton, Custom and Tor, omitting an identical attempt already tried.
     """
     choice = choice if isinstance(choice, dict) else {}
     mode = normalize_secondary_mode(choice.get("mode"))
@@ -465,9 +559,11 @@ def secondary_attempts(choice, last=None):
         return [(SECONDARY_TOR, entry)]
     last = last if isinstance(last, dict) else {}
     last_kind = str(last.get("kind") or "").strip().lower()
-    ring = [(SECONDARY_OPERA, r) for r in ("EU", "US", "AS")]
-    ring += [(SECONDARY_PROFILE, _GROUP_PROTON), (SECONDARY_TOR, TOR_ENTRY_AUTO),
-             (SECONDARY_PROFILE, _GROUP_CUSTOM)]
+    # Owner 2026-11-14: Nova > Opera > Proton > Custom > Tor, each at most AUTO_GROUP_BUDGET_SEC.
+    ring = [(SECONDARY_PROFILE, RING_NOVA)]
+    ring += [(SECONDARY_OPERA, r) for r in ("EU", "US", "AS")]
+    ring += [(SECONDARY_PROFILE, _GROUP_PROTON), (SECONDARY_PROFILE, RING_CUSTOM_OWN),
+             (SECONDARY_TOR, TOR_ENTRY_AUTO)]
     remembered = None
     if last_kind == SECONDARY_OPERA:
         remembered = (SECONDARY_OPERA, normalize_opera_region(last.get("region")))
@@ -520,7 +616,7 @@ def egress_state_path(base_dir):
 
 def make_egress_state(*, primary_up, primary_kind="", primary_label="", primary_country="",
                       secondary_up, secondary_kind=SECONDARY_OPERA, secondary_label="",
-                      secondary_country="", now=None):
+                      secondary_country="", dns_ai=False, now=None):
     """The whole state as one dict. No address, no key, no path -- only kinds, labels and a country.
 
     `secondary_country` is measured only for a reserve Nova itself runs (an imported profile): Opera
@@ -533,6 +629,7 @@ def make_egress_state(*, primary_up, primary_kind="", primary_label="", primary_
     return {
         "version": _STATE_VERSION,
         "updated_at": round(float(time.time() if now is None else now), 3),
+        "dns_ai": bool(dns_ai),
         "primary": {
             "up": bool(primary_up),
             "kind": str(primary_kind or ""),
@@ -554,6 +651,8 @@ def make_egress_state(*, primary_up, primary_kind="", primary_label="", primary_
 _DEFAULT_STATE = {
     "version": _STATE_VERSION,
     "updated_at": 0.0,
+    "fresh": False,
+    "dns_ai": False,
     "primary": {"up": False, "kind": "", "label": "", "country": "", "foreign": False,
                 "socks_port": PRIMARY_SOCKS_PORT},
     "secondary": {"up": False, "kind": SECONDARY_OPERA, "label": "", "country": "",
@@ -579,7 +678,7 @@ def normalize_egress_state(payload, now=None):
     primary = payload.get("primary") if isinstance(payload.get("primary"), dict) else {}
     secondary = payload.get("secondary") if isinstance(payload.get("secondary"), dict) else {}
     country = normalize_country(primary.get("country"))
-    fresh = updated > 0 and 0 <= now - updated <= EGRESS_FOREIGN_TRUST_SEC
+    fresh = updated > 0 and -2.0 <= now - updated <= EGRESS_FOREIGN_TRUST_SEC
     state["primary"].update({
         "up": bool(primary.get("up")),
         "kind": str(primary.get("kind") or ""),
@@ -595,6 +694,10 @@ def normalize_egress_state(payload, now=None):
         "country": normalize_country(secondary.get("country")),
         **secondary_ports(kind),
     })
+    # `fresh`: the writer heartbeats while Nova runs; a state nobody refreshed is not trusted for the
+    # AI rule, which fails closed (no slot, no DNS-AI direct leg).
+    state["fresh"] = bool(fresh)
+    state["dns_ai"] = bool(fresh and payload.get("dns_ai"))
     return state
 
 
@@ -692,20 +795,6 @@ def browser_auto_slots(*, primary_up, secondary_up, primary_foreign, secondary_f
 # Names that must leave by googlevideo.com's exit even though they are not YouTube: Google binds a
 # media URL to the exit that asked for it, and NotebookLM's audio issuer is bet to be lh3 (D22).
 YOUTUBE_ROUTE_FOLLOWERS = ("lh3.googleusercontent.com",)
-
-
-def youtube_route_slots(primary_foreign, secondary_kind=SECONDARY_OPERA):
-    """Where YouTube goes, in order, for browsers on «Auto» (the hybrid PAC).
-
-    A primary whose exit is Russian (or not measured yet) reaches Google from inside the Russian DPI:
-    through Cloudflare's Moscow colo 35-50 % of new YouTube connections sat silent for 10 s, filtered
-    by SNI (G81). The secondary exits abroad, so it goes first; the primary stays behind it, because a
-    YouTube that half works beats the direct leg. With a foreign exit YouTube is RU-list traffic again,
-    and so it is with Tor as the secondary: video over Tor is too slow to be worth it (owner, D23).
-    """
-    if primary_foreign or str(secondary_kind or "").strip().lower() == SECONDARY_TOR:
-        return ["primary", "secondary"]
-    return ["secondary", "primary"]
 
 
 def route_chain(slots, *, primary_up, secondary_up, primary_tokens, secondary_tokens, last_resort):

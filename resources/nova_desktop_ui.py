@@ -8,15 +8,76 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageTk
 
 import nova_appearance
+import nova_appearance_ui
+import nova_glass
+import nova_gpu
 
 
 MIN_WIDTH = 560
 MIN_HEIGHT = 420
+
+CONNECTED_TEXT = "АКТИВНО : РАБОТАЕТ"
+# Every label the connect sequence passes through before «АКТИВНО». The rings belong to all of them.
+CONNECTING_TEXTS = frozenset({
+    "ПОДКЛЮЧЕНИЕ", "ПЕРЕЗАПУСК", "ПЕРЕЗАПУСК ЯДРА...", "ЗАПУСК . . .", "Запуск...",
+})
+# A label that is not part of the sequence (ОСТАНОВЛЕНО while a profile switch stops and restarts the
+# core, ГОТОВ К ЗАПУСКУ between two steps) ends the rings only when it outlasts this. The rings used
+# to vanish for good on the first such flicker, and the connect then looked interrupted (2026-11-12).
+STOP_GRACE_SEC = 2.5
+
+
+class ConnectionStateTracker(object):
+    """The scene's connection state from the status label, without flicker.
+
+    `update(text)` is called with every label the status pill shows; `current()` is what the scene
+    should draw now and can be asked again later: a non-connect label that follows «connecting»
+    keeps the rings for `STOP_GRACE_SEC`, so a switch that stops and restarts the core in between
+    does not cut the animation. «АКТИВНО : РАБОТАЕТ» is immediate, in both directions.
+    """
+
+    def __init__(self, clock=time.monotonic, held=None):
+        self._clock = clock
+        # `held()` is true while «Автоподключение» is off and the user has not pressed ПОДКЛЮЧИТЬ: the VPN
+        # connects in the background, but that is not a connect the user asked for, so no rings.
+        self._held = held or (lambda: False)
+        self._text = ""
+        self._state = "stopped"
+        self._connecting_until = 0.0
+
+    def update(self, text):
+        text = str(text or "")
+        now = self._clock()
+        if self._held():
+            self._state = "stopped"
+            self._text = text
+            return self._state
+        if text == CONNECTED_TEXT:
+            self._state = "connected"
+        elif text in CONNECTING_TEXTS:
+            self._state = "connecting"
+            self._connecting_until = now + STOP_GRACE_SEC
+        elif self._state == "connecting" and now < self._connecting_until:
+            pass  # flicker: keep the rings until the grace is over (current() decides)
+        else:
+            self._state = "stopped"
+        self._text = text
+        return self.current()
+
+    def current(self):
+        if self._held():
+            self._state = "stopped"
+            return self._state
+        if self._state == "connecting" and self._text not in CONNECTING_TEXTS \
+                and self._clock() >= self._connecting_until:
+            self._state = "stopped"
+        return self._state
 
 
 def connection_waves(size, origin, elapsed, accent, scale=1.0):
@@ -51,15 +112,18 @@ def connection_waves(size, origin, elapsed, accent, scale=1.0):
         waves.alpha_composite(ring, (round(cx - outer), round(cy - outer)))
     return waves
 
-THEME_TITLES = {
-    "aurora": "Aurora", "dnsai": "DNS-AI", "proton": "Proton", "charcoal": "Charcoal",
-    "graphene": "Graphene", "neon": "Neon", "poe1": "Path of Exile", "poe2": "Path of Exile II",
-    "gta6sunset": "Vice Sunset", "gta6night": "Vice Night", "matrix": "Matrix", "diablo2": "Diablo II",
-}
-
-
 def display_scale(widget):
     return max(1.0, round(float(widget.tk.call("tk", "scaling")) * 0.75, 2))
+
+
+def _slot_geometry(width, scale):
+    """Centres of: primary button, its «>», secondary button, its «>» -- mirrored about the middle."""
+    button, nxt, inner, gap = round(112 * scale), round(34 * scale), round(6 * scale), round(16 * scale)
+    unit = button + inner + nxt
+    left = width / 2 - gap / 2 - unit
+    right = width / 2 + gap / 2
+    return (left + button / 2, left + button + inner + nxt / 2,
+            right + button / 2, right + button + inner + nxt / 2)
 
 
 def main_layout(width, height, scale=1.0):
@@ -77,6 +141,10 @@ def main_layout(width, height, scale=1.0):
         "slot_label_y": routes_top + round(50 * scale),
         "slot_y": routes_top + round(75 * scale),
         "slot_x": round(40 * scale), "slot_width": width - round(80 * scale),
+        # Two equal slot buttons about the centre line, as wide as the word «Дополнительный».
+        "slot_button_w": round(112 * scale), "slot_next_w": round(34 * scale),
+        "slot_button_centers": (_slot_geometry(width, scale)[0], _slot_geometry(width, scale)[2]),
+        "slot_next_centers": (_slot_geometry(width, scale)[1], _slot_geometry(width, scale)[3]),
         "footer_y": height - round(50 * scale),
         "links_y": height - round(18 * scale),
     }
@@ -111,6 +179,25 @@ def status_glow(text, pixel_size, color):
     return glow
 
 
+def soft_glow(mask, color, radius, strength):
+    """A faint halo of `color` shaped like an L mask (padded so the blur is not clipped); strength 0..1."""
+    pad = max(4, round(radius * 2.5))
+    padded = Image.new("L", (mask.width + 2 * pad, mask.height + 2 * pad), 0)
+    padded.paste(mask, (pad, pad))
+    padded = padded.filter(ImageFilter.GaussianBlur(max(1.0, radius))).point(lambda value: int(value * strength))
+    glow = Image.new("RGBA", padded.size, tuple(color))
+    glow.putalpha(padded)
+    return glow
+
+
+def text_mask(text, pixel_size):
+    font = ImageFont.truetype("seguisb.ttf", max(1, round(pixel_size)))
+    bounds = font.getbbox(text)
+    mask = Image.new("L", (bounds[2] - bounds[0], bounds[3] - bounds[1]), 0)
+    ImageDraw.Draw(mask).text((-bounds[0], -bounds[1]), text, font=font, fill=255)
+    return mask
+
+
 def fit_caption(text, width, measure):
     """Fit untrusted profile names with a bounded number of native font measurements."""
     if measure(text) <= width:
@@ -133,9 +220,28 @@ def action_foreground(theme_id):
     return "#090817" if (r * 299 + g * 587 + b * 114) / 1000 >= 150 else "#FFFFFF"
 
 
+_HEAVY_FAMILY = {}
+
+
+def bold_font(font):
+    """The hovered caption: heavier than the Semibold the UI uses. Windows has no bold cut of 'Segoe UI Semibold',
+    so asking for bold changes nothing; 'Segoe UI Black' is the next weight up."""
+    family, size = font[0], font[1]
+    if "heavy" not in _HEAVY_FAMILY:
+        try:
+            _HEAVY_FAMILY["heavy"] = "Segoe UI Black" in set(tkfont.families())
+        except (tk.TclError, RuntimeError):
+            # No Tk root yet: every supported Windows ships the face.
+            _HEAVY_FAMILY["heavy"] = sys.platform == "win32"
+    if family.startswith("Segoe UI") and _HEAVY_FAMILY["heavy"]:
+        return ("Segoe UI Black", size)
+    return (family, size, "bold")
+
+
 def set_link_hover(label, hovered, color, underline=True):
     """Style existing canvas items: recreating an item under the pointer loops Enter/Leave."""
-    font = tuple(label.font_spec) + (("underline",) if hovered and underline else ())
+    base = tuple(label.font_spec)
+    font = (bold_font(base) if hovered else base) + (("underline",) if hovered and underline else ())
     for item in label.text_items:
         label.canvas.itemconfigure(item, fill=color if hovered else label.fg, font=font)
 
@@ -178,10 +284,38 @@ def supernova_icon(size=64, accent="#50C878"):
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
+def app_icon(size=64, accent="#50C878"):
+    """Window / taskbar / tray icon: the starburst on its own dark rounded badge with a light rim, so it stays
+    visible on any taskbar colour (a bare transparent star vanishes on light green or white bars)."""
+    scale = 4
+    unit = size * scale
+    color = tuple(int(accent[index:index + 2], 16) for index in (1, 3, 5))
+    badge = Image.new("RGBA", (unit, unit), (0, 0, 0, 0))
+    pen = ImageDraw.Draw(badge)
+    margin = unit * .03
+    box = (margin, margin, unit - margin, unit - margin)
+    ground = tuple(round(value * .16 + 6) for value in color)
+    pen.rounded_rectangle(box, radius=unit * .24, fill=ground + (255,))
+    glow = Image.new("RGBA", badge.size, (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse((unit * .2, unit * .2, unit * .8, unit * .8), fill=color + (90,))
+    glow = glow.filter(ImageFilter.GaussianBlur(unit * .12))
+    mask = Image.new("L", badge.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(box, radius=unit * .24, fill=255)
+    glow.putalpha(ImageChops.multiply(glow.getchannel("A"), mask))
+    badge = Image.alpha_composite(badge, glow)
+    pen = ImageDraw.Draw(badge)
+    pen.rounded_rectangle(box, radius=unit * .24, outline=(255, 255, 255, 120), width=max(2, round(unit * .035)))
+    star = supernova_icon(round(size * .94), "#%02X%02X%02X" % tuple(round(v + (255 - v) * .35) for v in color))
+    star = star.resize((round(unit * .94), round(unit * .94)), Image.Resampling.LANCZOS)
+    offset = round((unit - star.width) / 2)
+    badge.alpha_composite(star, (offset, offset))
+    return badge.resize((size, size), Image.Resampling.LANCZOS)
+
+
 class DesktopScene:
     """Render one continuous textured surface, including translucent cards, off-thread."""
 
-    def __init__(self, canvas, appearance, version, preferences_path=None, on_error=None):
+    def __init__(self, canvas, appearance, version, preferences_path=None, on_error=None, gpu=None):
         self.canvas = canvas
         self.appearance = dict(appearance)
         self.version = version
@@ -197,6 +331,7 @@ class DesktopScene:
         self._saved_generation = -1
         self._photo = None
         self._connection = "stopped"
+        self.state_resolver = None  # optional callable -> state; polled on every animation tick
         self._animation_start = time.monotonic()
         self._animation_id = None
         self._render_pending = False
@@ -204,15 +339,51 @@ class DesktopScene:
         self._pattern_size = None
         self._overlay_key = None
         self._overlay = None
+        self._overlay_mask = None
+        # Glass plates registered by the buttons/pills of the main window (D51): key -> shape tuple.
+        self._plates = {}
+        self._plate_shapes = ()
+        self._plate_job = None
+        # NOVA caption toggle: the cards fold into pills around the text (glass_compact), animated by _compact_e.
+        self._compact = bool(appearance.get("glass_compact"))
+        self._compact_e = 1.0 if self._compact else 0.0
+        self._compact_anim = None
+        self._compact_job = None
+        self._zone_job = None
+        self._plates_cache = (None,)
+        self._brand_rect = None
+        self._brand_text = None
+        self._brand_font = None
+        self._brand_hit = None
+        self._caption_shadows = []      # (image item, text item, caption, pixel size): soft shadow of a text that has no glass when folded
+        self._shadow_cache = {}
         self._background = canvas.create_image(0, 0, anchor="nw", tags="desktop_background")
+        # GPU path (D52): nova-engine gpu-serve draws the background; None/False = CPU path only.
+        self._gpu = None
+        self._gpu_mode = False
+        self._gpu_photo = None
+        self._gpu_seq = 0
+        self._gpu_poll_id = None
+        self._gpu_poll_due = 0.
+        self._gpu_fast_until = 0.
+        self._gpu_paused = None
+        self._gpu_sent = None
+        self._gpu_surface = None
+        self._gpu_pointer_at = 0.
+        self._gpu_pointer_job = None
+        self._gpu_pointer_last = None
+        self._gpu_hires = False
+        self._gpu_frame_ms = 1000 / 60
         threading.Thread(target=self._render_worker, name="NovaAppearance", daemon=True).start()
         self._poll_id = canvas.after(40, self._poll)
         canvas.bind("<Destroy>", self._on_destroy, add="+")
+        self._gpu_setup(gpu)
         self._schedule_animation()
 
     def _persist_preferences(self, generation, prefs):
         if not self.preferences_path:
             return
+        prefs = {key: value for key, value in prefs.items() if not key.startswith("_")}   # render-only extras
         with self._preferences_lock:
             if generation < self._saved_generation:
                 return
@@ -230,14 +401,31 @@ class DesktopScene:
             self.canvas.after_cancel(self._poll_id)
             if self._animation_id is not None:
                 self.canvas.after_cancel(self._animation_id)
+            for job in (self._gpu_poll_id, self._gpu_pointer_job):
+                if job is not None:
+                    self.canvas.after_cancel(job)
+            self._gpu_poll_id = self._gpu_pointer_job = None
+            if self._gpu is not None:
+                # No waiting on the Tk thread: stdin closes, so the engine ends even if Nova dies first.
+                self._gpu.stop(wait=0)
+                self._gpu_mode = False
+            self._gpu_photo = None
+            self._gpu_hires_timer(False)
             # Release Tcl-backed images on their owner thread, before cyclic GC can run on a worker.
             self._photo = None
             self._logo_photo = None
+            self._brand_hit = None
+            self._logo_glow = None
+            self._brand_glow = None
 
     def set_appearance(self, appearance):
         if appearance["variant"] != self.appearance["variant"]:
             self._animation_start = time.monotonic()
-        self.appearance = dict(appearance)
+        self.appearance = dict(appearance, glass_compact=self._compact)    # the caption toggle is the scene's own
+        if self._gpu is not None:
+            self._gpu_refresh()
+            if self._gpu_mode:
+                self._gpu_configure()
         self.draw(*self._size, save=True)
         self._schedule_animation()
 
@@ -252,14 +440,29 @@ class DesktopScene:
         if self._animation_id is not None:
             self.canvas.after_cancel(self._animation_id)
             self._animation_id = None
+        if self._gpu_mode:
+            # The GPU animates by itself; only the connection waves (an overlay) cost CPU, at <= 20 Hz.
+            if self._connection == "connecting":
+                self._animation_id = self.canvas.after(50 if self.canvas.winfo_viewable() else 1000, self._animate)
+            return
         if self._connection == "connecting" or (
-                self.appearance.get("immersion") and self.appearance["texture"] != "none"):
+                self.appearance.get("immersion") and self.appearance["texture"] not in ("none", "custom")):
             self._animation_id = self.canvas.after(16 if self.canvas.winfo_viewable() else 1000, self._animate)
 
     def _animate(self):
         self._animation_id = None
         if self._closed:
             return
+        resolver = self.state_resolver
+        if resolver is not None:
+            # A grace that ran out while nothing changed the label: the tracker answers, the scene follows.
+            try:
+                state = resolver()
+            except Exception:
+                state = self._connection
+            if state != self._connection:
+                self.set_connection_state(state)
+                return
         if self.canvas.winfo_viewable() and not self._render_pending:
             self.draw(*self._size, frame=(self._connection, time.monotonic() - self._animation_start))
         self._schedule_animation()
@@ -271,11 +474,43 @@ class DesktopScene:
         self._size = (max(round(MIN_WIDTH * self.scale), width), max(round(MIN_HEIGHT * self.scale), height))
         self._generation += 1
         self._render_pending = True
-        self._requests.put((self._generation, self._size, dict(self.appearance), save, frame))
+        prefs = dict(self.appearance, glass_compact=self._compact)
+        prefs["_cards"] = self._card_groups(*self._size)      # None while the cards are whole
+        prefs["_fast"] = self._compact_anim is not None
+        self._requests.put((self._generation, self._size, prefs, save, frame))
         self.canvas.after_cancel(self._poll_id)
         self._poll_id = self.canvas.after(4, self._poll)
+        if self._gpu is not None:
+            self._gpu_kick()
         if redraw_labels:
             self._draw_labels()
+        self._update_caption_shadows()
+
+    def _update_caption_shadows(self):
+        """Texts left without glass once the cards are folded get a soft dark shadow (faint, only to keep them readable);
+        it fades in and out with the fold in a few steps."""
+        level = round(self._compact_e * 6) / 6
+        for image_id, text_id, caption, pixels in self._caption_shadows:
+            try:
+                if level <= 0:
+                    self.canvas.itemconfigure(image_id, state="hidden")
+                    continue
+                key = (caption, pixels, level)
+                image = self._shadow_cache.get(key)
+                if image is None:
+                    mask = text_mask(caption, pixels)
+                    blur = max(1.5, 2.2 * self.scale)
+                    image = ImageTk.PhotoImage(soft_glow(mask, (0, 0, 0), blur, .62 * level), master=self.canvas)
+                    if len(self._shadow_cache) > 24:
+                        self._shadow_cache.clear()
+                    self._shadow_cache[key] = image
+                box = self.canvas.bbox(text_id)
+                if box is None:
+                    continue
+                self.canvas.coords(image_id, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2 + round(1 * self.scale))
+                self.canvas.itemconfigure(image_id, image=image, state="normal")
+            except (tk.TclError, OSError):
+                continue
 
     def _dive_layer(self, size, prefs):
         # Keep the seeded surface across frames and resizes; only explicit appearance edits rebuild it.
@@ -295,7 +530,38 @@ class DesktopScene:
                 del self._layers[next(iter(self._layers))]
         return self._layers[key]
 
+    def _custom_frame(self, size, prefs):
+        """«Своё изображение»: the owner's picture, cover-fitted, still. Rendered once per size/setting."""
+        path = prefs.get("custom_image") or ""
+        key = (path, size, prefs.get("brightness", 100), prefs.get("saturation", 100))
+        cached = getattr(self, "_custom_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        frame = nova_appearance.render_background(*size, prefs["theme"], "none", 0)
+        try:
+            with Image.open(path) as source:
+                picture = source.convert("RGB")
+        except (OSError, ValueError):
+            picture = None
+        if picture is not None:
+            fit = max(size[0] / picture.width, size[1] / picture.height)
+            scaled = picture.resize((max(1, round(picture.width * fit)), max(1, round(picture.height * fit))),
+                                    Image.Resampling.LANCZOS)
+            left, top = (scaled.width - size[0]) // 2, (scaled.height - size[1]) // 2
+            frame = scaled.crop((left, top, left + size[0], top + size[1]))
+            frame = ImageEnhance.Brightness(frame).enhance(max(0.0, prefs.get("brightness", 100) / 100))
+            frame = ImageEnhance.Color(frame).enhance(max(0.0, prefs.get("saturation", 100) / 100))
+        self._custom_cache = (key, frame)
+        return frame
+
     def _dive_frame(self, size, prefs, elapsed):
+        if prefs["texture"] == "custom":
+            return self._custom_frame(size, prefs)
+        if nova_appearance.live_enabled(prefs["texture"]):
+            # D43: the native renderer owns the forward camera; time alone drives the motion.
+            return nova_appearance.render_live_background(
+                *size, prefs["theme"], prefs["texture"], prefs["texture_intensity"], prefs["variant"],
+                prefs["temperature"], elapsed if prefs.get("immersion") else 0.)
         # Always move inward; logarithmic easing retains detail without reversing or resetting the pattern.
         zoom = 1 + .5 * math.log1p(max(0, elapsed) / 60) if prefs.get("immersion") else 1
         if self._pattern_size is None:
@@ -317,6 +583,172 @@ class DesktopScene:
         left, top, crop_w, crop_h = left / w * layer.width, top / h * layer.height, crop_w / w * layer.width, crop_h / h * layer.height
         return layer.resize(size, Image.Resampling.BILINEAR, box=(left, top, left + crop_w, top + crop_h))
 
+    def set_plate(self, key, rect, radius, tint=None):
+        """Register (or move) a glass plate under a button/indicator: rect in canvas pixels."""
+        left, top, right, bottom = (round(value) for value in rect)
+        shape = (left, top, right, bottom, max(1, round(radius)), tuple(tint) if tint else None)
+        if self._plates.get(key) == shape:
+            return
+        self._plates[key] = shape
+        self._plates_changed()
+
+    def remove_plate(self, key):
+        if self._plates.pop(key, None) is not None:
+            self._plates_changed()
+
+    def _plates_changed(self):
+        self._plate_shapes = tuple(self._plates[key] for key in sorted(self._plates, key=str))
+        if self._plate_job is None and not self._closed:
+            self._plate_job = self.canvas.after_idle(self._plates_redraw)
+
+    def _plates_redraw(self):
+        self._plate_job = None
+        if not self._closed:
+            self.draw(*self._size)
+
+    def set_hot(self, rect, radius=0):
+        """Hover glow on a plate. True when the GPU background draws it (callers then skip their own glow)."""
+        engine = self._gpu
+        if not self._gpu_mode or engine is None or "hot" not in engine.features:
+            return False
+        engine.set_hot(rect, radius, reach=26 * self.scale)
+        self._gpu_kick()
+        return True
+
+    # --- the NOVA toggle: cards <-> pills around the text ---
+
+    COMPACT_SECONDS = .6
+    ZONES = (("hero", ("status", "update")), ("routes", ("heading",)))
+
+    @property
+    def compact(self):
+        return self._compact
+
+    def zone_rects(self):
+        """Pill rectangles hugging the text items tagged zone_<key> (hidden items have no bounding box)."""
+        zones = {}
+        pad_x, pad_y = 17 * self.scale, 8 * self.scale
+        for _group, keys in self.ZONES:
+            for key in keys:
+                box = self.canvas.bbox("zone_" + key)
+                if not box:
+                    continue
+                left, top, right, bottom = box
+                top, bottom = top - pad_y, bottom + pad_y
+                left, right = left - pad_x, right + pad_x
+                if right - left < bottom - top:
+                    centre = (left + right) / 2
+                    left, right = centre - (bottom - top) / 2, centre + (bottom - top) / 2
+                zones[key] = (left, top, right, bottom)
+        return zones
+
+    def _card_groups(self, width, height):
+        """Per card, the rectangles that make its glass at the current fold: the card itself at 0, one pill per text
+        zone at 1, in between every pill is the card pulled towards its pill (None while nothing is folded)."""
+        fold = self._compact_e
+        if fold <= 0.0:
+            return None
+        layout = main_layout(width, height, self.scale)
+        radius = round(nova_appearance.THEMES[self.appearance["theme"]]["radius"] * self.scale)
+        zones = self.zone_rects()
+        groups = []
+        for name, keys in self.ZONES:
+            left, top, right, bottom = layout[name]
+            pills = [zones[key] for key in keys if key in zones]
+            if not pills:
+                centre_x, centre_y = (left + right) / 2, (top + bottom) / 2
+                pills = [(centre_x - 2, centre_y - 2, centre_x + 2, centre_y + 2)]
+            rects = []
+            for pill in pills:
+                rect = [left + (pill[0] - left) * fold, top + (pill[1] - top) * fold,
+                        right + (pill[2] - right) * fold, bottom + (pill[3] - bottom) * fold,
+                        radius + ((pill[3] - pill[1]) / 2 - radius) * fold]
+                rects.append(tuple(round(value, 1) for value in rect))
+            groups.append(tuple(rects))
+        return tuple(groups)
+
+    def zone_changed(self):
+        """A text of a zone changed size or visibility: while folded the pills follow it."""
+        if self._compact_e > 0.0 and self._zone_job is None and not self._closed:
+            self._zone_job = self.canvas.after_idle(self._zone_redraw)
+
+    def _zone_redraw(self):
+        self._zone_job = None
+        if not self._closed and self._compact_anim is None:
+            self.draw(*self._size, frame=(self._connection, time.monotonic() - self._animation_start))
+
+    def toggle_compact(self):
+        self.set_compact(not self._compact)
+
+    def set_compact(self, flag, animate=True):
+        flag = bool(flag)
+        if flag == self._compact:
+            return
+        self._compact = flag
+        self.appearance["glass_compact"] = flag
+        target = 1.0 if flag else 0.0
+        try:
+            visible = self.canvas.winfo_viewable()
+        except tk.TclError:
+            visible = False
+        if self._compact_job is not None:
+            self.canvas.after_cancel(self._compact_job)
+            self._compact_job = None
+        if not animate or not visible:
+            self._compact_anim = None
+            self._compact_e = target
+            self.draw(*self._size, save=True)
+            return
+        span = abs(target - self._compact_e)
+        self._compact_anim = (time.monotonic(), self._compact_e, target, self.COMPACT_SECONDS * span)
+        self._compact_step(save=True)
+
+    def _compact_step(self, save=False):
+        self._compact_job = None
+        if self._closed or self._compact_anim is None:
+            return
+        start, source, target, seconds = self._compact_anim
+        now = time.monotonic()
+        x = min(1.0, (now - start) / max(seconds, 1e-3))
+        eased = x * x * x * (x * (6 * x - 15) + 10)                     # smootherstep: soft start and landing
+        self._compact_e = source + (target - source) * eased
+        if x >= 1.0:
+            self._compact_e = target
+            self._compact_anim = None
+        self.draw(*self._size, save=save or x >= 1.0, frame=(self._connection, now - self._animation_start))
+        if self._compact_anim is not None:
+            self._compact_job = self.canvas.after(8, self._compact_step)
+
+    def _brand_hover(self, on):
+        self.canvas.configure(cursor="hand2" if on else "")
+        lit = False
+        if self._brand_rect is not None:
+            left, top, right, bottom = self._brand_rect
+            lit = self.set_hot((left, top, right, bottom) if on else None, (bottom - top) / 2)
+        return lit
+
+    def _panel_overlay(self, width, height, prefs, colors, layout):
+        """Cards and plates as one RGBA layer plus a frost mask; rebuilt only when they change."""
+        plates = self._plate_shapes
+        cards = prefs.get("_cards")
+        overlay_key = (width, height, prefs["theme"], plates, cards)
+        if self._overlay_key != overlay_key:
+            radius = round(nova_appearance.THEMES[prefs["theme"]]["radius"] * self.scale)
+            if cards is not None:
+                overlay, mask = nova_glass.compose_cards((width, height), cards, self.scale, bool(prefs.get("_fast")))
+                plates_key = (width, height, plates)
+                if self._plates_cache[0] != plates_key:
+                    self._plates_cache = (plates_key, *nova_glass.compose((width, height), plates, self.scale))
+                _, plate_layer, plate_mask = self._plates_cache
+                overlay = Image.alpha_composite(overlay, plate_layer)
+                mask = ImageChops.lighter(mask, plate_mask)
+                self._overlay, self._overlay_mask, self._overlay_key = overlay, mask, overlay_key
+                return self._overlay
+            shapes = [(*layout[name], radius, None) for name in ("hero", "routes")] + list(plates)
+            overlay, mask = nova_glass.compose((width, height), shapes, self.scale)
+            self._overlay, self._overlay_mask, self._overlay_key = overlay, mask, overlay_key
+        return self._overlay
+
     def _render_worker(self):
         while True:
             request = self._requests.get()
@@ -336,22 +768,15 @@ class DesktopScene:
                         self._persist_preferences(generation, prefs)
                     except OSError as error:
                         self._results.put((generation, None, error))
+                if self._gpu_mode and nova_gpu.gpu_texture(prefs["texture"]) is not None:
+                    self._gpu_worker_step(width, height, prefs, frame)
+                    self._results.put((generation, None, None))
+                    continue
                 image = self._dive_frame((width, height), prefs, frame[1] if frame else 0).convert("RGBA")
                 colors = nova_appearance.settings_theme(prefs["theme"])
                 layout = main_layout(width, height, self.scale)
-                overlay_key = (width, height, prefs["theme"])
-                if self._overlay_key != overlay_key:
-                    overlay = Image.new("RGBA", image.size)
-                    for bounds in (layout["hero"], layout["routes"]):
-                        left, top, right, bottom = bounds
-                        radius = round(nova_appearance.THEMES[prefs["theme"]]["radius"] * self.scale)
-                        panel = nova_appearance.render_surface(right - left, bottom - top, prefs["theme"], radius=radius)
-                        overlay.alpha_composite(panel, (left, top))
-                    draw = ImageDraw.Draw(overlay)
-                    draw.line((width // 2, layout["slot_label_y"] - round(6 * self.scale),
-                               width // 2, layout["slot_y"] + round(8 * self.scale)), fill=colors["border"], width=1)
-                    self._overlay, self._overlay_key = overlay, overlay_key
-                image = Image.alpha_composite(image, self._overlay)
+                overlay = self._panel_overlay(width, height, prefs, colors, layout)
+                image = Image.alpha_composite(nova_glass.frost(image, self._overlay_mask), overlay)
                 if frame is not None and frame[0] == "connecting":
                     color = tuple(int(colors["accent"][i:i + 2], 16) for i in (1, 3, 5))
                     image = Image.alpha_composite(image, connection_waves(
@@ -365,19 +790,257 @@ class DesktopScene:
     def _poll(self):
         if self._closed:
             return
-        while not self._results.empty():
-            generation, rendered, error = self._results.get()
-            if error is not None:
-                logging.error("Cannot apply Nova appearance: %s", error)
-                if self.on_error is not None:
-                    self.on_error(f"[UI] Не удалось применить оформление: {error}")
-            if generation == self._generation and rendered is not None:
-                self._photo = ImageTk.PhotoImage(rendered, master=self.canvas)
-                self.canvas.itemconfigure(self._background, image=self._photo)
-                self.canvas.tag_lower(self._background)
-            if generation == self._generation:
-                self._render_pending = False
-        self._poll_id = self.canvas.after(4 if self._render_pending else 200, self._poll)
+        try:
+            while not self._results.empty():
+                generation, rendered, error = self._results.get()
+                # A failed upload must release backpressure just like a completed frame.
+                if generation == self._generation:
+                    self._render_pending = False
+                if error is not None:
+                    logging.error("Cannot apply Nova appearance: %s", error)
+                    if self.on_error is not None:
+                        try:
+                            self.on_error(f"[UI] Не удалось применить оформление: {error}")
+                        except Exception:
+                            logging.exception("Appearance error callback failed")
+                if generation == self._generation and rendered is not None and not self._gpu_mode:
+                    try:
+                        photo = ImageTk.PhotoImage(rendered, master=self.canvas)
+                        self.canvas.itemconfigure(self._background, image=photo)
+                        self._photo = photo
+                        self.canvas.tag_lower(self._background)
+                    except tk.TclError:
+                        logging.exception("Appearance frame upload failed")
+        finally:
+            if not self._closed:
+                self._poll_id = self.canvas.after(4 if self._render_pending else 200, self._poll)
+
+    # --- GPU background (nova_gpu.GpuEngine); every method below runs on the Tk thread unless noted ---
+
+    def _gpu_setup(self, gpu):
+        """gpu: None = decide by NOVA_GPU, False = never, or an engine object (tests)."""
+        if gpu is False or os.environ.get("NOVA_GPU") == "0":
+            return
+        if gpu is None or gpu is True:
+            temp = None
+            if self.preferences_path:
+                temp = os.path.join(os.path.dirname(os.path.abspath(os.fspath(self.preferences_path))), "temp")
+            gpu = nova_gpu.GpuEngine(temp_dir=temp)
+        self._gpu = gpu
+        if gpu.state == "new":
+            gpu.start_async()
+        canvas = self.canvas
+        canvas.bind("<Motion>", self._gpu_on_motion, add="+")
+        canvas.bind("<Leave>", self._gpu_on_leave, add="+")
+        canvas.bind("<Map>", lambda _event: self._gpu_kick(), add="+")
+        canvas.bind("<Unmap>", lambda _event: self._gpu_kick(), add="+")
+        self._gpu_schedule(100)
+
+    def _gpu_schedule(self, delay):
+        if self._closed:
+            return
+        due = time.monotonic() + delay / 1000
+        if self._gpu_poll_id is not None:
+            if self._gpu_poll_due <= due:
+                return
+            self.canvas.after_cancel(self._gpu_poll_id)
+        self._gpu_poll_due = due
+        self._gpu_poll_id = self.canvas.after(delay, self._gpu_poll)
+
+    def _gpu_kick(self):
+        """Something was sent that will produce a frame: poll fast for a while."""
+        if self._gpu is None or self._closed:
+            return
+        self._gpu_fast_until = time.monotonic() + 0.5
+        self._gpu_schedule(2)
+
+    def _gpu_hires_timer(self, enable):
+        """1 ms system timer while frames are flowing, so Tk's after() stops quantising to 15.6 ms."""
+        if enable != self._gpu_hires:
+            self._gpu_hires = enable
+            nova_gpu.hires_timer(enable)
+
+    def _gpu_wanted(self):
+        engine = self._gpu
+        return (engine is not None and engine.ready
+                and nova_gpu.gpu_texture(self.appearance.get("texture")) is not None
+                and nova_gpu.frame_fits(*self._size))
+
+    def _gpu_refresh(self):
+        """Move between the CPU and GPU paths: engine ready/failed, texture and size changes."""
+        if self._gpu is None:
+            return
+        if self._gpu.failed:
+            self._gpu_abandon()
+            return
+        wanted = self._gpu_wanted()
+        if wanted and not self._gpu_mode:
+            self._gpu_enter()
+        elif not wanted and self._gpu_mode:
+            self._gpu_leave()
+
+    def _gpu_enter(self):
+        self._gpu_mode = True
+        self._gpu_photo = None
+        self._gpu_seq = 0
+        self._gpu_paused = None
+        self._gpu_sent = None
+        self._gpu_surface = None
+        if self._animation_id is not None:
+            self.canvas.after_cancel(self._animation_id)
+            self._animation_id = None
+        self._gpu_configure()
+        self._gpu_sync_visibility()
+        self._schedule_animation()
+        self.draw(*self._size)
+
+    def _gpu_leave(self):
+        self._gpu_mode = False
+        self._gpu_hires_timer(False)
+        self._gpu_photo = None
+        self._gpu_paused = None
+        if self._gpu is not None:
+            self._gpu.set_paused(True)
+        self._schedule_animation()
+        self.draw(*self._size)
+
+    def _gpu_abandon(self, reason=None):
+        """The engine died or the pump broke: back to the CPU path for good, without a user-visible error."""
+        engine, self._gpu = self._gpu, None
+        if engine is None:
+            return
+        if reason and not engine.failed:
+            engine.fail(reason)
+        engine.stop(wait=0)
+        self._gpu_hires_timer(False)
+        if self._gpu_mode:
+            self._gpu_mode = False
+            self._gpu_photo = None
+            self._schedule_animation()
+            self.draw(*self._size)
+
+    def _gpu_configure(self):
+        config = nova_gpu.config_from_prefs(self.appearance, nova_appearance.THEMES[self.appearance["theme"]]["accent"],
+                                            nova_gpu.target_fps(self.appearance))
+        if config is not None and self._gpu is not None:
+            self._gpu_frame_ms = 1000 / max(1, config["fps"])
+            if "drift" not in getattr(self._gpu, "features", ()):
+                config.pop("drift", None)   # an older engine has no slowly drifting second hue
+            self._gpu.configure(**config)
+            self._gpu_kick()
+
+    def _gpu_sync_visibility(self):
+        """Pause the engine whenever the canvas cannot be seen (minimised or withdrawn)."""
+        try:
+            paused = not self.canvas.winfo_viewable()
+        except tk.TclError:
+            return
+        if paused != self._gpu_paused:
+            self._gpu_paused = paused
+            self._gpu_hires_timer(not paused and self._gpu_mode)
+            self._gpu.set_paused(paused)
+            if not paused:
+                self._gpu_kick()
+
+    def _gpu_poll(self):
+        self._gpu_poll_id = None
+        if self._closed or self._gpu is None:
+            return
+        delay = 250
+        try:
+            self._gpu_refresh()
+            if self._gpu is None:
+                return
+            if self._gpu_mode:
+                self._gpu_sync_visibility()
+                if self._gpu_show_frame():
+                    # The next frame is due in about one frame time: sleep most of it, then poll finely.
+                    delay = max(2, int(self._gpu_frame_ms * 0.7))
+                elif time.monotonic() < self._gpu_fast_until:
+                    delay = 2
+            elif self._gpu.state in ("new", "starting"):
+                delay = 100
+        except Exception:
+            logging.exception("GPU frame pump failed")
+            self._gpu_abandon("сбой показа кадра")
+            return
+        self._gpu_schedule(delay)
+
+    def _gpu_show_frame(self):
+        """Upload the newest engine frame into the background item; True when one was shown."""
+        engine = self._gpu
+        if engine.pending_seq == self._gpu_seq:
+            return False
+        frame = engine.latest_frame()
+        if frame is None or frame[0] == self._gpu_seq:
+            return False
+        seq, width, height, data = frame
+        image = Image.frombuffer("RGB", (width, height), data, "raw", "RGB", 0, 1)
+        photo = self._gpu_photo
+        if photo is not None and (photo.width(), photo.height()) == (width, height):
+            photo.paste(image)
+        else:
+            # One PhotoImage is reused for every frame of a size: paste() is 2x cheaper than a new image.
+            photo = self._gpu_photo = ImageTk.PhotoImage(image, master=self.canvas)
+            self.canvas.itemconfigure(self._background, image=photo)
+            self.canvas.tag_lower(self._background)
+        self._gpu_seq = seq
+        self._gpu_fast_until = time.monotonic() + 0.3
+        return True
+
+    def _gpu_on_motion(self, event):
+        if not self._gpu_mode:
+            return
+        self._gpu_pointer_last = (event.x, event.y, True)
+        if time.monotonic() - self._gpu_pointer_at >= 1 / 60:
+            self._gpu_flush_pointer()
+        elif self._gpu_pointer_job is None:
+            self._gpu_pointer_job = self.canvas.after(17, self._gpu_pointer_tick)
+
+    def _gpu_on_leave(self, event):
+        if self._gpu_mode:
+            self._gpu_pointer_last = (event.x, event.y, False)
+            self._gpu_flush_pointer()
+
+    def _gpu_pointer_tick(self):
+        self._gpu_pointer_job = None
+        if self._gpu_mode:
+            self._gpu_flush_pointer()
+
+    def _gpu_flush_pointer(self):
+        last = self._gpu_pointer_last
+        if last is None or self._gpu is None:
+            return
+        x, y = nova_gpu.pointer_to_lab(last[0], last[1], *self._size)
+        self._gpu.set_pointer(x, y, last[2])
+        self._gpu_pointer_at = time.monotonic()
+        self._gpu_kick()
+
+    def _gpu_worker_step(self, width, height, prefs, frame):
+        """Worker thread: size, then the cards/divider/waves overlay; never any widget access."""
+        engine = self._gpu
+        if engine is None or not engine.ready:
+            return
+        try:
+            if self._gpu_surface != (width, height):
+                engine.resize(width, height)  # the engine drops its overlay on a size change
+                self._gpu_surface = (width, height)
+                self._gpu_sent = None
+            connecting = frame is not None and frame[0] == "connecting"
+            key = (width, height, prefs["theme"], self._plate_shapes, prefs.get("_cards"), "waves" if connecting else "plain")
+            if not connecting and self._gpu_sent == key:
+                return
+            colors = nova_appearance.settings_theme(prefs["theme"])
+            layout = main_layout(width, height, self.scale)
+            layer = self._panel_overlay(width, height, prefs, colors, layout)
+            if connecting:
+                color = tuple(int(colors["accent"][i:i + 2], 16) for i in (1, 3, 5))
+                layer = Image.alpha_composite(layer, connection_waves(layer.size, layout["action"], frame[1],
+                                                                       color, self.scale))
+            engine.set_overlay(layer.tobytes(), width, height, mask=self._overlay_mask.tobytes())
+            self._gpu_sent = key
+        except OSError as error:
+            engine.fail("не записан слой панелей: %s" % type(error).__name__)
 
     def _draw_labels(self):
         canvas = self.canvas
@@ -389,18 +1052,60 @@ class DesktopScene:
         scale = self.scale
         layout = main_layout(width, height, scale)
 
-        def text(x, y, value, role, color, anchor="w"):
-            canvas.create_text(x, y, text=value, font=fonts[role],
-                               fill=color, anchor=anchor, tags="desktop_chrome")
+        def text(x, y, value, role, color, anchor="w", zone=None):
+            return canvas.create_text(x, y, text=value, font=fonts[role], fill=color, anchor=anchor,
+                                      tags=("desktop_chrome", "zone_" + zone) if zone else "desktop_chrome")
 
-        self._logo_photo = ImageTk.PhotoImage(supernova_icon(round(34 * scale), theme["accent"]), master=canvas)
+        brand_x, brand_lift = round(57 * scale), 0
+        # The logo and the NOVA caption glow faintly in the theme hue (weaker than a hovered button).
+        accent = tuple(int(theme["accent"][i:i + 2], 16) for i in (1, 3, 5))
+        icon = supernova_icon(round(34 * scale), theme["accent"])
+        self._logo_glow = ImageTk.PhotoImage(soft_glow(icon.getchannel("A"), accent, 7 * scale, .55), master=canvas)
+        canvas.create_image(round(36 * scale), layout["header_y"], image=self._logo_glow, tags="desktop_chrome")
+        self._logo_photo = ImageTk.PhotoImage(icon, master=canvas)
         canvas.create_image(round(36 * scale), layout["header_y"], image=self._logo_photo, tags="desktop_chrome")
-        text(62 * scale, layout["header_y"], "NOVA", "brand", colors["text"])
-        text(layout["slot_x"], layout["route_heading_y"], "Маршруты VPN", "section", colors["text"])
-        text(layout["slot_x"] + layout["slot_width"] / 4, layout["slot_label_y"],
-             "Основной", "caption", colors["value"], "center")
-        text(width - layout["slot_x"] - layout["slot_width"] / 4, layout["slot_label_y"],
-             "Дополнительный", "caption", colors["value"], "center")
+        try:
+            brand_px = fonts["brand"][1] * 96 / 72 * scale
+            brand_mask = text_mask("NOVA", brand_px)
+            self._brand_glow = ImageTk.PhotoImage(soft_glow(brand_mask, accent, 6 * scale, .5), master=canvas)
+            canvas.create_image(brand_x + brand_mask.width / 2, layout["header_y"], image=self._brand_glow,
+                                tags="desktop_chrome")
+            # Tk centres the whole line box on y, but the capitals sit lower in it: lift the caption so the
+            # centre of the letters (not of the line) lands on the centre of the logo.
+            font = ImageFont.truetype("seguisb.ttf", max(1, round(brand_px)))
+            ascent, descent = font.getmetrics()
+            _, glyph_top, _, glyph_bottom = font.getbbox("NOVA")
+            brand_lift = round((glyph_top + glyph_bottom) / 2 - (ascent + descent) / 2)
+        except OSError:
+            self._brand_glow = None
+        # A glass chip under the logo and caption keeps them legible over any texture.
+        brand_width = self._brand_glow.width() - round(30 * scale) if self._brand_glow is not None else 80 * scale
+        self.set_plate("brand", (round(14 * scale), layout["header_y"] - round(23 * scale),
+                                 round(brand_x + brand_width + 12 * scale), layout["header_y"] + round(23 * scale)),
+                       round(23 * scale))
+        self._brand_text = text(brand_x, layout["header_y"] - brand_lift, "NOVA", "brand", colors["text"])
+        self._brand_font = fonts["brand"]
+        text(layout["slot_x"], layout["route_heading_y"], "Маршруты VPN", "section", colors["text"], zone="heading")
+        self._caption_shadows = []
+        caption_px = fonts["caption"][1] * 96 / 72 * scale
+        for centre, caption in zip(layout["slot_button_centers"], ("Основной", "Дополнительный")):
+            shadow = canvas.create_image(centre, layout["slot_label_y"], anchor="center", state="hidden",
+                                         tags="desktop_chrome")
+            item = text(centre, layout["slot_label_y"], caption, "caption", colors["value"], "center")
+            canvas.tag_lower(shadow, item)
+            self._caption_shadows.append((shadow, item, caption, caption_px))
+        # The caption is a switch: an almost transparent image over the chip takes the pointer (an empty rectangle
+        # would only react on its outline).
+        chip = (round(14 * scale), layout["header_y"] - round(23 * scale),
+                round(brand_x + brand_width + 12 * scale), layout["header_y"] + round(23 * scale))
+        self._brand_rect = chip
+        self._brand_hit = ImageTk.PhotoImage(Image.new("RGBA", (chip[2] - chip[0], chip[3] - chip[1]), (0, 0, 0, 1)),
+                                             master=canvas)
+        hit = canvas.create_image(chip[0], chip[1], image=self._brand_hit, anchor="nw", tags="desktop_chrome")
+        canvas.tag_bind(hit, "<Enter>", lambda _event: self._brand_hover(True))
+        canvas.tag_bind(hit, "<Leave>", lambda _event: self._brand_hover(False))
+        canvas.tag_bind(hit, "<Button-1>", lambda _event: self.toggle_compact())
+        self.zone_changed()      # the labels exist now: while folded, the pills follow them
 
 
 class UiLogPump:
@@ -740,182 +1445,5 @@ class ThemedMenu:
         self._nova_var = None
 
 
-class AppearanceWindow:
-    """Live appearance controls, independent of connection and routing settings."""
-
-    def __init__(self, root, preferences, on_apply, place_window=None, show=True):
-        self.preferences = dict(preferences)
-        self.on_apply = on_apply
-        self.top = tk.Toplevel(root)
-        self.top.withdraw()
-        self.top.title("Оформление Nova")
-        self.top.transient(root)
-        self.top.resizable(False, False)
-        self.top.protocol("WM_DELETE_WINDOW", self.top.withdraw)
-        self._build()
-        self.top.update_idletasks()
-        if place_window is not None:
-            place_window(self.top)
-        else:
-            x = min(root.winfo_rootx() + root.winfo_width() + 12,
-                    root.winfo_screenwidth() - self.top.winfo_reqwidth() - 24)
-            y = max(24, min(root.winfo_rooty(), root.winfo_screenheight() - self.top.winfo_reqheight() - 64))
-            self.top.geometry(f"+{max(0, x)}+{y}")
-        self.top.bind("<Escape>", lambda event: self.top.withdraw())
-        self.top.bind("<Destroy>", self._on_destroy, add="+")
-        if show:
-            self.top.deiconify()
-
-    def _on_destroy(self, event):
-        if event.widget is self.top:
-            self.immersion = None
-            self.random_texture = None
-
-    def _build(self):
-        colors = nova_appearance.settings_theme(self.preferences["theme"])
-        theme = nova_appearance.THEMES[self.preferences["theme"]]
-        fonts = nova_appearance.font_roles(self.preferences["theme"])
-        scale = display_scale(self.top)
-        px = lambda value: round(value * scale)
-        self.top.configure(bg=colors["bg"])
-        outer = tk.Frame(self.top, bg=colors["bg"], padx=px(18), pady=px(16))
-        outer.pack(fill="both", expand=True)
-        tk.Label(outer, text="Оформление", bg=colors["bg"], fg=colors["text"],
-                 font=fonts["title"], anchor="w").pack(fill="x", pady=(0, px(12)))
-        theme_grid = tk.Frame(outer, bg=colors["bg"])
-        theme_grid.pack(fill="x")
-        self.theme_buttons = {}
-        tile_width = max(px(108), max(int(self.top.tk.call("font", "measure", fonts["control"], name))
-                                     for name in THEME_TITLES.values()) + px(24))
-        for index, (key, candidate) in enumerate(nova_appearance.THEMES.items()):
-            selected = key == self.preferences["theme"]
-            candidate_colors = nova_appearance.settings_theme(key)
-            swatch = tk.Canvas(theme_grid, width=tile_width, height=px(42), highlightthickness=0,
-                               bg=colors["bg"], cursor="hand2", takefocus=True)
-            swatch.grid(row=index // 4, column=index % 4, padx=px(2), pady=px(2))
-            swatch.create_rectangle(px(1), px(1), tile_width - px(1), px(41),
-                                    fill=candidate_colors["panel"],
-                                    outline=candidate["accent"] if selected else colors["border"],
-                                    width=px(2) if selected else 1)
-            swatch.create_line(px(10), px(10), px(24), px(10), fill=candidate["accent"], width=px(2))
-            swatch.create_text(px(10), px(28), anchor="w", text=THEME_TITLES[key],
-                               fill=candidate_colors["text"], font=fonts["control"])
-            swatch.bind("<Button-1>", lambda event, k=key: self._change(theme=k))
-            swatch.bind("<Return>", lambda event, k=key: self._change(theme=k))
-            swatch.bind("<space>", lambda event, k=key: self._change(theme=k))
-            swatch._nova_theme_key = key
-            self.theme_buttons[key] = swatch
-
-        self._caption(outer, "Фактура", colors, fonts, px)
-        style = ttk.Style(self.top)
-        style.theme_use("clam")
-        style.configure("Nova.TCombobox", fieldbackground=colors["panel"], background=colors["panel"],
-                        foreground=colors["text"], arrowcolor=theme["accent"],
-                        bordercolor=colors["border"], padding=px(4))
-        style.map("Nova.TCombobox", fieldbackground=[("readonly", colors["panel"])],
-                  foreground=[("readonly", colors["text"])], selectbackground=[("readonly", colors["panel"])])
-        self.top.option_add("*TCombobox*Listbox.background", colors["panel"])
-        self.top.option_add("*TCombobox*Listbox.foreground", colors["text"])
-        self.top.option_add("*TCombobox*Listbox.font", fonts["control"])
-        self.texture = ttk.Combobox(outer, values=list(nova_appearance.TEXTURES.values()),
-                                    state="readonly", style="Nova.TCombobox", font=fonts["control"])
-        self.texture.current(list(nova_appearance.TEXTURES).index(self.preferences["texture"]))
-        self.texture.pack(fill="x")
-        self.texture.bind("<<ComboboxSelected>>", lambda event: self._change(
-            texture=list(nova_appearance.TEXTURES)[self.texture.current()]))
-        self.intensity_value = self._caption(outer, "Интенсивность", colors, fonts, px,
-                                             str(round(self.preferences["texture_intensity"] * 100)) + " %")
-        self.intensity = self._slider(outer, 0, 60, self.preferences["texture_intensity"] * 100,
-                                     self._set_intensity, colors, px)
-        temperature = self.preferences["temperature"]
-        self.temperature_value = self._caption(outer, "Температура", colors, fonts, px,
-                                               self._temperature_text(temperature))
-        self.temperature = self._slider(outer, -100, 100, temperature, self._set_temperature, colors, px)
-        self.immersion = tk.BooleanVar(self.top, value=self.preferences.get("immersion", True))
-        tk.Checkbutton(outer, text="Анимация фоновой фактуры", variable=self.immersion,
-                       command=lambda: self._change(immersion=self.immersion.get()),
-                       bg=colors["bg"], fg=colors["text"], activebackground=colors["bg"],
-                       activeforeground=colors["text"], selectcolor=colors["panel"],
-                       font=fonts["control"], anchor="w").pack(fill="x", pady=(px(12), 0))
-        self.random_texture = tk.BooleanVar(self.top, value=self.preferences.get('random_texture_on_start', False))
-        tk.Checkbutton(outer, text="Случайная фактура при запуске", variable=self.random_texture,
-                       command=lambda: self._change(random_texture_on_start=self.random_texture.get()),
-                       bg=colors['bg'], fg=colors['text'], activebackground=colors['bg'],
-                       activeforeground=colors['text'], selectcolor=colors['panel'],
-                       font=fonts['control'], anchor='w').pack(fill='x', pady=(px(6), 0))
-        actions = tk.Frame(outer, bg=colors["bg"])
-        actions.pack(fill="x", pady=(px(16), 0))
-        self.pattern_button = tk.Button(
-            actions, text="Новый рисунок", command=self._new_pattern, relief="flat", bd=0,
-            bg=colors["panel"], fg=colors["text"], activebackground=colors["pill_on_bg"],
-            activeforeground=colors["pill_on_fg"], disabledforeground=colors["muted"],
-            font=fonts["control"], cursor="hand2", padx=px(12), pady=px(7))
-        self.pattern_button.pack(side="left")
-        tk.Button(actions, text="Готово", command=self.top.withdraw, relief="flat", bd=0,
-                  bg=colors["pill_on_bg"], fg=colors["text"], activebackground=colors["panel"],
-                  activeforeground=colors["pill_on_fg"], font=fonts["control"], cursor="hand2",
-                  padx=px(18), pady=px(7)).pack(side="right")
-        self._refresh_texture_controls()
-
-    @staticmethod
-    def _caption(parent, text, colors, fonts, px, value=None):
-        row = tk.Frame(parent, bg=colors["bg"])
-        row.pack(fill="x", pady=(px(12), px(5)))
-        tk.Label(row, text=text, bg=colors["bg"], fg=colors["value"],
-                 font=fonts["caption"], anchor="w").pack(side="left")
-        if value is not None:
-            label = tk.Label(row, text=value, bg=colors["bg"], fg=colors["value"], font=fonts["caption"])
-            label.pack(side="right")
-            return label
-
-    @staticmethod
-    def _slider(parent, start, end, value, command, colors, px):
-        style = ttk.Style(parent)
-        style.configure("Nova.Horizontal.TScale", background=colors["accent"], borderwidth=0,
-                        troughcolor=colors["panel"], bordercolor=colors["panel"],
-                        lightcolor=colors["panel"], darkcolor=colors["panel"], sliderlength=px(16))
-        style.map("Nova.Horizontal.TScale", background=[("active", colors["pill_on_fg"]),
-                                                       ("disabled", colors["muted"])])
-        scale = ttk.Scale(parent, from_=start, to=end, orient="horizontal", style="Nova.Horizontal.TScale")
-        scale.set(value)
-        scale.pack(fill="x", pady=(px(2), 0))
-        scale.configure(command=command)
-        return scale
-
-    @staticmethod
-    def _temperature_text(value):
-        return "Нейтральная" if value == 0 else "Холоднее " + str(abs(value)) if value < 0 else "Теплее " + str(value)
-
-    def _set_intensity(self, value):
-        value = round(float(value))
-        self.intensity_value.configure(text=str(value) + " %")
-        self._change(texture_intensity=value / 100)
-
-    def _set_temperature(self, value):
-        value = round(float(value))
-        self.temperature_value.configure(text=self._temperature_text(value))
-        self._change(temperature=value)
-
-    def _refresh_texture_controls(self):
-        disabled = self.preferences["texture"] == "none"
-        self.pattern_button.configure(state="disabled" if disabled else "normal")
-        self.intensity.state(["disabled"] if disabled else ["!disabled"])
-
-    def _change(self, **values):
-        focused = self.top.focus_get()
-        restore_theme_focus = getattr(focused, "_nova_theme_key", None) is not None
-        old_theme = self.preferences["theme"]
-        self.preferences.update(values)
-        self.on_apply(dict(self.preferences))
-        if self.preferences["theme"] != old_theme:
-            for child in self.top.winfo_children():
-                child.destroy()
-            self._build()
-            if restore_theme_focus:
-                self.theme_buttons[self.preferences["theme"]].focus_set()
-        else:
-            self._refresh_texture_controls()
-
-    def _new_pattern(self):
-        if self.preferences["texture"] != "none":
-            self._change(variant=self.preferences["variant"] + 1)
+AppearanceWindow = nova_appearance_ui.AppearanceWindow
+reveal_window = nova_appearance_ui.reveal_window

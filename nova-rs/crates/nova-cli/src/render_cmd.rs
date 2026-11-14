@@ -71,8 +71,20 @@ fn full_alpha() -> f32 {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveRequest {
+    version: u8,
+    width: usize,
+    height: usize,
+    texture: String,
+    variant: u32,
+    time: f64,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum RenderRequest {
+    Live(LiveRequest),
     Rain(RainRequest),
     Texture(TextureRequest),
     Android(AndroidRequest),
@@ -88,6 +100,29 @@ fn render() -> Result<(), String> {
     }
     let request: RenderRequest = serde_json::from_slice(&input).map_err(|e| e.to_string())?;
     let (width, height, pixels, words) = match request {
+        RenderRequest::Live(request) if request.version == 7 => {
+            // v7: live immersive texture frame; P6 for the RGB fractal, P5 otherwise.
+            let frame = nova_render::live_texture(
+                request.width, request.height, &request.texture, request.variant, request.time,
+            ).map_err(str::to_owned)?;
+            let mut output = std::io::stdout().lock();
+            let kind = if frame.channels == 3 { 6 } else { 5 };
+            write!(output, "P{kind}
+{} {}
+255
+", request.width, request.height).map_err(|e| e.to_string())?;
+            output.write_all(&frame.pixels).map_err(|e| e.to_string())?;
+            return output.flush().map_err(|e| e.to_string());
+        }
+        RenderRequest::Android(request) if request.version == 6 => {
+            let pixels = nova_render::smooth_fractal(
+                request.width, request.height, request.variant, request.source, request.crop,
+            ).map_err(str::to_owned)?;
+            let mut output = std::io::stdout().lock();
+            write!(output, "P6\n{} {}\n255\n", request.width, request.height).map_err(|e| e.to_string())?;
+            output.write_all(&pixels).map_err(|e| e.to_string())?;
+            return output.flush().map_err(|e| e.to_string());
+        }
         RenderRequest::Rain(request) if request.version == 5 => {
             if request.trace && (request.width > 256 || request.height > 256) {
                 return Err("trace is limited to 256 px".into());

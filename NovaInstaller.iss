@@ -35,7 +35,7 @@ LZMANumBlockThreads=7
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#MyOutputDir}
-OutputBaseFilename=NovaSetup
+OutputBaseFilename=NovaSetup-{#MyAppVersion}
 SetupIconFile={#MyRepoDir}\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile={#MyRepoDir}\LICENSE
@@ -57,6 +57,9 @@ russian.LicenseLink=Открыть лицензию на GitHub
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopShortcut}"; GroupDescription: "{cm:AdditionalIcons}"
+; On by default for a first install (owner 2026-11-14). An upgrade never touches the shortcut:
+; the Startup entry is Nova's own switch in the settings, and a user who turned it off keeps it off.
+Name: "startup"; Description: "Запускать Nova вместе с Windows (свёрнутой)"; GroupDescription: "Запуск:"; Check: IsFirstInstall
 
 [Dirs]
 Name: "{app}\temp"
@@ -136,6 +139,7 @@ Type: filesandordirs; Name: "{app}\temp\awg-runtime"
 [Icons]
 Name: "{autoprograms}\Nova"; Filename: "{app}\Nova.exe"
 Name: "{autodesktop}\Nova"; Filename: "{app}\Nova.exe"; Tasks: desktopicon
+Name: "{userstartup}\Nova"; Filename: "{app}\Nova.exe"; Parameters: "--minimized"; Tasks: startup; Check: IsFirstInstall
 
 [Run]
 Filename: "{app}\Nova.exe"; Parameters: "--updated"; Description: "Запустить Nova"; Flags: nowait postinstall skipifsilent
@@ -151,6 +155,7 @@ Type: filesandordirs; Name: "{app}\resources"
 [Code]
 var
   LicenseLinkLabel: TNewStaticText;
+  NovaWasInstalled: Boolean;
 
 function PsQuote(const S: string): string;
 begin
@@ -255,6 +260,21 @@ var
   ErrorCode: Integer;
 begin
   ShellExec('', '{#MyLicenseUrl}', '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
+end;
+
+function IsFirstInstall: Boolean;
+begin
+  Result := not NovaWasInstalled;
+end;
+
+function InitializeSetup: Boolean;
+var
+  UninstallKey: String;
+begin
+  { Decided before anything is copied: the uninstall key appears only after the first install. }
+  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6C4A94A4-56E3-4A3A-91AF-7E0D34E3B4C2}_is1';
+  NovaWasInstalled := RegKeyExists(HKCU, UninstallKey) or RegKeyExists(HKLM, UninstallKey);
+  Result := True;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

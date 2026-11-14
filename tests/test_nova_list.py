@@ -131,11 +131,9 @@ class StartupAppearanceTests(unittest.TestCase):
                 for child in widget.winfo_children():
                     yield child
                     yield from descendants(child)
-            checkbox = next(widget for widget in descendants(window.top)
-                            if isinstance(widget, tk.Checkbutton) and widget.cget('text') == 'Случайная фактура при запуске')
-            self.assertFalse(window.random_texture.get())
-            checkbox.invoke()
-            self.assertTrue(seen[-1]['random_texture_on_start'])
+            self.assertTrue(window.random_texture.get(), 'the owner keeps random-on-start from their own settings')
+            window.switches['random_texture_on_start'].toggle()
+            self.assertFalse(seen[-1]['random_texture_on_start'])
             self.assertEqual(seen[-1]['texture'], 'marble')
         finally:
             window.top.destroy()
@@ -149,8 +147,14 @@ class StartupAppearanceTests(unittest.TestCase):
     def test_owner_defaults_and_opt_in_randomization(self):
         with tempfile.TemporaryDirectory() as work:
             path = Path(work) / 'appearance.json'
-            prefs = appearance.startup_preferences(path, choose=lambda _: self.fail('disabled by default'))
-            self.assertEqual((prefs['theme'], prefs['texture'], prefs['texture_intensity']), ('dnsai', 'marble', .3))
+            prefs = appearance.startup_preferences(path, choose=lambda candidates: 'marble')
+            self.assertEqual((prefs['theme'], prefs['accent_hue'], prefs['brightness'], prefs['speed'], prefs['warp']),
+                             ('hue27', 27, 80, 25, 30))
+            self.assertTrue(appearance.DEFAULT_PREFERENCES['random_texture_on_start'])
+            path.unlink(missing_ok=True)
+            appearance.save_preferences(path, dict(appearance.DEFAULT_PREFERENCES, random_texture_on_start=False))
+            prefs = appearance.startup_preferences(path, choose=lambda _: self.fail('disabled when switched off'))
+            self.assertEqual(prefs['texture'], 'marble')
             appearance.save_preferences(path, dict(prefs, random_texture_on_start=True, variant=17))
             seen = []
             def choose(candidates):

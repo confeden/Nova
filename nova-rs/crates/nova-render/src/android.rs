@@ -154,6 +154,11 @@ pub fn android_fractal(
     source: [usize; 2],
     crop: [f64; 4],
 ) -> Result<Vec<u8>, &'static str> {
+    validate(width, height, variant, source, crop)?;
+    android_mask(width, height, variant, source, crop)
+}
+
+fn validate(width: usize, height: usize, variant: u32, source: [usize; 2], crop: [f64; 4]) -> Result<(), &'static str> {
     if width < 8
         || height < 8
         || width > 1440
@@ -166,6 +171,10 @@ pub fn android_fractal(
     if crop.iter().any(|n| !n.is_finite() || *n < 0.0 || *n > 1.0) || crop[2] <= crop[0] || crop[3] <= crop[1] {
         return Err("invalid normalized crop");
     }
+    Ok(())
+}
+
+fn android_mask(width: usize, height: usize, variant: u32, source: [usize; 2], crop: [f64; 4]) -> Result<Vec<u8>, &'static str> {
     let view = select(source[0], source[1], variant);
     let span = source[0].min(source[1]) as f32;
     let (ax, ay) = (source[0] as f32 / span, source[1] as f32 / span);
@@ -238,6 +247,90 @@ pub fn android_fractal(
                 (0.05 + (0.12 + 0.55 * prox) * (0.25 + 0.75 * wide) + 0.12 * line * prox) * vignette
             };
             pixels[y * width + x] = (tone * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok(pixels)
+}
+
+pub(crate) fn palette(nu: f32) -> [f64; 3] {
+    if nu < 0.0 {
+        return [0.035, 0.05, 0.09];
+    }
+    const STOPS: [[f64; 3]; 6] = [
+        [0.18, 0.22, 0.58], [0.12, 0.56, 0.78], [0.18, 0.72, 0.57],
+        [0.88, 0.64, 0.30], [0.56, 0.28, 0.66], [0.18, 0.22, 0.58],
+    ];
+    let phase = (nu as f64 * 0.018).rem_euclid(1.0) * 5.0;
+    let index = (phase as usize).min(4);
+    let fraction = phase - index as f64;
+    let blend = fraction * fraction * (3.0 - 2.0 * fraction);
+    let brightness = 0.45 + 0.55 * smooth(1.5, 90.0, nu) as f64;
+    std::array::from_fn(|c| (STOPS[index][c] * (1.0 - blend) + STOPS[index + 1][c] * blend) * brightness)
+}
+
+fn filtered_color(cr: f64, ci: f64, limit: u32, footprint: f64) -> [f64; 3] {
+    let inside = palette(-1.5);
+    let q = (cr - 0.25) * (cr - 0.25) + ci * ci;
+    if q * (q + cr - 0.25) <= 0.25 * ci * ci || (cr + 1.0).powi(2) + ci * ci <= 0.0625 {
+        return inside;
+    }
+    let (mut zr, mut zi, mut dr, mut di) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    for n in 0..limit {
+        let (rr, ii) = (zr * zr, zi * zi);
+        if rr + ii > 1e4 {
+            let radius = (rr + ii).sqrt();
+            let nu = (n as f64 + 1.0 - radius.ln().ln() / 2.0_f64.ln()) as f32;
+            let distance = 0.5 * radius.ln() * radius / dr.hypot(di);
+            let coverage = smooth(0.0, 1.5, (distance / footprint) as f32) as f64;
+            let color = palette(nu);
+            return std::array::from_fn(|c| inside[c] + (color[c] - inside[c]) * coverage);
+        }
+        let next_dr = 2.0 * (zr * dr - zi * di) + 1.0;
+        di = 2.0 * (zr * di + zi * dr);
+        dr = next_dr;
+        zi = 2.0 * zr * zi + ci;
+        zr = rr - ii + cr;
+    }
+    inside
+}
+
+/// Color the smooth escape potential BEFORE filtering. Interpolating signed orbit
+/// counts or choosing the nearest interior sample creates dark, flickering blocks.
+pub fn smooth_fractal(width: usize, height: usize, variant: u32, source: [usize; 2], crop: [f64; 4]) -> Result<Vec<u8>, &'static str> {
+    validate(width, height, variant, source, crop)?;
+    let view = select(source[0], source[1], variant);
+    let span = source[0].min(source[1]) as f64;
+    let (ax, ay) = (source[0] as f64 / span, source[1] as f64 / span);
+    let longest = 380.min(width.max(height));
+    let (gw, gh) = ((longest * width / width.max(height)).max(2), (longest * height / width.max(height)).max(2));
+    let footprint = (view.scale * ax * (crop[2] - crop[0]) / (gw - 1) as f64)
+        .max(view.scale * ay * (crop[3] - crop[1]) / (gh - 1) as f64);
+    let mut grid = vec![[0.0; 3]; gw * gh];
+    for gy in 0..gh {
+        let py = (crop[1] + gy as f64 / (gh - 1) as f64 * (crop[3] - crop[1]) - 0.5) * view.scale * ay;
+        for gx in 0..gw {
+            let px = (crop[0] + gx as f64 / (gw - 1) as f64 * (crop[2] - crop[0]) - 0.5) * view.scale * ax;
+            grid[gy * gw + gx] = filtered_color(
+                view.real + px * view.cosine - py * view.sine,
+                view.imaginary + px * view.sine + py * view.cosine, view.iterations, footprint,
+            );
+        }
+    }
+    let mut pixels = vec![0; width * height * 3];
+    for y in 0..height {
+        let gy = y as f64 * (gh - 1) as f64 / (height - 1) as f64;
+        let iy = (gy as usize).min(gh - 2);
+        let fy = gy - iy as f64;
+        for x in 0..width {
+            let gx = x as f64 * (gw - 1) as f64 / (width - 1) as f64;
+            let ix = (gx as usize).min(gw - 2);
+            let fx = gx - ix as f64;
+            let samples = [grid[iy * gw + ix], grid[iy * gw + ix + 1], grid[(iy + 1) * gw + ix], grid[(iy + 1) * gw + ix + 1]];
+            let weights = [(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy];
+            for c in 0..3 {
+                let value: f64 = samples.iter().zip(weights).map(|(p, w)| p[c] * w).sum();
+                pixels[(y * width + x) * 3 + c] = (value * 255.0).clamp(0.0, 255.0).round() as u8;
+            }
         }
     }
     Ok(pixels)

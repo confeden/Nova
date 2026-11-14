@@ -54,6 +54,32 @@ class WinDivertRecoveryTests(unittest.TestCase):
             self.assertTrue(state["pending_delete"])
             self.assertFalse(state["running"])
 
+    def test_live_device_marked_for_delete_is_not_reported_disabled(self):
+        # Field report 1.45.1: RUNNING, Start=4, DeleteFlag=1 blocked NovaDivert Redirect.
+        ns = _load_functions("_query_windivert_service_state")
+        ns.update(re=re, _run_hidden_sc=lambda *args: (0, "STATE : 4 RUNNING", ""),
+                  _is_windivert_pending_delete_text=lambda text: False,
+                  _is_sc_service_missing_text=lambda text: False,
+                  _is_windivert_disabled_text=lambda text: False,
+                  _probe_windivert_service_access=lambda: {
+                      "pending_delete": False, "missing": False, "access_denied": False},
+                  _probe_windivert_minimal_open_error=lambda: 0)
+        values = {"Start": 4, "DeleteFlag": 1}
+        registry = types.SimpleNamespace(
+            HKEY_LOCAL_MACHINE=0, KEY_READ=0,
+            OpenKey=mock.Mock(return_value=object()), CloseKey=mock.Mock(),
+            QueryValueEx=lambda key, name: (values[name], 4))
+        with mock.patch.dict(sys.modules, winreg=registry):
+            state = ns["_query_windivert_service_state"]()
+            self.assertFalse(state["disabled"])
+            self.assertFalse(state["pending_delete"])
+            self.assertTrue(state["running"])
+            self.assertTrue(state["registration_disabled"])
+            ns["_probe_windivert_minimal_open_error"] = lambda: 2
+            state = ns["_query_windivert_service_state"]()
+            self.assertTrue(state["disabled"])
+            self.assertTrue(state["pending_delete"])
+
     def test_invalid_name_detector_is_narrow(self):
         ns = _load_functions("_is_windivert_invalid_name_open_failure")
         detect = ns["_is_windivert_invalid_name_open_failure"]

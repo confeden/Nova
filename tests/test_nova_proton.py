@@ -1507,11 +1507,13 @@ class RenewalPolicyTests(unittest.TestCase):
         self.assertEqual(nova_proton.should_issue(self.account(), now, True)[0], False)
         self.assertEqual(nova_proton.should_issue(self.account(), now, False)[0], True)
         self.assertEqual(nova_proton.should_issue(None, now, False)[0], True)
-        self.assertEqual(nova_proton.should_issue(self.account(nodes_checked_at=now - 25 * 3600), now, True)[0], True)
+        # Owner 2026-11-12 (Android D40): an existing set is never re-issued automatically -- not
+        # for a stale node list, not for an expiring certificate. Only force=True runs do that.
+        self.assertEqual(nova_proton.should_issue(self.account(nodes_checked_at=now - 25 * 3600), now, True)[0], False)
         bundled = self.account(nodes_source="bundled")
         self.assertEqual(nova_proton.should_issue(dict(bundled, nodes_checked_at=now - 5 * 3600), now, True)[0], False)
-        self.assertEqual(nova_proton.should_issue(dict(bundled, nodes_checked_at=now - 7 * 3600), now, True)[0], True)
-        self.assertEqual(nova_proton.should_issue(self.account(cert_expires_at=now + 86400), now, True)[0], True)
+        self.assertEqual(nova_proton.should_issue(dict(bundled, nodes_checked_at=now - 7 * 3600), now, True)[0], False)
+        self.assertEqual(nova_proton.should_issue(self.account(cert_expires_at=now + 86400), now, True)[0], False)
         failed = self.account(failed_at=now - 600, last_code=None, last_error="API Proton недоступен")
         should, reason = nova_proton.should_issue(failed, now, False)
         self.assertFalse(should)

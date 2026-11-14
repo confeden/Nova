@@ -76,7 +76,7 @@ ENTRIES = (
       "лог помощника VLESS: что ядро Xray сделало с соединением. Имя узла в строках есть, "
       "ключа пользователя нет — он только в profiles/.runtime", needle='"nova-xray.log"'),
     E("nova-xray-secondary.log", "log", "nova-xray.exe (резервный слот)", "человек/агент",
-      "то же для профиля VLESS, занявшего слот дополнительного VPN (порты 1379/1380). "
+      "то же для профиля VLESS, занявшего слот дополнительного VPN (порты 1379/1373). "
       "Отдельный файл, потому что два экземпляра пишут одновременно",
       needle='"nova-xray-secondary.log"'),
     E("wireproxy-secondary.log", "log", "wireproxy-awg.exe (резервный слот)", "человек/агент",
@@ -89,6 +89,10 @@ ENTRIES = (
     E("list_sync_state.json", "state", "nova_list_sync.py", "nova_list_sync.py",
       "метка времени последнего применённого манифеста списков из nova_updates; "
       "манифест старше неё (устаревшее зеркало) не применяется"),
+    E("route-verdicts.json", "cache", "nova.pyw", "nova.pyw",
+      "открывается ли сайт из main.txt/YouTube напрямую (через стратегию winws): проба TLS, два успеха "
+      "подряд = напрямую; по нему PAC пускает такие имена DIRECT. Живёт 2-6 ч, можно удалять",
+      needle='"route-verdicts.json"'),
     E("checker_state.json", "state", "nova.pyw", "nova.pyw",
       "докуда дошла проверка стратегий; переживает перезапуск"),
     E("strategy_scores.json", "state", "nova.pyw", "nova.pyw",
@@ -136,6 +140,10 @@ ENTRIES = (
       "последняя удачная точка выхода Opera; ускоряет запуск"),
     E("tgrelay_cf_health.json", "cache", "tgrelay/", "tgrelay/",
       "здоровье доменов Worker'ов между запусками"),
+    E("gpu_overlay_*.rgba", "cache", "nova_gpu.py", "nova-engine.exe (gpu-serve)",
+      "слой панелей и волн подключения (RGBA, сырые байты) для GPU-фона: движок читает файл один раз, "
+      "Nova стирает его после следующего кадра и при остановке; оборванный запуск оставляет файлы, "
+      "их чистит следующий", needle="gpu_overlay_"),
     E("provider_public_ip.txt", "cache", "nova.pyw", "nova.pyw",
       "внешний адрес прямого маршрута, **маскированный** (I19)"),
     E("dns_warmup.txt", "report", "nova.pyw", "никто",
@@ -168,7 +176,7 @@ ENTRIES = (
       needle='"vless-ready-secondary.json"'),
     E("vpn-egress.json", "runtime", "nova.pyw (nova_vpn_slots.py)", "tcp_proxy.py, tgrelay/transport.py",
       "что сейчас основной и дополнительный VPN: вид, подпись, поднят ли, страна выхода основного "
-      "и порты дополнительного (Opera 1371, Tor 1375/1378 или свой профиль 1379/1380). По стране "
+      "и порты дополнительного (Opera 1371, Tor 1375/1378 или свой профиль 1379/1373). По стране "
       "решается, пускать ли список EU через основной. Без адресов"),
     E("tor/", "runtime", "nova_tor.py", "nova-tor.exe, nova-lyrebird.exe",
       "Tor: torrc, pt_state/, tor.log, tor.stdout.log, lyrebird.log, tor.pid, control_port, "

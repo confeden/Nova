@@ -62,8 +62,16 @@ def test_actual_live_matrix_streams_match_original_kotlin(case):
     assert_events(frame['events'], case)
 
 
-def test_texture_order_is_the_android_seed_ordinal_order():
-    assert tuple(appearance.TEXTURES) == android.TEXTURE_IDS
+def test_texture_list_is_the_light_lab_set():
+    # D51 supersedes D39: Crystals is gone, Splatter became Rain, Ether joined; the order is the lab's tile order.
+    assert tuple(appearance.TEXTURES) == (
+        'none', 'basalt', 'marble', 'wood', 'sand', 'grass', 'cracks', 'water', 'ether', 'aurora', 'smoke', 'starfield',
+        'constellation', 'slime', 'rain', 'lightning', 'snow', 'fractal', 'fractal2', 'warp', 'maze', 'matrix', 'custom')
+
+
+def test_saved_removed_textures_move_to_their_successors():
+    for saved, expected in (('shards', 'cracks'), ('crystals', 'cracks'), ('splatter', 'rain')):
+        assert appearance._preferences({'texture': saved})['texture'] == expected
 
 
 def test_missing_native_generator_is_reported_instead_of_substituting_a_pattern(monkeypatch):
@@ -73,7 +81,7 @@ def test_missing_native_generator_is_reported_instead_of_substituting_a_pattern(
         android.render_mask('lightning', 80, 60, 0)
 
 
-@pytest.mark.parametrize('texture', [name for name in android.TEXTURE_IDS if name not in ('none', 'fractal')])
+@pytest.mark.parametrize('texture', [name for name in appearance.TEXTURES if name not in ('none', 'fractal', 'custom')])
 def test_every_android_texture_reaches_the_visible_background(texture, monkeypatch):
     monkeypatch.setattr(native, '_disabled_reason', None)
     appearance._render_background.cache_clear()
@@ -92,8 +100,8 @@ def test_static_texture_retains_device_resolution_up_to_android_limit(monkeypatc
         return Image.new('L', (width, height), 70)
     appearance._render_background.cache_clear()
     monkeypatch.setattr(appearance, '_texture_mask', mask)
-    appearance.render_background(1120, 840, 'aurora', 'lightning', .4)
-    appearance.render_background(1920, 1440, 'aurora', 'lightning', .4)
+    appearance.render_background(1120, 840, 'aurora', 'marble', .4)
+    appearance.render_background(1920, 1440, 'aurora', 'marble', .4)
     assert calls == [(1120, 840), (1440, 1080)]
 
 

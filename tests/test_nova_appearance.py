@@ -22,9 +22,11 @@ def test_owner_defaults_do_not_override_explicit_preferences(tmp_path):
     path = tmp_path / "appearance.json"
     defaults = appearance.load_preferences(path)
     assert defaults["texture"] == "marble"
-    assert defaults["theme"] == "dnsai"
-    assert defaults["texture_intensity"] == .3
-    assert defaults['random_texture_on_start'] is False
+    assert (defaults["theme"], defaults["accent_hue"]) == ("hue27", 27)
+    assert (defaults["brightness"], defaults["saturation"], defaults["speed"], defaults["warp"]) == (80, 100, 25, 30)
+    assert defaults["random_texture_on_start"] is True
+    assert defaults["texture_intensity"] == .2667
+    assert defaults['random_texture_on_start'] is True
     assert defaults["immersion"] is True
     path.write_text(json.dumps({"texture": "none", "immersion": False}), encoding="utf-8")
     saved = appearance.load_preferences(path)
@@ -41,25 +43,26 @@ class PreferenceTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "appearance.json"
 
-    def test_roundtrip_keeps_texture_reseed_and_temperature(self):
-        selected = {
-            "theme": "matrix", "texture": "fractal", "texture_intensity": 0.31,
-            "variant": 197, "temperature": -35, "immersion": True, "random_texture_on_start": False,
-        }
+    def test_roundtrip_keeps_texture_reseed_and_sliders(self):
+        selected = appearance.normalize_preferences({
+            "accent_hue": 12, "texture": "fractal", "brightness": 93, "saturation": 140, "speed": 60,
+            "warp": 20, "variant": 197, "immersion": True, "random_texture_on_start": False,
+            "limit_30fps": True, "sync_monitor": False,
+        })
         appearance.save_preferences(self.path, selected)
         self.assertEqual(appearance.load_preferences(self.path), selected)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
     def test_partial_save_and_changed_defaults_preserve_user_choices_and_unknown_fields(self):
-        chosen = {'theme': 'matrix', 'texture': 'fractal', 'immersion': False,
+        chosen = {'accent_hue': 40, 'texture': 'fractal', 'immersion': False,
                   'random_texture_on_start': False, 'future_setting': {'enabled': False}}
         self.path.write_text(json.dumps(chosen), encoding='utf-8')
-        with mock.patch.dict(appearance.DEFAULT_PREFERENCES, theme='proton', texture='marble', immersion=True):
-            appearance.save_preferences(self.path, {'temperature': 25})
+        with mock.patch.dict(appearance.DEFAULT_PREFERENCES, texture='marble', immersion=True):
+            appearance.save_preferences(self.path, {'speed': 150})
             loaded = appearance.startup_preferences(self.path)
-        self.assertEqual((loaded['theme'], loaded['texture'], loaded['immersion']),
-                         ('matrix', 'fractal', False))
-        self.assertEqual(loaded['temperature'], 25)
+        self.assertEqual((loaded['accent_hue'], loaded['texture'], loaded['immersion']),
+                         (40, 'fractal', False))
+        self.assertEqual(loaded['speed'], 150)
         self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['future_setting'], {'enabled': False})
 
     def test_failed_replace_preserves_previous_file_and_removes_temporary(self):
@@ -98,18 +101,29 @@ class PreferenceTests(unittest.TestCase):
                 self.assertGreaterEqual(selected["temperature"], -100)
                 self.assertLessEqual(selected["temperature"], 100)
 
-    def test_saved_intensity_and_temperature_are_clamped(self):
-        for intensity, temperature, expected_intensity, expected_temperature in (
-            (-5, -300, 0, -100), (7, 300, 0.6, 100),
+    def test_saved_sliders_are_clamped(self):
+        for values, expected in (
+            (dict(brightness=-5, saturation=-300, speed=-1, warp=-9, accent_hue=-4),
+             dict(brightness=0, saturation=0, speed=0, warp=0, accent_hue=0)),
+            (dict(brightness=700, saturation=300, speed=999, warp=500, accent_hue=500),
+             dict(brightness=100, saturation=200, speed=300, warp=100, accent_hue=63)),
         ):
-            with self.subTest(intensity=intensity):
-                appearance.save_preferences(self.path, {
-                    "texture_intensity": intensity, "temperature": temperature, "variant": 57,
-                })
+            with self.subTest(values=values):
+                appearance.save_preferences(self.path, dict(values, variant=57))
                 selected = appearance.load_preferences(self.path)
-                self.assertEqual(selected["texture_intensity"], expected_intensity)
-                self.assertEqual(selected["temperature"], expected_temperature)
+                for key, value in expected.items():
+                    self.assertEqual(selected[key], value, key)
                 self.assertEqual(selected["variant"], 57)
+
+    def test_old_files_migrate_theme_to_hue_and_crystals_to_cracks(self):
+        self.path.write_text(json.dumps({"theme": "aurora", "texture": "crystals", "texture_intensity": 0.45,
+                                         "temperature": 40}), encoding="utf-8")
+        selected = appearance.load_preferences(self.path)
+        self.assertEqual(selected["texture"], "cracks")
+        self.assertEqual(selected["accent_hue"], appearance.hue_of_color("#50C878"))
+        self.assertEqual(selected["theme"], appearance.hue_theme_id(selected["accent_hue"]))
+        self.assertEqual((selected["brightness"], selected["temperature"]), (95, 0))
+        self.assertEqual(appearance.normalize_preferences({"texture": "splatter"})["texture"], "rain")
 
 
 class NativeRenderTests(unittest.TestCase):
@@ -251,7 +265,7 @@ class RenderingTests(unittest.TestCase):
         surface = appearance.render_surface(100, 60, "aurora")
         self.assertEqual(surface.mode, "RGBA")
         center = surface.getpixel((50, 30))
-        self.assertEqual(center[3], 11, "Aurora's Android card is white alpha 0x0B")
+        self.assertEqual(center[3], 20, "the card is a faint white veil, alpha 0x14")
         base = Image.new("RGBA", surface.size, "#120D27")
         composited = Image.alpha_composite(base, surface)
         self.assertNotEqual(composited.getpixel((50, 30)), base.getpixel((50, 30)))

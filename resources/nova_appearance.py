@@ -6,6 +6,7 @@ NovaTexturePatterns.kt. Pillow is the only rendering dependency.
 Render on a worker; PhotoImage creation and widget updates stay on the Tk thread.
 """
 
+import colorsys
 import json
 import logging
 import math
@@ -17,228 +18,136 @@ from functools import lru_cache
 import nova_fractal
 import nova_android_fractal
 import nova_android_textures
+import nova_native_render
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
-THEMES = {'aurora': {'name': 'Aurora mint',
-            'title': 'Aurora mint',
-            'font_family': 'Segoe UI',
-            'radius': 14,
-            'bg': ('#090817', '#120D27', '#1B1238'),
-            'accent': '#50C878',
-            'accent_on': '#090817',
-            'card_fill': '#0BFFFFFF',
-            'card_stroke': '#1FA88DFF',
-            'group_from': '#50C878',
-            'group_to': '#9FD9BC',
-            't_title': '#EEF0F8',
-            't_value': '#A8ADD4',
-            't_hint': '#7A7FA8',
-            'switch_on': '#50C878',
-            'field_fill': '#0BFFFFFF',
-            'field_stroke': '#18A88DFF'},
- 'dnsai': {'name': 'DNS-AI',
-           'title': 'DNS-AI',
-           'font_family': 'Segoe UI',
-           'radius': 14,
-           'bg': ('#0D1117', '#0F141C', '#111823'),
-           'accent': '#5B8CFF',
-           'accent_on': '#0D1117',
-           'card_fill': '#161B22',
-           'card_stroke': '#12FFFFFF',
-           'group_from': '#EEF4FF',
-           'group_to': '#7FE0BD',
-           't_title': '#E8ECF3',
-           't_value': '#A8B0BF',
-           't_hint': '#7B8494',
-           'switch_on': '#5B8CFF',
-           'field_fill': '#0BFFFFFF',
-           'field_stroke': '#21FFFFFF'},
- 'proton': {'name': 'Proton',
-            'title': 'Proton',
-            'font_family': 'Segoe UI',
-            'radius': 14,
-            'bg': ('#16141C', '#1A1824', '#1C1B24'),
-            'accent': '#6D4AFF',
-            'accent_on': '#FFFFFF',
-            'card_fill': '#242230',
-            'card_stroke': '#2E2B3C',
-            'group_from': '#8A6EFF',
-            'group_to': '#EDEAF8',
-            't_title': '#EDEAF8',
-            't_value': '#B0ABCC',
-            't_hint': '#706B8A',
-            'switch_on': '#6D4AFF',
-            'field_fill': '#1C1A26',
-            'field_stroke': '#2E2B3C'},
- 'charcoal': {'name': 'Charcoal birch',
-              'title': 'Charcoal birch',
-              'font_family': 'Segoe UI',
-              'radius': 16,
-              'bg': ('#08090C', '#0B0C10', '#0E1014'),
-              'accent': '#4FD8C4',
-              'accent_on': '#08090C',
-              'card_fill': '#0BFFFFFF',
-              'card_stroke': '#13FFFFFF',
-              'group_from': '#4FD8C4',
-              'group_to': '#C9D2D8',
-              't_title': '#F2F4F7',
-              't_value': '#9AA3AE',
-              't_hint': '#7A8290',
-              'switch_on': '#4FD8C4',
-              'field_fill': '#0BFFFFFF',
-              'field_stroke': '#13FFFFFF'},
- 'graphene': {'name': 'Graphene golden',
-              'title': 'Graphene golden',
-              'font_family': 'Segoe UI',
-              'radius': 12,
-              'bg': ('#101215', '#13161A', '#16191E'),
-              'accent': '#F0B429',
-              'accent_on': '#101215',
-              'card_fill': '#1B1F25',
-              'card_stroke': '#12FFFFFF',
-              'group_from': '#F0B429',
-              'group_to': '#F0E6D0',
-              't_title': '#E8EAF0',
-              't_value': '#9098A8',
-              't_hint': '#636B78',
-              'switch_on': '#F0B429',
-              'field_fill': '#22262D',
-              'field_stroke': '#14FFFFFF'},
- 'neon': {'name': 'Cyber neon',
-          'title': 'Cyber neon',
-          'font_family': 'Segoe UI',
-          'radius': 12,
-          'bg': ('#0A0A12', '#0C0A16', '#0E0B1A'),
-          'accent': '#39E6D6',
-          'accent_on': '#0A0A12',
-          'card_fill': '#08FFFFFF',
-          'card_stroke': '#3839E6D6',
-          'group_from': '#39E6D6',
-          'group_to': '#FF5FBF',
-          't_title': '#D6D9E6',
-          't_value': '#8C93A8',
-          't_hint': '#5F6678',
-          'switch_on': '#39E6D6',
-          'field_fill': '#0DFFFFFF',
-          'field_stroke': '#2839E6D6'},
- 'poe1': {'name': 'Path of Exile 1',
-          'title': 'Path of Exile 1',
-          'font_family': 'Georgia',
-          'radius': 4,
-          'bg': ('#0A0705', '#14100B', '#1A150E'),
-          'accent': '#C8AA6E',
-          'accent_on': '#0A0705',
-          'card_fill': '#1E1810',
-          'card_stroke': '#8B7343',
-          'group_from': '#E8DCC0',
-          'group_to': '#C8AA6E',
-          't_title': '#C9BFA8',
-          't_value': '#8A8073',
-          't_hint': '#6B6254',
-          'switch_on': '#9B2C2C',
-          'field_fill': '#17110A',
-          'field_stroke': '#6E5A33'},
- 'poe2': {'name': 'Path of Exile 2',
-          'title': 'Path of Exile 2',
-          'font_family': 'Georgia',
-          'radius': 2,
-          'bg': ('#0E1012', '#121517', '#16191C'),
-          'accent': '#C86A32',
-          'accent_on': '#FFF3EA',
-          'card_fill': ('#0EFFFFFF', '#05FFFFFF'),
-          'card_stroke': '#21BEC8D0',
-          'group_from': '#E68A4E',
-          'group_to': '#AEB8C0',
-          't_title': '#CBD2D8',
-          't_value': '#8E979F',
-          't_hint': '#666E75',
-          'switch_on': '#C86A32',
-          'field_fill': '#0DFFFFFF',
-          'field_stroke': '#21BEC8D0'},
- 'gta6sunset': {'name': 'GTA VI Vice Sunset',
-                'title': 'GTA VI Vice Sunset',
-                'font_family': 'Segoe UI',
-                'radius': 12,
-                'bg': ('#1F1F38', '#18182D', '#0C0D1B'),
-                'accent': '#E9639B',
-                'accent_on': '#2A0F1C',
-                'card_fill': ('#38365D', '#2A2947'),
-                'card_stroke': '#1FCCC2F5',
-                'group_from': '#FEC497',
-                'group_to': '#E9639B',
-                't_title': '#E5DDFF',
-                't_value': '#B0A6DE',
-                't_hint': '#8B84B8',
-                'switch_on': '#E9639B',
-                'field_fill': '#14CCC2F5',
-                'field_stroke': '#1FCCC2F5'},
- 'gta6night': {'name': 'GTA VI Vice Night',
-               'title': 'GTA VI Vice Night',
-               'font_family': 'Segoe UI',
-               'radius': 10,
-               'bg': ('#07080F', '#0A0B15', '#0C0D1B'),
-               'accent': '#E9639B',
-               'accent_on': '#2A0F1C',
-               'card_fill': '#0AD9F3FE',
-               'card_stroke': '#29E9639B',
-               'group_from': '#E9639B',
-               'group_to': '#D9F3FE',
-               't_title': '#E8EAF4',
-               't_value': '#9FB4C4',
-               't_hint': '#5F6A80',
-               'switch_on': '#E9639B',
-               'field_fill': '#0FD9F3FE',
-               'field_stroke': '#1FD9F3FE'},
- 'matrix': {'name': 'Matrix',
-            'title': 'Matrix',
-            'font_family': 'Consolas',
-            'radius': 0,
-            'bg': ('#000000', '#010703', '#031008'),
-            'accent': '#00FF41',
-            'accent_on': '#001204',
-            'card_fill': '#0A1A0E',
-            'card_stroke': '#2600FF41',
-            'group_from': '#00FF41',
-            'group_to': '#9DFFB8',
-            't_title': '#8FFFA8',
-            't_value': '#41C267',
-            't_hint': '#2E8A49',
-            'switch_on': '#00FF41',
-            'field_fill': '#07120A',
-            'field_stroke': '#2200FF41'},
- 'diablo2': {'name': 'Diablo II',
-             'title': 'Diablo II',
-             'font_family': 'Georgia',
-             'radius': 2,
-             'bg': ('#0B0907', '#100D0A', '#15110C'),
-             'accent': '#B79A5B',
-             'accent_on': '#EDE4CC',
-             'card_fill': ('#302C26', '#1E1B17'),
-             'card_stroke': '#8B7343',
-             'group_from': '#E4D3A0',
-             'group_to': '#8B7343',
-             't_title': '#D8D2C0',
-             't_value': '#9A9384',
-             't_hint': '#6E6A5E',
-             'switch_on': '#8E1B1B',
-             'field_fill': '#1A1712',
-             'field_stroke': '#6E5A33'}}
+HUE_COUNT = 64
+DEFAULT_HUE = 31
+
+# Themes are gone (D51): one accent hue of 64 drives every colour. These ids exist only so that an old
+# appearance.json (and callers that still pass a legacy name) land on the nearest hue.
+_LEGACY_ACCENTS = {
+    'aurora': '#50C878', 'dnsai': '#5B8CFF', 'proton': '#6D4AFF', 'charcoal': '#4FD8C4',
+    'graphene': '#F0B429', 'neon': '#39E6D6', 'poe1': '#C8AA6E', 'poe2': '#C86A32',
+    'gta6sunset': '#E9639B', 'gta6night': '#E9639B', 'matrix': '#00FF41', 'diablo2': '#B79A5B',
+}
+
+
+def _hsl(hue, saturation, lightness):
+    red, green, blue = colorsys.hls_to_rgb(hue % 1.0, lightness, saturation)
+    return '#%02X%02X%02X' % (round(red * 255), round(green * 255), round(blue * 255))
+
+
+def hue_theme_id(index):
+    return 'hue%d' % (int(index) % HUE_COUNT)
+
+
+def hue_of_color(color):
+    """Nearest hue index of a '#RRGGBB' colour; greys fall to the default teal."""
+    try:
+        text = color.strip().lstrip('#')
+        red, green, blue = (int(text[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    except (AttributeError, ValueError, IndexError):
+        return DEFAULT_HUE
+    hue, light, saturation = colorsys.rgb_to_hls(red, green, blue)
+    if saturation < 0.12 or light < 0.04 or light > 0.96:
+        return DEFAULT_HUE
+    return round(hue * HUE_COUNT) % HUE_COUNT
+
+
+def hue_from_theme_id(theme_id):
+    """hue index for 'hue12' or a legacy theme name; None for anything else."""
+    if isinstance(theme_id, str):
+        if theme_id.startswith('hue') and theme_id[3:].isdigit():
+            return int(theme_id[3:]) % HUE_COUNT
+        if theme_id in _LEGACY_ACCENTS:
+            return hue_of_color(_LEGACY_ACCENTS[theme_id])
+    return None
+
+
+def _hue_theme(index):
+    """The lab's derivation (D51): accent HSL(H,.68,.56), second HSL(H-.07,.55,.78), dark ground of that hue."""
+    hue = index / HUE_COUNT
+    accent = _hsl(hue, .68, .56)
+    second = _hsl(hue - .07, .55, .78)
+    ground = (_hsl(hue, .30, .045), _hsl(hue, .30, .06), _hsl(hue, .30, .085))
+    title = 'Hue %d' % index
+    return {'name': title, 'title': title, 'font_family': 'Segoe UI', 'radius': 14,
+            'bg': ground, 'accent': accent, 'accent_on': ground[0],
+            'card_fill': '#14FFFFFF', 'card_stroke': '#2EFFFFFF',
+            'group_from': accent, 'group_to': second,
+            't_title': '#EEF2F8', 't_value': _mix(second, '#FFFFFF', .35), 't_hint': '#A3ABBE',
+            'switch_on': accent, 'field_fill': '#14FFFFFF', 'field_stroke': '#26FFFFFF'}
+
+
+class _ThemeTable(dict):
+    """64 generated hue themes; legacy names resolve to the nearest hue and are not iterated."""
+
+    def __init__(self):
+        super().__init__()
+        for index in range(HUE_COUNT):
+            self[hue_theme_id(index)] = _hue_theme(index)
+
+    def __missing__(self, key):
+        index = hue_from_theme_id(key)
+        if index is None:
+            raise KeyError(key)
+        return dict.__getitem__(self, hue_theme_id(index))
+
+    def __contains__(self, key):
+        return hue_from_theme_id(key) is not None
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
 
 TEXTURES = {
     'none': 'Без фактуры', 'basalt': 'Базальт', 'marble': 'Мрамор', 'wood': 'Дерево',
-    'sand': 'Песок', 'grass': 'Луг', 'cracks': 'Трещины', 'water': 'Вода',
-    'smoke': 'Дым', 'starfield': 'Звёздное поле', 'slime': 'Плазма',
-    'shards': 'Осколки', 'splatter': 'Брызги', 'lightning': 'Молния',
-    'snow': 'Снег', 'fractal': 'Фрактал', 'matrix': 'Матрица',
+    'sand': 'Песок', 'grass': 'Луг', 'cracks': 'Трещины', 'water': 'Вода', 'ether': 'Эфир', 'aurora': 'Полярное сияние',
+    'smoke': 'Дым', 'starfield': 'Космос', 'constellation': 'Созвездия', 'slime': 'Плазма',
+    'rain': 'Дождь', 'lightning': 'Молния',
+    'snow': 'Снег', 'fractal': 'Фрактал 1', 'fractal2': 'Фрактал 2', 'warp': 'WARP', 'maze': 'Лабиринт', 'matrix': 'Matrix', 'custom': 'Своё изображение',
 }
 
+# D43: owner-designed live immersion; each frame is rendered natively as a function of time.
+LIVE_TEXTURES = frozenset(('sand', 'grass', 'cracks', 'starfield', 'splatter',
+                           'lightning', 'snow', 'fractal'))
+# Live frames are computed below display size and filtered up; motion hides the softness.
+LIVE_MAX_SIDE = 960
+# Saved names from older versions. The owner deleted Crystals; its slot goes to Cracks.
+_RENAMED_TEXTURES = {'shards': 'cracks', 'crystals': 'cracks', 'splatter': 'rain'}
+# New GPU-only textures keep a CPU stand-in for machines without GL 3.3 (the old look of the name).
+_CPU_TEXTURES = {'rain': 'splatter', 'ether': 'water', 'constellation': 'starfield',
+                 'fractal2': 'fractal', 'warp': 'starfield', 'aurora': 'smoke', 'maze': 'basalt', 'custom': 'none'}
+
+# The owner's own settings after the first real use of the new window (2026-11-12): everyone starts from them, a random
+# texture on every start included (the switch in the window turns it off). The texture itself stays undecided.
+# DEFAULT_HUE (31) is only the hue the preview atlas was baked at.
 DEFAULT_PREFERENCES = {
-    'theme': 'dnsai', 'texture': 'marble', 'texture_intensity': 0.30,
-    'variant': 0, 'temperature': 0, 'immersion': True,
-    'random_texture_on_start': False,
+    'accent_hue': 27, 'theme': hue_theme_id(27), 'texture': 'marble',
+    'brightness': 80, 'texture_intensity': 0.2667, 'saturation': 100, 'speed': 25, 'warp': 30,
+    'variant': 0, 'temperature': 0, 'immersion': True, 'random_texture_on_start': True,
+    'sync_monitor': True, 'limit_30fps': False, 'custom_image': '',
+    # NOVA caption on the main window: the glass folds into pills around the text (true) or covers the cards (false).
+    'glass_compact': False,
 }
+
+
+def brightness_from_intensity(value):
+    """Old texture_intensity 0..0.6 (default .30) -> brightness 0..100 (default 90, the lab's value)."""
+    return value / 0.30 * 90.0 if value <= 0.30 else 90.0 + (value - 0.30) / 0.30 * 10.0
+
+
+def intensity_from_brightness(value):
+    """Inverse of brightness_from_intensity: what the CPU renderer mixes in (0..0.6)."""
+    return value / 90.0 * 0.30 if value <= 90 else 0.30 + (value - 90) / 10.0 * 0.30
+
+
+def cpu_texture(texture_id):
+    """The texture the CPU renderer draws for a name (GPU-only names borrow an older look)."""
+    return _CPU_TEXTURES.get(texture_id, texture_id)
 
 
 def _number(value, default, low, high):
@@ -251,20 +160,50 @@ def _number(value, default, low, high):
     return min(high, max(low, value))
 
 
+def _flag(values, key, default):
+    value = values.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
 def _preferences(values):
     if not isinstance(values, dict):
         return dict(DEFAULT_PREFERENCES)
-    theme = values.get('theme')
     texture = values.get('texture')
+    texture = _RENAMED_TEXTURES.get(texture, texture) if isinstance(texture, str) else texture
+    # accent_hue wins; a file from before D51 only has `theme`, which becomes its nearest hue.
+    custom = values.get('custom_image', '')
+    hue = values.get('accent_hue')
+    if isinstance(hue, bool) or not isinstance(hue, (int, float)):
+        legacy = hue_from_theme_id(values.get('theme'))
+        hue = DEFAULT_PREFERENCES['accent_hue'] if legacy is None else legacy
+    hue = int(_number(hue, DEFAULT_PREFERENCES['accent_hue'], 0, HUE_COUNT - 1))
+    if 'brightness' in values:
+        brightness = _number(values.get('brightness'), DEFAULT_PREFERENCES['brightness'], 0, 100)
+    else:
+        brightness = brightness_from_intensity(_number(
+            values.get('texture_intensity'), DEFAULT_PREFERENCES['texture_intensity'], 0, 0.6))
     return {
-        'theme': theme if isinstance(theme, str) and theme in THEMES else DEFAULT_PREFERENCES['theme'],
+        'accent_hue': hue,
+        'theme': hue_theme_id(hue),
         'texture': texture if isinstance(texture, str) and texture in TEXTURES else DEFAULT_PREFERENCES['texture'],
-        'texture_intensity': _number(values.get('texture_intensity'), DEFAULT_PREFERENCES['texture_intensity'], 0, 0.6),
+        'brightness': int(round(brightness)),
+        'texture_intensity': round(intensity_from_brightness(brightness), 4),
+        'saturation': int(_number(values.get('saturation'), DEFAULT_PREFERENCES['saturation'], 0, 200)),
+        'speed': int(_number(values.get('speed'), DEFAULT_PREFERENCES['speed'], 0, 300)),
+        'warp': int(_number(values.get('warp'), DEFAULT_PREFERENCES['warp'], 0, 100)),
         'variant': int(_number(values.get('variant'), 0, 0, 2 ** 31 - 1)),
-        'temperature': int(_number(values.get('temperature'), 0, -100, 100)),
+        'temperature': 0,
         'immersion': values.get('immersion', DEFAULT_PREFERENCES['immersion']) is True,
-        'random_texture_on_start': values.get('random_texture_on_start', False) is True,
+        'random_texture_on_start': values.get(
+            'random_texture_on_start', DEFAULT_PREFERENCES['random_texture_on_start']) is True,
+        'sync_monitor': _flag(values, 'sync_monitor', True),
+        'limit_30fps': _flag(values, 'limit_30fps', False),
+        'custom_image': custom if isinstance(custom, str) and len(custom) <= 1024 else '',
+        'glass_compact': _flag(values, 'glass_compact', False),
     }
+
+
+normalize_preferences = _preferences
 
 
 def load_preferences(path):
@@ -284,7 +223,7 @@ def startup_preferences(path, choose=None):
     prefs = load_preferences(path)
     if not prefs['random_texture_on_start']:
         return prefs
-    candidates = [key for key in TEXTURES if key not in ('none', prefs['texture'])]
+    candidates = [key for key in TEXTURES if key not in ('none', 'custom', prefs['texture'])]
     if not candidates:
         return prefs
     next_prefs = dict(prefs, texture=(choose or random.SystemRandom().choice)(candidates))
@@ -355,6 +294,9 @@ def _veil(target, base):
     channels = [round(min(255, max(0, (color - (1 - amount) * behind) / amount)))
                 for color, behind in zip(colors, background)]
     return '#%02X%02X%02X%02X' % (alpha, *channels)
+
+
+THEMES = _ThemeTable()
 
 
 def font_roles(theme_id='aurora'):
@@ -631,6 +573,9 @@ def _gradient(width, height, colors):
 
 @lru_cache(maxsize=4)
 def _render_background(width, height, theme_id, texture_id, intensity, variant, temperature):
+    if texture_id == 'fractal':
+        return render_fractal_background(width, height, theme_id, intensity, variant, temperature,
+                                         (max(8, width), max(8, height)), (0., 0., 1., 1.))
     theme = THEMES[theme_id]
     image = _gradient(width, height, theme['bg'])
     # A quiet side light gives the desktop composition depth without busy text areas.
@@ -660,18 +605,53 @@ def _temperature(image, temperature):
 
 
 def render_fractal_background(width, height, theme_id, intensity, variant, temperature, source, crop):
-    """Reevaluate the same Android complex viewport at display resolution while zooming."""
+    """Stable seeded Mandelbrot geometry with a filtered escape-time color gradient."""
     image = render_background(width, height, theme_id, 'none', 0, 0, 0)
     if intensity <= 0:
         return _temperature(image, temperature)
     ratio = min(1.0, 1440 / max(width, height))
     mw, mh = max(8, round(width * ratio)), max(8, round(height * ratio))
-    pixels = nova_android_fractal.render_mask(mw, mh, variant, source=source, crop=crop)
-    mask = Image.frombytes('L', (mw, mh), pixels)
-    if mask.size != image.size:
-        mask = mask.resize(image.size, Image.Resampling.LANCZOS)
-    mask = mask.point(lambda value: round(value * intensity))
-    image = Image.composite(Image.new('RGB', image.size, THEMES[theme_id]['accent']), image, mask)
+    pixels = nova_android_fractal.render_color(mw, mh, variant, source=source, crop=crop)
+    color = Image.frombytes('RGB', (mw, mh), pixels)
+    if color.size != image.size:
+        color = color.resize(image.size, Image.Resampling.BILINEAR)
+    color = color.filter(ImageFilter.GaussianBlur(.55))
+    color = Image.blend(color, Image.new('RGB', image.size, THEMES[theme_id]['accent']), .12)
+    image = Image.blend(image, color, intensity)
+    return _temperature(image, temperature)
+
+
+def live_enabled(texture_id):
+    return cpu_texture(texture_id) in LIVE_TEXTURES and os.environ.get('NOVA_ANDROID_TEXTURES') != '0'
+
+
+def render_live_background(width, height, theme_id, texture_id, intensity, variant, temperature, elapsed):
+    """One live immersion frame (D43); elapsed=0 is the still picture when immersion is off."""
+    texture_id = cpu_texture(texture_id)
+    image = render_background(width, height, theme_id, 'none', 0, 0, 0)
+    if intensity <= 0:
+        return _temperature(image, temperature)
+    ratio = min(1.0, LIVE_MAX_SIDE / max(width, height))
+    mw, mh = max(8, round(width * ratio)), max(8, round(height * ratio))
+    result = nova_native_render.live_texture(texture_id, mw, mh, variant, max(0., float(elapsed)))
+    if result is None:
+        reason = nova_native_render._disabled_reason or 'нативный расчёт выключен'
+        raise RuntimeError(f'Генератор живых фактур недоступен: {reason}. Обновите nova-engine.exe.')
+    pixels, channels = result
+    accent = THEMES[theme_id]['accent']
+    if channels == 3:
+        color = Image.frombytes('RGB', (mw, mh), pixels)
+        if color.size != image.size:
+            color = color.resize(image.size, Image.Resampling.BILINEAR)
+        color = color.filter(ImageFilter.GaussianBlur(.55))
+        color = Image.blend(color, Image.new('RGB', image.size, accent), .12)
+        image = Image.blend(image, color, intensity)
+    else:
+        mask = Image.frombytes('L', (mw, mh), pixels)
+        if mask.size != image.size:
+            mask = mask.resize(image.size, Image.Resampling.BILINEAR)
+        mask = mask.point(lambda value: round(value * intensity))
+        image = Image.composite(Image.new('RGB', image.size, accent), image, mask)
     return _temperature(image, temperature)
 
 
@@ -696,10 +676,12 @@ def render_background(width, height, theme_id='aurora', texture_id='none', inten
     if not 1 <= width <= 4096 or not 1 <= height <= 4096:
         raise ValueError('Appearance dimensions must be within 1..4096')
     theme_id = theme_id if theme_id in THEMES else 'aurora'
-    texture_id = texture_id if texture_id in TEXTURES else 'none'
+    texture_id = cpu_texture(texture_id) if texture_id in TEXTURES else 'none'
     intensity = round(_number(intensity, 0.18, 0, 0.6), 3)
     variant = int(_number(variant, 0, 0, 2 ** 31 - 1))
     temperature = int(_number(temperature, 0, -100, 100))
+    if live_enabled(texture_id):
+        return render_live_background(width, height, theme_id, texture_id, intensity, variant, temperature, 0.)
     if texture_id == 'matrix' and os.environ.get('NOVA_ANDROID_TEXTURES') != '0':
         return render_matrix_background(width, height, theme_id, intensity, variant, temperature,
                                         (width, height), (0., 0., 1., 1.), 0.)

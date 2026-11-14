@@ -167,8 +167,8 @@ def plan_backfill(*, records, warp_state, proton_account, stats=None, tor_bridge
     issue, why = nova_proton.should_issue(proton_account, now, proton_present, proxies=proxies)
     if issue:
         steps.append((STEP_PROTON, why))
-    elif proton_set_is_dead(records, stats, proton_account, now):
-        steps.append((STEP_PROTON_FRESH, "ни один узел выпущенного набора Proton больше не отвечает"))
+    # No automatic STEP_PROTON_FRESH any more (owner 2026-11-12, Android D40): a dead set is
+    # replaced by «Перевыпустить» only. `proton_set_is_dead` stays for diagnostics and the UI.
     # Measured after an issue as well: the step list is re-read from disk before it runs.
     if issue or proton_rtt_targets(records, stats, now):
         steps.append((STEP_PROTON_RTT, "расстояние до узлов Proton не измерено или устарело"))

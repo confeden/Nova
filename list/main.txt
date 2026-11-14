@@ -5,6 +5,7 @@
 abuseipdb.com
 accounts.google.com
 soundcloud.cloud
+darkstore.bz
 activatica.org
 phncdn.com
 payproglobal.com
@@ -172,7 +173,9 @@ qt.io
 rust-lang.org
 rustup.rs
 crates.io
+ngrok.com
 pypi.org
+nova-app.eu
 pythonhosted.org
 idaprikol.ru
 live-video.net
@@ -211,11 +214,11 @@ myqcloud.com
 namecheap.com
 geohide.ru
 namecheapapi.com
+web.poecdn.com
 nc-img.com
 gname.net
 gname.com
 gameseal.com
-poecdn.com
 neuralwriter.com
 nnmclub.to
 nnmstatic.win
@@ -265,7 +268,6 @@ perfops.net
 phonevalidator.com
 pixelbuilds.org
 playlist.ttvnw.net
-pobb.in
 pocketnet.app
 poe2wiki.net
 poedb.tw

@@ -58,6 +58,40 @@ def _data_path(*parts):
 
 
 from tgrelay.udp_transport import UdpEndpoint, get_udp_upstream_attempts, open_udp_endpoint  # noqa: E402
+
+# ИИ-приложения на «Авто» читают тот же temp/vpn-egress.json, что и tcp_proxy (страна выхода слотов и
+# признак DNS-AI). Без модуля остаётся прежнее поведение.
+try:
+    import nova_vpn_slots as _vpn_slots  # noqa: E402
+except Exception:  # pragma: no cover
+    _vpn_slots = None
+
+_EGRESS_STATE_CACHE = (
+    _vpn_slots.EgressStateCache(str(_data_path("temp", _vpn_slots.EGRESS_STATE_FILENAME)))
+    if _vpn_slots is not None else None
+)
+
+
+def _egress_state():
+    if _EGRESS_STATE_CACHE is None:
+        return None
+    try:
+        return _EGRESS_STATE_CACHE.get()
+    except Exception:
+        return None
+
+
+def _ai_apps_udp_labels():
+    """UDP of an AI app on «Авто»: SOCKS5 of the main slot when its exit is outside RU/BY; with no
+    suitable slot, direct only while DNS-AI carries the DNS. The second slot is HTTP CONNECT and has
+    no UDP, so when it is the only suitable one the app falls back to TCP (nothing leaks)."""
+    state = _egress_state()
+    slots = _vpn_slots.ai_apps_auto_slots_from_state(state)
+    if "primary" in slots:
+        return ["warp-socks"]
+    if slots:
+        return []
+    return ["direct"] if _vpn_slots.ai_apps_direct_allowed(state) else []
 from nova_routing_profiles import dns_ai_route_state, dns_ai_route_labels, is_dns_ai_endpoint
 
 
@@ -68,6 +102,19 @@ ENVELOPE_MAGIC = b"NUP1"
 ENVELOPE_FAMILY_V4 = 4
 ENVELOPE_FAMILY_V6 = 6
 SESSION_IDLE_TIMEOUT = float(os.environ.get("NOVA_WFP_UDP_IDLE_TIMEOUT", "30.0") or 30.0)
+# Discord «Авто»: голос идёт сначала напрямую (winws уже десинхронизирует его UDP), и только
+# если за это время от сервера не пришло ни одного пакета — через VPN. Без этой проверки UDP
+# не умеет «не открылось»: сокет всегда открывается, а молчание выглядит как тишина в звонке.
+DISCORD_DIRECT_MIN_TX = int(os.environ.get("NOVA_WFP_DISCORD_DIRECT_MIN_TX", "6") or 6)
+DISCORD_DIRECT_SILENT_SEC = float(os.environ.get("NOVA_WFP_DISCORD_DIRECT_SILENT_SEC", "3.0") or 3.0)
+DISCORD_DIRECT_BAD_TTL = float(os.environ.get("NOVA_WFP_DISCORD_DIRECT_BAD_TTL", "300.0") or 300.0)
+# Второй случай «прямой молчит»: провайдер пропускает первые ответы сервера (IP discovery) и затем
+# режет поток (pktmon на сетевой карте: клиент шлёт ~20 пакетов/с, ответов 2 за минуту, а через VPN
+# тот же сервер отвечает ровно). Нулевых ответов тут нет, поэтому первая проверка его не ловит.
+DISCORD_DIRECT_STALL_SEC = float(os.environ.get("NOVA_WFP_DISCORD_DIRECT_STALL_SEC", "8.0") or 8.0)
+DISCORD_DIRECT_STALL_MIN_TX = int(os.environ.get("NOVA_WFP_DISCORD_DIRECT_STALL_MIN_TX", "3") or 3)
+DISCORD_DIRECT_STALL_BAD_TTL = float(os.environ.get("NOVA_WFP_DISCORD_DIRECT_STALL_BAD_TTL", "1800.0") or 1800.0)
+DISCORD_STATS_EVERY_SEC = float(os.environ.get("NOVA_WFP_DISCORD_STATS_EVERY_SEC", "15.0") or 15.0)
 NOVA_WFP_PROTOCOL_VERSION = 16
 NOVA_WFP_DEVICE_PATH = r"\\.\NovaWFP"
 NOVA_WFP_DEVICE_TYPE = 0xA501
@@ -91,6 +138,7 @@ ROUTING_GROUP_ALIASES = {
     "telegram": "telegram",
     "whatsapp": "whatsapp",
     "discord": "discord",
+    "ai_apps": "ai_apps",
 }
 
 
@@ -457,6 +505,16 @@ class PinnedRouteUnavailable(OSError):
 
 
 class UdpSession:
+    # Значения по умолчанию на уровне класса: тесты собирают сессию через object.__new__.
+    last_rx_at = None
+    tx_since_rx = 0
+    ka_sent_at = 0.0
+    ka_n = 0
+    ka_sum_ms = 0.0
+    ka_max_ms = 0.0
+    stats_logged_at = 0.0
+    failover_reason = ""
+
     def __init__(
         self,
         owner,
@@ -482,6 +540,9 @@ class UdpSession:
         self.upstream_generation = 0
         self.route_label = "unknown"
         self.recv_thread = None
+        self.tx_packets = 0
+        self.rx_packets = 0
+        self.vpn_failover_done = False
 
         self._open_upstream()
         self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
@@ -547,6 +608,60 @@ class UdpSession:
             )
             return True
 
+    def _direct_is_silent(self) -> bool:
+        """Discord «Авто»: прямой путь не отвечает (совсем или после первых пакетов)."""
+        if self.vpn_failover_done or self.route_label != "direct":
+            return False
+        if self.app_family != "discord" or _get_app_route_mode("discord") != "auto":
+            return False
+        now = time.monotonic()
+        if self.rx_packets == 0:
+            if self.tx_packets < DISCORD_DIRECT_MIN_TX:
+                return False
+            if (now - self.created_at) >= DISCORD_DIRECT_SILENT_SEC:
+                self.failover_reason = "no-reply"
+                return True
+            return False
+        last_rx = self.last_rx_at if self.last_rx_at is not None else self.created_at
+        if self.tx_since_rx >= DISCORD_DIRECT_STALL_MIN_TX and (now - last_rx) >= DISCORD_DIRECT_STALL_SEC:
+            self.failover_reason = "stalled"
+            return True
+        return False
+
+    def _failover_from_silent_direct(self) -> bool:
+        with self.lock:
+            if self.closed or self.vpn_failover_done:
+                return False
+            self.vpn_failover_done = True
+            try:
+                if self.upstream:
+                    self.upstream.close()
+            except Exception:
+                pass
+            self.upstream = None
+            bad_ttl = DISCORD_DIRECT_STALL_BAD_TTL if self.failover_reason == "stalled" else DISCORD_DIRECT_BAD_TTL
+            self.owner.mark_route_bad(self.target_host, self.target_port, "direct", ttl=bad_ttl)
+            attempts = [a for a in self._attempt_specs() if str((a or {}).get("kind") or "").strip().lower() != "direct"]
+            if not attempts:
+                # Нечем заменить: возвращаем прямой путь, чтобы звонок не остался без сокета.
+                attempts = [a for a in get_udp_upstream_attempts() if str(a.get("kind") or "").strip().lower() == "direct"]
+            try:
+                self.upstream, self.route_label = open_udp_endpoint(timeout=2.0, attempts=attempts)
+                self.upstream_generation += 1
+            except Exception as exc:
+                self.owner.log(
+                    f"[NovaWFP][UDP] vpn-failover-failed client={self.client_addr[0]}:{self.client_addr[1]} "
+                    f"target={self.target_host}:{self.target_port} error={exc}"
+                )
+                return False
+        self.owner.log(
+            f"[NovaWFP][UDP] direct-silent client={self.client_addr[0]}:{self.client_addr[1]} "
+            f"target={self.target_host}:{self.target_port} reason={self.failover_reason or 'no-reply'} "
+            f"tx={self.tx_packets} rx={self.rx_packets} "
+            f"-> route={self.route_label}"
+        )
+        return True
+
     def send(self, payload: bytes):
         payload = bytes(payload or b"")
         with self.lock:
@@ -555,12 +670,30 @@ class UdpSession:
             try:
                 self.upstream.sendto(payload, self.target_host, self.target_port)
                 self.last_activity = time.monotonic()
-                return
+                self.tx_packets += 1
+                self.tx_since_rx += 1
+                if len(payload) == 8:
+                    self.ka_sent_at = self.last_activity
+                silent = self._direct_is_silent()
             except Exception as exc:
+                silent = False
                 self.owner.log(
                     f"[NovaWFP][UDP] send-failed client={self.client_addr[0]}:{self.client_addr[1]} "
                     f"target={self.target_host}:{self.target_port} route={self.route_label} error={exc}"
                 )
+            else:
+                if not silent:
+                    return
+        if silent:
+            # Пакет, по которому принято решение, уже ушёл напрямую и пропал; повторим его по новому пути.
+            if self._failover_from_silent_direct():
+                with self.lock:
+                    if self.closed or self.upstream is None:
+                        raise OSError("session closed during failover")
+                    self.upstream.sendto(payload, self.target_host, self.target_port)
+                    self.last_activity = time.monotonic()
+                return
+            raise OSError("UDP upstream failover failed")
         if self.route_label != "direct" and self._reopen_direct():
             with self.lock:
                 if self.closed or self.upstream is None:
@@ -579,15 +712,11 @@ class UdpSession:
                 generation = self.upstream_generation
             try:
                 payload, source = upstream.recvfrom(65535, timeout=1.0)
-            except socket.timeout:
+            except (socket.timeout, TimeoutError):
                 if self.owner.should_close_idle(self):
                     self.close(reason="idle-timeout")
                     return
-                continue
-            except TimeoutError:
-                if self.owner.should_close_idle(self):
-                    self.close(reason="idle-timeout")
-                    return
+                self._maybe_log_stats()
                 continue
             except Exception as exc:
                 with self.lock:
@@ -604,6 +733,22 @@ class UdpSession:
                 return
 
             self.last_activity = time.monotonic()
+            self.last_rx_at = self.last_activity
+            self.tx_since_rx = 0
+            self.rx_packets += 1
+            if len(payload) == 8 and self.ka_sent_at:
+                rtt_ms = (self.last_activity - self.ka_sent_at) * 1000.0
+                self.ka_sent_at = 0.0
+                self.ka_n += 1
+                self.ka_sum_ms += rtt_ms
+                self.ka_max_ms = max(self.ka_max_ms, rtt_ms)
+            self._maybe_log_stats()
+            if self.rx_packets == 1 and self.app_family == "discord":
+                self.owner.log(
+                    f"[NovaWFP][UDP] first-reply client={self.client_addr[0]}:{self.client_addr[1]} "
+                    f"target={self.target_host}:{self.target_port} route={self.route_label} "
+                    f"after_ms={int((time.monotonic() - self.created_at) * 1000)} tx={self.tx_packets}"
+                )
             try:
                 if self.encapsulated:
                     packet = encode_envelope(source[0], int(source[1]), payload)
@@ -617,6 +762,28 @@ class UdpSession:
                 )
                 self.close(reason="deliver-error")
                 return
+
+    def _stats_text(self) -> str:
+        now = time.monotonic()
+        last_rx = self.last_rx_at if self.last_rx_at is not None else self.created_at
+        ka = f"{self.ka_sum_ms / self.ka_n:.0f}/{self.ka_max_ms:.0f}" if self.ka_n else "-"
+        return (
+            f"route={self.route_label} age_s={now - self.created_at:.0f} tx={self.tx_packets} "
+            f"rx={self.rx_packets} rx_age_s={now - last_rx:.1f} echo8_n={self.ka_n} echo8_avg/max_ms={ka}"
+        )
+
+    def _maybe_log_stats(self):
+        """Discord: раз в несколько секунд — сколько реально отвечает выбранный путь (по нему видно «пилу» пинга)."""
+        if self.app_family != "discord" or DISCORD_STATS_EVERY_SEC <= 0:
+            return
+        now = time.monotonic()
+        if (now - self.stats_logged_at) < DISCORD_STATS_EVERY_SEC:
+            return
+        self.stats_logged_at = now
+        self.owner.log(
+            f"[NovaWFP][UDP] voice-stats client={self.client_addr[0]}:{self.client_addr[1]} "
+            f"target={self.target_host}:{self.target_port} {self._stats_text()}"
+        )
 
     def close(self, reason: str = "closed"):
         with self.lock:
@@ -636,7 +803,8 @@ class UdpSession:
             f"[NovaWFP][UDP] session-close mode={'redirect' if not self.encapsulated else 'envelope'} "
             f"client={self.client_addr[0]}:{self.client_addr[1]} "
             f"target={self.target_host}:{self.target_port} route={self.route_label} "
-            f"reason={reason} duration_ms={lifetime_ms}"
+            f"reason={reason} duration_ms={lifetime_ms} tx={self.tx_packets} rx={self.rx_packets}"
+            + (f" echo8_n={self.ka_n}" if self.app_family == "discord" else "")
         )
 
 
@@ -742,8 +910,18 @@ class NovaWfpUdpProxy:
 
         if app_family == "webview2" or int(preferred_egress or 0) == 3:
             ordered_attempts = direct_attempts + proxy_attempts
+        elif app_family == "discord" and _get_app_route_mode("discord") == "auto":
+            # Голос Discord: напрямую (winws), VPN — только если прямой молчит (UdpSession).
+            ordered_attempts = direct_attempts + proxy_attempts
         else:
             ordered_attempts = proxy_attempts + direct_attempts
+
+        if app_family == "ai_apps" and _vpn_slots is not None and _get_app_route_mode("ai_apps") == "auto":
+            ai_labels = _ai_apps_udp_labels()
+            return [
+                dict(attempt) for attempt in ordered_attempts
+                if str((attempt or {}).get("label") or (attempt or {}).get("kind") or "").strip().lower() in ai_labels
+            ]
 
         pin = _pinned_egress_label(app_family)
         if pin:

@@ -212,7 +212,7 @@ def build_public_tcp_upstream_attempts(
         if secondary.get("ready"):
             # Tor builds a circuit before CONNECT answers (seconds); an own profile dials its node
             # abroad per flow, which is slower than Opera's local hop and faster than Tor.
-            default_port = 1378 if secondary_is_tor else 1380
+            default_port = 1378 if secondary_is_tor else 1373
             floor = 10.0 if secondary_is_tor else 6.0
             attempts.append(
                 {

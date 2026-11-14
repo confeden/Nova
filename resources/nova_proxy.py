@@ -395,18 +395,26 @@ def uses_udp_transport(record):
         'hysteria', 'hysteria2', 'tuic', 'wireguard', 'shadowquic', 'masque')
 
 
-def sort_records(records, mode='protocol', stats=None):
+def sort_records(records, mode='protocol', stats=None, order=None):
+    """`order` ({profile_id: position}) is the list's own order for never-measured rows (Nova list)."""
     import nova_profiles
     stats = stats or {}
+    order = order or {}
     def key(record):
         name = nova_profiles.natural_key(display_name(record))
         if mode == 'name':
             return (name, record.get('id', ''))
         if mode == 'ping':
+            # Alive by ascending ms, then the never-measured in the order given (the list's own),
+            # then the measured-and-silent last (owner 2026-11-12, as on Android).
             entry = stats.get(record.get('id')) or {}
             ms = entry.get('last_ms') if (entry.get('last_ok_at') or 0) >= (entry.get('last_fail_at') or 0) else None
             if ms is None:
                 ms = entry.get('rtt_ms')
-            return (ms is None, float(ms or 0), name)
+            if ms is not None:
+                return (0, float(ms), name)
+            if entry.get('rtt_at') or entry.get('last_fail_at'):
+                return (2, 0.0, name)
+            return (1, float(order.get(record.get('id'), 1 << 30)), name)
         return (protocol_of(record), name)
     return sorted(records, key=key)

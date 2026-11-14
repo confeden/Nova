@@ -70,7 +70,7 @@ func probeNodeBulk(proxy map[string]any, targets []string, budget time.Duration,
 		host, _ := proxy["server"].(string)
 		port := fmt.Sprint(proxy["port"])
 		preflight, stop := context.WithTimeout(ctx, 1500*time.Millisecond)
-		connection, err := (&net.Dialer{}).DialContext(preflight, "tcp", net.JoinHostPort(host, port))
+		connection, err := probeDial(preflight, net.JoinHostPort(host, port))
 		stop()
 		if err != nil {
 			result.Stage = "tcp"
@@ -165,8 +165,14 @@ func probeList(args []string) error {
 	// Some nodes answer only Cloudflare/gstatic and reset everything else; with -google
 	// the node must reach www.google.com itself instead of any one of the three targets.
 	google := flags.Bool("google", false, "require the www.google.com 204")
+	// Keep the probe's sockets off an active VPN (see probe_bind.go).
+	iface := flags.String("interface", "", "bind probe sockets to this network adapter")
+	protect := flags.String("protect", "", "abstract unix socket of the host app that binds each socket (Android)")
 	if flags.Parse(args) != nil || *workers < 1 || *workers > 64 || *seconds < 1 || *seconds > 60 || *bulk < 0 || *bulk > 4<<20 {
 		return errors.New("invalid probe bounds")
+	}
+	if err := configureProbeBinding(*iface, *protect); err != nil {
+		return err
 	}
 	data, err := io.ReadAll(io.LimitReader(os.Stdin, maxInput+1))
 	var request ImportResult

@@ -339,12 +339,11 @@ def build_warp_conf(identity: dict, host: str, port: int, junk, i1: str = "") ->
 
 # --- re-issue policy & failure counters (and-warpgen §5) ----------------------
 def should_reissue(state: dict, now: float, profiles_present: bool) -> tuple[bool, str]:
-    """Decide whether the whole set should be re-issued now. Returns (reissue, russian reason).
+    """Decide whether an automatic run should issue the set now. Returns (issue, russian reason).
 
-    Order matters. The 1-hour cooldown after a fruitless run wins first (a run costs a
-    registration plus up to 45 s of scanning; retrying every minute is pointless). Then: no
-    profiles on disk → issue; a set older than 14 days → issue; every recorded endpoint has
-    failed → issue immediately (the user moved networks). Otherwise the set is fresh, keep it.
+    The 1-hour cooldown after a fruitless run wins first (a run costs a registration plus up to
+    45 s of scanning). Then only "no own profiles on disk" issues: once a set exists it is replaced
+    by the manual «Перевыпустить» alone (owner 2026-11-12, mirrors Nova Android D40).
     """
     state = state or {}
     failed_at = state.get("failed_at") or 0
@@ -352,15 +351,11 @@ def should_reissue(state: dict, now: float, profiles_present: bool) -> tuple[boo
         return False, "недавняя неудачная попытка — ждём час до следующей"
     if not profiles_present:
         return True, "своих профилей ещё нет"
-    created_at = state.get("created_at") or 0
-    if not created_at:
-        return True, "нет отметки о времени выпуска набора"
-    if now - created_at > REISSUE_AFTER_SEC:
-        return True, "профилям больше 14 дней"
-    profiles = state.get("profiles") or {}
-    if profiles and all((entry or {}).get("failures", 0) > 0 for entry in profiles.values()):
-        return True, "все точки входа набора отказали"
-    return False, "набор свежий, перевыпуск не нужен"
+    # Owner, 2026-11-12 (Android D40): a set is issued once per install. Age, a missing stamp or
+    # every endpoint failing no longer re-registers on their own -- each re-issue is a fresh device
+    # registration at Cloudflare. Only «Перевыпустить» (force=True) replaces an existing set; the
+    # connect queue already falls back to the bundled seeds when own profiles fail.
+    return False, "набор уже выпущен — перевыпуск только вручную"
 
 
 def _state_path(base_dir: str) -> str:

@@ -130,6 +130,16 @@ BACKEND_AWG = "awg"
 BACKEND_MASQUE = "masque"
 BACKEND_VLESS = "vless"
 BACKEND_WARP_CLI = "warp-cli"
+# «Авто» step with no profile of its own: the walker runs the Nova list batch scan here and walks
+# the nodes it found alive, fastest first (owner 2026-11-12, Nova Android parity).
+BACKEND_NOVA_LIST = "nova-list"
+NOVA_LIST_SUBSCRIPTION = "nova-list"  # nova_subscriptions.NOVA_LIST_ID
+# «Авто» tries its modes in this order and spends at most this long on each one.
+# Owner 2026-11-14: primary «Авто» walks CF AWG > MASQUE > Proton > Custom; the Nova list moved to the
+# secondary ring (nova_vpn_slots.secondary_attempts). "nova" stays a label for a remembered/explicit Nova node.
+AUTO_MODE_ORDER = ("warp", "masque", "proton", "custom")
+AUTO_MODE_LABELS = {"nova": "Nova", "masque": "MASQUE", "warp": "WARP", "proton": "Proton", "custom": "Custom"}
+AUTO_MODE_BUDGET_SEC = 120.0
 
 ORIGIN_BUNDLED = "bundled"
 ORIGIN_GENERATED = "generated"
@@ -1326,6 +1336,11 @@ def normalize_selection(sel):
     country = str(sel.get("country") or "").strip().upper()
     if out.get("group", "").lower() == GROUP_PROTON.lower() and _COUNTRY_CODE_RE.fullmatch(country):
         out["country"] = country
+    # One subscription's nodes inside an imported group: the «Nova» choice of the primary slot.
+    subscription = str(sel.get("subscription") or "").strip().lower()
+    if (out.get("group", "").lower() in (GROUP_CUSTOM.lower(), GROUP_VLESS.lower())
+            and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", subscription)):
+        out["subscription"] = subscription
     return out
 
 
@@ -1417,12 +1432,17 @@ def resolve_effective_selection(sel, profiles):
         if not group:
             return {"mode": MODE_AUTO, "group": "", "profile_id": "", "reason": REASON_UNKNOWN_GROUP}
         members = [r for r in nova_proxy.group_records(records, group) if r.get("valid") and not _is_legacy_seed_copy(r)]
+        subscription = normalized.get("subscription", "")
+        if subscription:
+            members = [r for r in members if r.get("subscription") == subscription]
         effective = {
             "mode": MODE_GROUP,
             "group": group,
             "profile_id": "",
             "reason": "" if members else REASON_GROUP_EMPTY,
         }
+        if subscription:
+            effective["subscription"] = subscription
         country = normalized.get("country", "") if group == GROUP_PROTON else ""
         if country:
             # A country is part of the explicit choice (I1): no profiles there means no profiles,
@@ -1721,16 +1741,15 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
     shared seeds everyone got with the installer (owner's rule: switch to personal profiles whenever
     a switch happens at all). A .conf dropped into the Cloudflare folder by hand stays in the seeds'
     round-robin, as it always did: its identity may well be a seed's. `preferred_id` is the last profile that carried traffic: it goes first
-    before the regular Auto ladder. Without a remembered profile MASQUE leads auto.
+    before the regular Auto ladder. Without a remembered profile own Cloudflare (CF AWG) leads auto.
 
-    auto:    MASQUE (skipped after repeated failures) -> own Cloudflare (healthy, by rtt, <=12)
-             -> Proton (<=10, connect queue) -> shared Cloudflare seeds (identity round-robin)
-             -> own Cloudflare that failed -> warp-cli. The segment holding an own `preferred_id`
-             moves just after MASQUE. A valid remembered profile precedes the entire ladder, including
-             an imported profile; otherwise Custom and VLESS are not guessed in primary Auto, because they hold profiles whose
-             quality Nova cannot vouch for -- a Custom conf is the owner's, a VLESS node is a
-             stranger's -- and a dead one in the automatic ladder would cost every connect its
-             timeout. They are reached by choosing the group or the profile.
+    auto:    own Cloudflare (healthy, by rtt, <=12) -> shared Cloudflare seeds (identity round-robin)
+             -> own Cloudflare that failed -> MASQUE (skipped after repeated failures) -> Proton
+             (<=10, connect queue) -> Custom/VLESS imported profiles (the Nova list excluded: it leads
+             the secondary ring) -> warp-cli (owner 2026-11-14: CF AWG > MASQUE > Proton > Custom,
+             <=AUTO_MODE_BUDGET_SEC per mode). A valid remembered profile precedes the entire ladder,
+             including an imported profile. Imported profiles ride at the end of the ladder at the
+             owner's request: a dead one costs at most its mode budget.
     group:   that group only, never warp-cli; own profiles before seeds; Proton by the connect
              queue, narrowed to `country` when the selection names one.
     profile: exactly that profile.
@@ -1763,7 +1782,14 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
             group_members = [r for r in members(group) if not country or record_country(r) == country]
             ordered = _front(_proton_order(group_members, stats, now), preferred)
         elif group in (GROUP_VLESS, GROUP_CUSTOM):
-            ordered = _front(_vless_order(members(group), stats, now), preferred)
+            group_members = members(group)
+            if effective.get("subscription"):
+                group_members = [r for r in group_members if r.get("subscription") == effective["subscription"]]
+            else:
+                # The built-in Nova list serves the secondary slot (owner 2026-11-14); it is reached by its
+                # own subscription or by pinning a node, never as part of the plain Custom group.
+                group_members = [r for r in group_members if r.get("subscription") != NOVA_LIST_SUBSCRIPTION]
+            ordered = _front(_vless_order(group_members, stats, now), preferred)
         else:
             ordered = _front(_stats_order(members(group), stats), preferred)
         return [_attempt(r) for r in ordered]
@@ -1774,21 +1800,56 @@ def build_attempt_plan(profiles, sel, *, preferred_id="", generated_state=None, 
     proton_head = proton[:AUTO_PROTON_LIMIT]
     if not _contains_preferred(proton_head, preferred) and _contains_preferred(proton, preferred):
         proton_head = _front(proton, preferred)[:AUTO_PROTON_LIMIT]
-    personal = [_front(lead, preferred), _front(proton_head, preferred)]
-    for index, segment in enumerate(personal):
-        if _contains_preferred(segment, preferred):
-            personal.insert(0, personal.pop(index))
-            break
-    ordered = _front(masque, preferred) + [r for segment in personal for r in segment]
+    # Owner 2026-11-14: CF AWG > MASQUE > Proton > Custom, at most AUTO_MODE_BUDGET_SEC per mode.
+    # WARP is own Cloudflare, then the shared seeds, then own profiles that failed. Custom is the
+    # owner's imported profiles (the built-in Nova list is the secondary ring's first step, not this
+    # one's). Opera and Tor are the secondary slot's ring (D35); warp-cli stays the last resort.
+    custom = [r for r in _vless_order(members(GROUP_CUSTOM), stats, now)
+              if r.get("subscription") != NOVA_LIST_SUBSCRIPTION]
+    ordered = _front(lead, preferred)
     ordered += pool  # the round-robin already put a preferred seed first among the seeds
     ordered += _front(rest, preferred)
+    ordered += _front(masque, preferred)
+    ordered += _front(proton_head, preferred)
+    ordered += _front(custom, preferred)
     plan = [_attempt(r) for r in ordered]
     remembered = next((r for r in valid if r["id"] == preferred), None)
     if remembered is not None:
         # Auto resumes the exact profile that carried traffic; the normal ladder follows a failure.
-        plan = [_attempt(remembered)] + [a for a in plan if a["profile"]["id"] != preferred]
+        plan = [_attempt(remembered)] + [a for a in plan if (a["profile"] or {}).get("id") != preferred]
     plan.append({"backend": BACKEND_WARP_CLI, "profile": None})
     return plan
+
+
+def auto_mode_of(attempt):
+    """Which «Авто» mode an attempt belongs to: "nova", "masque", "warp", "proton", "custom" or ""."""
+    if not isinstance(attempt, dict):
+        return ""
+    backend = attempt.get("backend")
+    if backend == BACKEND_NOVA_LIST:
+        return "nova"
+    if backend == BACKEND_WARP_CLI:
+        return "warp"
+    record = attempt.get("profile") if isinstance(attempt.get("profile"), dict) else {}
+    group = record.get("group")
+    if group == GROUP_MASQUE:
+        return "masque"
+    if group == GROUP_CLOUDFLARE:
+        return "warp"
+    if group == GROUP_PROTON:
+        return "proton"
+    if record.get("subscription") == NOVA_LIST_SUBSCRIPTION:
+        return "nova"
+    if group in (GROUP_CUSTOM, GROUP_VLESS):
+        return "custom"
+    return ""
+
+
+def auto_modes_missing(plan):
+    """The «Авто» modes the plan holds nothing for, in AUTO_MODE_ORDER (Nova's step counts as Nova)."""
+    present = {auto_mode_of(a) for a in (plan or []) if isinstance(a, dict)
+               and (isinstance(a.get("profile"), dict) or a.get("backend") == BACKEND_NOVA_LIST)}
+    return [mode for mode in AUTO_MODE_ORDER if mode not in present]
 
 
 def build_recovery_plan(plan, failed_id, budget=DEFAULT_RECOVERY_BUDGET):
@@ -1863,6 +1924,9 @@ def _clean_stats_entry(entry):
         # Latest WireGuard handshake probe that got an authenticated answer / got none (nova_wg_probe).
         "hs_ok_at": _as_float(entry.get("hs_ok_at"), None),
         "hs_fail_at": _as_float(entry.get("hs_fail_at"), None),
+        # Latest verified HTTPS 204 through the node (nova-proxy probe-list) that answered / did not.
+        "h204_ok_at": _as_float(entry.get("h204_ok_at"), None),
+        "h204_fail_at": _as_float(entry.get("h204_fail_at"), None),
     }
 
 
@@ -1991,6 +2055,56 @@ def record_handshake_probes(base_dir, results, now=None):
         except OSError:
             return None
     return len(items)
+
+
+def record_https_probes(base_dir, results, now=None):
+    """Store HTTPS 204 verdicts `{profile_id: ms or None}` (nova-proxy probe-list) in one write.
+
+    An answer sets `h204_ok_at` and the distance to the 204 time; None sets `h204_fail_at` and
+    clears the distance, like `record_rtts`. Returns the count, or None when the write failed.
+    """
+    items = [(str(pid or "").strip(), value) for pid, value in dict(results or {}).items()]
+    items = [(pid, value) for pid, value in items if pid]
+    if not items:
+        return 0
+    stamp = round(float(time.time() if now is None else now), 3)
+    with _STATS_LOCK:
+        stats = load_stats(base_dir)
+        for profile_id, value in items:
+            entry = stats.get(profile_id) or _clean_stats_entry({})
+            ms = _as_float(value, None)
+            if ms is not None and ms >= 0:
+                entry["h204_ok_at"] = stamp
+                entry["rtt_ms"] = max(1, int(round(ms)))
+            else:
+                entry["h204_fail_at"] = stamp
+                entry["rtt_ms"] = None
+            entry["rtt_at"] = stamp
+            stats[profile_id] = entry
+        try:
+            _save_stats_locked(base_dir, stats)
+        except OSError:
+            return None
+    return len(items)
+
+
+def https_verdicts(stats, profile_ids, now=None, max_age=None):
+    """`{profile_id: ms or None}` for HTTPS 204 verdicts younger than `max_age` (the scan's `known`)."""
+    import nova_list_pages
+    now = time.time() if now is None else float(now)
+    max_age = nova_list_pages.ALIVE_FRESH_SEC if max_age is None else float(max_age)
+    out = {}
+    for profile_id in profile_ids or ():
+        entry = (stats or {}).get(profile_id)
+        if not isinstance(entry, dict):
+            continue
+        ok_at = _as_float(entry.get("h204_ok_at"), 0.0) or 0.0
+        fail_at = _as_float(entry.get("h204_fail_at"), 0.0) or 0.0
+        newest = max(ok_at, fail_at)
+        if not newest or not 0 <= now - newest < max_age:
+            continue
+        out[profile_id] = entry.get("rtt_ms") if ok_at >= fail_at and entry.get("rtt_ms") is not None else None
+    return out
 
 
 def _move_stats_entry(base_dir, old_id, new_id=None):

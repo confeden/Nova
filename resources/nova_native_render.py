@@ -81,6 +81,32 @@ def android_fractal(width, height, variant, source, crop):
     return None if body is None else _pixels(body, width, height)
 
 
+def smooth_fractal(width, height, variant, source, crop):
+    body = _request(dict(version=6, width=width, height=height, variant=variant,
+                         source=list(source), crop=list(crop)))
+    if body is None:
+        return None
+    header = f"P6\n{width} {height}\n255\n".encode("ascii")
+    if not body.startswith(header) or len(body) != len(header) + width * height * 3:
+        _disable("некорректный цветной ответ движка")
+        return None
+    return body[len(header):]
+
+
+def live_texture(texture, width, height, variant, time):
+    """Version 7: one live immersive frame. Returns (bytes, channels) or None."""
+    body = _request(dict(version=7, texture=texture, width=width, height=height, variant=variant,
+                         time=float(time)))
+    if body is None:
+        return None
+    for magic, channels in ((b"P5", 1), (b"P6", 3)):
+        header = magic + f"\n{width} {height}\n255\n".encode("ascii")
+        if body.startswith(header) and len(body) == len(header) + width * height * channels:
+            return body[len(header):], channels
+    _disable("некорректный ответ живой фактуры")
+    return None
+
+
 def texture_mask(texture, width, height, variant):
     # Static full-resolution multi-octave fields are cached by the appearance layer.
     body = _request(dict(version=4, texture=texture, width=width, height=height, variant=variant), timeout=20)

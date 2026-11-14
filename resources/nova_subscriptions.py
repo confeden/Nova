@@ -214,6 +214,9 @@ def normalize_record(record):
     builtin = url == NOVA_LIST_URL or record.get("id") == NOVA_LIST_ID
     if builtin:
         url = NOVA_LIST_URL
+    page_order = record.get("page_order")
+    page_order = [str(i) for i in page_order if str(i)] if isinstance(page_order, list) and builtin else []
+    pages_total = max(0, _as_int(record.get("pages_total"), 0)) if builtin else 0
     return {
         "shape": _SHAPE,
         "id": NOVA_LIST_ID if builtin else str(record.get("id") or make_id(url)),
@@ -237,6 +240,15 @@ def normalize_record(record):
         # The nodes this subscription brought last time. Only these may be taken away by a refresh
         # (rule 2 of plan_sync), so this list is the whole reason the file is state, not a cache.
         "identities": identities[:MAX_NODES],
+        # Nova list in pages (nova_list_pages): the index's validators, how many pages it has and
+        # how many are on disk, and the identities in list order (page 1 first) -- the order the
+        # batch scan walks. Empty/zero for every other subscription and for the whole-list path.
+        "pages_etag": str(record.get("pages_etag") or "") if builtin else "",
+        "pages_last_modified": str(record.get("pages_last_modified") or "") if builtin else "",
+        "pages_checked_at": str(record.get("pages_checked_at") or "") if builtin else "",
+        "pages_total": pages_total,
+        "pages_loaded": min(pages_total, max(0, _as_int(record.get("pages_loaded"), 0))) if builtin else 0,
+        "page_order": page_order[:MAX_NODES],
     }
 
 
@@ -660,6 +672,12 @@ def refresh(base_dir, record, *, proxies=(), direct=True, log=None, fetcher=None
     title = record["name"] or record["id"]
 
     get = fetcher or fetch
+    if record["builtin"]:
+        # Index + page 1 only (nova_list_pages); None means "no usable index on any mirror", and
+        # then the whole-list file below is read exactly as before.
+        paged = _refresh_pages(base_dir, record, get, proxies, direct, say, title, now)
+        if paged is not None:
+            return paged
     result = get(record["url"], etag=record["etag"], last_modified=record["last_modified"],
                  proxies=proxies, direct=direct, log=say)
 
@@ -761,11 +779,205 @@ def refresh(base_dir, record, *, proxies=(), direct=True, log=None, fetcher=None
     return ("updated" if imported else "unchanged"), record, stats
 
 
-def _apply_vless(base_dir, record, nodes, say, title):
+def _parse_nova_page(body, number, pages):
+    """`(meta, nodes, stats)` of one Nova list page, or raises ValueError (corrupt or incomplete)."""
+    import nova_list_pages
+    import nova_proxy
+    meta, _proxies, _ms = nova_list_pages.parse_page(body, number=number, pages=pages)
+    text = nova_vless.decode_subscription_body(body) if nova_vless is not None \
+        else body.decode("utf-8", "replace")
+    nodes, stats = nova_proxy.parse_many(text, limit=MAX_NODES)
+    if len(nodes) != int(meta["count"]):
+        raise ValueError("core read the page partially")
+    return meta, nodes, stats
+
+
+def _set_pages_state(record, index, index_result, loaded, order):
+    record["pages_etag"] = index_result.etag if loaded else ""
+    record["pages_last_modified"] = index_result.last_modified if loaded else ""
+    record["pages_checked_at"] = index["checked_at"]
+    record["pages_total"] = index["pages"]
+    record["pages_loaded"] = loaded
+    record["page_order"] = list(dict.fromkeys(order))[:MAX_NODES]
+    # The whole-list validators belong to the fallback path: a 304 there must not vouch for pages.
+    record["etag"], record["last_modified"] = "", ""
+
+
+def _forget_pages(record):
+    """Back on the whole-list path: no page is loaded and the list order is the file's own."""
+    record.update(pages_etag="", pages_last_modified="", pages_checked_at="", pages_total=0,
+                  pages_loaded=0, page_order=[])
+
+
+def _refresh_pages(base_dir, record, get, proxies, direct, say, title, now):
+    """The paged Nova list: index (conditional) + page 1, which replaces whatever pages were loaded.
+
+    Returns refresh()'s triple, or None when no mirror served a usable index (old whole-list path).
+    """
+    import nova_list_pages
+    conditional = record["pages_loaded"] > 0
+    index_result = get(nova_list_pages.INDEX_URL,
+                       etag=record["pages_etag"] if conditional else "",
+                       last_modified=record["pages_last_modified"] if conditional else "",
+                       proxies=proxies, direct=direct, log=say)
+    if index_result.status == "failed":
+        say("[Подписки] Nova list: индекса страниц нет ни на одном зеркале (%s) — читаем список целиком."
+            % (index_result.message or "не загрузился"))
+        _forget_pages(record)
+        return None
+    if index_result.status == "not_modified":
+        record["last_checked_at"] = now
+        record["fail_streak"] = 0
+        record["last_status"] = "не менялась"
+        record["last_ok_at"] = now
+        say("[Подписки] «%s» не менялась (304), страниц загружено %d из %d, профилей: %d." %
+            (title, record["pages_loaded"], record["pages_total"], record["node_count"]))
+        return "unchanged", record, {}
+    try:
+        index = nova_list_pages.parse_index(index_result.body)
+    except ValueError:
+        say("[Подписки] Nova list: индекс страниц повреждён — читаем список целиком.")
+        _forget_pages(record)
+        return None
+    record["last_checked_at"] = now
+    if not index["pages"]:
+        outcome = _apply_vless(base_dir, record, [], say, title)
+        _set_pages_state(record, index, index_result, 0, [])
+        record["fail_streak"] = 0
+        return outcome, record, {"parsed": 0}
+    page_result = get(nova_list_pages.page_url(index["files"][0]), proxies=proxies, direct=direct, log=say)
+    problem = None
+    if page_result.status != "ok":
+        problem = "страница 1 Nova list не загрузилась (%s)" % (page_result.message or page_result.status)
+    else:
+        try:
+            _meta, nodes, stats = _parse_nova_page(page_result.body, 1, index["pages"])
+        except (ValueError, KeyError, TypeError, RuntimeError):
+            problem = "страница 1 Nova list повреждена или неполна"
+    if problem:
+        # An incomplete or corrupt page never replaces a good list, and the index validators are
+        # not kept, so the next refresh asks again instead of answering itself with a 304.
+        record["fail_streak"] += 1
+        record["last_status"] = problem + "; прежние профили сохранены"
+        say(f'[Подписки] {record["last_status"]}.')
+        return "failed", record, {}
+    skipped = stats.get("skipped", 0)
+    if skipped:
+        say(f'[Подписки] «{title}»: ядро не приняло {skipped} профилей; остальные будут импортированы.')
+    outcome = _apply_vless(base_dir, record, nodes, say, title)
+    _set_pages_state(record, index, index_result, 1, [n.identity for n in nodes])
+    record["fail_streak"] = 0
+    say("[Подписки] «%s»: загружена страница 1 из %d (всего в списке %d)." %
+        (title, index["pages"], index["count"]))
+    return outcome, record, stats
+
+
+def load_next_page(base_dir, record, *, fetcher=None, proxies=(), direct=True, log=None):
+    """Download the next unloaded page of the Nova list and add its nodes (nothing is removed).
+
+    Returns the new identities in list order ([] when the page held only duplicates), or None when
+    there is no next page, it failed, or the list moved on since page 1 (then the next refresh
+    starts over from the new page 1). `record` is updated in place; the caller saves it.
+    """
+    import nova_list_pages
+    say = log if callable(log) else (lambda _message: None)
+    number = record.get("pages_loaded", 0) + 1
+    total = record.get("pages_total", 0)
+    if not record.get("builtin") or record.get("pages_loaded", 0) < 1 or number > total:
+        return None
+    get = fetcher or fetch
+    result = get(nova_list_pages.page_url("page-%03d.json" % number), proxies=proxies, direct=direct, log=say)
+    if result.status != "ok":
+        say("[Подписки] Nova list: страница %d не загрузилась (%s)." % (number, result.message or result.status))
+        return None
+    try:
+        meta, nodes, _stats = _parse_nova_page(result.body, number, total)
+    except (ValueError, KeyError, TypeError, RuntimeError):
+        say("[Подписки] Nova list: страница %d повреждена или неполна — не используем её." % number)
+        return None
+    if str(meta.get("checked_at") or "") != record.get("pages_checked_at", ""):
+        say("[Подписки] Nova list обновился после страницы 1 — дальше страниц не читаем до обновления.")
+        record["pages_etag"], record["pages_last_modified"] = "", ""
+        return None
+    known = set(record.get("page_order") or ())
+    fresh = []
+    for node in nodes:
+        if node.identity not in known:
+            known.add(node.identity)
+            fresh.append(node)
+    if fresh:
+        _apply_vless(base_dir, record, fresh, say, record.get("name") or record["id"], extend=True)
+    record["pages_loaded"] = number
+    record["page_order"] = (list(record.get("page_order") or ()) + [n.identity for n in fresh])[:MAX_NODES]
+    say("[Подписки] Nova list: загружена страница %d из %d, новых профилей %d." % (number, total, len(fresh)))
+    return [n.identity for n in fresh]
+
+
+def scan_nova_list(base_dir, probe, *, force_first=False, budget_sec=None, should_abort=None,
+                   fetcher=None, proxies=(), direct=True, log=None, now=None):
+    """Batch HTTPS 204 scan of the Nova list (nova_list_pages.scan) over the profiles on disk.
+
+    Batches follow `page_order`; a batch that runs past the loaded pages downloads the next one.
+    Verdicts go to profile-stats (`record_https_probes`) after every batch. `probe(ids, should_stop)`
+    is nova_list_pages.probe_runner(...). Returns the ScanResult (keys are profile ids).
+    """
+    import nova_list_pages
+    say = log if callable(log) else (lambda _message: None)
+    state = {"record": find(load(base_dir), NOVA_LIST_ID), "ids": {}}
+
+    def refresh_ids():
+        state["ids"] = {r.get("fingerprint"): r["id"] for r in nova_profiles.list_profiles(base_dir)
+                        if r.get("subscription") == NOVA_LIST_ID and r.get("fingerprint") and r.get("valid", True)}
+
+    def ordered_ids():
+        record = state["record"] or {}
+        ids = [state["ids"].get(identity) for identity in record.get("page_order") or ()]
+        if not record.get("page_order"):
+            # Whole-list fallback: no page order, so the subscription's files in their own order.
+            ids = list(state["ids"].values())
+        return [pid for pid in ids if pid]
+
+    refresh_ids()
+
+    def load_batch(index):
+        size = nova_list_pages.BATCH_SIZE
+        ids = ordered_ids()
+        while len(ids) < (index + 1) * size:
+            record = state["record"]
+            if (record is None or abort_now()
+                    or load_next_page(base_dir, record, fetcher=fetcher, proxies=proxies,
+                                      direct=direct, log=say) is None):
+                break
+            merge_saved(base_dir, [record])
+            refresh_ids()
+            ids = ordered_ids()
+        return ids[index * size:(index + 1) * size]
+
+    def abort_now():
+        return bool(should_abort()) if callable(should_abort) else False
+
+    def recording_probe(ids, should_stop):
+        measured = probe(ids, should_stop) or {}
+        if measured:
+            nova_profiles.record_https_probes(base_dir, measured, now=now)
+        return measured
+
+    known = nova_profiles.https_verdicts(nova_profiles.load_stats(base_dir), ordered_ids(), now=now)
+    result = nova_list_pages.scan(load_batch, recording_probe, known=known, force_first=force_first,
+                                  budget_sec=budget_sec, should_abort=should_abort, log=say)
+    say("[Nova list] Проверка: живых %d, пачек %d, проверено %d (%s)." %
+        (result.alive, result.batches, len(result.results),
+         {"enough": "хватает", "exhausted": "список кончился", "budget": "время вышло",
+          "aborted": "прервано"}.get(result.stop, result.stop)))
+    return result
+
+
+def _apply_vless(base_dir, record, nodes, say, title, extend=False):
     """The VLESS half of `refresh`: diff against what this subscription brought last time.
 
     Only this subscription's stamped files are counted and touched. The registry remembers its
     previous identities; matching a manual profile must never transfer ownership to the subscription.
+    `extend` adds a further Nova list page: everything already owned counts as still listed.
     """
     existing_owned = []
     total_vless = 0
@@ -785,8 +997,10 @@ def _apply_vless(base_dir, record, nodes, say, title):
     # allows, plus whatever this subscription is about to free by removing its own dead entries.
     foreign = total_vless - len(existing_owned)
     room = max(0, MAX_TOTAL_VLESS - foreign)
-    plan = plan_sync(existing_owned, [n.identity for n in nodes], record["identities"],
-                     min(record["keep"], room))
+    listed = [n.identity for n in nodes]
+    if extend:
+        listed = list(record["identities"]) + listed
+    plan = plan_sync(existing_owned, listed, record["identities"], min(record["keep"], room))
 
     removed = 0
     for profile_id in plan["remove"]:

@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 import time
 
+import nova_dns_ai
+
 
 @dataclass(frozen=True)
 class AppRoutingProfile:
@@ -217,7 +219,8 @@ def is_dns_ai_endpoint(host, port):
         address = ipaddress.ip_address(host)
         return any(address == ipaddress.ip_address(server) for server in state.get("servers", ()))
     except ValueError:
-        return str(host).lower().rstrip(".") == "dns.dns-ai.ru"
+        # dns./cf./ru.dns-ai.ru: every entry of the service is DNS-AI, not only the first one.
+        return nova_dns_ai.is_dns_ai_name(host)
 
 
 def dns_ai_route_labels(primary_up, secondary_up, state=None):

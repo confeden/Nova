@@ -2,6 +2,7 @@
 
 import threading
 import ast
+import contextlib
 import tempfile
 import time
 import tkinter as tk
@@ -53,7 +54,8 @@ class CaptionTests(unittest.TestCase):
         label = type("Link", (), dict(canvas=canvas, text_items=[17], font_spec=("Segoe UI Semibold", 9),
                                      fg="#b0b0b0"))()
         ui.set_link_hover(label, True, "#50c878")
-        self.assertEqual(canvas.itemconfigure.call_args.kwargs, dict(fill="#50c878", font=("Segoe UI Semibold", 9, "underline")))
+        self.assertEqual(canvas.itemconfigure.call_args.kwargs, dict(fill="#50c878", font=ui.bold_font(("Segoe UI Semibold", 9)) + ("underline",)))
+        self.assertNotEqual(ui.bold_font(("Segoe UI Semibold", 9))[0], "Segoe UI Semibold", "hover must be visibly heavier")
         ui.set_link_hover(label, False, "#50c878")
         self.assertEqual(canvas.itemconfigure.call_args.kwargs, dict(fill=label.fg, font=label.font_spec))
         canvas.create_text.assert_not_called()
@@ -99,6 +101,10 @@ class DesktopSceneTests(unittest.TestCase):
         self.photos = []
         self.temporary = tempfile.TemporaryDirectory(prefix="nova-desktop-ui-")
         self.addCleanup(self.temporary.cleanup)
+        # These tests drive the CPU renderer; the GPU path has its own suite (test_nova_gpu.py).
+        gpu_off = mock.patch.dict(ui.os.environ, NOVA_GPU="0")
+        gpu_off.start()
+        self.addCleanup(gpu_off.stop)
         actual_thread = threading.Thread
         actual_photo = ui.ImageTk.PhotoImage
 
@@ -148,6 +154,28 @@ class DesktopSceneTests(unittest.TestCase):
         self.scenes.append(scene)
         return scene
 
+    def test_captions_without_glass_get_a_shadow_only_while_folded(self):
+        scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
+        canvas = scene.canvas
+        for index, caption in enumerate(("Основной", "Дополнительный")):
+            shadow = canvas.create_image(100 + 200 * index, 50, anchor="center", state="hidden")
+            text = canvas.create_text(100 + 200 * index, 50, text=caption, anchor="center")
+            scene._caption_shadows.append((shadow, text, caption, 12))
+        states = lambda: [canvas.itemcget(shadow, "state") for shadow, *_rest in scene._caption_shadows]
+        scene._compact_e = 0.0
+        scene._update_caption_shadows()
+        self.assertEqual(states(), ["hidden", "hidden"])
+        scene._compact_e = 1.0
+        scene._update_caption_shadows()
+        self.assertEqual(states(), ["normal", "normal"])
+        for shadow, text, _caption, _pixels in scene._caption_shadows:
+            self.assertTrue(canvas.itemcget(shadow, "image"))
+            box = canvas.bbox(text)
+            self.assertLess(abs(canvas.coords(shadow)[0] - (box[0] + box[2]) / 2), 1)
+        scene._compact_e = 0.0
+        scene._update_caption_shadows()
+        self.assertEqual(states(), ["hidden", "hidden"])
+
     def test_slow_old_render_cannot_replace_rapid_latest_preferences(self):
         started, release = threading.Event(), threading.Event()
         self.release_events.append(release)
@@ -163,7 +191,7 @@ class DesktopSceneTests(unittest.TestCase):
 
         with mock.patch.object(ui.nova_appearance, "render_background", side_effect=render), \
                 mock.patch.object(ui.nova_appearance, "save_preferences") as save:
-            scene = self.scene()
+            scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
             scene.draw(ui.MIN_WIDTH, ui.MIN_HEIGHT)
             self.assertTrue(self.pump_until(started.is_set))
             scene.set_appearance(dict(scene.appearance, variant=1))
@@ -182,7 +210,7 @@ class DesktopSceneTests(unittest.TestCase):
                 mock.patch.object(ui.nova_appearance, "render_background",
                                   side_effect=lambda width, height, *_args: Image.new("RGB", (width, height), "#203040")), \
                 self.assertLogs(level="ERROR") as logs:
-            scene = self.scene(lambda message: errors.append((threading.get_ident(), message)))
+            scene = self.scene(lambda message: errors.append((threading.get_ident(), message)), preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
             scene.set_appearance(dict(scene.appearance, variant=1))
             self.assertTrue(self.pump_until(lambda: scene._photo is not None and errors))
             self.assertEqual(len(errors), 1)
@@ -190,6 +218,30 @@ class DesktopSceneTests(unittest.TestCase):
             self.assertIn("read only", errors[0][1])
             self.assertTrue(any("read only" in line for line in logs.output))
             self.assertEqual(self.photos, [(self.owner, (32, 48, 64))])
+
+    def test_frame_upload_failure_releases_backpressure_and_next_frame_recovers(self):
+        with mock.patch.object(ui.nova_appearance, "render_background",
+                               side_effect=lambda w, h, *_a: Image.new("RGB", (w, h), "#203040")):
+            scene = self.scene()
+            with mock.patch.object(scene.canvas, "itemconfigure", side_effect=tk.TclError("upload failed")), \
+                    self.assertLogs(level="ERROR"):
+                scene.draw(ui.MIN_WIDTH, ui.MIN_HEIGHT)
+                self.assertTrue(self.pump_until(lambda: not scene._render_pending))
+                self.assertIsNone(scene._photo)
+            scene.draw(ui.MIN_WIDTH, ui.MIN_HEIGHT)
+            self.assertTrue(self.pump_until(lambda: scene._photo is not None and not scene._render_pending))
+
+    def test_error_reporter_failure_does_not_stop_frame_delivery(self):
+        def report(_message):
+            raise RuntimeError("reporter failed")
+
+        with mock.patch.object(ui.nova_appearance, "save_preferences", side_effect=PermissionError("read only")), \
+                mock.patch.object(ui.nova_appearance, "render_background",
+                                  side_effect=lambda w, h, *_a: Image.new("RGB", (w, h))), \
+                self.assertLogs(level="ERROR"):
+            scene = self.scene(report)
+            scene.set_appearance(dict(scene.appearance, variant=1))
+            self.assertTrue(self.pump_until(lambda: scene._photo is not None and not scene._render_pending))
 
     def test_destroy_during_render_cancels_poll_and_stops_worker(self):
         started, release = threading.Event(), threading.Event()
@@ -392,7 +444,7 @@ class DesktopSceneTests(unittest.TestCase):
                            for y in range(h) for x in range(w)])
             return image
 
-        scene = self.scene()
+        scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
         with mock.patch.object(ui.nova_appearance, "render_background", side_effect=render) as renderer:
             first = scene._dive_frame((100, 80), scene.appearance, 0)
             next_frame = scene._dive_frame((100, 80), scene.appearance, .08)
@@ -414,7 +466,7 @@ class DesktopSceneTests(unittest.TestCase):
             self.assertNotEqual(first.tobytes(), replacement.tobytes())
 
     def test_dive_never_reverses_or_wraps_back_at_former_cycle_boundaries(self):
-        scene = self.scene()
+        scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
         layer = Image.new("RGB", (100, 80), "#203040")
         with mock.patch.object(scene, "_dive_layer", return_value=layer), \
                 mock.patch.object(layer, "resize", wraps=layer.resize) as resize:
@@ -427,24 +479,26 @@ class DesktopSceneTests(unittest.TestCase):
                 self.assertLess(before[0], after[0])
                 self.assertLess(before[1], after[1])
 
-    def test_fractal_recalculates_full_resolution_on_the_same_plane_during_zoom_and_resize(self):
-        scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture='fractal'))
-        with mock.patch.object(ui.nova_appearance.nova_android_fractal, "render_mask",
-                               side_effect=lambda w, h, *_a, **_k: bytes([70]) * (w * h)) as renderer, \
-                mock.patch.object(scene, "_dive_layer", side_effect=AssertionError("Fractal must not magnify a thumbnail")):
-            for size, elapsed in (((700, 500), 0), ((700, 500), 3600), ((900, 600), 3601)):
-                self.assertEqual(scene._dive_frame(size, scene.appearance, elapsed).size, size)
-            self.assertEqual([call.args[:2] for call in renderer.call_args_list], [(700, 500), (700, 500), (900, 600)])
-            self.assertTrue(all(call.kwargs["source"] == (700, 500) for call in renderer.call_args_list))
-            self.assertTrue(all(call.args[2] == scene.appearance["variant"] for call in renderer.call_args_list))
-            first, later = (call.kwargs["crop"] for call in renderer.call_args_list[:2])
-            self.assertEqual(first, (0, 0, 1, 1))
-            self.assertLess(later[2] - later[0], first[2] - first[0])
+    def test_live_textures_are_pure_functions_of_elapsed_time_and_ignore_the_static_layer(self):
+        scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="fractal", immersion=True))
+        prefs = scene.appearance
+        with mock.patch.object(scene, "_dive_layer", side_effect=AssertionError("Live textures must not use the cached layer")):
+            start = scene._dive_frame((160, 120), prefs, 0)
+            self.assertEqual(start.size, (160, 120))
+            self.assertEqual(start.tobytes(), nova_appearance.render_background(
+                160, 120, prefs["theme"], "fractal", prefs["texture_intensity"], prefs["variant"],
+                prefs["temperature"]).tobytes())
+            later = scene._dive_frame((160, 120), prefs, 30)
+            self.assertNotEqual(start.tobytes(), later.tobytes())
+            self.assertEqual(later.tobytes(), scene._dive_frame((160, 120), prefs, 30).tobytes())
+            self.assertEqual(scene._dive_frame((220, 150), prefs, 31).size, (220, 150))
+            still = dict(prefs, immersion=False)
+            self.assertEqual(start.tobytes(), scene._dive_frame((160, 120), still, 30).tobytes())
 
     def test_initial_resize_and_connection_draws_use_the_animation_path(self):
         with mock.patch.object(ui.nova_appearance, "render_background",
                                side_effect=lambda w, h, *_args: Image.new("RGB", (w, h), "#203040")) as renderer:
-            scene = self.scene()
+            scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
             with mock.patch.object(scene, "_dive_frame", wraps=scene._dive_frame) as frames:
                 scene.draw(ui.MIN_WIDTH, ui.MIN_HEIGHT)
                 self.assertTrue(self.pump_until(lambda: scene._photo is not None))
@@ -504,11 +558,13 @@ class DesktopSceneTests(unittest.TestCase):
 
     def test_journal_icon_is_legible_separate_and_moves_with_its_button(self):
         source = Path(__file__).resolve().parents[1] / "nova.pyw"
-        names = {"CanvasButton", "create_round_rect_img", "create_round_outline_img", "get_lighter_hex", "get_rgb"}
+        names = {"CanvasButton", "create_round_rect_img", "create_round_outline_img", "create_glow_img",
+                 "glass_plate", "glass_unplate", "glass_hover", "hover_text_color", "bold_variant",
+                 "get_lighter_hex", "get_rgb"}
         nodes = [node for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig")))
                  if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
         theme = nova_appearance.settings_theme("aurora")
-        namespace = dict(root=self.root, tk=tk, time=time, UI_SCALE=1, SETTINGS_THEME=theme,
+        namespace = dict(root=self.root, tk=tk, time=time, UI_SCALE=1, SETTINGS_THEME=theme, contextlib=contextlib,
                          OUTLINE_ACCENT_COLOR=theme["accent"], _ROUND_RECT_IMG_CACHE=ui.ImageCache(),
                          _ROUND_OUTLINE_IMG_CACHE=ui.ImageCache())
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
