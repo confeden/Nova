@@ -201,6 +201,9 @@ class DesktopSceneTests(unittest.TestCase):
             self.assertEqual([variant for variant, _thread in rendered], [0, 2])
             self.assertTrue(all(thread != self.owner for _variant, thread in rendered))
             self.assertEqual(self.photos, [(self.owner, (22, 40, 60))])
+            # The save comes once the changes settle (PREFERENCES_SAVE_QUIET_S), and only the last one.
+            self.assertTrue(self.pump_until(lambda: save.call_count >= 1))
+            self.pump_until(lambda: False, timeout=0.3)
             self.assertEqual(save.call_count, 1)
             self.assertEqual(save.call_args.args[1]["variant"], 2)
 
@@ -235,13 +238,38 @@ class DesktopSceneTests(unittest.TestCase):
         def report(_message):
             raise RuntimeError("reporter failed")
 
-        with mock.patch.object(ui.nova_appearance, "save_preferences", side_effect=PermissionError("read only")), \
+        with mock.patch.object(ui.nova_appearance, "save_preferences",
+                               side_effect=PermissionError("read only")) as save, \
+                mock.patch.object(ui, "PREFERENCES_SAVE_QUIET_S", 0.0), \
                 mock.patch.object(ui.nova_appearance, "render_background",
                                   side_effect=lambda w, h, *_a: Image.new("RGB", (w, h))), \
                 self.assertLogs(level="ERROR"):
             scene = self.scene(report)
             scene.set_appearance(dict(scene.appearance, variant=1))
             self.assertTrue(self.pump_until(lambda: scene._photo is not None and not scene._render_pending))
+            # The save waits for the change to settle; its failure is still reported.
+            self.assertTrue(self.pump_until(lambda: save.called))
+            self.pump_until(lambda: False, timeout=0.4)   # the idle poll runs every 200 ms
+
+    def test_a_drag_of_appearance_changes_is_saved_once_after_it_settles(self):
+        with mock.patch.object(ui.nova_appearance, "save_preferences") as save, \
+                mock.patch.object(ui, "PREFERENCES_SAVE_QUIET_S", 0.3), \
+                mock.patch.object(ui.nova_appearance, "render_background",
+                                  side_effect=lambda w, h, *_a: Image.new("RGB", (w, h))):
+            scene = self.scene(preferences=dict(nova_appearance.DEFAULT_PREFERENCES, texture="marble"))
+            scene.draw(ui.MIN_WIDTH, ui.MIN_HEIGHT)
+            self.assertTrue(self.pump_until(lambda: scene._photo is not None and not scene._render_pending))
+            self.pump_until(lambda: False, timeout=0.5)
+            save.reset_mock()
+            for step in range(8):   # a slider drag: a saving change every ~33 ms
+                scene.set_appearance(dict(scene.appearance, brightness=40 + step))
+                self.root.update()
+                time.sleep(0.03)
+            self.assertEqual(save.call_count, 0, "во время перетаскивания на диск не пишем")
+            self.assertTrue(self.pump_until(lambda: save.call_count >= 1))
+            self.pump_until(lambda: False, timeout=0.4)
+            self.assertEqual(save.call_count, 1)
+            self.assertEqual(save.call_args[0][1].get("brightness"), 47, "сохранено последнее значение")
 
     def test_destroy_during_render_cancels_poll_and_stops_worker(self):
         started, release = threading.Event(), threading.Event()

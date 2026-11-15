@@ -51,8 +51,15 @@ func TestNewAPIClientValidation(t *testing.T) {
 	if _, err := NewAPIClient("proxy", "", log); err == nil {
 		t.Fatal("proxy mode without a proxy accepted")
 	}
-	if _, err := NewAPIClient("auto", "socks5://127.0.0.1:1", log); err == nil {
-		t.Fatal("socks5 proxy URL accepted (http.Transport would treat it differently)")
+	for _, ok := range []string{"socks5://127.0.0.1:1375", "socks5h://127.0.0.1:1375"} {
+		if _, err := NewAPIClient("auto", ok, log); err != nil {
+			t.Fatalf("%s rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"socks5://user:hunter2@127.0.0.1:1375", "ftp://127.0.0.1:21"} {
+		if _, err := NewAPIClient("auto", bad, log); err == nil || strings.Contains(err.Error(), "hunter2") {
+			t.Fatalf("%s: err = %v, want a refusal that does not echo credentials", bad, err)
+		}
 	}
 	if _, err := NewAPIClient("weird", "", log); err == nil {
 		t.Fatal("unknown mode accepted")

@@ -31,6 +31,13 @@ CONNECTING_TEXTS = frozenset({
 # core, ГОТОВ К ЗАПУСКУ between two steps) ends the rings only when it outlasts this. The rings used
 # to vanish for good on the first such flicker, and the connect then looked interrupted (2026-11-12).
 STOP_GRACE_SEC = 2.5
+# Appearance preferences reach the disk this long after the last change (a slider drag is many changes).
+PREFERENCES_SAVE_QUIET_S = 0.6
+# While another Nova window (Настройки, Профили, Оформление, Журнал…) is on screen the background runs at
+# most this fast (owner 2026-11-15): at 60 fps the frame upload took 8-16 % of the Tk thread, which those
+# windows need for building and painting. Checked at most every SECONDARY_CHECK_S.
+SECONDARY_WINDOW_FPS = 30
+SECONDARY_CHECK_S = 0.25
 
 
 class ConnectionStateTracker(object):
@@ -136,7 +143,9 @@ def main_layout(width, height, scale=1.0):
         "routes": (round(20 * scale), routes_top, width - round(20 * scale), height - round(70 * scale)),
         "status": (width / 2, round(109 * scale + extra * 0.2)),
         "action": (width / 2, round(169 * scale + extra * 0.2)),
-        "update": (width / 2, hero_bottom - round(17 * scale)),
+        # The update notice sits in the header, centred between the NOVA chip and «Оформление», a little
+        # above their row so it reads as a notification rather than as a button of the hero card.
+        "update": (width / 2, round(22 * scale)),
         "header_y": round(31 * scale), "route_heading_y": routes_top + round(20 * scale),
         "slot_label_y": routes_top + round(50 * scale),
         "slot_y": routes_top + round(75 * scale),
@@ -284,9 +293,24 @@ def supernova_icon(size=64, accent="#50C878"):
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
+_APP_ICON_CACHE = {}
+
+
 def app_icon(size=64, accent="#50C878"):
     """Window / taskbar / tray icon: the starburst on its own dark rounded badge with a light rim, so it stays
-    visible on any taskbar colour (a bare transparent star vanishes on light green or white bars)."""
+    visible on any taskbar colour (a bare transparent star vanishes on light green or white bars).
+
+    Drawn once per (size, accent): every secondary window asks for it on each open (~9 ms a time)."""
+    key = (int(size), str(accent))
+    cached = _APP_ICON_CACHE.get(key)
+    if cached is None:
+        if len(_APP_ICON_CACHE) > 16:
+            _APP_ICON_CACHE.clear()
+        cached = _APP_ICON_CACHE[key] = _draw_app_icon(*key)
+    return cached.copy()
+
+
+def _draw_app_icon(size, accent):
     scale = 4
     unit = size * scale
     color = tuple(int(accent[index:index + 2], 16) for index in (1, 3, 5))
@@ -374,7 +398,10 @@ class DesktopScene:
         self._gpu_pointer_last = None
         self._gpu_hires = False
         self._gpu_frame_ms = 1000 / 60
-        threading.Thread(target=self._render_worker, name="NovaAppearance", daemon=True).start()
+        self._secondary_open = False
+        self._secondary_checked = 0.
+        self._worker = threading.Thread(target=self._render_worker, name="NovaAppearance", daemon=True)
+        self._worker.start()
         self._poll_id = canvas.after(40, self._poll)
         canvas.bind("<Destroy>", self._on_destroy, add="+")
         self._gpu_setup(gpu)
@@ -447,7 +474,43 @@ class DesktopScene:
             return
         if self._connection == "connecting" or (
                 self.appearance.get("immersion") and self.appearance["texture"] not in ("none", "custom")):
-            self._animation_id = self.canvas.after(16 if self.canvas.winfo_viewable() else 1000, self._animate)
+            delay = 16 if not self._refresh_secondary_open() else round(1000 / SECONDARY_WINDOW_FPS)
+            self._animation_id = self.canvas.after(delay if self.canvas.winfo_viewable() else 1000, self._animate)
+
+    def _secondary_window_open(self):
+        """True when another toplevel of this Tk app is on screen (withdrawn pre-created windows are not)."""
+        try:
+            stack = list(self.canvas.winfo_toplevel().winfo_children())
+            main = self.canvas.winfo_toplevel()
+            while stack:
+                widget = stack.pop()
+                if widget is main or widget.winfo_class() != "Toplevel":
+                    continue
+                if widget.winfo_viewable():
+                    return True
+                stack.extend(widget.winfo_children())   # a dialog may hang off a secondary window
+        except tk.TclError:
+            return False
+        return False
+
+    def _refresh_secondary_open(self):
+        """Re-check (throttled) whether a secondary window is open; on a change re-tell the engine its rate."""
+        now = time.monotonic()
+        if now - self._secondary_checked < SECONDARY_CHECK_S:
+            return self._secondary_open
+        self._secondary_checked = now
+        opened = self._secondary_window_open()
+        if opened != self._secondary_open:
+            self._secondary_open = opened
+            if self._gpu_mode and self._gpu is not None:
+                fps = self._gpu_fps()
+                self._gpu_frame_ms = 1000 / fps
+                self._gpu.configure(fps=fps)
+        return opened
+
+    def _gpu_fps(self):
+        fps = max(1, nova_gpu.target_fps(self.appearance))
+        return min(fps, SECONDARY_WINDOW_FPS) if self._secondary_open else fps
 
     def _animate(self):
         self._animation_id = None
@@ -618,7 +681,7 @@ class DesktopScene:
     # --- the NOVA toggle: cards <-> pills around the text ---
 
     COMPACT_SECONDS = .6
-    ZONES = (("hero", ("status", "update")), ("routes", ("heading",)))
+    ZONES = (("hero", ("status",)), ("routes", ("heading",)))
 
     @property
     def compact(self):
@@ -749,25 +812,51 @@ class DesktopScene:
             self._overlay, self._overlay_mask, self._overlay_key = overlay, mask, overlay_key
         return self._overlay
 
+    def _save_settled(self, pending):
+        """Worker: write the preferences a drag left behind (see `_render_worker`)."""
+        if pending is None:
+            return
+        generation, prefs = pending
+        try:
+            self._persist_preferences(generation, prefs)
+        except OSError as error:
+            self._results.put((generation, None, error))
+
     def _render_worker(self):
+        # A slider drag asks for a saving frame every ~33 ms, and each save is a read, a temp file, a
+        # write, an fsync and a replace — on an HDD that was ~30 fsyncs a second for as long as the
+        # owner dragged. The save now waits until the requests stop asking for one for
+        # PREFERENCES_SAVE_QUIET_S; the exit path still saves at once (`flush_preferences`).
+        pending_save = None     # (generation, prefs) not yet on disk
+        save_due = 0.
         while True:
-            request = self._requests.get()
+            try:
+                timeout = None if pending_save is None else max(0., save_due - time.monotonic())
+                request = self._requests.get(timeout=timeout)
+            except queue.Empty:
+                self._save_settled(pending_save)
+                pending_save = None
+                continue
             if request is None:
+                self._save_settled(pending_save)
                 return
             save = request[3]
             while not self._requests.empty():
                 latest = self._requests.get()
                 if latest is None:
+                    self._save_settled(pending_save)
                     return
                 save = save or latest[3]
                 request = latest
             generation, (width, height), prefs, _, frame = request
+            if save and self.preferences_path:
+                pending_save = (generation, prefs)
+                save_due = time.monotonic() + PREFERENCES_SAVE_QUIET_S
+            elif pending_save is not None and time.monotonic() >= save_due:
+                # Animation frames keep the queue busy, so the timeout alone could wait forever.
+                self._save_settled(pending_save)
+                pending_save = None
             try:
-                if save and self.preferences_path:
-                    try:
-                        self._persist_preferences(generation, prefs)
-                    except OSError as error:
-                        self._results.put((generation, None, error))
                 if self._gpu_mode and nova_gpu.gpu_texture(prefs["texture"]) is not None:
                     self._gpu_worker_step(width, height, prefs, frame)
                     self._results.put((generation, None, None))
@@ -921,7 +1010,7 @@ class DesktopScene:
 
     def _gpu_configure(self):
         config = nova_gpu.config_from_prefs(self.appearance, nova_appearance.THEMES[self.appearance["theme"]]["accent"],
-                                            nova_gpu.target_fps(self.appearance))
+                                            self._gpu_fps())
         if config is not None and self._gpu is not None:
             self._gpu_frame_ms = 1000 / max(1, config["fps"])
             if "drift" not in getattr(self._gpu, "features", ()):
@@ -953,6 +1042,7 @@ class DesktopScene:
                 return
             if self._gpu_mode:
                 self._gpu_sync_visibility()
+                self._refresh_secondary_open()
                 if self._gpu_show_frame():
                     # The next frame is due in about one frame time: sleep most of it, then poll finely.
                     delay = max(2, int(self._gpu_frame_ms * 0.7))

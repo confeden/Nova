@@ -34,6 +34,10 @@ __all__ = [
     "MAX_PER_SUBNET",
     "REISSUE_AFTER_SEC",
     "COOLDOWN_SEC",
+    "UNREACHABLE_COOLDOWN_SEC",
+    "route_keys",
+    "failure_cooldown_left",
+    "cooldown_reason",
     "generate_keypair",
     "parse_registration",
     "parse_scan_output",
@@ -84,6 +88,10 @@ _SUBPROCESS_MARGIN_SEC = 20
 
 REISSUE_AFTER_SEC = 14 * 24 * 60 * 60  # 14 days (NovaVpnService GENERATED_WARP_REISSUE_AFTER_MS)
 COOLDOWN_SEC = 60 * 60  # 1 hour after a fruitless run (GENERATED_WARP_BACKFILL_RETRY_MS)
+# A registration that never got an HTTP answer (nova-go exit 20) created no device on Cloudflare's
+# side, so the "every attempt is a registration" reason for the long wait does not apply: a short
+# wait, and none at all once a route the failed run did not have exists (a tunnel came up).
+UNREACHABLE_COOLDOWN_SEC = 10 * 60
 
 # Junk bounds — only Jc/Jmin/Jmax vary; S/H are stock WireGuard literals (and-warpgen §2.2, N5).
 JUNK_COUNT_MIN = 3
@@ -95,10 +103,13 @@ _STATE_VERSION = 1
 _IDENTITY_VERSION = 1
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_BELOW_NORMAL_PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
 
 # nova-go reads the registration proxy from this variable when --api-proxy is absent, so a relay
 # URL with credentials never has to sit on a command line (readable by every local process).
 _API_PROXY_ENV = "NOVA_API_PROXY"
+# nova-go keeps its API route memory (direct winner, quarantined relays) in the file this names.
+_API_STATE_ENV = "NOVA_API_STATE"
 # nova-go exit code for rejected arguments (bad flag, malformed key) — see cmd/nova-go/warp.go.
 _EXIT_USAGE = 2
 
@@ -338,17 +349,67 @@ def build_warp_conf(identity: dict, host: str, port: int, junk, i1: str = "") ->
 
 
 # --- re-issue policy & failure counters (and-warpgen §5) ----------------------
-def should_reissue(state: dict, now: float, profiles_present: bool) -> tuple[bool, str]:
+def route_keys(api_proxy) -> list[str]:
+    """One URL, a list of URLs or None -> sorted, de-duplicated `scheme://host:port` keys.
+
+    Credential-free on purpose: the keys are written to temp/ (I19) and compared across runs to
+    tell whether a route exists now that did not when a registration failed.
+    """
+    keys = set()
+    for value in _proxy_routes(api_proxy):
+        text = _URL_CREDENTIALS_RE.sub(r"\1", str(value).strip())
+        scheme, sep, rest = text.partition("://")
+        if not sep:
+            scheme, rest = "http", text
+        keys.add(f"{scheme.lower()}://{rest.split('/', 1)[0].lower()}")
+    return sorted(keys)
+
+
+def failure_cooldown_left(failed_at, now, *, unreachable=False, failed_routes=None, routes=None,
+                          normal_sec=COOLDOWN_SEC) -> float:
+    """Seconds an automatic retry still has to wait after a failure at `failed_at` (0 = go).
+
+    A failure with an answer from Cloudflare (or a scan/write fault) waits `normal_sec`. One where
+    no route reached the API (`unreachable`) waits UNREACHABLE_COOLDOWN_SEC instead, and not at all
+    when `routes` (the routes available now) hold one the failed run (`failed_routes`) did not have.
+    """
+    try:
+        failed_at = float(failed_at or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    age = float(now) - failed_at
+    limit = UNREACHABLE_COOLDOWN_SEC if unreachable else normal_sec
+    if not failed_at or not 0 <= age < limit:
+        return 0.0
+    if unreachable and routes is not None and set(routes) - set(failed_routes or ()):
+        return 0.0
+    return limit - age
+
+
+def cooldown_reason(state: dict, now: float, routes=None) -> str:
+    """Russian reason an automatic WARP run must wait after the recorded failure, or "" when none."""
+    state = state or {}
+    left = failure_cooldown_left(
+        state.get("failed_at"), now, unreachable=bool(state.get("failed_unreachable")),
+        failed_routes=state.get("failed_routes"), routes=routes)
+    if left <= 0:
+        return ""
+    if state.get("failed_unreachable"):
+        return (f"API Cloudflare был недоступен — повтор через {max(1, int(-(-left // 60)))} мин "
+                f"или когда появится новый маршрут")
+    return "недавняя неудачная попытка — ждём час до следующей"
+
+
+def should_reissue(state: dict, now: float, profiles_present: bool, routes=None) -> tuple[bool, str]:
     """Decide whether an automatic run should issue the set now. Returns (issue, russian reason).
 
-    The 1-hour cooldown after a fruitless run wins first (a run costs a registration plus up to
-    45 s of scanning). Then only "no own profiles on disk" issues: once a set exists it is replaced
+    The cooldown after a fruitless run wins first (1 hour: a run costs a registration plus up to
+    45 s of scanning; 10 minutes, lifted by a new route, when the API was never reached). Then only "no own profiles on disk" issues: once a set exists it is replaced
     by the manual «Перевыпустить» alone (owner 2026-11-12, mirrors Nova Android D40).
     """
-    state = state or {}
-    failed_at = state.get("failed_at") or 0
-    if failed_at and 0 <= now - failed_at < COOLDOWN_SEC:
-        return False, "недавняя неудачная попытка — ждём час до следующей"
+    waiting = cooldown_reason(state, now, routes)
+    if waiting:
+        return False, waiting
     if not profiles_present:
         return True, "своих профилей ещё нет"
     # Owner, 2026-11-12 (Android D40): a set is issued once per install. Age, a missing stamp or
@@ -510,13 +571,14 @@ def note_outcome(base_dir: str, name: str, ok: bool) -> dict:
 
 # --- nova-go bridge (the single seam tests replace) ---------------------------
 def _run_nova_go(args: list[str], stdin_text: str = "", timeout: float = REGISTER_TIMEOUT_SEC,
-                 env_extra: dict | None = None):
+                 env_extra: dict | None = None, low_priority: bool = False):
     """Run `nova-go <args>`; return (returncode, stdout, stderr). The one place tests fake.
 
     `args[0]` is the nova-go executable path. Never places a secret on argv — the scan private
     key rides in on stdin, a proxy URL in `env_extra`. `env_extra` overlays the inherited
     environment (a None value removes the variable); without it the environment is inherited
-    unchanged. Windowless like every Nova helper. A timeout or a spawn failure is turned into a
+    unchanged. `low_priority` starts the helper below normal priority (a background scan must not
+    compete with the user's own work). Windowless like every Nova helper. A timeout or a spawn failure is turned into a
     non-zero return and a russian, path-free stderr line rather than an exception, so the caller
     has one failure path.
     """
@@ -537,7 +599,7 @@ def _run_nova_go(args: list[str], stdin_text: str = "", timeout: float = REGISTE
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW,
+            creationflags=_CREATE_NO_WINDOW | (_BELOW_NORMAL_PRIORITY if low_priority else 0),
             env=env,
         )
         return completed.returncode, completed.stdout or "", completed.stderr or ""
@@ -590,7 +652,18 @@ def _stderr_detail(stderr: str) -> str:
     return _scrub_reason(_GO_LOG_PREFIX_RE.sub("", lines[-1]))
 
 
-def _register(nova_go_path: str, public_key_b64: str, api_proxy, log) -> dict:
+def _api_state_path(base_dir) -> str:
+    """The file nova-go keeps its API route memory in (temp/cf_api_state.json), or "" without a base dir.
+
+    It remembers the direct route that answered last and the relays that did not answer a moment
+    ago, so a run does not wait out the same dead relay again. Advisory: absent or broken = no memory.
+    """
+    if not base_dir:
+        return ""
+    return os.path.join(str(base_dir), "temp", "cf_api_state.json")
+
+
+def _register(nova_go_path: str, public_key_b64: str, api_proxy, log, state_path: str = "") -> dict:
     """Register the public key via nova-go. Raises RuntimeError with a russian reason on failure.
 
     `api_proxy` is one URL or a list of them (local Opera first, then the Nova relays, which carry
@@ -602,21 +675,27 @@ def _register(nova_go_path: str, public_key_b64: str, api_proxy, log) -> dict:
     routes = _proxy_routes(api_proxy)
     attempts = [("auto", routes[0] if routes else None)] + [("proxy", route) for route in routes[1:]]
     last_error = None
+    all_unreachable = True
     for index, (mode, route) in enumerate(attempts):
         try:
-            return _register_once(nova_go_path, public_key_b64, route, mode, log)
+            return _register_once(nova_go_path, public_key_b64, route, mode, log, state_path)
         except RuntimeError as exc:
             last_error = exc
+            all_unreachable = all_unreachable and bool(getattr(exc, "unreachable", False))
             if getattr(exc, "usage_error", False) or index == len(attempts) - 1:
                 break
             log(f"{LOG_PREFIX} регистрация не прошла ({exc}) — пробую следующий маршрут.")
+    # "Unreachable" is a verdict on every route together: one answer from Cloudflare (a refusal, a
+    # 429) means the API was reached, and the failure is then an ordinary one.
+    last_error.unreachable = all_unreachable
     raise last_error
 
 
-def _register_once(nova_go_path: str, public_key_b64: str, api_proxy, api_mode, log) -> dict:
+def _register_once(nova_go_path: str, public_key_b64: str, api_proxy, api_mode, log, state_path: str = "") -> dict:
     # The proxy never goes on argv (a relay URL carries its password). None removes an
     # inherited NOVA_API_PROXY so a stray value cannot silently reroute the registration.
-    env_extra = {_API_PROXY_ENV: str(api_proxy) if api_proxy else None}
+    env_extra = {_API_PROXY_ENV: str(api_proxy) if api_proxy else None,
+                 _API_STATE_ENV: state_path or None}
     code, stdout, stderr = _run_nova_go(
         _register_args(nova_go_path, public_key_b64, api_mode),
         timeout=REGISTER_TIMEOUT_SEC + _SUBPROCESS_MARGIN_SEC,
@@ -655,20 +734,25 @@ def _register_once(nova_go_path: str, public_key_b64: str, api_proxy, api_mode, 
     error = RuntimeError(reason)
     # Wrong arguments are wrong on every route; a missing binary is missing on every route too.
     error.usage_error = code in (2, 127)
+    # nova-go exit 20: no route produced an HTTP answer, so no device was created on Cloudflare's side.
+    error.unreachable = code == 20
     raise error
 
 
-def _scan(nova_go_path: str, private_key_b64: str, peer_public_key_b64: str, log):
+def _scan(nova_go_path: str, private_key_b64: str, peer_public_key_b64: str, log, background: bool = False):
     """One scan pass via nova-go → (verified endpoints, error).
 
     `error` is None when nova-go exited 0 (zero hits included — exit 0 is Go's success), else
     `{"code": N, "detail": "<last stderr line>"}`: a killed, missing or argument-rejecting
     scanner is a failure, not an empty network.
     """
+    # Only a background run passes the extra keyword, so a test double with the old signature works.
+    extra = {"low_priority": True} if background else {}
     code, stdout, stderr = _run_nova_go(
         _scan_args(nova_go_path, peer_public_key_b64),
         stdin_text=private_key_b64 + "\n",
         timeout=SCAN_TIMEOUT_SEC + _SUBPROCESS_MARGIN_SEC,
+        **extra,
     )
     if code != 0:
         detail = _stderr_detail(stderr)
@@ -682,26 +766,35 @@ def _scan_error_reason(error: dict) -> str:
     return f"сканер завершился с ошибкой (код {error.get('code')})" + (f": {detail}" if detail else "")
 
 
-def _collect_verified(nova_go_path: str, identity: dict, log, progress=None, target: int = TARGET_COUNT):
+def _collect_verified(nova_go_path: str, identity: dict, log, progress=None, target: int = TARGET_COUNT,
+                      background: bool = False):
     """Two-pass verified-endpoint collection → (endpoints, error of the last pass or None).
 
     The second pass runs only if the first exited cleanly with fewer than 24 hits. Union (not
     intersection) of the two passes, taking the min rtt per (host,port) — the scanner walks the
     prefixes at random, so two passes find largely different addresses and an intersection would
     be near-empty (and-warpgen §3.5). The progress callback fires before the second pass, so a
-    cancel (or Nova shutting down) does not spawn another nova-go.
+    cancel (or Nova shutting down) does not spawn another nova-go. A `background` run (the
+    automatic issue after a connect) makes ONE pass at low priority: a thinner set beats a second
+    45 s burst of sockets while the person is working (Nova Android D45 does the same).
     """
     private_key, peer_key = identity["private_key"], identity["peer_public_key"]
-    first, error = _scan(nova_go_path, private_key, peer_key, log)
+
+    def scan():
+        if background:
+            return _scan(nova_go_path, private_key, peer_key, log, True)
+        return _scan(nova_go_path, private_key, peer_key, log)
+
+    first, error = scan()
     if error is not None:
         # A scanner that failed (killed at Nova exit, missing, rejecting its arguments) fails
         # again; a second pass would only start another nova-go that may outlive Nova.
         return first, error
-    if len(first) >= ENOUGH_VERIFIED:
+    if len(first) >= ENOUGH_VERIFIED or background:
         return first, None
     log(f"{LOG_PREFIX} проверенных точек {len(first)} — меньше {ENOUGH_VERIFIED}, идём вторым проходом.")
     _progress(progress, "WARP: ищу точки входа, второй проход", 0, target)
-    second, error = _scan(nova_go_path, private_key, peer_key, log)
+    second, error = scan()
     best: dict[tuple, dict] = {}
     for endpoint in first + second:
         key = (endpoint["host"], endpoint["port"])
@@ -744,15 +837,18 @@ def _load_identity(base_dir: str) -> tuple[dict, str]:
     return ({}, problem) if problem else (identity, "")
 
 
-def _issue_identity(base_dir: str, nova_go_path: str, api_proxy, log, now: float) -> tuple[dict, str]:
-    """Generate a key, register it and save the identity → (identity, "") or ({}, russian reason)."""
+def _issue_identity(base_dir: str, nova_go_path: str, api_proxy, log, now: float) -> tuple[dict, str, bool]:
+    """Generate a key, register it and save the identity → (identity, "", False) or ({}, russian reason, unreachable).
+
+    `unreachable` is True when no route reached the API at all (no device was created).
+    """
     private_b64, public_b64 = generate_keypair()
     try:
-        parsed = _register(nova_go_path, public_b64, api_proxy, log)
+        parsed = _register(nova_go_path, public_b64, api_proxy, log, _api_state_path(base_dir))
     except RuntimeError as exc:
         reason = str(exc)
         log(f"{LOG_PREFIX} регистрация не прошла — {reason}. Остаются встроенные семена.")
-        return {}, f"регистрация не прошла: {reason}"
+        return {}, f"регистрация не прошла: {reason}", bool(getattr(exc, "unreachable", False))
     identity = {
         "private_key": private_b64,
         "public_key": public_b64,
@@ -770,9 +866,9 @@ def _issue_identity(base_dir: str, nova_go_path: str, api_proxy, log, now: float
     except OSError as exc:
         reason = f"не удалось сохранить личность: {_os_error_text(exc)}"
         log(f"{LOG_PREFIX} {reason}. Остаются встроенные семена.")
-        return {}, reason
+        return {}, reason, False
     log(f"{LOG_PREFIX} личность зарегистрирована, адрес {identity['ipv4'] or identity['ipv6']}.")
-    return identity, ""
+    return identity, "", False
 
 
 def _existing_generated(cloudflare_dir: str) -> list[str]:
@@ -804,7 +900,8 @@ def _profile_entry(endpoint: dict, prior) -> dict:
     }
 
 
-def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progress=None, target=50) -> dict:
+def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progress=None, target=50,
+             background=False) -> dict:
     """Issue up to `target` own-WARP profiles into `profiles/AWG Cloudflare/`.
 
     Reuses `warp_identity.json` unless `force` or it is unusable (malformed keys, a private key
@@ -825,7 +922,9 @@ def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progre
     cloudflare_dir = _cloudflare_dir(base_dir)
     os.makedirs(cloudflare_dir, exist_ok=True)
     previous_state = load_state(base_dir)  # read-only: decisions only, never written back
-    summary = {"ok": False, "reason": "", "count": 0, "reused_identity": False, "best_rtt_ms": None}
+    summary = {"ok": False, "reason": "", "count": 0, "reused_identity": False, "best_rtt_ms": None,
+               "unreachable": False}
+    routes_now = route_keys(api_proxy)
 
     def save_state(mutate) -> None:
         try:
@@ -833,11 +932,15 @@ def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progre
         except OSError as exc:
             log(f"{LOG_PREFIX} не удалось сохранить состояние генератора: {_os_error_text(exc)}")
 
-    def record_failure(reason: str, *, scan_code=None, swapped=()) -> dict:
+    def record_failure(reason: str, *, scan_code=None, swapped=(), unreachable=False) -> dict:
         def mutate(state: dict) -> None:
             state["last_run_at"] = now
             state["last_error"] = reason
             state["failed_at"] = now
+            # The short cooldown and its "a new route lifts it" rule need to know what kind of
+            # failure this was and which routes it had (credential-free keys, I19).
+            state["failed_unreachable"] = bool(unreachable)
+            state["failed_routes"] = routes_now if unreachable else []
             if scan_code is not None:
                 state["last_scan_code"] = scan_code
             if swapped:
@@ -849,6 +952,7 @@ def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progre
         save_state(mutate)
         summary["ok"] = False
         summary["reason"] = reason
+        summary["unreachable"] = bool(unreachable)
         return summary
 
     # Any exception below propagates to the caller on purpose: a progress-callback abort
@@ -866,12 +970,12 @@ def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progre
         summary["reused_identity"] = True
     else:
         _progress(progress, "WARP: регистрирую устройство", 0, target)
-        identity, reason = _issue_identity(base_dir, nova_go_path, api_proxy, log, now)
+        identity, reason, unreachable = _issue_identity(base_dir, nova_go_path, api_proxy, log, now)
         if not identity:
-            return record_failure(reason)
+            return record_failure(reason, unreachable=unreachable)
 
     _progress(progress, "WARP: ищу точки входа", 0, target)
-    verified, scan_error = _collect_verified(nova_go_path, identity, log, progress, target)
+    verified, scan_error = _collect_verified(nova_go_path, identity, log, progress, target, background)
     if (not verified and scan_error is not None and scan_error["code"] == _EXIT_USAGE
             and summary["reused_identity"]
             and _as_int(previous_state.get("last_scan_code"), 0) != _EXIT_USAGE):
@@ -880,12 +984,12 @@ def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progre
         log(f"{LOG_PREFIX} сканер отверг сохранённую личность (код {_EXIT_USAGE}) — "
             f"регистрирую устройство заново.")
         _progress(progress, "WARP: регистрирую устройство", 0, target)
-        identity, reason = _issue_identity(base_dir, nova_go_path, api_proxy, log, now)
+        identity, reason, unreachable = _issue_identity(base_dir, nova_go_path, api_proxy, log, now)
         if not identity:
-            return record_failure(reason)
+            return record_failure(reason, unreachable=unreachable)
         summary["reused_identity"] = False
         _progress(progress, "WARP: ищу точки входа", 0, target)
-        verified, scan_error = _collect_verified(nova_go_path, identity, log, progress, target)
+        verified, scan_error = _collect_verified(nova_go_path, identity, log, progress, target, background)
 
     verified.sort(key=lambda e: e["rtt_ms"])
     endpoints = diversify(verified)[:target]
@@ -969,6 +1073,8 @@ def generate(base_dir, nova_go_path, *, log, force=False, api_proxy=None, progre
             "last_run_at": now,
             "last_error": "",
             "failed_at": 0,
+            "failed_unreachable": False,
+            "failed_routes": [],
             "last_scan_code": 0,
             "profiles": {name: _profile_entry(endpoint, old_profiles.get(name)) for name, endpoint in swapped},
         })

@@ -44,7 +44,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 __all__ = [
     "open_profiles_window", "toggle_profiles_window", "close_profiles_window", "get_profiles_window",
     "ProfilesWindow", "ImportPreview", "FallbackPillButton", "ThemedScrollbar",
-    "TABS", "TAB_TOR", "TAB_SUBS", "ACTION_LABELS", "TAB_ACTION_ROWS", "TOR_ENTRIES",
+    "TABS", "TAB_TOR", "TAB_SUBS", "TAB_NOVA", "ACTION_LABELS", "TAB_ACTION_ROWS", "TOR_ENTRIES",
     "IMPORT_FILETYPES", "DEFAULT_THEME", "merge_theme", "is_dark_theme", "set_pill_text",
     "format_outcome", "format_row_text", "format_selection_text", "format_runtime_text",
     "format_job_line", "format_tor_status", "format_list_header", "classify_import_candidates",
@@ -58,7 +58,7 @@ GROUP_PROTON = "AWG Proton"
 GROUP_MASQUE = "MASQUE"
 GROUP_VLESS = "VLESS"
 GROUP_CUSTOM = "Custom"
-PROFILE_GROUPS = (GROUP_MASQUE, GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_CUSTOM)
+PROFILE_GROUPS = (GROUP_CLOUDFLARE, GROUP_MASQUE, GROUP_PROTON, GROUP_CUSTOM)
 # Profile kinds, likewise repeated (nova_profiles.KIND_*): the file's own type, not its folder,
 # decides which helper starts it and therefore which group an import lands in.
 KIND_AWG = "awg"
@@ -67,17 +67,28 @@ KIND_VLESS = "vless"
 # Groups whose profiles the user brought in, so renaming them is theirs to do.
 IMPORTED_GROUPS = (GROUP_CUSTOM, GROUP_VLESS)
 TAB_TOR = "tor"
+# The built-in Nova list has a tab of its own (owner 2026-11-15): its nodes live in the Custom folder
+# and come from the «nova-list» subscription, but they are Nova's, not the owner's, so they are
+# neither «Custom profiles» nor a row of «Подписки». The tab is a view, not a group: what is stored
+# (folder, ids, stats keys) stays "Custom", and its group connect is the Custom group narrowed to the
+# subscription — the same selection the main window's «Nova» item writes (nova_vpn_slots).
+TAB_NOVA = "Nova"
+NOVA_LIST_SUBSCRIPTION = "nova-list"  # nova_subscriptions.NOVA_LIST_ID
+# Tabs that show a profile list (the Nova view included), and those with the sort row.
+PROFILE_TABS = PROFILE_GROUPS + (TAB_NOVA,)
+SORTED_TABS = (GROUP_CUSTOM, TAB_NOVA)
 # The subscriptions tab: URLs that hand out profiles, and how often each is re-downloaded. It has
 # no profile list of its own -- what it brings lands in VLESS and «Custom AWG» -- so it reuses the
 # list panel with rows of its own.
 TAB_SUBS = "subscriptions"
 TABS = (
-    (GROUP_MASQUE, "MASQUE"),
     (GROUP_CLOUDFLARE, "AWG Cloudflare"),
+    (GROUP_MASQUE, "MASQUE"),
     (GROUP_PROTON, "AWG Proton"),
     # The group's folder, its id prefix and everything stored under it stay "Custom"; only the
     # caption says what is in it, because «Custom» alone told the owner nothing.
     (GROUP_CUSTOM, "Custom profiles"),
+    (TAB_NOVA, "Nova"),
     (TAB_SUBS, "Подписки"),
     (TAB_TOR, "Tor"),
 )
@@ -128,6 +139,8 @@ TAB_ACTION_ROWS = {
     GROUP_MASQUE: (_MAIN_ROW, ("delete",)),
     GROUP_VLESS: (_MAIN_ROW, ("import_file", "import_clipboard", "rename", "delete")),
     GROUP_CUSTOM: (_MAIN_ROW, ("import_file", "import_clipboard", "rename", "delete")),
+    # The list is the subscription's: an import, a rename or a delete would be undone by its next refresh.
+    TAB_NOVA: (_MAIN_ROW,),
     TAB_SUBS: (("sub_add", "sub_interval", "sub_toggle", "sub_refresh", "sub_delete"),),
     TAB_TOR: (("tor_toggle", "tor_new_identity", "tor_refresh_bridges"),),
 }
@@ -157,7 +170,7 @@ TOR_DEFAULT_HTTP_PORT = 1378
 JOB_KIND_BY_GROUP = {GROUP_CLOUDFLARE: "warp", GROUP_PROTON: "proton", GROUP_MASQUE: "masque"}
 # Which job line a tab shows. Subscriptions feed both import groups, so both watch «subs».
 JOB_LINE_BY_GROUP = dict(JOB_KIND_BY_GROUP,
-                         **{GROUP_VLESS: "subs", GROUP_CUSTOM: "subs", TAB_SUBS: "subs"})
+                         **{GROUP_VLESS: "subs", GROUP_CUSTOM: "subs", TAB_NOVA: "subs", TAB_SUBS: "subs"})
 _JOB_NOUNS = {"warp": "Генерация WARP", "proton": "Выпуск Proton", "masque": "Регистрация MASQUE",
               "subs": "Обновление подписок"}
 
@@ -493,6 +506,7 @@ def format_list_header(group, records, loaded=True):
             GROUP_MASQUE: "нажмите «Зарегистрировать»",
             GROUP_VLESS: "нажмите «Обновить профили» или вставьте ссылку vless:// из буфера",
             GROUP_CUSTOM: "импортируйте файл или вставьте конфиг из буфера",
+            TAB_NOVA: "нажмите «Обновить профили», чтобы скачать список Nova",
         }
         return f"В группе «{group}» пока нет профилей — {hints.get(group, 'добавьте профиль')}"
     text = f"{group}: {total} {_plural(total, 'профиль', 'профиля', 'профилей')}"
@@ -618,6 +632,8 @@ def format_selection_text(effective, selection=None):
             wanted = str(sel.get("profile") or sel.get("profile_id") or "")
             name = wanted.partition("/")[2] or wanted or "?"
             return f"Профиль «{name}» удалён — используется группа «{group}»"
+        if str(eff.get("subscription") or sel.get("subscription") or "") == NOVA_LIST_SUBSCRIPTION:
+            group = TAB_NOVA
         text = f"Группа «{group}»: Nova перебирает только её профили"
     else:
         # Both imported groups are out of «Авто» (D25), and the line used to name only one of them.
@@ -745,7 +761,8 @@ def _selection_key(selection):
     if mode == "profile":
         return mode, group or profile.partition("/")[0], profile
     if mode == "group":
-        return mode, group, ""
+        # The Nova list is the Custom group narrowed to a subscription: a different choice.
+        return mode, group, str(sel.get("subscription") or "").strip()
     return "auto", "", ""
 
 
@@ -2036,7 +2053,7 @@ class ProfilesWindow:
         return {"mode": mode, "group": group if mode != "auto" else "", "profile_id": profile, "reason": ""}
 
     def _render_all(self):
-        if self.current_tab != GROUP_CUSTOM:
+        if self.current_tab not in SORTED_TABS:
             self.sort_row.pack_forget()
         if not self.alive():
             return
@@ -2053,9 +2070,30 @@ class ProfilesWindow:
             self._render_list()
             self._render_job_line()
 
+    @staticmethod
+    def _tab_groups(group):
+        """The stored groups a tab (or a selection's group) draws from."""
+        if group in (GROUP_CUSTOM, GROUP_VLESS, TAB_NOVA):
+            return (GROUP_CUSTOM, GROUP_VLESS)
+        return (group,)
+
+    def _is_nova_record(self, profile_id):
+        """True when `profile_id` is a node of the built-in Nova list (per the last snapshot)."""
+        for record in self._snapshot.get('profiles') or ():
+            if isinstance(record, dict) and record.get('id') == profile_id:
+                return record.get('subscription') == NOVA_LIST_SUBSCRIPTION
+        return False
+
     def _records_for(self, group):
-        records = nova_proxy.group_records([r for r in self._snapshot.get('profiles') or [] if isinstance(r, dict)], group)
-        if group != GROUP_CUSTOM:
+        profiles = [r for r in self._snapshot.get('profiles') or [] if isinstance(r, dict)]
+        if group == TAB_NOVA:
+            records = [r for r in nova_proxy.group_records(profiles, GROUP_CUSTOM)
+                       if r.get('subscription') == NOVA_LIST_SUBSCRIPTION]
+        else:
+            records = nova_proxy.group_records(profiles, group)
+            if group == GROUP_CUSTOM:
+                records = [r for r in records if r.get('subscription') != NOVA_LIST_SUBSCRIPTION]
+        if group not in SORTED_TABS:
             return records
         return nova_proxy.sort_records(records, self._sort_mode, self._snapshot.get('stats'),
                                        order=self._nova_list_order(records))
@@ -2090,7 +2128,7 @@ class ProfilesWindow:
 
     def _render_list(self):
         group = self.current_tab
-        if group == GROUP_CUSTOM:
+        if group in SORTED_TABS:
             self.sort_row.pack(fill='x', before=self.listbox.master, pady=(0, 6))
             for key, pill in self.sort_pills.items():
                 pill.set_selected(key == self._sort_mode)
@@ -2159,7 +2197,10 @@ class ProfilesWindow:
 
     def _render_subs(self):
         """The «Подписки» tab, in the same listbox the profile tabs use."""
-        records = list(self._snapshot.get("subs") or [])
+        # The built-in Nova list is not the owner's subscription: it has its own tab and cannot be
+        # removed, so this tab lists only what the owner added.
+        records = [r for r in self._snapshot.get("subs") or []
+                   if isinstance(r, dict) and r.get("id") != NOVA_LIST_SUBSCRIPTION]
         loaded = bool(self._snapshot.get("subs_loaded"))
         self._set_label(self.list_header, format_subs_header(records, loaded))
         running = bool((self._snapshot.get("jobs") or {}).get("subs", {}).get("running"))
@@ -2309,7 +2350,7 @@ class ProfilesWindow:
 
     def _sweep_current_tab(self):
         """Measure the visible group in the background, unless its figures are still fresh."""
-        if self.current_tab not in PROFILE_GROUPS:
+        if self.current_tab not in PROFILE_TABS:
             return
         records = self._records_for(self.current_tab)
         if records:
@@ -2325,7 +2366,9 @@ class ProfilesWindow:
         group = str(profile_id or "").partition("/")[0]
         if group == GROUP_VLESS:
             group = GROUP_CUSTOM
-        if group not in PROFILE_GROUPS:
+        if group == GROUP_CUSTOM and self._is_nova_record(profile_id):
+            group = TAB_NOVA
+        if group not in PROFILE_TABS:
             return False
         self._selected_ids[group] = profile_id
         self._reveal_ids[group] = profile_id
@@ -2336,7 +2379,7 @@ class ProfilesWindow:
         return profile_id in self._row_ids
 
     def _selected_record(self):
-        if self.current_tab not in PROFILE_GROUPS:
+        if self.current_tab not in PROFILE_TABS:
             return None
         selection = self.listbox.curselection()
         wanted = None
@@ -2403,7 +2446,10 @@ class ProfilesWindow:
         if mode == "profile":
             return live_id == profile
         if mode == "group":
-            return bool(live_id) and live_id.partition("/")[0] == group
+            if not live_id or live_id.partition("/")[0] not in self._tab_groups(group):
+                return False
+            # `profile` holds the group's subscription here (`_selection_key`).
+            return self._is_nova_record(live_id) == (profile == NOVA_LIST_SUBSCRIPTION)
         return True
 
     def _apply_selection(self, selection, notice):
@@ -2422,10 +2468,18 @@ class ProfilesWindow:
 
     def _on_connect_group(self):
         group = self.current_tab
-        if group not in PROFILE_GROUPS:
+        if group not in PROFILE_TABS:
             self._notice("Откройте вкладку группы профилей, чтобы выбрать группу", "warn")
             return
         valid = [r for r in self._records_for(group) if r.get("valid", True)]
+        if group == TAB_NOVA:
+            if not valid and self._snapshot.get("loaded"):
+                self._notice("Список Nova пуст — нажмите «Обновить профили»", "warn")
+                return
+            self._apply_selection({"version": 1, "mode": "group", "group": GROUP_CUSTOM,
+                                   "subscription": NOVA_LIST_SUBSCRIPTION},
+                                  "Список «Nova» (Auto): Nova промерит узлы и начнёт с самого быстрого")
+            return
         if group in IMPORTED_GROUPS and not valid and self._snapshot.get("loaded"):
             # The issued groups fill themselves when they are chosen empty; an imported one cannot —
             # nothing will arrive unless the user imports it or a subscription brings it.
@@ -2446,7 +2500,7 @@ class ProfilesWindow:
         """
         record = self._selected_record()
         if record is None:
-            if self.current_tab in PROFILE_GROUPS:
+            if self.current_tab in PROFILE_TABS:
                 self._on_connect_group()
             else:
                 self._notice("Выберите профиль в списке", "warn")
@@ -2545,14 +2599,16 @@ class ProfilesWindow:
             self._notice(f"«{pid.partition('/')[2] or pid}»: проверка не ответила за "
                          f"{int(TEST_RESULT_TIMEOUT_S // 60)} мин", "fail")
             self._log(f"[Profiles] Проверка профиля «{pid}» не вернула результат за {int(TEST_RESULT_TIMEOUT_S)} с.")
-        if expired and self.alive() and self.current_tab in PROFILE_GROUPS:
+        if expired and self.alive() and self.current_tab in PROFILE_TABS:
             self._pump_profile_checks()
             self._render_list()
 
     def _on_folder(self):
         group = self.current_tab
-        if group not in PROFILE_GROUPS:
+        if group not in PROFILE_TABS:
             return
+        if group == TAB_NOVA:
+            group = GROUP_CUSTOM  # the Nova list's files live in the Custom folder
         if not callable(getattr(self.ctx, "open_folder", None)):
             self._notice("Открытие папки недоступно в этой сборке Nova", "warn")
             return
@@ -2868,7 +2924,7 @@ class ProfilesWindow:
             # The sweep is over and something never reported its end: the rows must not stay marked.
             self._latency_active.clear()
             changed = True
-        if changed and self.current_tab in PROFILE_GROUPS:
+        if changed and self.current_tab in PROFILE_TABS:
             self._render_list()
 
     def _on_latency_done(self, measured):
@@ -2910,10 +2966,11 @@ class ProfilesWindow:
             else:
                 self._profile_check_queue.clear()
                 break
-        pill = self.action_pills.get(GROUP_CUSTOM, {}).get('test_list')
-        if pill is not None:
-            set_pill_text(pill, 'Остановить' if self._profile_check_queue or self._profile_check_active
-                          else ACTION_LABELS['test_list'])
+        busy = bool(self._profile_check_queue or self._profile_check_active)
+        for tab in SORTED_TABS:
+            pill = self.action_pills.get(tab, {}).get('test_list')
+            if pill is not None:
+                set_pill_text(pill, 'Остановить' if busy else ACTION_LABELS['test_list'])
 
     def _on_test_list(self):
         """«Проверить список»: measure every profile of the tab, cheaply.
@@ -2927,14 +2984,14 @@ class ProfilesWindow:
         few hundred needs; «Проверить» stays the way to prove one of them carries traffic.
         """
         group = self.current_tab
-        if group not in PROFILE_GROUPS:
+        if group not in PROFILE_TABS:
             return
         records = self._records_for(group)
         if not records:
             self._notice(f"В группе «{group}» нет профилей", "warn")
             return
         modern = [r for r in records if r.get('kind') in (KIND_VLESS, nova_proxy.KIND) and r.get('valid', True)]
-        if group == GROUP_CUSTOM and modern:
+        if group in SORTED_TABS and modern:
             if self._profile_check_queue or self._profile_check_active:
                 self._profile_check_queue.clear()
                 self._notice('Очередь остановлена; текущие проверки завершатся', 'muted')
@@ -2978,7 +3035,7 @@ class ProfilesWindow:
         if kind:
             self._on_job(kind, force=bool(self._records_for(group)))
             return
-        if group in (GROUP_VLESS, GROUP_CUSTOM):
+        if group in (GROUP_VLESS, GROUP_CUSTOM, TAB_NOVA):
             if not callable(getattr(self.ctx, "refresh_subscriptions", None)):
                 self._notice("Обновление подписок недоступно в этой сборке Nova", "warn")
                 return

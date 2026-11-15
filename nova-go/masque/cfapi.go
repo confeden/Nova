@@ -30,6 +30,9 @@ import (
 
 	usquemodels "github.com/Diniboy1123/usque/models"
 	utls "github.com/refraction-networking/utls"
+
+	"nova-pc/nova-go/internal/apifail"
+	"nova-pc/nova-go/internal/apistate"
 )
 
 const (
@@ -161,6 +164,16 @@ type APIClient struct {
 	// refusing CONNECT with 407. routes() runs for every API call, and re-probing a dead remote relay
 	// each time would spend the --timeout budget before the direct routes.
 	proxyDown map[*url.URL]bool
+
+	// state remembers across runs which direct route answered and which remote proxies were dead
+	// (NOVA_API_STATE; nil = no memory). skipNotes are the proxies routes() left out this call.
+	state     *apistate.Store
+	skipNotes []routeFailure
+
+	// Test hooks: zero values mean the defaults.
+	directWidth int
+	hedgeStep   time.Duration
+	directDial  func(ctx context.Context, ip netip.Addr) (net.Conn, error)
 }
 
 // NewAPIClient validates the mode/proxy combination.
@@ -183,7 +196,7 @@ func newAPIClient(mode string, proxies []string, log *Logger) (*APIClient, error
 	default:
 		return nil, fmt.Errorf("unknown --api-mode %q (auto|proxy|direct|plain)", mode)
 	}
-	c := &APIClient{mode: mode, log: log}
+	c := &APIClient{mode: mode, log: log, state: apistate.FromEnv()}
 	seen := make(map[string]bool)
 	for _, raw := range proxies {
 		raw = strings.TrimSpace(raw)
@@ -191,9 +204,11 @@ func newAPIClient(mode string, proxies []string, log *Logger) (*APIClient, error
 			continue
 		}
 		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-			// Never echo the value: a relay URL carries a password.
-			return nil, fmt.Errorf("--api-proxy and %s must hold http:// or https:// URLs", apiProxyEnv)
+		socks := err == nil && (u.Scheme == "socks5" || u.Scheme == "socks5h")
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" && !socks) || (socks && u.User != nil) {
+			// Never echo the value: a relay URL carries a password. A socks5:// URL is a local
+			// tunnel's SOCKS5 port (Nova's primary slot): unauthenticated, the name resolved by the proxy.
+			return nil, fmt.Errorf("--api-proxy and %s must hold http://, https://, or credential-free socks5:// URLs", apiProxyEnv)
 		}
 		if seen[u.String()] {
 			continue
@@ -237,17 +252,42 @@ func (c *APIClient) relayState() (outdated bool, current string) {
 }
 
 func (c *APIClient) routes(ctx context.Context) []apiRoute {
+	// Profile-major: the same fingerprint on both addresses before the next fingerprint, so a few
+	// attempts already cover both addresses (a filter often hits one address, not the other).
 	var direct []apiRoute
-	for _, ip := range apiPinnedIPs {
-		for _, p := range apiProfiles() {
+	for _, p := range apiProfiles() {
+		for _, ip := range apiPinnedIPs {
 			direct = append(direct, apiRoute{kind: "direct", ip: ip, profile: p})
 		}
+	}
+	var notes []routeFailure
+	// usable decides whether a proxy is worth a connection attempt: not quarantined by an earlier run
+	// and, when probe is set, accepting TCP now. A dead one is quarantined so the next run skips it.
+	usable := func(u *url.URL, probe bool) bool {
+		key := apistate.ProxyKey(proxyURLLabel(u))
+		if left, dead := c.state.ProxyDead(key); dead {
+			notes = append(notes, routeFailure{label: "proxy " + proxyURLLabel(u), group: "proxy", class: "skipped",
+				text: "skipped, it did not accept a connection recently (quarantine " + left.Round(time.Second).String() + " left)"})
+			return false
+		}
+		if probe && !c.proxyReachable(ctx, u) {
+			c.markProxyDown(u)
+			c.state.NoteProxyDead(key)
+			notes = append(notes, routeFailure{label: "proxy " + proxyURLLabel(u), group: "proxy", class: "proxy-dial",
+				text: "not accepting connections"})
+			c.log.Warn("API proxy is not accepting connections, skipping it", "proxy", proxyURLLabel(u))
+			return false
+		}
+		return true
 	}
 	var out []apiRoute
 	switch c.mode {
 	case APIModeProxy:
+		// An explicit proxy run is not probed (its failure is its answer); only a quarantine skips.
 		for _, u := range c.proxies {
-			out = append(out, apiRoute{kind: "proxy", proxy: u})
+			if usable(u, false) {
+				out = append(out, apiRoute{kind: "proxy", proxy: u})
+			}
 		}
 	case APIModeDirect:
 		out = direct
@@ -259,13 +299,11 @@ func (c *APIClient) routes(ctx context.Context) []apiRoute {
 			c.mu.Lock()
 			down := c.proxyDown[u]
 			c.mu.Unlock()
-			switch {
-			case down:
-			case c.proxyReachable(ctx, u):
+			if down {
+				continue
+			}
+			if usable(u, true) {
 				out = append(out, apiRoute{kind: "proxy", proxy: u})
-			default:
-				c.markProxyDown(u)
-				c.log.Warn("API proxy is not accepting connections, skipping it", "proxy", proxyURLLabel(u))
 			}
 		}
 		out = append(out, direct...)
@@ -273,15 +311,30 @@ func (c *APIClient) routes(ctx context.Context) []apiRoute {
 	}
 	c.mu.Lock()
 	winner := c.winner
+	c.skipNotes = append(c.skipNotes, notes...)
 	c.mu.Unlock()
+	winLabel, remembered := "", "none"
 	if winner != nil {
+		winLabel = winner.label()
+	} else if ip, profile, ok := c.state.Winner(); ok {
+		winLabel, remembered = ip+"/"+profile, ip+"/"+profile
+	}
+	if winLabel != "" {
 		for i, r := range out {
-			if r.label() == winner.label() {
+			if r.label() == winLabel {
 				out = append([]apiRoute{r}, slices.Delete(out, i, i+1)...)
 				break
 			}
 		}
 	}
+	live := make([]string, 0, len(c.proxies))
+	for _, r := range out {
+		if r.kind == "proxy" {
+			live = append(live, proxyURLLabel(r.proxy))
+		}
+	}
+	c.log.Info("API plan", "mode", c.mode, "routes", len(out), "live_proxies", strings.Join(live, ","),
+		"skipped_proxies", len(notes), "remembered_direct", remembered)
 	return out
 }
 
@@ -297,9 +350,12 @@ func (c *APIClient) markProxyDown(u *url.URL) {
 func (c *APIClient) proxyReachable(ctx context.Context, u *url.URL) bool {
 	host := u.Host
 	if u.Port() == "" {
-		if u.Scheme == "https" {
+		switch u.Scheme {
+		case "https":
 			host = net.JoinHostPort(u.Hostname(), "443")
-		} else {
+		case "socks5", "socks5h":
+			host = net.JoinHostPort(u.Hostname(), "1080")
+		default:
 			host = net.JoinHostPort(u.Hostname(), "80")
 		}
 	}
@@ -319,21 +375,88 @@ func (c *APIClient) proxyReachable(ctx context.Context, u *url.URL) bool {
 	return true
 }
 
+// errSuperseded marks a direct attempt abandoned after its handshake because another attempt of the
+// same call had already been answered. It is not a failure of its route.
+var errSuperseded = errors.New("superseded by another attempt")
+
+const (
+	// directWidth is how many direct attempts may be in flight at once. A filter that swallows a
+	// ClientHello makes an attempt cost its whole handshake timeout (6-9 s), so walking the 16
+	// profiles one by one never gets past the first few inside the operation's deadline.
+	directWidth = 3
+	// hedgeStep starts one more attempt when the running ones are still silent after this long; a
+	// failed attempt starts the next one at once.
+	hedgeStep = 1500 * time.Millisecond
+)
+
+// apiGate admits one request at a time and hears its outcome while it still holds the gate. Parallel
+// direct attempts share one, so two completed handshakes cannot send two registrations (each one
+// creates a device).
+type apiGate func(context.Context) (done func(*apiResponse, error), err error)
+
+// routeFailure is one attempt that produced no HTTP answer.
+type routeFailure struct {
+	label string
+	group string
+	class string
+	text  string
+}
+
+func newRouteFailure(route apiRoute, err error) routeFailure {
+	group := route.kind
+	if route.kind == "direct" {
+		group = "direct " + route.ip.String()
+	}
+	class := apifail.ClassifyText(err.Error())
+	if errors.Is(err, errSuperseded) {
+		class = apifail.Superseded
+	}
+	return routeFailure{label: route.label(), group: group, class: class, text: err.Error()}
+}
+
 // do sends one API request. It returns the first HTTP 200; otherwise the first non-200 response
 // (a real answer from Cloudflare beats a transport error); otherwise ErrAPIUnreachable.
 //
 // A non-200 answer ends the current route group: every direct profile reaches the same server, so
 // asking 29 more times would only repeat the answer. Each proxy and plain are still tried because
-// their egress addresses differ.
+// their egress addresses differ. The direct profiles of one call run a few at a time (raceDirect).
 func (c *APIClient) do(ctx context.Context, req apiRequest) (*apiResponse, error) {
 	var (
-		failures  []string
+		failures  []routeFailure
 		first     *apiResponse
 		skipGroup string
 	)
-	for _, route := range c.routes(ctx) {
+	routes := c.routes(ctx)
+	failures = append(failures, c.takeSkipNotes()...)
+	for i := 0; i < len(routes); i++ {
 		if err := ctx.Err(); err != nil {
 			break
+		}
+		route := routes[i]
+		if route.kind == "direct" {
+			j := i
+			for j < len(routes) && routes[j].kind == "direct" {
+				j++
+			}
+			if skipGroup != "direct" {
+				out := c.raceDirect(ctx, routes[i:j], req)
+				failures = append(failures, out.failures...)
+				if out.win != nil {
+					r := out.winRoute
+					c.mu.Lock()
+					c.winner = &r
+					c.mu.Unlock()
+					return out.win, nil
+				}
+				if out.first != nil {
+					if first == nil {
+						first = out.first
+					}
+					skipGroup = "direct"
+				}
+			}
+			i = j - 1
+			continue
 		}
 		if route.group() == skipGroup {
 			continue
@@ -342,9 +465,16 @@ func (c *APIClient) do(ctx context.Context, req apiRequest) (*apiResponse, error
 		c.log.Debug("API request", "label", req.label, "route", c.routeLog(route))
 		resp, err := c.doRoute(ctx, route, req)
 		if err != nil {
-			failures = append(failures, route.label()+": "+err.Error())
+			f := newRouteFailure(route, err)
+			failures = append(failures, f)
 			c.log.Debug("API route failed", "label", req.label, "route", c.routeLog(route), "err", err)
+			if route.kind == "proxy" && f.class == "proxy-dial" {
+				c.state.NoteProxyDead(apistate.ProxyKey(proxyURLLabel(route.proxy)))
+			}
 			continue
+		}
+		if route.kind == "proxy" {
+			c.state.NoteProxyAlive(apistate.ProxyKey(proxyURLLabel(route.proxy)))
 		}
 		c.log.Info("API response", "label", req.label, "status", resp.Status, "route", c.routeLog(route),
 			"ms", time.Since(started).Milliseconds())
@@ -366,10 +496,174 @@ func (c *APIClient) do(ctx context.Context, req apiRequest) (*apiResponse, error
 	if err := ctx.Err(); err != nil && len(failures) == 0 {
 		return nil, fmt.Errorf("%w: %v", ErrAPIUnreachable, err)
 	}
-	if len(failures) > 6 {
-		failures = append(failures[:6], fmt.Sprintf("… %d more", len(failures)-6))
+	return nil, fmt.Errorf("%w: %s", ErrAPIUnreachable, describeFailures(failures))
+}
+
+// describeFailures leads with the summary: callers truncate this text, and its first characters must
+// already say which routes failed and how. The raw lines follow, capped.
+func describeFailures(failures []routeFailure) string {
+	entries := make([]apifail.Entry, 0, len(failures))
+	var raw []string
+	for _, f := range failures {
+		entries = append(entries, apifail.Entry{Group: f.group, Class: f.class})
+		if f.class != apifail.Superseded {
+			raw = append(raw, f.label+": "+f.text)
+		}
 	}
-	return nil, fmt.Errorf("%w: %s", ErrAPIUnreachable, strings.Join(failures, " | "))
+	if len(raw) > 6 {
+		raw = append(raw[:6], fmt.Sprintf("… %d more", len(raw)-6))
+	}
+	summary := apifail.Summarize(entries)
+	switch {
+	case summary == "":
+		return strings.Join(raw, " | ")
+	case len(raw) == 0:
+		return summary
+	}
+	return summary + " | " + strings.Join(raw, " | ")
+}
+
+// takeSkipNotes returns, once, the proxies routes() left out and why.
+func (c *APIClient) takeSkipNotes() []routeFailure {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	notes := c.skipNotes
+	c.skipNotes = nil
+	return notes
+}
+
+type directOutcome struct {
+	win      *apiResponse
+	winRoute apiRoute
+	first    *apiResponse // an HTTP answer other than 200; it ends the direct group
+	failures []routeFailure
+}
+
+// raceDirect walks routes (all of kind "direct", in order) a few at a time: a failed attempt starts
+// the next one at once, a silent one makes room for the next after hedgeStep. Attempts overlap in
+// their handshakes only; the request itself goes through a gate that admits one attempt at a time and
+// refuses once an answer exists.
+func (c *APIClient) raceDirect(ctx context.Context, routes []apiRoute, req apiRequest) directOutcome {
+	width, step := directWidth, hedgeStep
+	if c.directWidth > 0 {
+		width = c.directWidth
+	}
+	if c.hedgeStep > 0 {
+		step = c.hedgeStep
+	}
+	var (
+		mu        sync.Mutex
+		out       directOutcome
+		answered  bool
+		wg        sync.WaitGroup
+		sem       = make(chan struct{}, 1)
+		finished  = make(chan struct{}, len(routes)+1)
+		inflight  int
+		next      int
+		canLaunch = true
+	)
+	over := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return answered
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	hedge := time.NewTimer(step)
+	defer hedge.Stop()
+
+	attempt := func(route apiRoute) {
+		defer wg.Done()
+		defer func() { finished <- struct{}{} }()
+		started := time.Now()
+		c.log.Debug("API request", "label", req.label, "route", c.routeLog(route))
+		booked := false
+		gate := func(gctx context.Context) (func(*apiResponse, error), error) {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return nil, gctx.Err()
+			}
+			if over() {
+				<-sem
+				return nil, errSuperseded
+			}
+			return func(resp *apiResponse, err error) {
+				defer func() { <-sem }()
+				if err != nil || resp == nil {
+					return
+				}
+				booked = true
+				c.state.NoteWinner(route.ip.String(), route.profile.label) // any HTTP answer: the path passes the filter
+				c.log.Info("API response", "label", req.label, "status", resp.Status, "route", c.routeLog(route),
+					"ms", time.Since(started).Milliseconds())
+				mu.Lock()
+				answered = true
+				if resp.StatusCode == http.StatusOK {
+					out.win, out.winRoute = resp, route
+				} else if out.first == nil {
+					out.first = resp
+				}
+				mu.Unlock()
+			}, nil
+		}
+		_, err := c.doDirect(runCtx, route, req, gate)
+		if err == nil || booked || errors.Is(err, errSuperseded) {
+			return
+		}
+		if runCtx.Err() != nil && over() {
+			return // cut off by another attempt's answer: not this route's failure
+		}
+		c.log.Debug("API route failed", "label", req.label, "route", c.routeLog(route), "err", err)
+		mu.Lock()
+		out.failures = append(out.failures, newRouteFailure(route, err))
+		mu.Unlock()
+	}
+
+	for !over() {
+		if canLaunch && inflight < width && next < len(routes) {
+			if runCtx.Err() != nil {
+				break
+			}
+			route := routes[next]
+			next++
+			inflight++
+			canLaunch = false
+			if !hedge.Stop() {
+				select {
+				case <-hedge.C:
+				default:
+				}
+			}
+			hedge.Reset(step)
+			wg.Add(1)
+			go attempt(route)
+			continue
+		}
+		if inflight == 0 && next >= len(routes) {
+			break
+		}
+		select {
+		case <-finished:
+			inflight--
+			canLaunch = true
+		case <-hedge.C:
+			canLaunch = true
+		case <-runCtx.Done():
+			for inflight > 0 {
+				<-finished
+				inflight--
+			}
+		}
+		if runCtx.Err() != nil && inflight == 0 {
+			break
+		}
+	}
+	cancel()
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	return out
 }
 
 func (c *APIClient) routeLog(r apiRoute) string {
@@ -379,7 +673,7 @@ func (c *APIClient) routeLog(r apiRoute) string {
 func (c *APIClient) doRoute(ctx context.Context, route apiRoute, req apiRequest) (*apiResponse, error) {
 	switch route.kind {
 	case "direct":
-		return c.doDirect(ctx, route, req)
+		return c.doDirect(ctx, route, req, nil)
 	case "proxy":
 		return c.doHTTPClient(ctx, req, route.proxy, route.label())
 	case "plain":
@@ -418,12 +712,17 @@ func newAPIHTTPRequest(ctx context.Context, req apiRequest) (*http.Request, erro
 
 // doDirect is register.go:435-521: TCP to a pinned IP, fragmented uTLS ClientHello, raw HTTP/1.1.
 // The certificate is verified against api.cloudflareclient.com with the system roots.
-func (c *APIClient) doDirect(parent context.Context, route apiRoute, req apiRequest) (*apiResponse, error) {
+func (c *APIClient) doDirect(parent context.Context, route apiRoute, req apiRequest, gate apiGate) (out *apiResponse, err error) {
 	p := route.profile
 	ctx, cancel := context.WithTimeout(parent, p.handshakeTimeout+6*time.Second)
 	defer cancel()
 
-	rawConn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp4", net.JoinHostPort(route.ip.String(), "443"))
+	var rawConn net.Conn
+	if c.directDial != nil {
+		rawConn, err = c.directDial(ctx, route.ip)
+	} else {
+		rawConn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp4", net.JoinHostPort(route.ip.String(), "443"))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("tcp dial: %w", err)
 	}
@@ -444,12 +743,20 @@ func (c *APIClient) doDirect(parent context.Context, route apiRoute, req apiRequ
 		NextProtos: []string{"http/1.1"},
 		MinVersion: utls.VersionTLS12,
 		MaxVersion: utls.VersionTLS13,
+		RootCAs:    c.rootCAs,
 	}, p.helloID)
 	if err := tlsConn.SetDeadline(time.Now().Add(p.handshakeTimeout)); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 	if err := tlsConn.Handshake(); err != nil {
 		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	if gate != nil {
+		done, gateErr := gate(ctx)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		defer func() { done(out, err) }()
 	}
 	hr, err := newAPIHTTPRequest(ctx, req)
 	if err != nil {

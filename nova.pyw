@@ -168,6 +168,7 @@ import contextlib
 import ctypes
 from ctypes import wintypes
 import locale
+import copy
 import threading
 import time
 import unicodedata
@@ -325,6 +326,7 @@ import nova_vpn_slots
 import nova_exit_probe
 import nova_latency
 import nova_issuance
+import nova_issue_policy
 import nova_wg_probe
 import nova_vless
 import nova_proxy
@@ -2074,7 +2076,7 @@ try:
         def _nova_list_scan_now(self, generation, budget_sec=None):
             """Forced Nova list scan for this connect; the verdicts by profile id ({} when it could not run)."""
             budget = nova_profiles.AUTO_MODE_BUDGET_SEC if budget_sec is None else max(1.0, float(budget_sec))
-            result = run_nova_list_scan(
+            result = run_nova_list_scan_for_connect(
                 force_first=True, budget_sec=budget,
                 should_abort=lambda: self._selection_generation != generation,
                 log=self.log_func)
@@ -2092,8 +2094,56 @@ try:
             if not results or self._selection_generation != generation:
                 return plan
             by_id = {str(a["profile"].get("id") or ""): a for a in attempts}
-            order = nova_list_pages.sort_by_ping(list(by_id), results)
+            order = nova_list_pages.sort_by_ping(self._nova_page_order(list(by_id)), results)
             return [by_id[pid] for pid in order] + others
+
+        @staticmethod
+        def _nova_page_order(ids):
+            """`ids` in the Nova list's page order (the unmeasured keep it); ids outside the list follow it."""
+            try:
+                wanted = set(ids)
+                listed = [pid for pid in nova_subscriptions.page_ordered_ids(get_base_dir()) if pid in wanted]
+            except Exception:
+                return list(ids)
+            seen = set(listed)
+            return listed + [pid for pid in ids if pid not in seen]
+
+        # «Next profile» and the recovery walk on a Nova list node: re-measure the head if the stored
+        # verdicts are stale, then take the next-lowest ping after the current node (wrapping).
+        NOVA_NEXT_SCAN_BUDGET_SEC = 60.0
+
+        def _nova_cycle_after(self, current_id, generation, effective=None):
+            """The Nova list nodes after `current_id` in the ping-ordered cycle, as attempts; None = not a Nova walk.
+
+            With `effective` (the recovery) only an explicit Nova choice qualifies; without it (the «>» button)
+            any current Nova list node does. The same `sort_by_ping` as the walk's «Nova» ordering.
+            """
+            try:
+                base = get_base_dir()
+                records = {r["id"]: r for r in nova_profiles.list_profiles(base)
+                           if r.get("valid") and r.get("subscription") == nova_profiles.NOVA_LIST_SUBSCRIPTION}
+            except Exception:
+                return None
+            if current_id not in records:
+                return None
+            if (effective is not None and effective.get("subscription") != nova_profiles.NOVA_LIST_SUBSCRIPTION
+                    and str(effective.get("mode") or "") != nova_profiles.MODE_PROFILE):
+                return None
+            ids = self._nova_page_order(list(records))
+            with contextlib.suppress(Exception):
+                run_nova_list_scan_for_connect(
+                    force_first=False, budget_sec=self.NOVA_NEXT_SCAN_BUDGET_SEC,
+                    should_abort=lambda: self._selection_generation != generation, log=self.log_func)
+            try:
+                stats = nova_profiles.load_stats(get_base_dir())
+                results = nova_profiles.https_verdicts(stats, ids)
+                if not results:  # the scan could not run: the last known figures beat the file order
+                    results = nova_profiles.https_verdicts(stats, ids, max_age=10 ** 9)
+            except Exception:
+                results = {}
+            order = nova_list_pages.next_in_ping_cycle(ids, results, current_id)
+            return [{"backend": nova_profiles._attempt(records[pid])["backend"],
+                     "profile": self._adapt_profile_record(records[pid])} for pid in order]
 
         def _nova_list_attempts(self, generation, budget_sec, skip_ids=()):
             """«Авто» reached Nova: scan (forced), then the alive nodes fastest first as attempts."""
@@ -3005,6 +3055,7 @@ try:
                 return False
             profile_id = str(profile.get("id") or profile.get("name") or "").strip()
             started = time.monotonic()
+            self._attempt_started_helper = False
             if backend == nova_profiles.BACKEND_MASQUE:
                 ok = bool(self._start_masque_backend(profile, abort_generation=abort_generation, explicit=explicit))
             elif backend == nova_profiles.BACKEND_VLESS:
@@ -3025,6 +3076,14 @@ try:
             base = get_base_dir()
             with contextlib.suppress(Exception):
                 nova_profiles.record_outcome(base, profile_id, ok, elapsed_ms if ok else None)
+            if (profile.get("subscription") == nova_profiles.NOVA_LIST_SUBSCRIPTION and profile.get("fingerprint")
+                    and (ok or self._attempt_started_helper)):
+                # Owner 2026-11-14: a Nova list node leaves the app only after real failed connections
+                # in a row (never for a ping), so each started attempt counts: success clears, failure adds.
+                with contextlib.suppress(Exception):
+                    nova_subscriptions.record_connect_result(base, profile.get("fingerprint"), ok)
+                    if not ok:
+                        nova_subscriptions.prune_dead_nodes(base, log=self.log_func)
             if (profile.get("group") == nova_profiles.GROUP_CLOUDFLARE
                     and profile.get("origin") == nova_profiles.ORIGIN_GENERATED):
                 with contextlib.suppress(Exception):
@@ -3199,11 +3258,18 @@ try:
                                   "пропущен — профилей нет.")
             queue = list(plan)
             position = 0
+            walk_started = time.monotonic()
             while position < len(queue):
                 attempt = queue[position]
                 position += 1
                 if _interrupted():
                     return _interrupted_outcome()
+                if explicit and time.monotonic() - walk_started >= nova_profiles.AUTO_MODE_BUDGET_SEC:
+                    # D69: an explicit group is walked for at most the same budget as an «Авто» mode (one
+                    # running start is not cut), and never replaced by another mode.
+                    self.log_func(f"[Profiles] «{target}»: перебор занял {int(nova_profiles.AUTO_MODE_BUDGET_SEC)} с — "
+                                  "дальше не идём. Выбор сделан явно — другие режимы не пробуем.")
+                    return "explicit-failed"
                 backend = attempt.get("backend")
                 if backend == nova_profiles.BACKEND_WARP_CLI:
                     # Only auto plans end with this sentinel.
@@ -3366,9 +3432,14 @@ try:
                 candidates = nova_profiles.build_recovery_plan(
                     plan, current_id, budget=self.AWG_RECOVERY_PROFILE_BUDGET
                 )
+            nova_next = self._nova_cycle_after(current_id, generation, effective)
+            if nova_next is not None:
+                candidates = nova_next[:self.AWG_RECOVERY_PROFILE_BUDGET]
             tried = 0
+            recovery_started = time.monotonic()
             for attempt in candidates:
-                if is_closing or tried >= self.AWG_RECOVERY_PROFILE_BUDGET:
+                if (is_closing or tried >= self.AWG_RECOVERY_PROFILE_BUDGET
+                        or time.monotonic() - recovery_started >= nova_profiles.AUTO_MODE_BUDGET_SEC):
                     break
                 if self._selection_generation != generation:
                     # apply_selection_now took over; the new selection gets its own start.
@@ -3474,7 +3545,10 @@ try:
                         attempts = [{"backend": a.get("backend"), "profile": self._adapt_profile_record(a["profile"])}
                                     for a in group_plan if isinstance(a.get("profile"), dict)]
                 ids = [str(a["profile"].get("id") or "") for a in attempts]
-                if current_id in ids:
+                nova_next = self._nova_cycle_after(current_id, self._selection_generation)
+                if nova_next is not None:
+                    ordered = nova_next
+                elif current_id in ids:
                     ordered = attempts[ids.index(current_id) + 1:]
                 else:
                     ordered = list(attempts)
@@ -3482,7 +3556,7 @@ try:
                 if not ordered and mode in (nova_profiles.MODE_GROUP, nova_profiles.MODE_PROFILE):
                     # The group is used up: go on to the first profile of the next group.
                     base = get_base_dir()
-                    ring = (nova_profiles.GROUP_MASQUE, nova_profiles.GROUP_CLOUDFLARE,
+                    ring = (nova_profiles.GROUP_CLOUDFLARE, nova_profiles.GROUP_MASQUE,
                             nova_profiles.GROUP_PROTON, nova_profiles.GROUP_CUSTOM)
                     here = str(effective.get("group") or (attempts[0]["profile"].get("group") if attempts else ""))
                     here = nova_profiles.GROUP_CUSTOM if here == nova_profiles.GROUP_VLESS else here
@@ -3516,15 +3590,18 @@ try:
 
                 # A manual switch should land on the first thing that works, not pay ~17 s for each
                 # profile that failed last time (measured: three such in a row before the fourth held).
-                ordered.sort(key=_shaky)
+                if nova_next is None:
+                    ordered.sort(key=_shaky)
                 self.log_func(f"[RU] [AWG] Переключение на следующий профиль: {reason}.")
                 generation = self._selection_generation
                 self.is_connected = False
                 self._stop_awg_proxy_process(reset_backend=True, force_orphans=True)
                 self._awg_recovery_block_until = 0.0
                 tried = 0
+                switch_started = time.monotonic()
                 for attempt in ordered:
-                    if is_closing or tried >= self.AWG_RECOVERY_PROFILE_BUDGET:
+                    if (is_closing or tried >= self.AWG_RECOVERY_PROFILE_BUDGET
+                            or time.monotonic() - switch_started >= nova_profiles.AUTO_MODE_BUDGET_SEC):
                         break
                     if self._selection_generation != generation:
                         return ""
@@ -3787,6 +3864,7 @@ try:
                     stdin=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
+                self._attempt_started_helper = True  # a REAL attempt: the failure below is the node's (strikes)
                 self.vless_active_profile_name = profile_id
                 self.vless_runtime_config_path = config_path
                 self.active_backend = "vless"
@@ -6107,6 +6185,29 @@ try:
             pass
         return proxies
 
+    def _api_proxies_cf():
+        """`_api_proxies()` plus the local tunnels that can carry Cloudflare's API when Opera and the
+        relays cannot: Tor's HTTP CONNECT port (1378, no token) while Tor carries, then the primary
+        slot's SOCKS5 port (1370, unauthenticated: browsers take it from the PAC without a login).
+
+        For nova-go only. nova_proton and TorManager take `_api_proxies()` and speak http(s) proxies
+        only, and nova-go reads `socks5://` itself, resolving the name through the tunnel. The tunnels
+        come last: a port that is open does not prove its tunnel carries, and a dead one costs a
+        connect timeout. Loopback routes are never quarantined (nova-go's route memory).
+        """
+        proxies = list(_api_proxies())
+        try:
+            if tor_route_ready() and is_local_port_open_quick(1378):
+                proxies.append("http://127.0.0.1:1378")
+        except Exception:
+            pass
+        try:
+            if is_local_port_open_quick(1370):
+                proxies.append("socks5://127.0.0.1:1370")
+        except Exception:
+            pass
+        return proxies
+
     def _nova_go_api_env(first_proxy=""):
         """Environment for a nova-go Cloudflare API call: the Nova relays as extra routes.
 
@@ -6115,11 +6216,16 @@ try:
         command line, where any local process could read them.
         """
         env = dict(os.environ)
-        routes = [p for p in _api_proxies() if p and p != first_proxy]
+        routes = [p for p in _api_proxies_cf() if p and p != first_proxy]
         if routes:
             env["NOVA_API_PROXY"] = " ".join(routes)
         else:
             env.pop("NOVA_API_PROXY", None)
+        # nova-go remembers which direct route answered and which relays were dead (advisory file).
+        try:
+            env["NOVA_API_STATE"] = os.path.join(get_base_dir(), "temp", "cf_api_state.json")
+        except Exception:
+            env.pop("NOVA_API_STATE", None)
         return env
 
     def _parse_nova_go_events(text, prefix="NOVA_MASQUE"):
@@ -6264,6 +6370,10 @@ try:
         SUBS_TIMEOUT_SEC = 180
         BACKFILL_INTERVAL_SEC = 1800.0
         BACKFILL_SETTLE_SEC = 30.0
+        # While WARP or MASQUE registration is waiting for a route to the Cloudflare API (nothing
+        # reached it, so no device was created), the 30-min throttle would hide a tunnel that just
+        # came up: ask the planner every couple of minutes instead (it is cheap and cooldown-gated).
+        UNREACHABLE_RETRY_POLL_SEC = 120.0
         MASQUE_REGISTER_TIMEOUT_SEC = 150
         MASQUE_PROBE_TIMEOUT_SEC = 40
         MASQUE_PROBE_SNI = "www.google.com"
@@ -6279,6 +6389,12 @@ try:
             # One issuing pipeline at a time: a backfill and a manual re-issue never interleave steps.
             self._pipeline_lock = threading.Lock()
             self._masque_failed_at = 0.0
+            # How the last MASQUE registration failed: nova-go exit 20 = no route reached the API.
+            self._masque_unreachable = False
+            self._masque_failed_routes = []
+            self._masque_last_unreachable = False
+            # Kinds (STEP_WARP / STEP_MASQUE) whose last attempt ended "unreachable".
+            self._unreachable_kinds = set()
 
         # -- state -------------------------------------------------------------------------
 
@@ -6342,15 +6458,24 @@ try:
 
         # -- issuing -----------------------------------------------------------------------
 
-        def generate_warp(self, force=False, wait=False):
+        @staticmethod
+        def _lower_thread_priority():
+            """Background issuing yields to the person's own work (Windows THREAD_PRIORITY_BELOW_NORMAL)."""
+            with contextlib.suppress(Exception):
+                kernel32 = ctypes.windll.kernel32
+                kernel32.SetThreadPriority(kernel32.GetCurrentThread(), -1)
+
+        def generate_warp(self, force=False, wait=False, background=False):
             def _work():
+                if background:
+                    self._lower_thread_priority()
                 nova_go = self._nova_go_path()
                 if not os.path.exists(nova_go):
                     self.log_func("[WARP-ген] Выпуск невозможен: nova-go.exe не найден.")
                     return False, "nova-go.exe не найден"
                 # Direct first (nova-go's own auto), then local Opera, then the Nova relays, whose
                 # allow-list carries api.cloudflareclient.com: registration survives a blocked API.
-                api_proxy = _api_proxies() or None
+                api_proxy = _api_proxies_cf() or None
                 result = nova_warp_generator.generate(
                     get_base_dir(),
                     nova_go,
@@ -6358,6 +6483,7 @@ try:
                     force=bool(force),
                     api_proxy=api_proxy,
                     progress=self._progress("warp"),
+                    background=bool(background),
                 )
                 if result.get("ok"):
                     best = result.get("best_rtt_ms")
@@ -6367,13 +6493,16 @@ try:
 
             return self._run("warp", _work, wait, "NovaWarpGenerate")
 
-        def issue_proton(self, force=False, wait=False, interactive=False):
+        def issue_proton(self, force=False, wait=False, interactive=False, background=False):
             """`interactive`: the owner pressed the button, so a Proton CAPTCHA (Code 9001) opens a
-            window for them to solve. Unattended runs never pop a window up or block on one."""
+            window for them to solve. Unattended runs never pop a window up or block on one.
+            `background`: an automatic run, below normal thread priority."""
             def _human_verifier(api_host, hv_token, proxy_url):
                 return nova_captcha_window.solve(api_host, hv_token, proxy=proxy_url)
 
             def _work():
+                if background:
+                    self._lower_thread_priority()
                 base = get_base_dir()
                 # What this install's own tunnels and pre-start handshakes proved, never a probe run
                 # for the purpose: nodes that carried traffic keep their places in the new set.
@@ -6453,6 +6582,8 @@ try:
                     return True, f"готово: «{profile_name}»"
                 exit_event = next((e for e in reversed(events) if e.get("ev") == "exit"), None) or {}
                 detail = str(exit_event.get("class") or "").strip() or f"код {result.returncode}"
+                # Exit 20: no route produced an HTTP answer, so Cloudflare created no device.
+                self._masque_last_unreachable = int(result.returncode) == 20
                 self.log_func(f"[Profiles] MASQUE: регистрация не удалась: {detail} (код {result.returncode}).")
                 return False, f"не удалось: {detail}"
 
@@ -6863,7 +6994,8 @@ try:
             """
             now = time.time()
             with self._lock:
-                if now - self._backfill_at < self.BACKFILL_INTERVAL_SEC:
+                interval = self.UNREACHABLE_RETRY_POLL_SEC if self._unreachable_kinds else self.BACKFILL_INTERVAL_SEC
+                if now - self._backfill_at < interval:
                     return False
                 self._backfill_at = now
             threading.Thread(target=self._backfill_worker, daemon=True, name="NovaProfilesBackfill").start()
@@ -6896,13 +7028,16 @@ try:
                     self.log_func(f"[Profiles] Не удалось решить, что выпускать: {type(e).__name__}")
                     return
                 if not steps:
+                    # Nothing left to issue (or still cooling down for a longer reason): the fast
+                    # polling for a new route to the Cloudflare API has nothing to wait for.
+                    self._unreachable_kinds.clear()
                     if IS_DEBUG_MODE:
                         self.log_func("[Profiles] Свои профили и мосты Tor свежие — выпуск не нужен.")
                     return
                 self.log_func("[Profiles] Выпуск своих профилей после подключения: "
                               + "; ".join(f"{step} — {why}" for step, why in steps) + ". "
                               "Текущее подключение не трогаем: новые профили применятся при следующем переключении.")
-                self._run_steps(steps, force=False)
+                self._run_steps(steps, force=False, background=True)
             finally:
                 self._pipeline_lock.release()
 
@@ -6952,31 +7087,139 @@ try:
                 masque_failed_at=self._masque_failed_at,
                 now=time.time(),
                 proxies=_api_proxies(),
+                cf_routes=self._cf_routes_now(),
+                masque_unreachable=self._masque_unreachable,
+                masque_failed_routes=self._masque_failed_routes,
                 subscriptions_due=subscriptions_due,
+                ledger=nova_issue_policy.load(base),
+                app_version=CURRENT_VERSION,
             )
             if not os.path.exists(self._nova_go_path()):
                 steps = [s for s in steps if s[0] not in (nova_issuance.STEP_WARP, nova_issuance.STEP_MASQUE)]
             return steps
 
-        def _run_steps(self, steps, force):
+        # Steps that register something or scan the network: only these wait for a calm PC.
+        _ISSUING_STEPS = (nova_issuance.STEP_WARP, nova_issuance.STEP_MASQUE, nova_issuance.STEP_PROTON,
+                          nova_issuance.STEP_PROTON_FRESH)
+        GATE_LOG_EVERY_SEC = 1800.0
+
+        def _pause(self, seconds):
+            waited = 0.0
+            while waited < seconds:
+                if is_closing:
+                    return False
+                time.sleep(0.5)
+                waited += 0.5
+            return True
+
+        def _gate_open(self):
+            """Android D45 gate: no issuing while the channel/CPU is busy or the battery is low."""
+            try:
+                opened, why = nova_issue_policy.check_gate(should_stop=lambda: is_closing)
+            except Exception as e:
+                self.log_func(f"[Profiles] Не удалось измерить загрузку ПК ({type(e).__name__}) — выпуск идёт без проверки.")
+                return True
+            if not opened:
+                now = time.time()
+                if now - getattr(self, "_gate_logged_at", 0.0) >= self.GATE_LOG_EVERY_SEC:
+                    self._gate_logged_at = now
+                    self.log_func(f"[Profiles] Выпуск своих профилей отложен: {why}. Повторим, когда станет свободно.")
+            return opened
+
+        def _cf_routes_now(self):
+            """Credential-free keys of the Cloudflare API routes nova-go would get right now."""
+            try:
+                return nova_warp_generator.route_keys(_api_proxies_cf())
+            except Exception:
+                return []
+
+        def _warp_failed_unreachable(self, since):
+            """True when the WARP run that started at `since` ended because no route reached the API."""
+            try:
+                state = nova_warp_generator.load_state(get_base_dir())
+                return bool(state.get("failed_unreachable")) and float(state.get("failed_at") or 0.0) >= since
+            except Exception:
+                return False
+
+        def _stamp(self, kind, ok, force, unreachable=False):
+            """Ledger entry after an issuing step: success stamps this version, an automatic failure backs off.
+
+            A run that never reached the Cloudflare API is not an attempt: nothing was registered, and
+            letting it count would spend the 1 h / 3 h / 12 h / 24 h back-off (and the per-version
+            attempt cap) on a network that is down, not on a set that cannot be issued.
+            """
+            if not ok and (force or unreachable):
+                return  # a manual failure is the owner's retry, not the schedule's
+            with contextlib.suppress(Exception):
+                nova_issue_policy.record_attempt(get_base_dir(), kind, CURRENT_VERSION, bool(ok))
+
+        def _warp_set_is_useful(self):
+            try:
+                profiles = nova_warp_generator.load_state(get_base_dir()).get("profiles")
+                return len(profiles or {}) >= nova_issue_policy.MIN_USEFUL_WARP_PROFILES
+            except Exception:
+                return False
+
+        def _run_steps(self, steps, force, background=False, _retry=False):
+            """Run the planned steps. `background` = the automatic pipeline: issuing steps wait for a calm
+            PC, run at low priority and are spaced STEP_SPACING_SEC apart; a manual run (force) never waits.
+
+            A WARP or MASQUE step that ends "unreachable" (no route got an answer from Cloudflare, so
+            nothing was registered) is retried once at the end of the run when a route to the API
+            exists now that did not at its start (a tunnel came up meanwhile); otherwise it waits for
+            the planner (short cooldown, `UNREACHABLE_RETRY_POLL_SEC` polling, lifted by a new route).
+            """
+            deferred = False
+            issued_one = False
+            routes_at_start = set(self._cf_routes_now())
+            unreachable_failed = []
             for step, _why in steps:
                 if is_closing:
                     return
+                if background and step in self._ISSUING_STEPS:
+                    if deferred:
+                        continue
+                    if issued_one and not self._pause(nova_issue_policy.STEP_SPACING_SEC):
+                        return
+                    if not self._gate_open():
+                        # Not a failure: forget the throttle stamp so the 5-minute heartbeat asks again.
+                        deferred = True
+                        with self._lock:
+                            self._backfill_at = 0.0
+                        continue
+                    issued_one = True
                 try:
                     if step == nova_issuance.STEP_WARP:
-                        self.generate_warp(force=force, wait=True)
+                        step_started = time.time()
+                        ok = (self.generate_warp(force=force, wait=True, background=True) if background
+                              else self.generate_warp(force=force, wait=True))
+                        unreachable = (not ok) and self._warp_failed_unreachable(step_started)
+                        self._stamp(nova_issue_policy.KIND_WARP, ok and self._warp_set_is_useful(), force,
+                                    unreachable=unreachable)
+                        self._note_unreachable(step, ok, unreachable, unreachable_failed)
                     elif step == nova_issuance.STEP_MASQUE:
+                        self._masque_last_unreachable = False
                         ok = self.register_masque(wait=True, replace=force)
+                        unreachable = (not ok) and bool(self._masque_last_unreachable)
                         if not ok:
                             self._masque_failed_at = time.time()
-                        elif force:
-                            self._drop_older_masque_profiles(get_base_dir(), self._newest_masque_profile_id())
+                            self._masque_unreachable = unreachable
+                            self._masque_failed_routes = sorted(routes_at_start) if unreachable else []
+                        else:
+                            self._masque_unreachable = False
+                            self._masque_failed_routes = []
+                            if force:
+                                self._drop_older_masque_profiles(get_base_dir(), self._newest_masque_profile_id())
+                        self._note_unreachable(step, ok, unreachable, unreachable_failed)
                     elif step == nova_issuance.STEP_PROTON:
-                        self.issue_proton(force=force, wait=True)
+                        ok = (self.issue_proton(force=force, wait=True, background=True) if background
+                              else self.issue_proton(force=force, wait=True))
+                        self._stamp(nova_issue_policy.KIND_PROTON, ok, force)
                     elif step == nova_issuance.STEP_PROTON_FRESH:
                         # Forced on purpose: every ordinary guard says the set is fresh, and every
                         # one of them is looking at the clock rather than at the nodes.
-                        self.issue_proton(force=True, wait=True)
+                        ok = self.issue_proton(force=True, wait=True)
+                        self._stamp(nova_issue_policy.KIND_PROTON, ok, True)
                     elif step == nova_issuance.STEP_PROTON_RTT:
                         self.measure_proton_distances(force=force)
                     elif step == nova_issuance.STEP_TOR_BRIDGES:
@@ -6989,6 +7232,21 @@ try:
                         self.refresh_subscriptions(force=force, wait=True, only_due=not force)
                 except Exception as e:
                     self.log_func(f"[Profiles] Шаг выпуска «{step}» упал: {type(e).__name__}")
+            if unreachable_failed and not _retry and not is_closing:
+                appeared = sorted(set(self._cf_routes_now()) - routes_at_start)
+                if appeared:
+                    self.log_func("[Profiles] К API Cloudflare появился новый маршрут "
+                                  f"({', '.join(appeared)}) — повторяем регистрацию, которая не дошла до сервера.")
+                    self._run_steps([(step, "появился новый маршрут к API") for step in unreachable_failed],
+                                    force=force, background=background, _retry=True)
+
+        def _note_unreachable(self, step, ok, unreachable, unreachable_failed):
+            """Book how a WARP/MASQUE step ended for the fast re-poll and the end-of-run retry."""
+            if unreachable:
+                self._unreachable_kinds.add(step)
+                unreachable_failed.append(step)
+            else:
+                self._unreachable_kinds.discard(step)
 
         def measure_proton_distances(self, force=False):
             """TCP 443 connect time to every Proton node: the «nearest first» order of the queue.
@@ -7051,20 +7309,33 @@ try:
             return False
 
     # Nova list batch scan (nova_list_pages / nova_subscriptions.scan_nova_list): HTTPS 204 through
-    # each node in batches of 50 from the head of the list, more pages only while fewer than 5 are
-    # alive, sockets bound to the physical adapter so an active VPN does not answer for the node.
+    # each node in batches of PAGE_SIZE from the head of the list, more pages while fewer than MIN_ALIVE
+    # are alive. Sockets are bound to the physical adapter so an active VPN does not answer for the
+    # node; with no adapter found and a VPN up nothing is probed. A connect scans only to
+    # CONNECT_MIN_ALIVE and kicks the rest as a background top-up (run_nova_list_scan_for_connect).
     # One scan at a time; the verdicts land in profile-stats, which «Профили» re-reads every 1.5 s.
     _nova_list_scan_lock = threading.Lock()
-    _nova_list_scan_kick = {"running": False}
+    _nova_list_scan_kick = {"running": False, "again": False}
+    _nova_list_scan_preempt = {"want": 0}  # a foreground (connect) scan waiting: the background one yields
 
     def run_nova_list_scan(force_first=True, budget_sec=nova_profiles.AUTO_MODE_BUDGET_SEC,
-                           should_abort=None, log=None):
+                           should_abort=None, log=None, min_alive=nova_list_pages.MIN_ALIVE, background=False):
         say = log or _profiles_log
         base = get_base_dir()
         engine = nova_proxy.engine_path()
         if not os.path.isfile(engine):
             say("[Nova list] Проверка пропущена: nova-proxy.exe не найден.")
             return None
+        interface = nova_list_pages.detect_physical_interface(log=say)
+        if not interface:
+            vpn_up = True  # cannot tell = assume a tunnel: better no scan than a scan through it
+            with contextlib.suppress(Exception):
+                vpn_up = bool(is_vpn_active_func())
+            if not nova_list_pages.unbound_probe_allowed(interface, vpn_up):
+                say("[Nova list] Проверка пропущена: физический адаптер не найден, а VPN включён — "
+                    "пинг ушёл бы через туннель.")
+                return None
+            say("[Nova list] VPN не активен — проверка идёт без привязки к адаптеру.")
         records = {}
 
         def proxy_of(profile_id):
@@ -7082,42 +7353,69 @@ try:
             # probe-list cannot confirm a chained node; it would only answer "dependency".
             return None if node.dependencies else node.proxy
 
+        # Lists are downloaded direct or through the working local VPN proxy (never a dead path).
         proxies = []
         with contextlib.suppress(Exception):
             if is_local_port_open_quick(1371):
                 proxies.append("http://127.0.0.1:1371")
         probe = nova_list_pages.probe_runner(
             engine, proxy_of,
-            interface_provider=lambda: nova_list_pages.detect_physical_interface(log=say))
+            interface_provider=lambda: nova_list_pages.detect_physical_interface() or interface)
 
         def aborted():
-            return is_closing or bool(should_abort and should_abort())
+            return (is_closing or bool(should_abort and should_abort())
+                    or (background and _nova_list_scan_preempt["want"] > 0))
 
+        if not background:
+            _nova_list_scan_preempt["want"] += 1
         with _nova_list_scan_lock:
+            if not background:
+                _nova_list_scan_preempt["want"] -= 1
             try:
                 return nova_subscriptions.scan_nova_list(
-                    base, probe, force_first=force_first, budget_sec=budget_sec,
+                    base, probe, force_first=force_first, budget_sec=budget_sec, min_alive=min_alive,
                     should_abort=aborted, proxies=proxies, log=say)
             except Exception as e:
                 say(f"[Nova list] Проверка не удалась: {type(e).__name__}")
                 return None
 
-    def kick_nova_list_scan(reason=""):
-        """Forced scan on a background thread (the «Nova» chip clicked while nothing reconnects)."""
+    def kick_nova_list_scan(reason="", force_first=True):
+        """Scan toward MIN_ALIVE on a background thread (the chip clicked, or a connect's top-up).
+
+        A kick while one runs asks it to go round once more (it also does so after yielding to a connect).
+        """
         if _nova_list_scan_kick["running"]:
+            _nova_list_scan_kick["again"] = True
             return False
         _nova_list_scan_kick["running"] = True
 
         def _worker():
+            first = bool(force_first)
             try:
                 if reason:
-                    _profiles_log(f"[Nova list] Пересортировка по пингу: {reason}.")
-                run_nova_list_scan(force_first=True)
+                    _profiles_log(f"[Nova list] Фоновая проверка: {reason}.")
+                while True:
+                    _nova_list_scan_kick["again"] = False
+                    result = run_nova_list_scan(force_first=first, background=True)
+                    first = False
+                    yielded = result is not None and result.stop == "aborted" and not is_closing
+                    if is_closing or not (_nova_list_scan_kick["again"] or yielded):
+                        break
             finally:
                 _nova_list_scan_kick["running"] = False
 
         threading.Thread(target=_worker, daemon=True, name="NovaListScan").start()
         return True
+
+    def run_nova_list_scan_for_connect(force_first=True, budget_sec=nova_profiles.AUTO_MODE_BUDGET_SEC,
+                                       should_abort=None, log=None):
+        """The scan a connect waits for: stops at CONNECT_MIN_ALIVE live nodes, then the top-up to
+        MIN_ALIVE goes on in the background (nova_list_pages.top_up_needed)."""
+        result = run_nova_list_scan(force_first=force_first, budget_sec=budget_sec, should_abort=should_abort,
+                                    log=log, min_alive=nova_list_pages.CONNECT_MIN_ALIVE)
+        if nova_list_pages.top_up_needed(result) and not is_closing:
+            kick_nova_list_scan(f"доскан до {nova_list_pages.MIN_ALIVE} живых", force_first=False)
+        return result
 
     _tor_pac_watcher_state = {"started": False}
 
@@ -7461,8 +7759,8 @@ try:
                 return is_closing or (callable(still_current) and not still_current())
 
             try:
-                result = run_nova_list_scan(force_first=False, budget_sec=self.NOVA_SCAN_BUDGET_SEC,
-                                            should_abort=aborted, log=self.log_func)
+                result = run_nova_list_scan_for_connect(force_first=False, budget_sec=self.NOVA_SCAN_BUDGET_SEC,
+                                                        should_abort=aborted, log=self.log_func)
             except Exception:
                 return plan
             results = dict(result.results) if result is not None else {}
@@ -7554,8 +7852,10 @@ try:
                     with self._lock:
                         self._tried_ids = set()
                 tried = 0
+                walk_started = time.monotonic()
                 for index, attempt in enumerate(plan):
-                    if is_closing or not still_current() or tried >= self.WALK_BUDGET:
+                    if (is_closing or not still_current() or tried >= self.WALK_BUDGET
+                            or time.monotonic() - walk_started >= nova_vpn_slots.AUTO_MODE_BUDGET_SEC):
                         break
                     record = attempt["profile"]
                     profile_id = str(record.get("id") or "")
@@ -15270,13 +15570,44 @@ function FindProxyForURLEx(url, host) {{
                 log_func(f"[TgRelay] Не удалось применить настройки релея: {exc}")
             return {}
 
+    # load_routing_settings is called ~30 places, several of them per refresh tick of an open window
+    # («Профили» asked twice every 1.5 s through tor_status, «Настройки» before every show). On an HDD
+    # each call was an exists + open + read of a cold file; now an unchanged file costs one stat.
+    # Keyed by (mtime_ns, size); every caller gets its own deep copy, so a caller that edits the dict
+    # before saving it cannot change what the next caller reads.
+    _routing_settings_cache = {"key": None, "value": None}
+    _routing_settings_cache_lock = threading.Lock()
+
+    def _routing_settings_signature():
+        try:
+            st = os.stat(ROUTING_SETTINGS_PATH)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _forget_routing_settings_cache():
+        with _routing_settings_cache_lock:
+            _routing_settings_cache["key"] = None
+            _routing_settings_cache["value"] = None
+
     def load_routing_settings():
+        signature = _routing_settings_signature()
+        if signature is not None:
+            with _routing_settings_cache_lock:
+                if _routing_settings_cache["key"] == signature:
+                    return copy.deepcopy(_routing_settings_cache["value"])
         payload = load_json_robust(ROUTING_SETTINGS_PATH, None)
         if isinstance(payload, dict) and payload:
             normalized = normalize_routing_settings(payload)
             if payload.get("version") != CURRENT_VERSION:
                 with contextlib.suppress(Exception):
                     save_routing_settings(normalized)
+            elif signature is not None:
+                # The stat came before the read: a write in between leaves an older key, which the
+                # next call sees as a change and reads again — never the other way round.
+                with _routing_settings_cache_lock:
+                    _routing_settings_cache["key"] = signature
+                    _routing_settings_cache["value"] = copy.deepcopy(normalized)
             return normalized
         legacy_payload = load_json_robust(LEGACY_ROUTING_SETTINGS_PATH, None)
         if isinstance(legacy_payload, dict) and legacy_payload:
@@ -15288,7 +15619,11 @@ function FindProxyForURLEx(url, host) {{
 
     def save_routing_settings(data):
         payload = normalize_routing_settings(data)
-        save_json_safe(ROUTING_SETTINGS_PATH, payload)
+        _forget_routing_settings_cache()
+        try:
+            save_json_safe(ROUTING_SETTINGS_PATH, payload)
+        finally:
+            _forget_routing_settings_cache()
         # Also write to the legacy root path for backward compatibility
         # with older installations and external tools.
         save_json_safe(LEGACY_ROUTING_SETTINGS_PATH, payload)
@@ -31391,8 +31726,9 @@ function FindProxyForURLEx(url, host) {{
         def configure(self, **kwargs): self.config(**kwargs)
 
     class CanvasLabel:
-        def __init__(self, canvas, x, y, text, font, fg="black", anchor="center", bg_color=None, spacing=0, outline_color="black", outline_width=1, formatter=None, zone=None):
+        def __init__(self, canvas, x, y, text, font, fg="black", anchor="center", bg_color=None, spacing=0, outline_color="black", outline_width=1, formatter=None, zone=None, glow=False):
             self.canvas = canvas
+            self.glow = glow      # soft halo in the text colour, like the status caption
             self.zone = zone      # glass zone of the main window: the folded glass hugs this text (NOVA toggle)
             self.fg = fg
             self.bg_color = bg_color
@@ -31442,7 +31778,7 @@ function FindProxyForURLEx(url, host) {{
                 self.x, self.y, text=text, font=self.font_spec, fill=self.fg, anchor=anchor,
                 tags=("zone_" + self.zone,) if self.zone else ()))
             self._zone_changed()
-            if self.formatter is nova_desktop_ui.status_text:
+            if self.formatter is nova_desktop_ui.status_text or self.glow:
                 pixels = abs(self.font_spec[1]) if self.font_spec[1] < 0 else self.font_spec[1] * float(self.canvas.tk.call("tk", "scaling"))
                 key = (text, pixels, self.fg)
                 if key != self._glow_key:
@@ -31860,16 +32196,34 @@ function FindProxyForURLEx(url, host) {{
                     text = nova_desktop_ui.fit_caption(text, limit, self.tk_font.measure)
                     fitted.append((text, color))
                 segments = fitted
+            # A leading emoji is drawn by itself in the emoji face: inside the text it falls back to a
+            # symbol font and comes out a speck next to the capitals (probed in a bare Tk window).
+            leads = []
+            stripped = []
+            for text, color in segments:
+                lead = ""
+                if text and ord(text[0]) >= 0x1F300:
+                    lead, text = text[0], text[1:].lstrip()
+                leads.append(lead)
+                stripped.append((text, color))
+            segments = stripped
+            emoji_font = None
+            lead_widths = [0] * len(leads)
+            if any(leads):
+                emoji_font = ("Segoe UI Emoji", int(round(abs(self.font_spec[1] if len(self.font_spec) > 1 else 9) * 1.3)))
+                emoji_measure = tkfont.Font(font=emoji_font).measure
+                space_w = self.tk_font.measure(" ")
+                lead_widths = [emoji_measure(lead) + space_w if lead else 0 for lead in leads]
             widths = []
             char_widths = []
-            for text, color in segments:
+            for index, (text, color) in enumerate(segments):
                 if self._gradient_stops(color):
                     chars = [self.tk_font.measure(char) for char in text]
                     char_widths.append(chars)
-                    widths.append(sum(chars))
+                    widths.append(lead_widths[index] + sum(chars))
                 else:
                     char_widths.append(None)
-                    widths.append(self.tk_font.measure(text))
+                    widths.append(lead_widths[index] + self.tk_font.measure(text))
             total_width = sum(widths) + self.gap * max(0, len(widths) - 1)
 
             if self.anchor == "center":
@@ -31891,10 +32245,19 @@ function FindProxyForURLEx(url, host) {{
                         item_y += round(24 * UI_SCALE)
                 stops = self._gradient_stops(color)
                 seg_items = []
+                text_x = cur_x + lead_widths[index]
+                text_w = seg_width - lead_widths[index]
+                if leads[index]:
+                    # Not in seg_items: the hover weight change would swap the emoji face for a text one.
+                    lead_id = self.canvas.create_text(
+                        cur_x, item_y, text=leads[index], font=emoji_font,
+                        fill=stops[0][1] if stops else color, anchor="w")
+                    self.text_items.append(lead_id)
+                    self._bind_segment_item(lead_id, index)
                 if stops:
-                    char_x = cur_x
+                    char_x = text_x
                     for char, char_w in zip(text, char_widths[index]):
-                        share = ((char_x - cur_x) + char_w / 2.0) / float(max(1, seg_width))
+                        share = ((char_x - text_x) + char_w / 2.0) / float(max(1, text_w))
                         item_id = self.canvas.create_text(
                             char_x + char_w / 2.0,
                             item_y,
@@ -31908,7 +32271,7 @@ function FindProxyForURLEx(url, host) {{
                         char_x += char_w
                 else:
                     item_id = self.canvas.create_text(
-                        cur_x + seg_width / 2,
+                        text_x + text_w / 2,
                         item_y,
                         text=text,
                         font=self.font_spec,
@@ -32858,17 +33221,17 @@ function FindProxyForURLEx(url, host) {{
         log_fg = SETTINGS_THEME["text"]
         log_bg = SETTINGS_THEME["panel"]
 
-        update_button_default_fg = COLOR_TEXT_NORMAL
-        update_button_available_fg = COLOR_TEXT_NORMAL
+        update_button_default_fg = SETTINGS_THEME["accent"]
+        update_button_available_fg = SETTINGS_THEME["accent"]
         btn_update = CanvasLabel(
             main_canvas,
             *initial_layout["update"],
             "Обновить до",
-            main_fonts["caption"],
+            main_fonts["notice"],
             fg=update_button_available_fg,
             anchor="center",
             outline_width=0,
-            zone="update",
+            glow=True,
         )
         btn_update.bind("<Button-1>", lambda e: request_installer_update())
         btn_update.bind("<Enter>", lambda e: main_canvas.config(cursor="hand2"))
@@ -32883,6 +33246,13 @@ function FindProxyForURLEx(url, host) {{
         btn_settings = None
         btn_profiles = None
         refresh_update_button()
+        # Dev only: `--fake-update[=<версия>]` shows the «Обновить до …» button without a release.
+        # Source runs never check GitHub (not compiled), so this is the only way to see it.
+        for _fake_arg in sys.argv:
+            if _fake_arg == "--fake-update" or _fake_arg.startswith("--fake-update="):
+                set_update_state(available=True, checking=False,
+                                 version=_fake_arg.partition("=")[2] or CURRENT_VERSION)
+                break
 
         ui_jobs = nova_desktop_ui.UiJobs(root)
         ui_log_pump.start(root, _deliver_log_rows)
@@ -34517,10 +34887,11 @@ function FindProxyForURLEx(url, host) {{
         INDICATOR_WARP = "#8FD8FF"
         INDICATOR_EU = "#D8B6BF"
         INDICATOR_TOR = "#B79CFF"
-        # Градиент вордмарка dns-ai.ru, взят с самого сайта:
-        # linear-gradient(100deg, #58a6ff 0%, #7ea6ff 45%, #a371f7 100%).
-        # Стопы, а не два конца: середина у логотипа сдвинута к 45 %.
-        INDICATOR_DNS_AI = ((0.0, "#58a6ff"), (0.45, "#7ea6ff"), (1.0, "#a371f7"))
+        # DNS-AI по нынешнему логотипу dns-ai.ru: лист на зелёной плашке (favicon.svg, #145a4b),
+        # листва сайта --lv3 #86b84e -> --lv1 #4f9a43 -> --lv2 #2f7a4a. Тёмный конец осветлён
+        # (#3f9a6a), иначе последняя буква тонет на тёмном стекле окна. Прежний сине-фиолетовый
+        # градиент (#58a6ff -> #a371f7) принадлежал старому вордмарку сайта.
+        INDICATOR_DNS_AI = ((0.0, "#86b84e"), (0.5, "#5fae55"), (1.0, "#3f9a6a"))
         INDICATOR_PENDING = "#777777"
 
         region_indicator_pill = CanvasRegionPill(
@@ -34580,7 +34951,7 @@ function FindProxyForURLEx(url, host) {{
                 return ""
             result = ctl.next_now()
             if result == "end":
-                ring = (nova_profiles.GROUP_MASQUE, nova_profiles.GROUP_CLOUDFLARE,
+                ring = (nova_profiles.GROUP_CLOUDFLARE, nova_profiles.GROUP_MASQUE,
                         nova_profiles.GROUP_PROTON, nova_profiles.GROUP_CUSTOM)
                 here = str(ctl.profile_runner().status().get("group") or "")
                 here = nova_profiles.GROUP_CUSTOM if here == nova_profiles.GROUP_VLESS else here
@@ -34607,7 +34978,7 @@ function FindProxyForURLEx(url, host) {{
         region_indicator_pill.set_next_handler(_switch_to_next_profile)
         indicator_log_state = {"shown": None}
 
-        # Строкой выше регионов: DNS-AI градиентом вордмарка dns-ai.ru значит,
+        # Строкой выше регионов: DNS-AI зелёным градиентом листвы dns-ai.ru значит,
         # что системный резолвер - это он и правила NRPT не нужны вовсе. Серый -
         # подмену делает Nova своим каскадом. Пусто - ни того, ни другого.
         dns_ai_indicator_pill = CanvasRegionPill(
@@ -34618,7 +34989,7 @@ function FindProxyForURLEx(url, host) {{
             anchor="e",
             bg_color=log_bg,
         )
-        dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", SETTINGS_THEME["muted"], "dns_ai")])
+        dns_ai_indicator_pill.set_regions([("🍃 DNS-AI", SETTINGS_THEME["muted"], "dns_ai")])
         dns_ai_install_state = {"busy": False, "menu": None}
 
         def _install_dns_ai():
@@ -34838,7 +35209,7 @@ function FindProxyForURLEx(url, host) {{
             dns_ai_install_state["menu"] = menu
             effective = get_dns_ai_effective_choice()
             busy = bool(dns_ai_install_state["busy"])
-            menu.add_command(label="⇄ DNS-AI", state="disabled")
+            menu.add_command(label="🍃 DNS-AI", state="disabled")
             menu.add_separator()
             for choice, caption in (("dns_ai", "Работать через DNS-AI"), ("system", "Использовать системный DNS")):
                 mark = "● " if effective == choice else "○ "
@@ -34972,8 +35343,8 @@ function FindProxyForURLEx(url, host) {{
             main_canvas.itemconfig(btn_toggle.text_id, font=btn_toggle.normal_font)
             status_label.font_spec = fonts["status"]
             status_label.tk_font.configure(family=fonts["status"][0], size=fonts["status"][1], weight="normal")
-            btn_update.font_spec = fonts["caption"]
-            btn_update.tk_font.configure(family=fonts["caption"][0], size=fonts["caption"][1], weight="normal")
+            btn_update.font_spec = fonts["notice"]
+            btn_update.tk_font.configure(family=fonts["notice"][0], size=fonts["notice"][1], weight="bold")
             btn_update.config(fg=SETTINGS_THEME["accent"])
             for pill, role in ((region_indicator_pill, "body"), (dns_ai_indicator_pill, "caption")):
                 pill.font_spec = fonts[role]
@@ -35178,11 +35549,11 @@ function FindProxyForURLEx(url, host) {{
                 # не гасит. Серый - уже про работу самой Nova: подмену делает
                 # её каскад NRPT, а его без разблокировки не бывает.
                 if system_dns_ai:
-                    dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", INDICATOR_DNS_AI, "dns_ai")])
+                    dns_ai_indicator_pill.set_regions([("🍃 DNS-AI", INDICATOR_DNS_AI, "dns_ai")])
                 elif ai_unlock_enabled and rules_applied:
-                    dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", INDICATOR_PENDING, "dns_ai")])
+                    dns_ai_indicator_pill.set_regions([("🍃 DNS-AI", INDICATOR_PENDING, "dns_ai")])
                 else:
-                    dns_ai_indicator_pill.set_regions([("⇄ DNS-AI", INDICATOR_PENDING, "dns_ai")])
+                    dns_ai_indicator_pill.set_regions([("🍃 DNS-AI", INDICATOR_PENDING, "dns_ai")])
             except:
                 pass
 

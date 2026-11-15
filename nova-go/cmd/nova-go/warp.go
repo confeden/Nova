@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"nova-pc/nova-go/internal/apistate"
 	"nova-pc/nova-go/warp"
 )
 
@@ -104,7 +105,7 @@ func warpRegister(args []string, stdout io.Writer) int {
 	publicKey := fs.String("public-key", "", "base64 X25519 public key of the device (required)")
 	model := fs.String("model", "PC", "registration model")
 	locale := fs.String("locale", "en-US", "registration locale")
-	apiProxy := fs.String("api-proxy", "", "HTTP CONNECT proxy, e.g. http://127.0.0.1:1371 (default: $"+warpProxyEnv+")")
+	apiProxy := fs.String("api-proxy", "", "HTTP CONNECT or SOCKS5 proxy, e.g. http://127.0.0.1:1371 or socks5://127.0.0.1:1370 (default: $"+warpProxyEnv+")")
 	apiMode := fs.String("api-mode", "auto", "auto (direct, then proxy) | direct | proxy | plain")
 	timeout := fs.Duration("timeout", 60*time.Second, "whole operation")
 
@@ -148,7 +149,7 @@ func warpRegister(args []string, stdout io.Writer) int {
 		PublicKey: *publicKey,
 		Model:     *model,
 		Locale:    *locale,
-		API:       warp.APIOptions{Mode: mode, ProxyURL: proxyURL, Logf: warpLog},
+		API:       warp.APIOptions{Mode: mode, ProxyURL: proxyURL, Logf: warpLog, State: apistate.FromEnv()},
 	})
 	if err != nil {
 		var statusErr *warp.StatusError

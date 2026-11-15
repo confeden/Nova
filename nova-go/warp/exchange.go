@@ -77,6 +77,14 @@ func newAPIHTTPRequest(ctx context.Context, apiReq APIRequest) (*http.Request, e
 // spoken as HTTP/2 when negotiated and as HTTP/1.1 otherwise. Certificates are verified against
 // APIHost; the pinned address never relaxes that.
 func tlsExchange(ctx context.Context, conn net.Conn, helloID utls.ClientHelloID, handshakeTimeout time.Duration, apiReq APIRequest, roots *x509.CertPool) (*APIResponse, error) {
+	return tlsExchangeGated(ctx, conn, helloID, handshakeTimeout, apiReq, roots, nil)
+}
+
+// tlsExchangeGated is tlsExchange with an apiGate between the handshake and the request. Parallel
+// attempts share one gate so that only one of them sends a request at a time: a registration is a
+// POST that creates a device, and two completed handshakes must not make two devices. The gate hears
+// the outcome before it lets the next attempt in, so the next one sees an answered call.
+func tlsExchangeGated(ctx context.Context, conn net.Conn, helloID utls.ClientHelloID, handshakeTimeout time.Duration, apiReq APIRequest, roots *x509.CertPool, gate apiGate) (resp *APIResponse, err error) {
 	uconn := utls.UClient(conn, &utls.Config{
 		ServerName: APIHost,
 		NextProtos: []string{"http/1.1"},
@@ -89,6 +97,13 @@ func tlsExchange(ctx context.Context, conn net.Conn, helloID utls.ClientHelloID,
 	}
 	if err := uconn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("tls handshake failed: %w", err)
+	}
+	if gate != nil {
+		done, gateErr := gate(ctx)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		defer func() { done(resp, err) }()
 	}
 	if err := uconn.SetDeadline(boundedDeadline(ctx, requestIOTimeout)); err != nil {
 		return nil, fmt.Errorf("set request deadline: %w", err)

@@ -588,8 +588,19 @@ class AppearanceWindow:
     # ----- previews ---------------------------------------------------------------------------------
 
     def _custom_cell(self):
-        """The chosen picture cut to the tile (cover fit), or None."""
+        """The chosen picture cut to the tile (cover fit), or None.
+
+        Kept per (path, mtime, size, tile): every hue step repaints the tiles, and opening and decoding
+        a photo from an HDD each time was the slowest part of it."""
         path = self.preferences.get("custom_image") or ""
+        try:
+            st = os.stat(path) if path else None
+        except OSError:
+            st = None
+        key = (path, st.st_mtime_ns if st else 0, st.st_size if st else 0, tuple(self.tile_size))
+        cached = getattr(self, "_custom_cell_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         try:
             with Image.open(path) as picture:
                 picture = picture.convert("RGB")
@@ -599,18 +610,31 @@ class AppearanceWindow:
         size = (max(1, round(picture.width * scale)), max(1, round(picture.height * scale)))
         picture = picture.resize(size, Image.Resampling.BILINEAR)
         left, top = (size[0] - self.tile_size[0]) // 2, (size[1] - self.tile_size[1]) // 2
-        return picture.crop((left, top, left + self.tile_size[0], top + self.tile_size[1]))
+        cell = picture.crop((left, top, left + self.tile_size[0], top + self.tile_size[1]))
+        self._custom_cell_cache = (key, cell)
+        return cell
+
+    def _atlas_tile(self, key):
+        """An atlas cell scaled to the tile, scaled once per tile size (the hue is applied per paint)."""
+        cache = getattr(self, "_atlas_tile_cache", None)
+        size = tuple(self.tile_size)
+        if cache is None or cache[0] is not self._atlas or cache[1] != size:
+            cache = self._atlas_tile_cache = (self._atlas, size, {})
+        cells = cache[2]
+        if key not in cells:
+            cell = atlas_cell(self._atlas, key)
+            cells[key] = None if cell is None else cell.resize(size, Image.Resampling.BILINEAR)
+        return cells[key]
 
     def _paint_tiles(self, hue):
         for key, tile in self.tiles.items():
             if key == "custom":
                 tile.set_image(self._custom_cell())
                 continue
-            cell = atlas_cell(self._atlas, key)
+            cell = self._atlas_tile(key)
             if cell is None:
                 tile.set_image(None)
                 continue
-            cell = cell.resize(self.tile_size, Image.Resampling.BILINEAR)
             tile.set_image(rotate_hue(cell, hue))
 
     def _schedule_tiles(self, hue):

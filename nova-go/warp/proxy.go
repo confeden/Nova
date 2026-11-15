@@ -8,16 +8,19 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // proxyEndpoint is a parsed --api-proxy value. Credentials stay out of String().
 type proxyEndpoint struct {
-	scheme   string // "http" or "https"
+	scheme   string // "http", "https", "socks5" or "socks5h" (no authentication)
 	host     string
 	port     string
 	username string
@@ -26,7 +29,9 @@ type proxyEndpoint struct {
 }
 
 // parseProxyURL accepts http://[user:pass@]host:port and https://... (TLS to the proxy itself, as
-// the relay speaks). A bare host:port means http.
+// the relay speaks), and socks5://host:port / socks5h://host:port: a local tunnel's SOCKS5 port
+// (Nova's primary slot, Tor), unauthenticated, the name always resolved by the proxy. A bare
+// host:port means http.
 func parseProxyURL(raw string) (*proxyEndpoint, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -41,8 +46,12 @@ func parseProxyURL(raw string) (*proxyEndpoint, error) {
 		return nil, fmt.Errorf("%w: proxy URL does not parse", ErrUsage)
 	}
 	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
-		return nil, fmt.Errorf("%w: proxy scheme %q is not http or https", ErrUsage, scheme)
+	if scheme != "http" && scheme != "https" && !isSocksScheme(scheme) {
+		return nil, fmt.Errorf("%w: proxy scheme %q is not http, https, socks5 or socks5h", ErrUsage, scheme)
+	}
+	if isSocksScheme(scheme) && u.User != nil {
+		// Never echo the value: it may hold a password.
+		return nil, fmt.Errorf("%w: a socks5 proxy with credentials is not supported", ErrUsage)
 	}
 	host := u.Hostname()
 	if host == "" {
@@ -50,7 +59,7 @@ func parseProxyURL(raw string) (*proxyEndpoint, error) {
 	}
 	port := u.Port()
 	if port == "" {
-		port = map[string]string{"http": "80", "https": "443"}[scheme]
+		port = map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[scheme]
 	}
 	p := &proxyEndpoint{scheme: scheme, host: host, port: port}
 	if u.User != nil {
@@ -60,6 +69,8 @@ func parseProxyURL(raw string) (*proxyEndpoint, error) {
 	}
 	return p, nil
 }
+
+func isSocksScheme(scheme string) bool { return scheme == "socks5" || scheme == "socks5h" }
 
 func (p *proxyEndpoint) address() string { return net.JoinHostPort(p.host, p.port) }
 
@@ -103,6 +114,16 @@ func dialViaProxy(ctx context.Context, p *proxyEndpoint, target string, proxyRoo
 	}()
 	if err := conn.SetDeadline(boundedDeadline(ctx, 10*time.Second)); err != nil {
 		return nil, fmt.Errorf("set proxy deadline: %w", err)
+	}
+	if isSocksScheme(p.scheme) {
+		if err := socks5Connect(conn, target); err != nil {
+			return nil, err
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return nil, fmt.Errorf("clear proxy deadline: %w", err)
+		}
+		ok = true
+		return conn, nil
 	}
 	if p.scheme == "https" {
 		tlsConn := tls.Client(raw, &tls.Config{ServerName: p.host, MinVersion: tls.VersionTLS12, RootCAs: proxyRoots})
@@ -155,3 +176,115 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// socks5Connect runs a no-authentication SOCKS5 CONNECT to target ("host:port") over conn. A host
+// name is sent as such (ATYP 3), so the proxy resolves it: the local resolver may be filtered, and
+// a name resolved here would not reach the same address anyway.
+//
+// A server that does not speak SOCKS5, or hangs up mid-exchange, is "proxy unreachable" (nothing a
+// TLS profile can fix); one that answers with a refusal is a *ProxyError, like a refused CONNECT.
+func socks5Connect(conn net.Conn, target string) error {
+	host, portText, err := net.SplitHostPort(target)
+	if err != nil {
+		return fmt.Errorf("socks5 target: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("socks5 target: bad port %q", portText)
+	}
+	fail := func(stage string, err error) error {
+		return fmt.Errorf("%w: socks5 %s: %v", errProxyDial, stage, err)
+	}
+	if _, err := conn.Write([]byte{5, 1, 0}); err != nil { // version 5, one method: no authentication
+		return fail("greeting", err)
+	}
+	var method [2]byte
+	if _, err := readFull(conn, method[:]); err != nil {
+		return fail("method reply", err)
+	}
+	if method[0] != 5 {
+		return fail("method reply", errors.New("not a SOCKS5 server"))
+	}
+	if method[1] != 0 {
+		return &ProxyError{Status: fmt.Sprintf("socks5 wants authentication (method 0x%02x)", method[1])}
+	}
+
+	req := []byte{5, 1, 0}
+	if ip, perr := netip.ParseAddr(host); perr == nil {
+		ip = ip.Unmap()
+		if ip.Is4() {
+			a := ip.As4()
+			req = append(req, 1)
+			req = append(req, a[:]...)
+		} else {
+			a := ip.As16()
+			req = append(req, 4)
+			req = append(req, a[:]...)
+		}
+	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return fmt.Errorf("socks5 target: bad host length %d", len(host))
+		}
+		req = append(req, 3, byte(len(host)))
+		req = append(req, host...)
+	}
+	req = append(req, byte(port>>8), byte(port))
+	if _, err := conn.Write(req); err != nil {
+		return fail("request", err)
+	}
+	var head [4]byte
+	if _, err := readFull(conn, head[:]); err != nil {
+		return fail("reply", err)
+	}
+	if head[0] != 5 {
+		return fail("reply", errors.New("not a SOCKS5 reply"))
+	}
+	if head[1] != 0 {
+		return &ProxyError{Status: fmt.Sprintf("socks5 reply 0x%02x (%s)", head[1], socks5ReplyText(head[1]))}
+	}
+	var skip int
+	switch head[3] {
+	case 1:
+		skip = 4 + 2
+	case 4:
+		skip = 16 + 2
+	case 3:
+		var n [1]byte
+		if _, err := readFull(conn, n[:]); err != nil {
+			return fail("reply", err)
+		}
+		skip = int(n[0]) + 2
+	default:
+		return fail("reply", fmt.Errorf("unknown address type 0x%02x", head[3]))
+	}
+	if _, err := readFull(conn, make([]byte, skip)); err != nil {
+		return fail("reply", err)
+	}
+	return nil
+}
+
+func readFull(conn net.Conn, buf []byte) (int, error) {
+	return io.ReadFull(conn, buf)
+}
+
+func socks5ReplyText(code byte) string {
+	switch code {
+	case 1:
+		return "general failure"
+	case 2:
+		return "not allowed by ruleset"
+	case 3:
+		return "network unreachable"
+	case 4:
+		return "host unreachable"
+	case 5:
+		return "connection refused"
+	case 6:
+		return "TTL expired"
+	case 7:
+		return "command not supported"
+	case 8:
+		return "address type not supported"
+	}
+	return "unknown"
+}

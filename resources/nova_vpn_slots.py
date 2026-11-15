@@ -47,7 +47,7 @@ __all__ = [
     "GROUP_BY_PRIMARY", "primary_kind_of_group", "proton_country_of", "normalize_primary_country",
     "primary_choice_from_selection", "selection_for_primary", "primary_indicator_label",
     "SECONDARY_AUTO", "SECONDARY_OPERA", "SECONDARY_TOR", "SECONDARY_PROFILE", "SECONDARY_MODES",
-    "SECONDARY_MENU_LABELS", "SECONDARY_PROFILE_KEY", "RING_NOVA", "RING_CUSTOM_OWN", "AUTO_GROUP_BUDGET_SEC",
+    "SECONDARY_MENU_LABELS", "SECONDARY_PROFILE_KEY", "RING_NOVA", "RING_CUSTOM_OWN", "AUTO_GROUP_BUDGET_SEC", "AUTO_MODE_BUDGET_SEC",
     "SECONDARY_PILL_CHOICES", "OPERA_REGIONS", "TOR_ENTRY_AUTO", "TOR_ENTRIES", "TOR_AUTO_ATTEMPTS",
     "normalize_tor_entry", "normalize_opera_region", "normalize_secondary_mode", "normalize_secondary_block",
     "normalize_secondary_kind", "normalize_secondary_profile_block",
@@ -475,8 +475,11 @@ def normalize_secondary_block(block):
 # carries them (it says "Custom" and gets everything).
 RING_NOVA = "Nova"
 RING_CUSTOM_OWN = "Custom~own"
-# «Авто» spends at most this long on one group of profiles before it moves to the next (owner 2026-11-14).
-AUTO_GROUP_BUDGET_SEC = 120.0
+# One mode/group of profiles is walked for at most this long, in «Авто» and for an explicit choice (owner 2026-11-14, D69).
+# Same name and value as nova_profiles.AUTO_MODE_BUDGET_SEC and Nova Android; repeated here because helpers
+# import this module without nova_profiles (a test keeps the two equal).
+AUTO_MODE_BUDGET_SEC = 120.0
+AUTO_GROUP_BUDGET_SEC = AUTO_MODE_BUDGET_SEC
 
 SECONDARY_PROFILE_KEY = "secondary_profile"
 

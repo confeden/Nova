@@ -15,6 +15,7 @@ so a registration never competes with the next one for the same narrow uplink.
 
 import time
 
+import nova_issue_policy
 import nova_profiles
 import nova_proton
 import nova_warp_generator
@@ -42,7 +43,9 @@ STEPS = (STEP_WARP, STEP_MASQUE, STEP_PROTON, STEP_PROTON_FRESH, STEP_PROTON_RTT
          STEP_TOR_BRIDGES, STEP_SUBSCRIPTIONS)
 
 # A failed MASQUE registration is not retried for this long within one run of Nova: every attempt
-# is a device registration on Cloudflare's side.
+# is a device registration on Cloudflare's side. A registration that never reached the API created
+# none, so it waits nova_warp_generator.UNREACHABLE_COOLDOWN_SEC instead, and not at all once a route
+# exists that the failed run did not have.
 MASQUE_REGISTER_COOLDOWN_SEC = 3600
 # Distances to Proton nodes are re-measured when older than this; networks change (Wi-Fi, LTE).
 PROTON_RTT_MAX_AGE_SEC = 6 * 3600
@@ -142,29 +145,67 @@ def proton_rtt_targets(records, stats, now=None, max_age=PROTON_RTT_MAX_AGE_SEC)
 
 
 def plan_backfill(*, records, warp_state, proton_account, stats=None, tor_bridges_fresh=True,
-                  masque_failed_at=0.0, now=None, proxies=None, subscriptions_due=0):
+                  masque_failed_at=0.0, now=None, proxies=None, subscriptions_due=0,
+                  ledger=None, app_version=None, cf_routes=None, masque_unreachable=False,
+                  masque_failed_routes=None):
     """[(step, Russian reason), ...] in the order they should run; empty when all is fresh.
 
     `records` is nova_profiles.list_profiles(); `warp_state` nova_warp_generator.load_state();
     `proton_account` nova_proton.read_account() (None when absent); `proxies` the API routes a
     Proton run would get (nova_proton.should_issue uses them to lift a cooldown when a route was
     added); `masque_failed_at` the time of this run's last failed MASQUE registration.
+    `ledger` (nova_issue_policy.load) with `app_version` adds Android's D45 rule: a set stamped
+    with an older version, or not stamped at all, is renewed once after an update and then left
+    alone (the renewal reuses the identity/key, so it is a rescan, not a new registration). With
+    `ledger=None` only the old once-per-install rule applies. `cf_routes` are the Cloudflare API routes
+    available now (nova_warp_generator.route_keys of what nova-go would get; `proxies` stays the
+    http(s)-only list Proton takes): a registration that failed as unreachable is retried early when
+    this holds a route the failed run did not have. `masque_unreachable` / `masque_failed_routes`
+    describe the last MASQUE failure the same way.
     """
     now = time.time() if now is None else float(now)
     steps = []
+    versioned = ledger is not None and bool(app_version)
 
     generated_present = bool(_valid(records, nova_profiles.GROUP_CLOUDFLARE, {nova_profiles.ORIGIN_GENERATED}))
-    reissue, why = nova_warp_generator.should_reissue(warp_state, now, generated_present)
+    reissue, why = nova_warp_generator.should_reissue(warp_state, now, generated_present, routes=cf_routes)
+    if versioned:
+        if generated_present:
+            reissue, why = nova_issue_policy.decide(
+                ledger, nova_issue_policy.KIND_WARP, set_present=True, current_version=app_version, now=now)
+            # The generator's own cooldown after a fruitless run still holds (1 h; 10 min, lifted by a
+            # new route, when the API was never reached).
+            waiting = nova_warp_generator.cooldown_reason(warp_state, now, cf_routes)
+            if reissue and waiting:
+                reissue, why = False, waiting
+        elif reissue:
+            reissue, why = nova_issue_policy.decide(
+                ledger, nova_issue_policy.KIND_WARP, set_present=False, current_version=app_version, now=now)
     if reissue:
         steps.append((STEP_WARP, why))
 
     if not _valid(records, nova_profiles.GROUP_MASQUE):
-        failed_at = float(masque_failed_at or 0.0)
-        if not failed_at or not 0 <= now - failed_at < MASQUE_REGISTER_COOLDOWN_SEC:
+        left = nova_warp_generator.failure_cooldown_left(
+            masque_failed_at, now, unreachable=bool(masque_unreachable),
+            failed_routes=masque_failed_routes, routes=cf_routes, normal_sec=MASQUE_REGISTER_COOLDOWN_SEC)
+        if left <= 0:
             steps.append((STEP_MASQUE, "профиля MASQUE ещё нет"))
 
     proton_present = bool(_valid(records, nova_profiles.GROUP_PROTON))
     issue, why = nova_proton.should_issue(proton_account, now, proton_present, proxies=proxies)
+    if versioned:
+        if proton_present:
+            if not issue:
+                # `should_issue(..., profiles_present=False)` answers only "is a cooldown running":
+                # a CAPTCHA or failure cooldown must hold for a renewal exactly as for a first issue.
+                clear, _ = nova_proton.should_issue(proton_account, now, False, proxies=proxies)
+                if clear:
+                    issue, why = nova_issue_policy.decide(
+                        ledger, nova_issue_policy.KIND_PROTON, set_present=True,
+                        current_version=app_version, now=now)
+        elif issue:
+            issue, why = nova_issue_policy.decide(
+                ledger, nova_issue_policy.KIND_PROTON, set_present=False, current_version=app_version, now=now)
     if issue:
         steps.append((STEP_PROTON, why))
     # No automatic STEP_PROTON_FRESH any more (owner 2026-11-12, Android D40): a dead set is

@@ -96,7 +96,8 @@ GROUP_MASQUE = "MASQUE"
 # folder per backend is what keeps "choose this profile" from meaning "start the wrong program".
 GROUP_VLESS = "VLESS"
 GROUP_CUSTOM = "Custom"
-GROUPS = (GROUP_MASQUE, GROUP_CLOUDFLARE, GROUP_PROTON, GROUP_VLESS, GROUP_CUSTOM)
+# Owner 2026-11-14 order everywhere: NOVA > CF AWG > MASQUE > Opera > Proton > Tor (D69); list_profiles and the tabs follow it.
+GROUPS = (GROUP_CLOUDFLARE, GROUP_MASQUE, GROUP_PROTON, GROUP_VLESS, GROUP_CUSTOM)
 RUNTIME_DIRNAME = ".runtime"
 RELAY_KEY_FILENAME = "opera_relay.key"
 LEGACY_AWG_DIRNAME = "awg"
@@ -1238,10 +1239,15 @@ def list_profiles(base_dir):
     records = []
     for group in GROUPS:
         folder = os.path.join(root, group)
+        # scandir, not listdir + stat: on Windows the size and mtime come with the directory read
+        # itself, so a folder of a few hundred profiles costs one directory read instead of one
+        # file open per profile — on an HDD that was most of the «Профили» refresh (owner 2026-11-15).
         try:
-            entries = os.listdir(folder)
+            with os.scandir(folder) as scan:
+                dir_entries = {item.name: item for item in scan}
         except OSError:
             continue
+        entries = list(dir_entries)
         group_records = []
         seen_ids = set()
         # .conf before .json so a stem clash keeps the AWG file on the plain id.
@@ -1255,7 +1261,7 @@ def list_profiles(base_dir):
                 continue
             path = os.path.join(folder, entry)
             try:
-                st = os.stat(path)
+                st = dir_entries[entry].stat()
             except OSError:
                 continue
             if not stat.S_ISREG(st.st_mode):

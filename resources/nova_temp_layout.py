@@ -121,8 +121,14 @@ ENTRIES = (
       "выбор в окне «Профили»: авто, группа или один профиль. Явный выбор не подменяется"),
     E("profile-stats.json", "state", "nova_profiles.py", "nova.pyw",
       "удачи и неудачи по профилям: порядок попыток и строки окна «Профили». Без ключей"),
+    E("nova-list-strikes.json", "state", "nova_subscriptions.py", "nova_subscriptions.py",
+      "Nova list: подряд неудавшиеся настоящие подключения через узел и удалённые узлы (24 ч не "
+      "возвращаются из ленты). Только хэши узлов, без адресов и ключей"),
     E("warp-generated-state.json", "state", "nova_warp_generator.py", "nova_warp_generator.py",
       "когда выпущены свои профили WARP, чем кончился выпуск, RTT точек. Без ключей"),
+    E("profile-issue-ledger.json", "state", "nova_issue_policy.py", "nova_issue_policy.py",
+      "какой версией Nova выпущен личный набор WARP/Proton и сколько раз подряд замена не удалась. "
+      "Без неё набор считается «без отметки» и один раз обновляется. Без ключей"),
     E("vpn-last.json", "state", "nova_vpn_slots.py", "nova.pyw",
       "последнее подключение основного и дополнительного VPN: вид, имя профиля, страна, "
       "регион Opera или вход Tor. С него начинается «Авто» после перезапуска. Без ключей и адресов"),
@@ -138,6 +144,9 @@ ENTRIES = (
       "что уже проверено на прямом маршруте"),
     E("opera_endpoint_cache.json", "cache", "nova.pyw", "nova.pyw",
       "последняя удачная точка выхода Opera; ускоряет запуск"),
+    E("cf_api_state.json", "cache", "nova-go (warp, masque)", "nova-go (warp, masque)",
+      "какой прямой маршрут к API Cloudflare отвечал в прошлый раз и какие удалённые релей-прокси "
+      "недавно не отвечали (10 минут не опрашиваются). Без ключей; стереть безопасно", needle="cf_api_state"),
     E("tgrelay_cf_health.json", "cache", "tgrelay/", "tgrelay/",
       "здоровье доменов Worker'ов между запусками"),
     E("gpu_overlay_*.rgba", "cache", "nova_gpu.py", "nova-engine.exe (gpu-serve)",

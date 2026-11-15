@@ -472,6 +472,26 @@ def legacy_awg_leftovers(base_dir: Path) -> list[str]:
     return problems
 
 
+def refresh_bundled_profiles(base_dir: Path) -> None:
+    """Освежить встроенные профили (точки WARP у семян, узлы Proton) перед проверкой источников.
+
+    Не роняет сборку: любая нехватка данных или ошибка — только [WARN], файлы остаются как были.
+    """
+    if os.environ.get("NOVA_SKIP_PROFILE_REFRESH") == "1":
+        print("[WARN] NOVA_SKIP_PROFILE_REFRESH=1: Пропуск освежения встроенных профилей")
+        return
+
+    def log(line: str) -> None:
+        print(f"[WARN] {line[6:]}" if line.startswith("WARN: ") else f"[BUILD] {line}")
+
+    try:
+        sys.path.insert(0, str(base_dir))
+        import refresh_bundled_profiles as profile_refresh
+        profile_refresh.refresh(base_dir, log=log)
+    except Exception as exc:  # noqa: BLE001 - освежение не должно ронять сборку
+        print(f"[WARN] Освежение встроенных профилей не удалось: {type(exc).__name__}: {exc}")
+
+
 def require_profile_sources(base_dir: Path) -> None:
     """Проверить, что в profiles/ есть то, без чего установка не работает.
 
@@ -876,6 +896,8 @@ def require_paths(base_dir: Path) -> None:
     # NovaInstaller.iss pulls these from the repo instead of the staging tree, so
     # a missing one surfaces as an opaque ISCC "No files found matching" error.
     required_paths.extend(base_dir / rel for rel in REPO_SOURCE_FILES)
+    # The staging loop skips a missing RESOURCE_ROOT_FILES entry silently; fail here instead.
+    required_paths.extend(base_dir / RESOURCE_SOURCE_DIR / name for name in RESOURCE_ROOT_FILES)
 
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
@@ -890,14 +912,13 @@ def require_paths(base_dir: Path) -> None:
 
     # Cheap file checks first, so a missing key or Tor binary fails before minutes of builds.
     require_tor_binaries(base_dir)
+    refresh_bundled_profiles(base_dir)
     require_profile_sources(base_dir)
 
     ensure_tls_terminator(base_dir)
     ensure_nova_engine(base_dir)
     ensure_nova_go(base_dir)
     ensure_nova_xray(base_dir)
-    # The staging loop skips a missing RESOURCE_ROOT_FILES entry silently; fail here instead.
-    required_paths.extend(base_dir / RESOURCE_SOURCE_DIR / name for name in RESOURCE_ROOT_FILES)
     ensure_nova_proxy(base_dir)
 
 

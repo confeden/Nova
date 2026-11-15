@@ -450,6 +450,12 @@ class SceneWiringTests(unittest.TestCase):
             if scene.canvas.winfo_exists():
                 scene.canvas.destroy()
         self.root.update()
+        # The worker writes the settled preferences on its way out; let it finish before the
+        # temporary folder goes.
+        for scene in self.scenes:
+            worker = getattr(scene, "_worker", None)
+            if worker is not None:
+                worker.join(3)
         self.root.withdraw()
 
     def scene(self, mode="ok", **prefs):
@@ -573,6 +579,20 @@ class SceneWiringTests(unittest.TestCase):
         self.assertTrue(self.pump(lambda: len([c for c in self.commands() if c["cmd"] == "config"]) >= 2))
         seeds = [c["seed"] for c in self.commands() if c["cmd"] == "config"]
         self.assertNotEqual(seeds[0], seeds[-1])
+
+    def test_an_open_secondary_window_caps_the_background_at_30_fps(self):
+        with mock.patch.object(ui, "SECONDARY_CHECK_S", 0.0),                 mock.patch.object(nova_gpu, "target_fps", return_value=60):
+            scene, engine = self.scene()
+            self.assertTrue(self.pump(lambda: scene._gpu_mode))
+            fps_sent = lambda: [c["fps"] for c in self.commands() if c["cmd"] == "config" and "fps" in c]
+            self.assertTrue(self.pump(lambda: fps_sent() and fps_sent()[-1] == 60))
+            other = tk.Toplevel(self.root)
+            self.addCleanup(other.destroy)
+            self.assertTrue(self.pump(lambda: fps_sent()[-1] == ui.SECONDARY_WINDOW_FPS),
+                            "окно «Профили»/«Настройки» открыто — фон не быстрее 30 к/с")
+            self.assertAlmostEqual(scene._gpu_frame_ms, 1000 / ui.SECONDARY_WINDOW_FPS)
+            other.withdraw()   # the pre-created windows hide, they are not destroyed
+            self.assertTrue(self.pump(lambda: fps_sent()[-1] == 60))
 
     def test_engine_crash_falls_back_silently_to_the_cpu_path(self):
         scene, engine = self.scene("crash")

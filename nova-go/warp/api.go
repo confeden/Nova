@@ -10,7 +10,11 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+
+	"nova-pc/nova-go/internal/apifail"
+	"nova-pc/nova-go/internal/apistate"
 )
 
 // Mode selects which transports DoAPIRequest may use.
@@ -49,6 +53,13 @@ const (
 	deadIPAfter = 2
 	// minAttemptTime: an attempt with less time left than this is not started.
 	minAttemptTime = 1500 * time.Millisecond
+	// directWidth is how many direct attempts may be in flight at once. A filter that swallows a
+	// ClientHello makes an attempt cost its whole handshake timeout (6-9 s), so walking 15 profiles
+	// one by one never gets past the first few inside the operation's deadline.
+	directWidth = 3
+	// hedgeStep starts one more attempt when the running ones are still silent after this long; a
+	// failed attempt starts the next one at once.
+	hedgeStep = 1500 * time.Millisecond
 )
 
 // ErrUnreachable wraps "no transport produced an HTTP answer".
@@ -74,7 +85,10 @@ type APIOptions struct {
 	Mode     Mode
 	ProxyURL string // http://[user:pass@]host:port or https://...; required for ModeProxy
 	Logf     Logf
-	hooks    *testHooks
+	// State, when set, remembers the last direct route that got an answer and the remote proxies that
+	// did not accept a connection, across runs. Nil means no memory.
+	State *apistate.Store
+	hooks *testHooks
 }
 
 // testHooks lets tests aim the tiers at local servers. Nil in production.
@@ -86,6 +100,8 @@ type testHooks struct {
 	profiles      []registrationProfile
 	proxyProfiles []proxyProfile
 	proxyReserve  time.Duration
+	directWidth   int           // 0 = directWidth
+	hedgeStep     time.Duration // 0 = hedgeStep
 }
 
 // DoAPIRequest sends req over the tiers opts allows and returns the first 200 (that passes
@@ -111,10 +127,11 @@ func DoAPIRequest(ctx context.Context, req APIRequest, opts APIOptions) (*APIRes
 		return nil, fmt.Errorf("%w: api mode proxy needs a proxy URL", ErrUsage)
 	}
 
-	run := &apiRun{req: req, logf: opts.Logf, hooks: opts.hooks}
+	run := &apiRun{req: req, logf: opts.Logf, hooks: opts.hooks, state: opts.State}
 	if run.hooks == nil {
 		run.hooks = &testHooks{}
 	}
+	run.logPlan(ctx, mode, proxy)
 
 	switch mode {
 	case ModePlain:
@@ -138,26 +155,42 @@ func DoAPIRequest(ctx context.Context, req APIRequest, opts APIOptions) (*APIRes
 			}
 		}
 		run.direct(directCtx)
-		if run.win == nil && !run.stop && proxy != nil && ctx.Err() == nil {
+		if !run.won() && !run.stopped() && proxy != nil && ctx.Err() == nil {
 			run.viaProxy(ctx, proxy)
 		}
 	}
 	return run.result(ctx)
 }
 
-// apiRun accumulates the outcome of the tiers of one DoAPIRequest.
+// apiRun accumulates the outcome of the tiers of one DoAPIRequest. The direct tier runs attempts in
+// parallel, so everything below mu may be touched from several goroutines.
 type apiRun struct {
-	req      APIRequest
-	logf     Logf
-	hooks    *testHooks
+	req   APIRequest
+	logf  Logf
+	hooks *testHooks
+	state *apistate.Store
+
+	mu       sync.Mutex
 	win      *APIResponse
 	first    *APIResponse
 	stop     bool
-	failures []string
+	tierDone bool // an attempt ended the current tier (a win, a definitive answer, a 429)
+	failures []routeFailure
+}
+
+// routeFailure is one attempt that produced no HTTP answer. group names the route family for the
+// summary ("direct 104.16.24.84", "proxy", "plain"); class is a short reason.
+type routeFailure struct {
+	where string
+	group string
+	class string
+	err   error
 }
 
 func (r *apiRun) fail(where string, err error) {
-	r.failures = append(r.failures, where+": "+err.Error())
+	r.mu.Lock()
+	r.failures = append(r.failures, routeFailure{where: where, group: failureGroup(where), class: failureClass(err), err: err})
+	r.mu.Unlock()
 	r.logf.printf("api %s: %s failed: %v", r.req.Label, where, err)
 }
 
@@ -172,36 +205,109 @@ func (r *apiRun) answer(resp *APIResponse) bool {
 				return false
 			}
 		}
+		r.mu.Lock()
 		r.win = resp
+		r.tierDone = true
+		r.mu.Unlock()
 		return true
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.first == nil {
 		r.first = resp
 	}
 	if definitiveStatus(resp.StatusCode) {
 		r.stop = true
+		r.tierDone = true
 		return true
 	}
-	return tierEndingStatus(resp.StatusCode)
+	if tierEndingStatus(resp.StatusCode) {
+		r.tierDone = true
+		return true
+	}
+	return false
+}
+
+func (r *apiRun) over() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tierDone
+}
+
+func (r *apiRun) stopped() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stop
+}
+
+func (r *apiRun) won() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.win != nil
+}
+
+// beginTier re-arms tierDone: a 429 ends one tier, the next one starts clean.
+func (r *apiRun) beginTier() {
+	r.mu.Lock()
+	r.tierDone = r.win != nil || r.stop
+	r.mu.Unlock()
+}
+
+// logPlan writes which routes this call may use and how much time it has: the one line that tells a
+// later reader whether "unreachable" meant "tried everything" or "tried little".
+func (r *apiRun) logPlan(ctx context.Context, mode Mode, proxy *proxyEndpoint) {
+	budget := "none"
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = time.Until(deadline).Round(time.Second).String()
+	}
+	via := "none"
+	if proxy != nil {
+		via = proxy.String()
+		if left, dead := r.state.ProxyDead(via); dead {
+			via += " (quarantined " + left.Round(time.Second).String() + ")"
+		}
+	}
+	remembered := "none"
+	if ip, profile, ok := r.state.Winner(); ok {
+		remembered = ip + "/" + profile
+	}
+	r.logf.printf("api %s: plan mode=%s proxy=%s budget=%s remembered-direct=%s", r.req.Label, mode, via, budget, remembered)
 }
 
 func (r *apiRun) result(ctx context.Context) (*APIResponse, error) {
-	if r.win != nil {
-		return r.win, nil
+	r.mu.Lock()
+	win, first, failures := r.win, r.first, append([]routeFailure(nil), r.failures...)
+	r.mu.Unlock()
+	if win != nil {
+		return win, nil
 	}
-	if r.first != nil {
-		return r.first, &StatusError{
-			StatusCode: r.first.StatusCode,
-			Status:     r.first.Status,
-			Body:       truncate(string(r.first.Body), 200),
-			Via:        r.first.Via,
+	if first != nil {
+		return first, &StatusError{
+			StatusCode: first.StatusCode,
+			Status:     first.Status,
+			Body:       truncate(string(first.Body), 200),
+			Via:        first.Via,
 		}
 	}
-	failures := r.failures
-	if len(failures) > 8 {
-		failures = failures[:8]
+	raw := make([]string, 0, len(failures))
+	for _, f := range failures {
+		if f.class == apifail.Superseded {
+			continue
+		}
+		raw = append(raw, f.where+": "+f.err.Error())
 	}
-	detail := strings.Join(failures, " | ")
+	if len(raw) > 8 {
+		raw = raw[:8]
+	}
+	// The summary goes first: callers truncate this text, and its first 240 characters must already
+	// say which routes failed and how.
+	detail := summarizeFailures(failures)
+	if len(raw) > 0 {
+		if detail != "" {
+			detail += " | "
+		}
+		detail += strings.Join(raw, " | ")
+	}
 	if ctx.Err() != nil {
 		if detail == "" {
 			detail = "no attempt finished"
@@ -212,6 +318,50 @@ func (r *apiRun) result(ctx context.Context) (*APIResponse, error) {
 		detail = "no attempt was made"
 	}
 	return nil, fmt.Errorf("%w: %s", ErrUnreachable, detail)
+}
+
+// failureGroup is the route family of a failure's "where" label.
+func failureGroup(where string) string {
+	parts := strings.Split(where, "/")
+	switch parts[0] {
+	case "direct":
+		if len(parts) > 1 {
+			return "direct " + parts[1]
+		}
+		return "direct"
+	case "proxy":
+		return "proxy"
+	}
+	return where
+}
+
+// failureClass names a transport failure in one short word, so that "3xtls-timeout" can be read at a
+// glance where the raw text is a line of socket addresses.
+func failureClass(err error) string {
+	if err == nil {
+		return "none"
+	}
+	var proxyErr *ProxyError
+	switch {
+	case errors.Is(err, errSuperseded):
+		return apifail.Superseded
+	case errors.As(err, &proxyErr):
+		return "proxy-refused"
+	case errors.Is(err, errProxyDial):
+		return "proxy-dial"
+	case errors.Is(err, errTCPDial):
+		return "tcp-dial"
+	}
+	return apifail.ClassifyText(err.Error())
+}
+
+// summarizeFailures: "direct 104.16.24.84: 2xtls-timeout; direct 104.16.192.82: tls-timeout; proxy: proxy-dial".
+func summarizeFailures(failures []routeFailure) string {
+	entries := make([]apifail.Entry, 0, len(failures))
+	for _, f := range failures {
+		entries = append(entries, apifail.Entry{Group: f.group, Class: f.class})
+	}
+	return apifail.Summarize(entries)
 }
 
 // definitiveStatus: a 4xx that is about the request itself. 403/407/408/421/425 can depend on the
@@ -244,9 +394,21 @@ func (r *apiRun) plain(ctx context.Context) {
 	r.answer(resp)
 }
 
-// direct walks the profile table against the pinned addresses. The address rotates per attempt, so
-// the first attempts cover different fingerprints on both addresses; a second round swaps them. An
-// address whose TCP dial failed deadIPAfter times in a row is skipped for the rest of the run.
+// errSuperseded marks an attempt that was abandoned after its handshake because another attempt of
+// the same call had already produced the answer. It is not a failure of its route.
+var errSuperseded = errors.New("superseded by another attempt")
+
+// apiGate admits one request at a time and reports the answer back while it still holds the gate.
+type apiGate func(context.Context) (done func(*APIResponse, error), err error)
+
+// direct walks the profile table against the pinned addresses, a few attempts at a time. The address
+// rotates per attempt, so the first attempts cover different fingerprints on both addresses; a second
+// round swaps them. An address whose TCP dial failed deadIPAfter times in a row is skipped for the
+// rest of the run. The route that answered last time (apistate) goes first.
+//
+// Attempts overlap in their handshakes only: before a request is written each attempt takes a gate
+// that admits one at a time and refuses once the call is answered, so a registration cannot be sent
+// twice (it creates a device).
 func (r *apiRun) direct(ctx context.Context) {
 	ips := r.hooks.pinnedIPs
 	if len(ips) == 0 {
@@ -256,38 +418,160 @@ func (r *apiRun) direct(ctx context.Context) {
 	if len(profiles) == 0 {
 		profiles = defaultProfiles()
 	}
-	dialFailures := make(map[netip.Addr]int, len(ips))
-	for round := 0; round < len(ips); round++ {
-		for k, profile := range profiles {
-			if !hasTimeFor(ctx) {
-				if ctx.Err() == nil {
+	ips, profiles = r.rememberedFirst(ips, profiles)
+
+	width := directWidth
+	if r.hooks.directWidth > 0 {
+		width = r.hooks.directWidth
+	}
+	step := hedgeStep
+	if r.hooks.hedgeStep > 0 {
+		step = r.hooks.hedgeStep
+	}
+	r.logf.printf("api %s: direct tier %d address(es) x %d profiles, %d at a time", r.req.Label, len(ips), len(profiles), width)
+
+	r.beginTier()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg           sync.WaitGroup
+		dialFailures = make(map[netip.Addr]int, len(ips))
+		total        = len(ips) * len(profiles)
+		finished     = make(chan struct{}, total+1)
+		sem          = make(chan struct{}, 1)
+		inflight     int
+		next         int
+		canLaunch    = true
+		exhausted    bool
+	)
+	hedge := time.NewTimer(step)
+	defer hedge.Stop()
+
+	for !r.over() {
+		if canLaunch && inflight < width && next < total && !exhausted {
+			if !hasTimeFor(runCtx) {
+				if runCtx.Err() == nil {
 					r.logf.printf("api %s: direct tier out of time", r.req.Label)
 				}
-				return
+				exhausted = true
+				continue
 			}
+			round, k := next/len(profiles), next%len(profiles)
+			r.mu.Lock()
 			ip, ok := pickIP(ips, k+round, dialFailures)
+			r.mu.Unlock()
 			if !ok {
 				r.logf.printf("api %s: no pinned address accepts TCP, leaving the direct tier", r.req.Label)
-				return
+				exhausted = true
+				continue
 			}
-			where := "direct/" + ip.String() + "/" + profile.label
-			resp, err := r.viaIP(ctx, ip, profile)
-			if err != nil {
+			next++
+			inflight++
+			canLaunch = false
+			if !hedge.Stop() {
+				select {
+				case <-hedge.C:
+				default:
+				}
+			}
+			hedge.Reset(step)
+			wg.Add(1)
+			go func(ip netip.Addr, profile registrationProfile) {
+				defer wg.Done()
+				defer func() { finished <- struct{}{} }()
+				err := r.directAttempt(runCtx, ip, profile, sem)
+				r.mu.Lock()
 				if errors.Is(err, errTCPDial) {
 					dialFailures[ip]++
 				} else {
 					dialFailures[ip] = 0
 				}
-				r.fail(where, err)
-				continue
-			}
-			dialFailures[ip] = 0
-			resp.Via = where
-			if r.answer(resp) {
-				return
+				r.mu.Unlock()
+			}(ip, profiles[k])
+			continue
+		}
+		if inflight == 0 && (next >= total || exhausted) {
+			break
+		}
+		select {
+		case <-finished:
+			inflight--
+			canLaunch = true
+		case <-hedge.C:
+			canLaunch = true
+		case <-runCtx.Done():
+			exhausted = true
+			canLaunch = false
+			for inflight > 0 {
+				<-finished
+				inflight--
 			}
 		}
 	}
+	cancel()
+	wg.Wait()
+}
+
+// directAttempt is one direct attempt: dial, fragmented uTLS handshake, then (through the gate) the
+// request. It books its own outcome and returns the transport error, if any.
+func (r *apiRun) directAttempt(ctx context.Context, ip netip.Addr, profile registrationProfile, sem chan struct{}) error {
+	where := "direct/" + ip.String() + "/" + profile.label
+	booked := false
+	var gate apiGate = func(gctx context.Context) (func(*APIResponse, error), error) {
+		select {
+		case sem <- struct{}{}:
+		case <-gctx.Done():
+			return nil, gctx.Err()
+		}
+		if r.over() {
+			<-sem
+			return nil, errSuperseded
+		}
+		return func(resp *APIResponse, err error) {
+			defer func() { <-sem }()
+			if err != nil || resp == nil {
+				return
+			}
+			resp.Via = where
+			booked = true
+			r.state.NoteWinner(ip.String(), profile.label) // any HTTP answer proves the path passes the filter
+			r.answer(resp)
+		}, nil
+	}
+	_, err := r.viaIP(ctx, ip, profile, gate)
+	if err == nil || booked || errors.Is(err, errSuperseded) {
+		return err
+	}
+	if ctx.Err() != nil && r.over() {
+		return err // cut off by another attempt's answer: not this route's failure
+	}
+	r.fail(where, err)
+	return err
+}
+
+// rememberedFirst moves the direct pair that answered last time to the front of the walk.
+func (r *apiRun) rememberedFirst(ips []netip.Addr, profiles []registrationProfile) ([]netip.Addr, []registrationProfile) {
+	ipText, label, ok := r.state.Winner()
+	if !ok {
+		return ips, profiles
+	}
+	addr, err := netip.ParseAddr(ipText)
+	if err != nil {
+		return ips, profiles
+	}
+	ipIdx := slices.Index(ips, addr)
+	profIdx := slices.IndexFunc(profiles, func(p registrationProfile) bool { return p.label == label })
+	if ipIdx < 0 || profIdx < 0 {
+		return ips, profiles
+	}
+	reordered := append([]netip.Addr{}, ips[ipIdx:]...)
+	reordered = append(reordered, ips[:ipIdx]...)
+	first := []registrationProfile{profiles[profIdx]}
+	first = append(first, profiles[:profIdx]...)
+	first = append(first, profiles[profIdx+1:]...)
+	r.logf.printf("api %s: remembered direct route %s/%s goes first", r.req.Label, ipText, label)
+	return reordered, first
 }
 
 func pickIP(ips []netip.Addr, start int, dialFailures map[netip.Addr]int) (netip.Addr, bool) {
@@ -312,7 +596,7 @@ func hasTimeFor(ctx context.Context) bool {
 
 var errTCPDial = errors.New("tcp dial failed")
 
-func (r *apiRun) viaIP(parent context.Context, ip netip.Addr, profile registrationProfile) (*APIResponse, error) {
+func (r *apiRun) viaIP(parent context.Context, ip netip.Addr, profile registrationProfile, gate apiGate) (*APIResponse, error) {
 	ctx, cancel := context.WithTimeout(parent, profile.handshakeTimeout+6*time.Second)
 	defer cancel()
 
@@ -334,16 +618,24 @@ func (r *apiRun) viaIP(parent context.Context, ip netip.Addr, profile registrati
 	// The local address tells "went out the physical interface" from "went through a tunnel".
 	r.logf.printf("api %s: socket %s -> %s (%s)", r.req.Label, raw.LocalAddr(), raw.RemoteAddr(), profile.label)
 
-	return tlsExchange(ctx, newFragmentedConn(raw, profile), profile.helloID, profile.handshakeTimeout, r.req, r.hooks.roots)
+	return tlsExchangeGated(ctx, newFragmentedConn(raw, profile), profile.helloID, profile.handshakeTimeout, r.req, r.hooks.roots, gate)
 }
 
 // viaProxy: CONNECT to APIHost:443 through the proxy, then uTLS inside. A proxy that cannot be
-// reached or refuses CONNECT ends the tier; a TLS or HTTP failure moves to the next profile.
+// reached or refuses CONNECT ends the tier; a TLS or HTTP failure moves to the next profile. A remote
+// proxy that would not accept a connection a few minutes ago is not asked again until its
+// quarantine ends (apistate); loopback proxies are always asked, they refuse instantly.
 func (r *apiRun) viaProxy(ctx context.Context, proxy *proxyEndpoint) {
 	profiles := r.hooks.proxyProfiles
 	if len(profiles) == 0 {
 		profiles = defaultProxyProfiles()
 	}
+	key := proxy.String()
+	if left, dead := r.state.ProxyDead(key); dead {
+		r.fail("proxy/"+key, fmt.Errorf("skipped, it did not accept a connection recently (quarantine %s left)", left.Round(time.Second)))
+		return
+	}
+	r.beginTier()
 	r.logf.printf("api %s: trying proxy %s", r.req.Label, proxy)
 	for _, profile := range profiles {
 		if !hasTimeFor(ctx) {
@@ -354,11 +646,16 @@ func (r *apiRun) viaProxy(ctx context.Context, proxy *proxyEndpoint) {
 		if err != nil {
 			r.fail(where, err)
 			var proxyErr *ProxyError
-			if errors.Is(err, errProxyDial) || errors.As(err, &proxyErr) {
+			if errors.Is(err, errProxyDial) {
+				r.state.NoteProxyDead(key)
+				return
+			}
+			if errors.As(err, &proxyErr) {
 				return
 			}
 			continue
 		}
+		r.state.NoteProxyAlive(key)
 		resp.Via = where
 		if r.answer(resp) {
 			return

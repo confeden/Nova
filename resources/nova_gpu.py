@@ -508,7 +508,11 @@ class GpuEngine:
             name = "%s%d_%d%s" % (OVERLAY_PREFIX, os.getpid(), self._overlay_counter, OVERLAY_SUFFIX)
         os.makedirs(self.temp_dir, exist_ok=True)
         path = os.path.join(self.temp_dir, name)
-        with open(path, "wb") as stream:
+        # FILE_ATTRIBUTE_TEMPORARY (O_SHORT_LIVED): the cache manager keeps the file in memory instead
+        # of writing it out. While connecting the overlay changes 20 times a second and each file is
+        # 2-4 MB, read once by the engine and deleted, so on an HDD every byte of it was wasted seeks.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
+        with os.fdopen(os.open(path, flags, 0o600), "wb") as stream:
             stream.write(rgba)
             if mask is not None:
                 stream.write(mask)

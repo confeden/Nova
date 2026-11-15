@@ -25,6 +25,7 @@ subscription URL can carry a token, and `profiles/` is the folder that is never 
 attached to a problem report (I19).
 """
 
+import contextlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
+import nova_list_pages
 import nova_profiles
 
 try:
@@ -59,7 +61,7 @@ KIND_AWG = "awg"
 
 # Twelve hours is Android's default and the reason holds here: lists change slowly, and a
 # conditional request costs nothing, so the interval is chosen for freshness rather than for cost.
-DEFAULT_INTERVAL_HOURS = 12
+DEFAULT_INTERVAL_HOURS = nova_list_pages.REFRESH_HOURS
 MIN_INTERVAL_HOURS = 1
 MAX_INTERVAL_HOURS = 24 * 7
 
@@ -744,6 +746,8 @@ def refresh(base_dir, record, *, proxies=(), direct=True, log=None, fetcher=None
         skipped = stats.get('skipped', 0) + stats.get('modern_skipped', 0)
         if skipped:
             say(f'[Подписки] «{title}»: ядро не приняло {skipped} профилей; остальные будут импортированы.')
+        if record["builtin"]:
+            nodes = filter_bad(base_dir, nodes, say, now)
         outcome = _apply_vless(base_dir, record, nodes, say, title)
         return outcome, record, stats
 
@@ -777,6 +781,128 @@ def refresh(base_dir, record, *, proxies=(), direct=True, log=None, fetcher=None
     say("[Подписки] «%s»: импортировано %d, уже были %d." %
         (title, imported, sum(1 for r in results if r.get("status") == "duplicate")))
     return ("updated" if imported else "unchanged"), record, stats
+
+
+# --------------------------------------------------------------------------------------------
+# Real connection failures and the 24 h memory of deleted Nova list nodes (owner 2026-11-14).
+# The rules are pure (nova_list_pages.note_connect_result / strikes_to_prune / bad_add); this is
+# only the file. temp/nova-list-strikes.json: {"strikes": {identity: {"n","at"}}, "bad": {identity: ts}},
+# identities are hashes, no addresses (I19); declared in nova_temp_layout (I20).
+
+LIST_STATE_FILENAME = "nova-list-strikes.json"
+
+
+def list_state_path(base_dir):
+    return os.path.join(base_dir, nova_profiles.TEMP_DIRNAME, LIST_STATE_FILENAME)
+
+
+def load_list_state(base_dir):
+    """`{"strikes": {identity: {"n", "at"}}, "bad": {identity: deleted_at}}`; missing or corrupt -> empty."""
+    state = {"strikes": {}, "bad": {}}
+    try:
+        with open(list_state_path(base_dir), "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return state
+    if not isinstance(document, dict):
+        return state
+    strikes, bad = document.get("strikes"), document.get("bad")
+    for key, entry in (strikes if isinstance(strikes, dict) else {}).items():
+        if isinstance(key, str) and key and isinstance(entry, dict):
+            state["strikes"][key] = {"n": max(0, _as_int(entry.get("n"), 0)), "at": _as_float(entry.get("at"), 0.0)}
+    for key, stamp in (bad if isinstance(bad, dict) else {}).items():
+        if isinstance(key, str) and key:
+            state["bad"][key] = _as_float(stamp, 0.0)
+    return state
+
+
+def _save_list_state(base_dir, state):
+    try:
+        nova_profiles._atomic_write_json(list_state_path(base_dir), state)
+        return True
+    except OSError:
+        return False
+
+
+def bad_identities(base_dir, now=None):
+    """Identities deleted less than `BAD_TTL_HOURS` ago (the feed must not re-add them yet)."""
+    now = _now() if now is None else float(now)
+    with _LOCK:
+        return nova_list_pages.bad_active(load_list_state(base_dir)["bad"], now)
+
+
+def filter_bad(base_dir, nodes, say=None, now=None):
+    """`nodes` without the recently deleted ones (a refresh every 12 h must not bring them straight back)."""
+    bad = bad_identities(base_dir, now)
+    if not bad:
+        return list(nodes)
+    kept = [n for n in nodes if n.identity not in bad]
+    if len(kept) != len(nodes) and callable(say):
+        say("[Подписки] Nova list: %d узлов пропущено — удалены после неудачных подключений меньше %d ч назад."
+            % (len(nodes) - len(kept), nova_list_pages.BAD_TTL_HOURS))
+    return kept
+
+
+def record_connect_result(base_dir, identity, ok, now=None):
+    """One REAL connection attempt through a Nova list node (helper started, readiness probe through it).
+
+    Success clears its strikes, a failure adds one. A ping verdict never goes through here.
+    """
+    identity = str(identity or "")
+    if not identity:
+        return False
+    now = _now() if now is None else float(now)
+    with _LOCK:
+        state = load_list_state(base_dir)
+        state["strikes"] = nova_list_pages.note_connect_result(state["strikes"], identity, ok, now)
+        return _save_list_state(base_dir, state)
+
+
+def page_ordered_ids(base_dir):
+    """Profile ids of the Nova list in page order (newest first); the file order for the whole-list fallback."""
+    record = find(load(base_dir), NOVA_LIST_ID) or {}
+    by_identity = {r.get("fingerprint"): r["id"] for r in nova_profiles.list_profiles(base_dir)
+                   if r.get("subscription") == NOVA_LIST_ID and r.get("fingerprint") and r.get("valid", True)}
+    if not record.get("page_order"):
+        return list(by_identity.values())
+    return [by_identity[i] for i in record["page_order"] if i in by_identity]
+
+
+def prune_dead_nodes(base_dir, log=None, now=None):
+    """Delete Nova list nodes that failed `CONNECT_FAIL_STRIKES` real connections in a row, have no
+    fresh successful ping and while some other node has one. Returns the removed profile ids.
+
+    A ping failure alone never deletes. The identity of a removed node is remembered for
+    `BAD_TTL_HOURS` (`filter_bad`), strikes of listed-no-more nodes are dropped.
+    """
+    say = log if callable(log) else (lambda _message: None)
+    now = _now() if now is None else float(now)
+    with _LOCK:
+        state = load_list_state(base_dir)
+        if not any((e.get("n") or 0) >= nova_list_pages.CONNECT_FAIL_STRIKES for e in state["strikes"].values()):
+            return []
+        rows = [r for r in nova_profiles.list_profiles(base_dir)
+                if r.get("subscription") == NOVA_LIST_ID and r.get("fingerprint") and r.get("valid", True)]
+        id_of = {r["fingerprint"]: r["id"] for r in rows}
+        verdicts_by_id = nova_profiles.https_verdicts(nova_profiles.load_stats(base_dir), list(id_of.values()), now=now)
+        verdicts = {identity: verdicts_by_id[pid] for identity, pid in id_of.items() if pid in verdicts_by_id}
+        victims = nova_list_pages.strikes_to_prune(state["strikes"], verdicts, listed=set(id_of))
+        removed = []
+        for identity in victims:
+            try:
+                nova_profiles.delete_profile(base_dir, id_of[identity])
+            except (ValueError, OSError) as exc:
+                say("[Nova list] Профиль «%s» не удалён: %s" % (id_of[identity], exc))
+                continue
+            removed.append(identity)
+            say("[Nova list] Удалён профиль «%s»: %d подключений подряд не удались, пинга нет, а у других есть."
+                % (id_of[identity], state["strikes"][identity]["n"]))
+        if removed:
+            state["bad"] = nova_list_pages.bad_add(state["bad"], removed, now)
+            for identity in removed:
+                state["strikes"].pop(identity, None)
+            _save_list_state(base_dir, state)
+        return [id_of[i] for i in removed]
 
 
 def _parse_nova_page(body, number, pages):
@@ -864,6 +990,7 @@ def _refresh_pages(base_dir, record, get, proxies, direct, say, title, now):
     skipped = stats.get("skipped", 0)
     if skipped:
         say(f'[Подписки] «{title}»: ядро не приняло {skipped} профилей; остальные будут импортированы.')
+    nodes = filter_bad(base_dir, nodes, say, now)
     outcome = _apply_vless(base_dir, record, nodes, say, title)
     _set_pages_state(record, index, index_result, 1, [n.identity for n in nodes])
     record["fail_streak"] = 0
@@ -901,7 +1028,7 @@ def load_next_page(base_dir, record, *, fetcher=None, proxies=(), direct=True, l
         return None
     known = set(record.get("page_order") or ())
     fresh = []
-    for node in nodes:
+    for node in filter_bad(base_dir, nodes, say):
         if node.identity not in known:
             known.add(node.identity)
             fresh.append(node)
@@ -914,7 +1041,8 @@ def load_next_page(base_dir, record, *, fetcher=None, proxies=(), direct=True, l
 
 
 def scan_nova_list(base_dir, probe, *, force_first=False, budget_sec=None, should_abort=None,
-                   fetcher=None, proxies=(), direct=True, log=None, now=None):
+                   fetcher=None, proxies=(), direct=True, log=None, now=None,
+                   min_alive=nova_list_pages.MIN_ALIVE):
     """Batch HTTPS 204 scan of the Nova list (nova_list_pages.scan) over the profiles on disk.
 
     Batches follow `page_order`; a batch that runs past the loaded pages downloads the next one.
@@ -964,7 +1092,9 @@ def scan_nova_list(base_dir, probe, *, force_first=False, budget_sec=None, shoul
 
     known = nova_profiles.https_verdicts(nova_profiles.load_stats(base_dir), ordered_ids(), now=now)
     result = nova_list_pages.scan(load_batch, recording_probe, known=known, force_first=force_first,
-                                  budget_sec=budget_sec, should_abort=should_abort, log=say)
+                                  budget_sec=budget_sec, should_abort=should_abort, min_alive=min_alive, log=say)
+    with contextlib.suppress(Exception):
+        prune_dead_nodes(base_dir, log=say, now=now)
     say("[Nova list] Проверка: живых %d, пачек %d, проверено %d (%s)." %
         (result.alive, result.batches, len(result.results),
          {"enough": "хватает", "exhausted": "список кончился", "budget": "время вышло",

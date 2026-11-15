@@ -4,14 +4,21 @@ Same rules as Nova Android (owner, 2026-11-12):
 
 * The collector publishes `Github list/pages/index.json` plus `page-NNN.json`, newest verified
   first (collector.py `pages_of`, `list_rank`). A client never downloads the whole list: it reads
-  the index and page 1, and page n+1 only when a scan of what it has finds fewer than
-  `MIN_ALIVE` live nodes. `nova-list.json` stays published for old clients and is the fallback
-  when no mirror has the index.
-* A scan probes `BATCH_SIZE` nodes at a time in list order (the head is the freshest) and stops at
+  the index and page 1 (refreshed every `REFRESH_HOURS`), and page n+1 only when a scan of what it
+  has finds fewer than `MIN_ALIVE` live nodes. `nova-list.json` stays published for old clients
+  and is the fallback when no mirror has the index. List downloads go direct or through a working
+  VPN (`nova_subscriptions.fetch`); only probes are pinned to the physical adapter.
+* A scan probes `PAGE_SIZE` nodes at a time in list order (the head is the freshest) and stops at
   `MIN_ALIVE` live ones, when nothing is left, when the caller's budget is spent, or on abort.
-  Never the whole list.
+  Never the whole list. A connect does not wait for `MIN_ALIVE`: it scans with
+  `CONNECT_MIN_ALIVE` (stops after the first batch with one live node), and `top_up_needed` says
+  whether a background scan must go on toward `MIN_ALIVE`.
 * Probes go out over the physical adapter (`nova-proxy probe-list -interface NAME`), never through
   whatever VPN is up: a node reached through another tunnel answers with that tunnel's time.
+  No adapter + a VPN up = no scan (`unbound_probe_allowed`).
+* No ping is not death. A node leaves the app only after `CONNECT_FAIL_STRIKES` real failed
+  connections in a row while it has no ping and another node has one (`strikes_to_prune`); its
+  identity then stays out of the feed for `BAD_TTL_HOURS` (`bad_active`).
 
 Pure helpers plus two thin runners (the adapter lookup and the probe subprocess); nothing here
 touches routes, adapters or system settings.
@@ -24,16 +31,24 @@ import threading
 import time
 
 __all__ = [
-    "PAGES_BASE_URL", "INDEX_URL", "PAGE_SIZE", "BATCH_SIZE", "MIN_ALIVE", "ALIVE_FRESH_SEC",
-    "page_url", "parse_index", "parse_page", "scan", "ScanResult", "sort_by_ping",
+    "PAGES_BASE_URL", "INDEX_URL", "REFRESH_HOURS", "PAGE_SIZE", "BATCH_SIZE", "MIN_ALIVE",
+    "CONNECT_MIN_ALIVE", "CONNECT_FAIL_STRIKES", "BAD_TTL_HOURS", "ALIVE_FRESH_SEC",
+    "page_url", "parse_index", "parse_page", "scan", "ScanResult", "sort_by_ping", "next_in_ping_cycle",
+    "top_up_needed", "unbound_probe_allowed", "note_connect_result", "strikes_to_prune", "bad_add",
+    "bad_active",
     "physical_interface", "detect_physical_interface", "probe_runner",
 ]
 
 PAGES_BASE_URL = "https://raw.githubusercontent.com/confeden/nova_updates/main/Github%20list/pages/"
 INDEX_URL = PAGES_BASE_URL + "index.json"
-PAGE_SIZE = 50
-BATCH_SIZE = 50
-MIN_ALIVE = 5
+# The numbers below are the owner's (2026-11-14) and are the same, with the same names, in Nova Android.
+REFRESH_HOURS = 12          # the list (index + page 1) is re-downloaded this often
+PAGE_SIZE = 50              # profiles per downloaded page and per scan batch, newest first
+BATCH_SIZE = PAGE_SIZE
+MIN_ALIVE = 25              # live (HTTPS 204 ok, fresh) profiles wanted; fewer = load and scan the next page
+CONNECT_MIN_ALIVE = 1       # a connect may stop scanning at this many; the top-up goes on in the background
+CONNECT_FAIL_STRIKES = 2    # real failed connections in a row before a node without ping may be deleted
+BAD_TTL_HOURS = 24          # a deleted node stays out of the feed this long
 # A verdict younger than this is reused instead of probing again (not for a forced first batch).
 ALIVE_FRESH_SEC = 10 * 60
 # Hard ceilings so a hostile or broken index cannot make the client loop or allocate.
@@ -195,6 +210,95 @@ def sort_by_ping(keys, results):
     return [k for _ms, _pos, k in alive] + unknown + dead
 
 
+def next_in_ping_cycle(keys, results, current):
+    """The nodes to walk after `current` in the ping-ordered cycle (`sort_by_ping`), wrapping around.
+
+    The one right after `current` (the next-lowest ping) is first, the ones before it follow, and
+    `current` itself is left out. A `current` that is not in `keys` gives the whole order.
+    """
+    order = sort_by_ping(keys, results)
+    if current in order:
+        at = order.index(current)
+        return order[at + 1:] + order[:at]
+    return order
+
+
+def top_up_needed(result, min_alive=MIN_ALIVE):
+    """True when a finished scan left fewer than `min_alive` live nodes and the list was not used up.
+
+    A connect scan stops at `CONNECT_MIN_ALIVE`; the caller asks this and, when True, goes on with a
+    background scan toward `MIN_ALIVE`. "exhausted" (no page left) and "aborted" never ask for more.
+    """
+    return (result is not None and result.alive < int(min_alive)
+            and result.stop not in ("exhausted", "aborted"))
+
+
+def unbound_probe_allowed(interface, vpn_active):
+    """May a scan probe without `-interface`? Only when no VPN is up: otherwise the tunnel would answer."""
+    return bool(interface) or not vpn_active
+
+
+# --------------------------------------------------------------------------------------------
+# Real connection failures (strikes) and the 24 h "deleted" memory. All pure: persistence is
+# `nova_subscriptions` (temp/nova-list-strikes.json). Keys are node identities (fingerprints).
+
+def note_connect_result(strikes, key, ok, now):
+    """New `{key: {"n": failures in a row, "at": ts}}` after one real connection through `key`.
+
+    A success clears the node's strikes. A ping failure is not an input here: only a connection that
+    was really started through the node and did not carry traffic counts.
+    """
+    out = {k: dict(v) for k, v in (strikes or {}).items() if isinstance(v, dict)}
+    if not key:
+        return out
+    if ok:
+        out.pop(key, None)
+    else:
+        out[key] = {"n": int((out.get(key) or {}).get("n") or 0) + 1, "at": float(now)}
+    return out
+
+
+def strikes_to_prune(strikes, verdicts, listed=None, need=CONNECT_FAIL_STRIKES):
+    """Keys that may be deleted: `need` strikes in a row, no successful ping now, another node pinged.
+
+    `verdicts`: fresh `{key: ms or None}` (None = measured dead; a missing key = not measured, which
+    is no successful ping either). `listed`: keys still present (others are ignored when given).
+    Without a successful ping on some other node nothing is deleted: that looks like our own network
+    being down, not like dead nodes.
+    """
+    verdicts = verdicts or {}
+    alive = {k for k, v in verdicts.items() if v is not None}
+    out = []
+    for key, entry in (strikes or {}).items():
+        if listed is not None and key not in listed:
+            continue
+        if int((entry or {}).get("n") or 0) < int(need) or key in alive:
+            continue
+        if alive - {key}:
+            out.append(key)
+    return sorted(out)
+
+
+def _bad_alive(stamp, now, ttl_hours=BAD_TTL_HOURS):
+    try:
+        return 0 <= float(now) - float(stamp) < ttl_hours * 3600.0
+    except (TypeError, ValueError):
+        return False
+
+
+def bad_add(bad, keys, now):
+    """`bad` ({key: deleted_at}) with `keys` stamped `now`; expired entries are dropped on the way."""
+    out = {k: float(v) for k, v in (bad or {}).items() if _bad_alive(v, now)}
+    for key in keys or ():
+        out[key] = float(now)
+    return out
+
+
+def bad_active(bad, now, ttl_hours=BAD_TTL_HOURS):
+    """Keys deleted less than `ttl_hours` ago: the feed must not bring them back yet."""
+    return {k for k, v in (bad or {}).items() if _bad_alive(v, now, ttl_hours)}
+
+
 # --------------------------------------------------------------------------------------------
 # The physical adapter: the one carrying the default route to the Internet that is not a tunnel.
 
@@ -277,7 +381,7 @@ def detect_physical_interface(log=None, clock=time.monotonic, lister=None):
         elif value:
             _IFACE_CACHE["warned"] = False
     if warn and callable(log):
-        log("[Nova list] Физический адаптер не найден — проверка узлов идёт без привязки к нему.")
+        log("[Nova list] Физический адаптер не найден.")
     return value
 
 

@@ -463,12 +463,12 @@ func TestProxyOptionsValidation(t *testing.T) {
 	if _, err := DoAPIRequest(ctx, APIRequest{}, APIOptions{Mode: ModeProxy}); !errors.Is(err, ErrUsage) {
 		t.Fatalf("proxy mode without URL: %v", err)
 	}
-	for _, bad := range []string{"socks5://127.0.0.1:1080", "http://", "http://user:pa ss@[::1"} {
+	for _, bad := range []string{"ftp://127.0.0.1:1080", "socks5://user:secret@127.0.0.1:1080", "http://", "http://user:pa ss@[::1"} {
 		_, err := DoAPIRequest(ctx, APIRequest{}, APIOptions{Mode: ModeProxy, ProxyURL: bad})
 		if !errors.Is(err, ErrUsage) {
 			t.Errorf("%q: err = %v", bad, err)
 		}
-		if err != nil && strings.Contains(err.Error(), "pa ss") {
+		if err != nil && (strings.Contains(err.Error(), "pa ss") || strings.Contains(err.Error(), "secret")) {
 			t.Errorf("error echoes credentials: %v", err)
 		}
 	}
