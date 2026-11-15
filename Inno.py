@@ -126,8 +126,13 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # nova_vpn_slots.py: tcp_proxy.py and tgrelay/transport.py read the two-slot egress state through it
 # (which egress the reserve is, whether the primary exits abroad). Missing, they fall back to the
 # pre-1.39 routing in silence -- so it must be listed here, not merely present in the tree.
+# nova_dns_ai.py and nova_exit_probe.py: nova_routing_profiles.py (imported by tcp_proxy.py, udp_proxy.py and both
+# NovaDivert helpers) does `import nova_dns_ai`, which does `import nova_exit_probe`. Frozen Nova.exe has them in its
+# PYZ, the helpers' separate interpreter does not: 1.46.1 shipped without them and every helper died at import with
+# ModuleNotFoundError. tests/test_installer_helper_imports.py walks the closure, so a new link cannot be forgotten.
 RESOURCE_ROOT_FILES = ("nova_routing_profiles.py", "nova_transport_plans.py", "nova_privacy.py", "nova_temp_log.py",
-                       "nova_vpn_slots.py", "nova_gpu.py", "nova_texture_thumbs.png")
+                       "nova_vpn_slots.py", "nova_dns_ai.py", "nova_exit_probe.py",
+                       "nova_gpu.py", "nova_texture_thumbs.png")
 RESOURCE_SOURCE_DIR = "resources"
 ROOT_DOC_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md")
 # The proxy helpers (NovaWFP\proxy\tcp_proxy.py, udp_proxy.py) run as separate
@@ -891,6 +896,8 @@ def require_paths(base_dir: Path) -> None:
     ensure_nova_engine(base_dir)
     ensure_nova_go(base_dir)
     ensure_nova_xray(base_dir)
+    # The staging loop skips a missing RESOURCE_ROOT_FILES entry silently; fail here instead.
+    required_paths.extend(base_dir / RESOURCE_SOURCE_DIR / name for name in RESOURCE_ROOT_FILES)
     ensure_nova_proxy(base_dir)
 
 
