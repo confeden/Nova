@@ -19,7 +19,7 @@ jobs:
           echo "VERSION=$CLEAN_VERSION" >> $GITHUB_ENV
           
           # Формируем ссылку на скачивание установщика
-          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/NovaSetup.exe"
+          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/NovaSetup-${CLEAN_VERSION}.exe"
           echo "ASSET_URL=$ASSET_URL" >> $GITHUB_ENV
           echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${TAG_NAME}" >> $GITHUB_ENV
 

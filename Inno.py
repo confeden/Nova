@@ -26,9 +26,9 @@ except Exception:
 
 APP_NAME = "Nova"
 APP_EXE = "Nova.exe"
-# Updater-compatible name: every installed Nova up to 1.45 looks for an asset called exactly this one,
-# so each release carries a copy under it beside the versioned file people see (owner 2026-11-14).
-INSTALLER_EXE = "NovaSetup.exe"
+# Only the versioned installer is built (owner 2026-11-15): no plain NovaSetup.exe copy any more. Nova up to
+# 1.45 looked for an asset called exactly that, so a release without it is invisible to those clients;
+# 1.46+ reads NovaSetup-<version>.exe.
 INSTALLER_EXE_VERSIONED = "NovaSetup-{version}.exe"
 ISS_TEMPLATE = "NovaInstaller.iss"
 
@@ -1762,9 +1762,6 @@ def build_installer(base_dir: Path) -> None:
     installer_path = release_dir / INSTALLER_EXE_VERSIONED.format(version=version)
     if not installer_path.exists():
         raise RuntimeError(f"Installer was not created: {installer_path}")
-    compat_path = release_dir / INSTALLER_EXE
-    shutil.copy2(installer_path, compat_path)
-    print(f"[DONE] Updater-compatible copy: {compat_path}")
 
     try:
         safe_rmtree(staging_dir)
