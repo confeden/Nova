@@ -413,8 +413,9 @@ PAC_SERVER_PORT = 1369
 RELAY_PORT = 1372
 TLS_TERMINATOR_PORT = 1374
 PLANNED_WHATSAPP_RELAY_PORT = 1377  # reserved, nothing listens (nova_public_relays)
+UNLISTED_PROXY_PORT = 1376  # D75: tcp_proxy's CONNECT decision proxy for https hosts on no list
 NOVA_PORT_BAND = (1369, 1379)
-# Every fixed port, by what owns it. 1376 is the one spare. pinned by tests/test_nova_port_band.py.
+# Every fixed port, by what owns it. No spare left (1376 = the decision proxy, D75). Pinned by tests/test_nova_port_band.py.
 NOVA_PORTS = {
     PAC_SERVER_PORT: "pac-server",
     PRIMARY_SOCKS_PORT: "primary-socks",
@@ -424,6 +425,7 @@ NOVA_PORTS = {
     TLS_TERMINATOR_PORT: "tls-terminator",
     TOR_SOCKS_PORT: "tor-socks",
     PLANNED_WHATSAPP_RELAY_PORT: "whatsapp-relay-reserved",
+    UNLISTED_PROXY_PORT: "unlisted-decision-proxy",
     TOR_HTTP_PORT: "tor-http",
     SECONDARY_PROFILE_SOCKS_PORT: "secondary-socks",
 }

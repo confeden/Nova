@@ -126,12 +126,13 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # nova_vpn_slots.py: tcp_proxy.py and tgrelay/transport.py read the two-slot egress state through it
 # (which egress the reserve is, whether the primary exits abroad). Missing, they fall back to the
 # pre-1.39 routing in silence -- so it must be listed here, not merely present in the tree.
+# nova_unlisted_route.py: tcp_proxy.py imports it for the 1376 decision proxy (D75); absent, the proxy is silently off.
 # nova_dns_ai.py and nova_exit_probe.py: nova_routing_profiles.py (imported by tcp_proxy.py, udp_proxy.py and both
 # NovaDivert helpers) does `import nova_dns_ai`, which does `import nova_exit_probe`. Frozen Nova.exe has them in its
 # PYZ, the helpers' separate interpreter does not: 1.46.1 shipped without them and every helper died at import with
 # ModuleNotFoundError. tests/test_installer_helper_imports.py walks the closure, so a new link cannot be forgotten.
 RESOURCE_ROOT_FILES = ("nova_routing_profiles.py", "nova_transport_plans.py", "nova_privacy.py", "nova_temp_log.py",
-                       "nova_vpn_slots.py", "nova_dns_ai.py", "nova_exit_probe.py",
+                       "nova_vpn_slots.py", "nova_dns_ai.py", "nova_exit_probe.py", "nova_unlisted_route.py",
                        "nova_gpu.py", "nova_texture_thumbs.png")
 RESOURCE_SOURCE_DIR = "resources"
 ROOT_DOC_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "README.md")

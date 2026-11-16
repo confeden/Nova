@@ -1,6 +1,24 @@
 {
     "strategies": [
         {
+            "name": "general_ALT4",
+            "args": [
+                "--filter-tcp=80,443",
+                "--dpi-desync=fake,multisplit",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fooling=badseq",
+                "--dpi-desync-badseq-increment=1000",
+                "--dpi-desync-fake-tls=fake/stun.bin",
+                "--dpi-desync-fake-tls=fake/tls_clienthello_www_google_com.bin",
+                "--dpi-desync-fake-http=fake/tls_clienthello_www_sferum_ru.bin",
+                "--new",
+                "--filter-udp=443",
+                "--dpi-desync=fake",
+                "--dpi-desync-repeats=6",
+                "--dpi-desync-fake-quic=fake/quic_initial_www_google_com.bin"
+            ]
+        },
+        {
             "name": "general_M46C",
             "args": [
                 "--filter-tcp=80,443",

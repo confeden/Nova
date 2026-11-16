@@ -14,9 +14,7 @@ import os
 # командной строки: winws проверяет все --hostlist-exclude профиля.
 GENERAL_EXCLUDED_LISTS = (
     "exclude.txt",
-    "main.txt",
     "second.txt",
-    "u_main.txt",
     "u_second.txt",
     "ai.txt",
     "youtube.txt",
@@ -26,6 +24,18 @@ GENERAL_EXCLUDED_LISTS = (
     "cloudflare.txt",
     "games.txt",
 )
+
+# main.txt / u_main.txt общая стратегия больше не исключает (владелец 2026-11-16, D76, G154): браузер на «Авто»
+# отправляет имя из main напрямую, только если оно открылось по стратегии, а без десинхронизации такое имя
+# не открывалось никогда и ехало в VPN. Трафик в VPN-туннель имени сайта не несёт, так что стратегия ему не мешает.
+# NOVA_GENERAL_ON_MAIN=0 возвращает прежнее исключение.
+GENERAL_MAIN_LISTS = ("main.txt", "u_main.txt")
+
+
+def general_covers_main(env=None):
+    env = os.environ if env is None else env
+    return str(env.get("NOVA_GENERAL_ON_MAIN", "1")).strip().lower() not in ("0", "false", "no", "off")
+
 
 # Адресные списки сервисов со своими профилями.
 GENERAL_EXCLUDED_IPSETS = (
@@ -92,7 +102,7 @@ def _has_entries(path):
     return False
 
 
-def general_scope_args(base_dir, runtime_lists=None, extra_hostlists=(), extra_ipsets=(), has_entries=None):
+def general_scope_args(base_dir, runtime_lists=None, extra_hostlists=(), extra_ipsets=(), has_entries=None, env=None):
     """Аргументы --hostlist-exclude/--ipset-exclude для профиля general.
 
     runtime_lists: {имя_файла: путь} — сгенерированные на лету копии
@@ -112,7 +122,10 @@ def general_scope_args(base_dir, runtime_lists=None, extra_hostlists=(), extra_i
         seen.add(key)
         out.append(f"{flag}={path}")
 
-    for name in GENERAL_EXCLUDED_LISTS:
+    names = list(GENERAL_EXCLUDED_LISTS)
+    if not general_covers_main(env):
+        names[1:1] = list(GENERAL_MAIN_LISTS)
+    for name in names:
         add("--hostlist-exclude", runtime_lists.get(name) or os.path.join(base_dir, "list", name))
     for path in extra_hostlists:
         add("--hostlist-exclude", path)
@@ -168,3 +181,41 @@ def reset_stale_general_scores(scores, state, recorded_method):
             state.pop(key, None)
         state["checks_completed"] = False
     return True
+
+
+# Фоновая замена general. До 1.46.3 чекер, эволюция и сортировщик меняли активную general
+# при любом, хоть на один домен, превосходстве по сохранённому счёту и не сравнивали
+# замену с текущей на одной панели: шум замера (±1-2 домена на ~100) приводил к смене
+# проверенной стратегии на равноценную или худшую для контрольных сайтов.
+# Замена допустима, только если кандидат выигрывает у ТЕКУЩЕЙ на той же панели и тем же
+# проходом (оба счёта из одного прогона) и выигрыш превышает шум.
+GENERAL_MIN_GAIN_RATIO = 0.04
+GENERAL_MIN_GAIN_COUNT = 3
+
+
+def general_guard_enabled(env=None):
+    """Защита включена по умолчанию; NOVA_GENERAL_GUARD=0 возвращает прежнее поведение."""
+    import os
+    source = os.environ if env is None else env
+    return str(source.get("NOVA_GENERAL_GUARD", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def general_swap_allowed(service, cur_score, cur_total, cand_score, cand_total, env=None):
+    """True, если фоновой замене разрешено поменять активную стратегию сервиса.
+
+    Для всех сервисов, кроме general, проверка не вмешивается (у youtube свой пин).
+    Для general нужны оба счёта, и выигрыш по доле не меньше GENERAL_MIN_GAIN_RATIO
+    и по числу доменов не меньше GENERAL_MIN_GAIN_COUNT на панели кандидата.
+    """
+    if str(service).lower() != "general" or not general_guard_enabled(env):
+        return True
+    try:
+        cur_score, cur_total = float(cur_score), float(cur_total)
+        cand_score, cand_total = float(cand_score), float(cand_total)
+    except (TypeError, ValueError):
+        return False
+    if cur_total <= 0 or cand_total <= 0 or cur_score < 0:
+        return False  # у текущей нет измерения: доказательств, что кандидат лучше, нет
+    gain_ratio = cand_score / cand_total - cur_score / cur_total
+    gain_count = gain_ratio * cand_total
+    return gain_ratio >= GENERAL_MIN_GAIN_RATIO and gain_count >= GENERAL_MIN_GAIN_COUNT

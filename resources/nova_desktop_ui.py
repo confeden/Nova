@@ -1,5 +1,6 @@
 """Desktop presentation of Nova Android's appearance system. No transport logic."""
 
+import colorsys
 import logging
 import math
 import os
@@ -31,6 +32,8 @@ CONNECTING_TEXTS = frozenset({
 # core, ГОТОВ К ЗАПУСКУ between two steps) ends the rings only when it outlasts this. The rings used
 # to vanish for good on the first such flicker, and the connect then looked interrupted (2026-11-12).
 STOP_GRACE_SEC = 2.5
+# Pauses before restarting a dead GPU engine (the last one repeats): a driver install resets GL under it.
+GPU_RESTART_DELAYS = (3, 10, 30, 60, 120)
 # Appearance preferences reach the disk this long after the last change (a slider drag is many changes).
 PREFERENCES_SAVE_QUIET_S = 0.6
 # While another Nova window (Настройки, Профили, Оформление, Журнал…) is on screen the background runs at
@@ -147,6 +150,7 @@ def main_layout(width, height, scale=1.0):
         # above their row so it reads as a notification rather than as a button of the hero card.
         "update": (width / 2, round(22 * scale)),
         "header_y": round(31 * scale), "route_heading_y": routes_top + round(20 * scale),
+        "route_heading": (round(40 * scale), routes_top + round(20 * scale)),
         "slot_label_y": routes_top + round(50 * scale),
         "slot_y": routes_top + round(75 * scale),
         "slot_x": round(40 * scale), "slot_width": width - round(80 * scale),
@@ -175,16 +179,50 @@ def action_text(value):
     return {"ПОДКЛЮЧИТЬ": "Подключить", "ОТКЛЮЧИТЬ": "Отключить"}.get(value, value)
 
 
+_HAIR_SPACE = " "
+
+
+def status_caption(text):
+    """Neon-tube caption: capitals with a hair of tracking (Tk has no letter-spacing; PIL draws the same string)."""
+    return _HAIR_SPACE.join(text.upper())
+
+
+def _hex_rgb(color):
+    try:
+        return tuple(int(color[index:index + 2], 16) for index in (1, 3, 5)) if len(color) == 7 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def tube_core(color):
+    """The hot core of a neon tube: the state colour pushed almost to white."""
+    rgb = _hex_rgb(color)
+    if rgb is None:
+        return color
+    hue, _light, saturation = colorsys.rgb_to_hls(*(value / 255 for value in rgb))
+    return "#%02x%02x%02x" % tuple(round(value * 255) for value in colorsys.hls_to_rgb(hue, .93, saturation))
+
+
 def status_glow(text, pixel_size, color):
-    """Soft static halo; the sharp, native Tk caption stays above it."""
+    """Neon-tube halo in three layers (wide soft, tight, a hugging pale rim); the sharp native Tk caption in the
+    hot-core colour stays above it."""
+    rgb = _hex_rgb(color) or (255, 255, 255)
+    hue, _light, saturation = colorsys.rgb_to_hls(*(value / 255 for value in rgb))
+    rim = tuple(round(value * 255) for value in colorsys.hls_to_rgb(hue, .72, saturation))
     font = ImageFont.truetype("seguisb.ttf", max(1, round(pixel_size)))
     bounds = font.getbbox(text)
-    pad = max(6, round(pixel_size * .5))
+    unit = pixel_size / 25
+    layers = ((16 * unit, 1.6, rgb), (6 * unit, 2.0, rgb), (2.5 * unit, 2.2, rim))
+    pad = max(8, round(layers[0][0] * 3))
     mask = Image.new("L", (bounds[2] - bounds[0] + pad * 2, bounds[3] - bounds[1] + pad * 2))
-    ImageDraw.Draw(mask).text((pad - bounds[0], pad - bounds[1]), text, font=font, fill=180)
-    mask = mask.filter(ImageFilter.GaussianBlur(max(1.5, pixel_size * .12)))
-    glow = Image.new("RGBA", mask.size, color)
-    glow.putalpha(mask)
+    ImageDraw.Draw(mask).text((pad - bounds[0], pad - bounds[1]), text, font=font, fill=255)
+    glow = Image.new("RGBA", mask.size, (0, 0, 0, 0))
+    for radius, strength, tint in layers:
+        alpha = mask.filter(ImageFilter.GaussianBlur(max(1.0, radius))).point(
+            lambda value, k=strength: min(255, int(value * k)))
+        layer = Image.new("RGBA", mask.size, tint)
+        layer.putalpha(alpha)
+        glow = Image.alpha_composite(glow, layer)
     return glow
 
 
@@ -255,50 +293,121 @@ def set_link_hover(label, hovered, color, underline=True):
         label.canvas.itemconfigure(item, fill=color if hovered else label.fg, font=font)
 
 
-def supernova_icon(size=64, accent="#50C878"):
-    """A vector starburst, rasterized at the target DPI for windows and the tray."""
-    scale = 4
-    image = Image.new("RGBA", (size * scale, size * scale))
-    color = tuple(int(accent[index:index + 2], 16) for index in (1, 3, 5))
-    center = size * scale / 2
-    unit = size * scale
-    glow = Image.new("RGBA", image.size)
-    pen = ImageDraw.Draw(glow)
-    pen.ellipse((center - unit * .16, center - unit * .16,
-                 center + unit * .16, center + unit * .16), fill=color + (95,))
-    radius = unit * .325
-    pen.ellipse((center - radius, center - radius, center + radius, center + radius),
-                outline=color + (180,), width=max(1, round(unit * .025)))
-    image = Image.alpha_composite(image, glow.filter(ImageFilter.GaussianBlur(unit * .11)))
-    pen = ImageDraw.Draw(image)
-    for radius, opacity, width in ((.36, 50, .006), (.325, 220, .009), (.304, 70, .005)):
+ICON_ACCENT = "#2EE5C3"  # Nova teal: the brand colour of the launcher icon on Android and of icon.ico here
+_ICON_REFERENCE = {"ray": (0xB8, 0xFF, 0xF1), "ring": (0x7D, 0xF5, 0xE0),
+                   "ground": ((0x0A, 0x3C, 0x44), (0x06, 0x2A, 0x32), (0x02, 0x12, 0x18))}
+_ICON_GROUND_STOPS = (0.0, 0.55, 1.0)
+_ICON_STAR_SPAN = .94      # a bare star (header logo, window list) fills almost the whole canvas
+_ICON_BADGE_STAR = .78     # on the badge it is larger than Android's 66/108: a 16 px taskbar icon must stay legible
+
+
+def _icon_palette(accent):
+    """Colours of the neon star for one accent. The brand teal gives the exact reference palette (same as
+    Nova Android); any other hue keeps the reference lightness and saturation of every tint."""
+    try:
+        core = tuple(int(accent[index:index + 2], 16) for index in (1, 3, 5))
+    except (TypeError, ValueError, IndexError):
+        core = (0x2E, 0xE5, 0xC3)
+    if core == (0x2E, 0xE5, 0xC3):
+        return {"core": core, **_ICON_REFERENCE}
+    hue = colorsys.rgb_to_hls(*(value / 255 for value in core))[0]
+
+    def tint(reference):
+        _, light, saturation = colorsys.rgb_to_hls(*(value / 255 for value in reference))
+        return tuple(round(value * 255) for value in colorsys.hls_to_rgb(hue, light, saturation))
+
+    return {"core": core, "ray": tint(_ICON_REFERENCE["ray"]), "ring": tint(_ICON_REFERENCE["ring"]),
+            "ground": tuple(tint(value) for value in _ICON_REFERENCE["ground"])}
+
+
+def _radial_alpha(size, center, radius, stops):
+    """'L' image whose value is the piecewise-linear stop value at each pixel's distance from centre/radius."""
+    t = Image.new("L", (size, size), 255)
+    # PIL's gradient is 181 mid-edge and 255 only in the corners: pasted at half-width `radius`, rescale so that
+    # the circle of `radius` is exactly 255 and the pasted square never shows as an edge.
+    span = max(2, round(radius * 2))
+    t.paste(Image.radial_gradient("L").resize((span, span), Image.Resampling.BILINEAR),
+            (round(center[0] - radius), round(center[1] - radius)))
+    t = t.point([min(255, round(value * 255 / 181)) for value in range(256)])
+    return t.point(_stops_lut(stops))
+
+
+def _stops_lut(stops):
+    """256-entry table for stops [(position 0..1, value)] sampled at i/255."""
+    table = []
+    for index in range(256):
+        position = index / 255
+        for (p0, v0), (p1, v1) in zip(stops, stops[1:]):
+            if position <= p1:
+                table.append(round(v0 + (v1 - v0) * (position - p0) / max(1e-9, p1 - p0)))
+                break
+        else:
+            table.append(round(stops[-1][1]))
+    return table
+
+
+def _neon_star(canvas, span, palette):
+    """The A2 'Neon' starburst, transparent ground: a soft halo, a blurred copy of the ring and rays as the
+    glowing tube, then the crisp drawing. `span` is the share of the canvas the star's own square takes."""
+    unit = canvas * span
+    center = canvas / 2
+    core, ray, ring = palette["core"], palette["ray"], palette["ring"]
+    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    # General halo: radial, centre alpha .75 -> .2 at 60% -> 0 at the rim (radius = half of the star's square).
+    halo_alpha = _radial_alpha(canvas, (center, center), unit * .5, ((0, 191), (.6, 51), (1, 0)))
+    halo = Image.new("RGBA", image.size, core + (0,))
+    halo.putalpha(halo_alpha)
+    image = Image.alpha_composite(image, halo)
+
+    def rays(pen, fill):
+        for index in range(12):
+            angle = index * math.tau / 12 - math.pi / 2
+            length = unit * (.46 if index % 3 == 0 else .30 if index % 2 == 0 else .21)
+            half_width = unit * (.045 if index % 3 == 0 else .018)
+            dx, dy = math.cos(angle), math.sin(angle)
+            px, py = -dy * half_width, dx * half_width
+            pen.polygon(((center + px, center + py), (center + dx * length, center + dy * length),
+                         (center - px, center - py)), fill=fill)
+
+    def circle(pen, radius, **style):
         distance = unit * radius
-        pen.ellipse((center - distance, center - distance, center + distance, center + distance),
-                    outline=color + (opacity,), width=max(1, round(unit * width)))
-    for index in range(12):
-        angle = index * math.tau / 12 - math.pi / 2
-        length = unit * (.46 if index % 3 == 0 else .30 if index % 2 == 0 else .21)
-        half_width = unit * (.045 if index % 3 == 0 else .018)
-        dx, dy = math.cos(angle), math.sin(angle)
-        px, py = -dy * half_width, dx * half_width
-        pen.polygon(((center + px, center + py), (center + dx * length, center + dy * length),
-                     (center - px, center - py)), fill=color + (255,))
-    radius = unit * .115
-    pen.ellipse((center - radius, center - radius, center + radius, center + radius), fill=color + (255,))
-    radius = unit * .048
-    pen.ellipse((center - radius, center - radius, center + radius, center + radius), fill="#F5FFF8")
+        pen.ellipse((center - distance, center - distance, center + distance, center + distance), **style)
+
+    tube = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    pen = ImageDraw.Draw(tube)
+    circle(pen, .325, outline=core + (255,), width=max(1, round(unit * .03)))
+    rays(pen, core + (255,))
+    tube = tube.filter(ImageFilter.GaussianBlur(unit * .036))
+    tube.putalpha(tube.getchannel("A").point(lambda value: min(255, round(value * 3.4))))
+    image = Image.alpha_composite(image, tube)
+
+    pen = ImageDraw.Draw(image)
+    for radius, opacity, width in ((.36, 77, .006), (.325, 255, .009), (.304, 90, .005)):
+        circle(pen, radius, outline=ring + (opacity,), width=max(1, round(unit * width)))
+    rays(pen, ray + (255,))
+    circle(pen, .115, fill=core + (255,))
+    circle(pen, .048, fill=(255, 255, 255, 255))
     for x, y, radius in ((.74, .23, .019), (.22, .70, .014), (.73, .72, .013)):
-        pen.ellipse(((x - radius) * unit, (y - radius) * unit,
-                     (x + radius) * unit, (y + radius) * unit), fill=color + (180,))
+        x, y = center + (x - .5) * unit, center + (y - .5) * unit
+        pen.ellipse((x - radius * unit, y - radius * unit, x + radius * unit, y + radius * unit),
+                    fill=ring + (255,))
+    return image
+
+
+def supernova_icon(size=64, accent=ICON_ACCENT):
+    """The A2 'Neon' logo, shared with Nova Android: a starburst in `accent` with a glow of the same hue,
+    rasterized at the target DPI for windows and the header."""
+    scale = 4
+    image = _neon_star(size * scale, _ICON_STAR_SPAN, _icon_palette(accent))
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
 
 _APP_ICON_CACHE = {}
 
 
-def app_icon(size=64, accent="#50C878"):
-    """Window / taskbar / tray icon: the starburst on its own dark rounded badge with a light rim, so it stays
-    visible on any taskbar colour (a bare transparent star vanishes on light green or white bars).
+def app_icon(size=64, accent=ICON_ACCENT):
+    """Window / taskbar / tray icon: the neon star on a dark rounded badge with a thin light rim, so it stays
+    visible on any taskbar colour (a bare transparent star vanishes on light bars).
 
     Drawn once per (size, accent): every secondary window asks for it on each open (~9 ms a time)."""
     key = (int(size), str(accent))
@@ -311,28 +420,26 @@ def app_icon(size=64, accent="#50C878"):
 
 
 def _draw_app_icon(size, accent):
-    scale = 4
+    scale = 4 if size <= 128 else 2
     unit = size * scale
-    color = tuple(int(accent[index:index + 2], 16) for index in (1, 3, 5))
-    badge = Image.new("RGBA", (unit, unit), (0, 0, 0, 0))
-    pen = ImageDraw.Draw(badge)
+    palette = _icon_palette(accent)
     margin = unit * .03
     box = (margin, margin, unit - margin, unit - margin)
-    ground = tuple(round(value * .16 + 6) for value in color)
-    pen.rounded_rectangle(box, radius=unit * .24, fill=ground + (255,))
-    glow = Image.new("RGBA", badge.size, (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse((unit * .2, unit * .2, unit * .8, unit * .8), fill=color + (90,))
-    glow = glow.filter(ImageFilter.GaussianBlur(unit * .12))
+    radius = unit * .24
+    # Ground: radial (50%, 52%) of the side, radius .657 of it, three stops; clipped to the rounded square.
+    t = _radial_alpha(unit, (unit * .5, unit * .52), unit * .657, ((0, 0), (1, 255)))
+    channels = []
+    for channel in range(3):
+        stops = [(position, palette["ground"][index][channel])
+                 for index, position in enumerate(_ICON_GROUND_STOPS)]
+        channels.append(t.point(_stops_lut(stops)))
+    badge = Image.merge("RGB", channels).convert("RGBA")
     mask = Image.new("L", badge.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle(box, radius=unit * .24, fill=255)
-    glow.putalpha(ImageChops.multiply(glow.getchannel("A"), mask))
-    badge = Image.alpha_composite(badge, glow)
-    pen = ImageDraw.Draw(badge)
-    pen.rounded_rectangle(box, radius=unit * .24, outline=(255, 255, 255, 120), width=max(2, round(unit * .035)))
-    star = supernova_icon(round(size * .94), "#%02X%02X%02X" % tuple(round(v + (255 - v) * .35) for v in color))
-    star = star.resize((round(unit * .94), round(unit * .94)), Image.Resampling.LANCZOS)
-    offset = round((unit - star.width) / 2)
-    badge.alpha_composite(star, (offset, offset))
+    ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
+    badge.putalpha(mask)
+    badge = Image.alpha_composite(badge, _neon_star(unit, _ICON_BADGE_STAR, palette))
+    ImageDraw.Draw(badge).rounded_rectangle(
+        box, radius=radius, outline=palette["ring"] + (90,), width=max(2, round(unit * .02)))
     return badge.resize((size, size), Image.Resampling.LANCZOS)
 
 
@@ -384,6 +491,9 @@ class DesktopScene:
         self._background = canvas.create_image(0, 0, anchor="nw", tags="desktop_background")
         # GPU path (D52): nova-engine gpu-serve draws the background; None/False = CPU path only.
         self._gpu = None
+        self._gpu_owned = False
+        self._gpu_restarts = 0
+        self._gpu_restart_job = None
         self._gpu_mode = False
         self._gpu_photo = None
         self._gpu_seq = 0
@@ -428,10 +538,10 @@ class DesktopScene:
             self.canvas.after_cancel(self._poll_id)
             if self._animation_id is not None:
                 self.canvas.after_cancel(self._animation_id)
-            for job in (self._gpu_poll_id, self._gpu_pointer_job):
+            for job in (self._gpu_poll_id, self._gpu_pointer_job, self._gpu_restart_job):
                 if job is not None:
                     self.canvas.after_cancel(job)
-            self._gpu_poll_id = self._gpu_pointer_job = None
+            self._gpu_poll_id = self._gpu_pointer_job = self._gpu_restart_job = None
             if self._gpu is not None:
                 # No waiting on the Tk thread: stdin closes, so the engine ends even if Nova dies first.
                 self._gpu.stop(wait=0)
@@ -681,7 +791,10 @@ class DesktopScene:
     # --- the NOVA toggle: cards <-> pills around the text ---
 
     COMPACT_SECONDS = .6
-    ZONES = (("hero", ("status",)), ("routes", ("heading",)))
+    # Neither card keeps a pill once folded: the status caption and the route heading stand on the bare background
+    # (like the slot captions) and each card collapses into the point below, then disappears.
+    ZONES = (("hero", ()), ("routes", ()))
+    FOLD_POINT = {"hero": "status", "routes": "route_heading"}
 
     @property
     def compact(self):
@@ -719,8 +832,9 @@ class DesktopScene:
             left, top, right, bottom = layout[name]
             pills = [zones[key] for key in keys if key in zones]
             if not pills:
-                centre_x, centre_y = (left + right) / 2, (top + bottom) / 2
-                pills = [(centre_x - 2, centre_y - 2, centre_x + 2, centre_y + 2)]
+                # No text of its own: collapse into a point (under 2 px, so compose_cards draws nothing at fold 1).
+                centre_x, centre_y = layout.get(self.FOLD_POINT.get(name), ((left + right) / 2, (top + bottom) / 2))
+                pills = [(centre_x - .5, centre_y - .5, centre_x + .5, centre_y + .5)]
             rects = []
             for pill in pills:
                 rect = [left + (pill[0] - left) * fold, top + (pill[1] - top) * fold,
@@ -910,11 +1024,9 @@ class DesktopScene:
         """gpu: None = decide by NOVA_GPU, False = never, or an engine object (tests)."""
         if gpu is False or os.environ.get("NOVA_GPU") == "0":
             return
-        if gpu is None or gpu is True:
-            temp = None
-            if self.preferences_path:
-                temp = os.path.join(os.path.dirname(os.path.abspath(os.fspath(self.preferences_path))), "temp")
-            gpu = nova_gpu.GpuEngine(temp_dir=temp)
+        self._gpu_owned = gpu is None or gpu is True
+        if self._gpu_owned:
+            gpu = self._gpu_new_engine()
         self._gpu = gpu
         if gpu.state == "new":
             gpu.start_async()
@@ -970,6 +1082,7 @@ class DesktopScene:
 
     def _gpu_enter(self):
         self._gpu_mode = True
+        self._gpu_restarts = 0
         self._gpu_photo = None
         self._gpu_seq = 0
         self._gpu_paused = None
@@ -993,8 +1106,19 @@ class DesktopScene:
         self._schedule_animation()
         self.draw(*self._size)
 
+    def _gpu_new_engine(self):
+        temp = None
+        if self.preferences_path:
+            temp = os.path.join(os.path.dirname(os.path.abspath(os.fspath(self.preferences_path))), "temp")
+        return nova_gpu.GpuEngine(temp_dir=temp)
+
     def _gpu_abandon(self, reason=None):
-        """The engine died or the pump broke: back to the CPU path for good, without a user-visible error."""
+        """The engine died or the pump broke: CPU path meanwhile, without a user-visible error.
+
+        A dead engine is restarted later with growing pauses: a display-driver install or reset kills
+        the GL child, and without a restart the window would stay on the CPU stand-ins until Nova restarts.
+        A broken frame pump (`reason` given) is a bug rather than an environment fault: no restart.
+        """
         engine, self._gpu = self._gpu, None
         if engine is None:
             return
@@ -1007,6 +1131,18 @@ class DesktopScene:
             self._gpu_photo = None
             self._schedule_animation()
             self.draw(*self._size)
+        if reason is None and self._gpu_owned and not self._closed:
+            delay = GPU_RESTART_DELAYS[min(self._gpu_restarts, len(GPU_RESTART_DELAYS) - 1)]
+            self._gpu_restarts += 1
+            self._gpu_restart_job = self.canvas.after(int(delay * 1000), self._gpu_restart)
+
+    def _gpu_restart(self):
+        self._gpu_restart_job = None
+        if self._closed or self._gpu is not None or os.environ.get("NOVA_GPU") == "0":
+            return
+        self._gpu = self._gpu_new_engine()
+        self._gpu.start_async()
+        self._gpu_schedule(100)
 
     def _gpu_configure(self):
         config = nova_gpu.config_from_prefs(self.appearance, nova_appearance.THEMES[self.appearance["theme"]]["accent"],
@@ -1175,8 +1311,14 @@ class DesktopScene:
                        round(23 * scale))
         self._brand_text = text(brand_x, layout["header_y"] - brand_lift, "NOVA", "brand", colors["text"])
         self._brand_font = fonts["brand"]
-        text(layout["slot_x"], layout["route_heading_y"], "Маршруты VPN", "section", colors["text"], zone="heading")
+        heading = text(layout["slot_x"], layout["route_heading_y"], "Маршруты VPN", "section", colors["text"],
+                       zone="heading")
         self._caption_shadows = []
+        # Folded, the heading has no glass either: it gets the same faint shadow as the slot captions.
+        heading_shadow = canvas.create_image(layout["slot_x"], layout["route_heading_y"], anchor="center",
+                                             state="hidden", tags="desktop_chrome")
+        canvas.tag_lower(heading_shadow, heading)
+        self._caption_shadows.append((heading_shadow, heading, "Маршруты VPN", fonts["section"][1] * 96 / 72 * scale))
         caption_px = fonts["caption"][1] * 96 / 72 * scale
         for centre, caption in zip(layout["slot_button_centers"], ("Основной", "Дополнительный")):
             shadow = canvas.create_image(centre, layout["slot_label_y"], anchor="center", state="hidden",

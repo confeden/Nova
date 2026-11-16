@@ -436,14 +436,16 @@ class LogicalsParsingTests(unittest.TestCase):
         self.assertTrue(all(n["load"] == 50 and n["score"] == 0.0 for n in loaded))
 
     def test_shipped_node_list_is_usable(self):
-        """profiles/AWG Proton/proton_nodes.json — копия ассета Android: 50 узлов, все валидны."""
+        """profiles/AWG Proton/proton_nodes.json — копия ассета Android, освежённая сборкой: 30..150 узлов, все валидны."""
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(repo, "profiles", "AWG Proton", "proton_nodes.json")
         if not os.path.exists(path):
             self.skipTest("proton_nodes.json ещё не разложен в profiles/")
         nodes = nova_proton.load_bundled_nodes(path)
-        self.assertEqual(len(nodes), 50)
-        self.assertEqual(len({n["entry_ip"] for n in nodes}), 50)
+        # refresh_bundled_profiles.py вливает свежую выдачу: MIN_PROTON_NODES..MAX_PROTON_NODES.
+        self.assertGreaterEqual(len(nodes), 30)
+        self.assertLessEqual(len(nodes), 150)
+        self.assertEqual(len({n["entry_ip"] for n in nodes}), len(nodes))
 
 
 def node(name, country, load, city="C"):

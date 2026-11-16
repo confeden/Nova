@@ -335,6 +335,7 @@ import nova_subscriptions
 import nova_list_pages
 import nova_port_holder
 import nova_route_verdicts
+import nova_unlisted_route
 import nova_direct_probe
 import nova_list_sync
 import nova_ai_region
@@ -5338,7 +5339,9 @@ try:
 
             _add(self.port)
             _add(self.port_legacy)
-            for p in (1370, 1376, 1374, 1080, 10808):
+            # 1376 is not a WARP fallback any more: the unlisted decision proxy (D75) listens there, and a
+            # listener on it would read as «WARP is up on 1376».
+            for p in (1370, 1374, 1080, 10808):
                 _add(p)
 
             raw = str(os.environ.get("NOVA_WARP_PORT_CANDIDATES", "")).strip()
@@ -9805,6 +9808,21 @@ try:
                 ai_apps_js = "{" + ",".join(f'"{d}":1' for d in sorted(AI_APP_DOMAINS)) + "}"
                 youtube_js = "{" + ",".join(f'"{d}":1' for d in sorted(youtube_domains)) + "}"
                 auto_direct_js = "{" + ",".join(f'"{d}":1' for d in sorted(auto_direct_hosts)) + "}"
+                # Hosts on no list (D75): the proxy on 1376 races direct against main/second for an https host
+                # with no verdict; a host it judged leaves the proxy -- direct_ok goes DIRECT, direct_bad takes the
+                # main chain. Only while a VPN can carry main (main_class_route is DIRECT when none can).
+                unlisted_direct_hosts, unlisted_vpn_hosts, unlisted_decider_js = [], [], ""
+                if browser_auto and main_class_route != "DIRECT" and nova_unlisted_route.unlisted_proxy_enabled():
+                    with contextlib.suppress(Exception):
+                        _listed_now = set(ru_domains) | set(youtube_domains) | set(user_ru_domains) | set(eu_domains) | set(exclude_domains)
+                        _ud, _uv = route_verdict_unlisted_hosts()
+                        unlisted_direct_hosts = [h for h in _ud if h not in _listed_now][:MAX_UNLISTED_PAC_HOSTS]
+                        unlisted_vpn_hosts = [h for h in _uv if h not in _listed_now][:MAX_UNLISTED_PAC_HOSTS]
+                    unlisted_decider_js = (
+                        '    if (url.substring(0, 6) === "https:" && !isIpV4 && !isIpV6 && host.indexOf(".") > 0 && '
+                        '!/\\.(ru|su|local|lan|internal)$/.test(host)) return "PROXY 127.0.0.1:1376; DIRECT";\n')
+                unlisted_direct_js = "{" + ",".join(f'"{d}":1' for d in sorted(unlisted_direct_hosts)) + "}"
+                unlisted_vpn_js = "{" + ",".join(f'"{d}":1' for d in sorted(unlisted_vpn_hosts)) + "}"
 
                 # AI-домены (те же, что разблокирует NRPT) не должны уходить в EU
                 # kill-switch: DNS для них уже развязан правилами, а blackhole
@@ -10012,6 +10030,8 @@ var ai_region_direct = {ai_region_direct_js};
     var ai_apps = {ai_apps_js};
     var youtube = {youtube_js};
     var auto_direct = {auto_direct_js};
+    var unlisted_direct = {unlisted_direct_js};
+    var unlisted_vpn = {unlisted_vpn_js};
     var user_ru_ips = {user_ru_ips_js};
     var user_eu_ips = {user_eu_ips_js};
     var ru_ips = {ru_ips_js};
@@ -10184,8 +10204,10 @@ var ai_region_direct = {ai_region_direct_js};
     // Cloudflare IP routing is a fallback for unknown domains only.
     // Explicit domain lists above must keep their selected geography.
     if (!isIpV4 && !isIpV6 && anyIpMatches(resolveHostIps(host), cloudflare_ips)) return "{ru_route}";
-    
-    return "DIRECT";
+
+    if (matchDomain(unlisted_direct, host)) return "DIRECT";
+    if (matchDomain(unlisted_vpn, host)) return "{main_class_route}";
+{unlisted_decider_js}    return "DIRECT";
 }}
 
 // WinINET/WinHTTP вызывают FindProxyForURLEx, если она есть, и только её; Chrome и Firefox
@@ -18974,22 +18996,72 @@ function FindProxyForURLEx(url, host) {{
     BACKGROUND_RATE_LIMITER = RateLimiter(32)
         
     # ================= TRAY LOGIC =================
-    TRAY_ICON = None
-    
-    def on_tray_open(icon, item):
+    # One pystray icon lives for the whole session and is only shown while the window is hidden.
+    # Creating/stopping an icon per minimize leaked ghost icons and lost the icon whenever the window
+    # came back by any path other than the tray menu; Map on the main window now hides it everywhere.
+    globals().setdefault("TRAY_ICON", None)
+    TRAY_LOCK = threading.Lock()
+    # wanted: the window is hidden, the icon should be up. ready: pystray's message loop is running
+    # (its window handles exist only from then on, so visible must not be touched before).
+    TRAY_STATE = {"wanted": False, "ready": False}
+
+    def _tray_setup(icon):
+        with TRAY_LOCK:
+            TRAY_STATE["ready"] = True
+            icon.visible = TRAY_STATE["wanted"]
+
+    def tray_show():
+        """Make the tray icon visible (creating it once). Main thread; True when it is on screen."""
+        global TRAY_ICON
+        if not TRAY_SUPPORT:
+            return False
         try:
+            with TRAY_LOCK:
+                TRAY_STATE["wanted"] = True
+                icon = TRAY_ICON
+                if icon is not None and TRAY_STATE["ready"] and not getattr(icon, "_running", False):
+                    icon = TRAY_ICON = None  # its message loop died: build a new one
+                if icon is None:
+                    TRAY_STATE["ready"] = False
+                    image = nova_desktop_ui.app_icon(64, SETTINGS_THEME["accent"])
+                    menu = (pystray.MenuItem('Открыть', on_tray_open, default=True),
+                            pystray.MenuItem('Выход', on_tray_quit))
+                    icon = TRAY_ICON = pystray.Icon("Nova", image, "Nova", menu)
+                    icon.run_detached(_tray_setup)
+                elif TRAY_STATE["ready"]:
+                    icon.visible = False  # drop and re-add: re-registers a lost shell entry
+                    icon.visible = True
+            return True
+        except Exception as e:
+            safe_trace(f"Tray Error: {e}")
+            return False
+
+    def tray_hide():
+        try:
+            with TRAY_LOCK:
+                TRAY_STATE["wanted"] = False
+                icon = globals().get("TRAY_ICON")
+                if icon is not None and TRAY_STATE["ready"]:
+                    icon.visible = False
+        except Exception as e:
+            safe_trace(f"Tray hide error: {e}")
+
+    def restore_main_window():
+        try:
+            tray_hide()
             root.deiconify()
             root.state('normal')
             root.lift()
             root.attributes('-topmost', True)
             root.after(50, lambda: root.attributes('-topmost', False))
-            icon.stop()
-        except: pass
+        except Exception as e:
+            safe_trace(f"Tray restore error: {e}")
+
+    def on_tray_open(icon, item):
+        try: root.after(0, restore_main_window)   # pystray calls this on its own thread
+        except Exception: pass
 
     def on_tray_quit(icon, item):
-        try:
-            icon.stop()
-        except: pass
         try:
             # Route through on_closing() (main thread, via after()) instead of
             # os._exit(0) here directly: a bare exit skipped restore_system_proxy(),
@@ -18998,29 +19070,15 @@ function FindProxyForURLEx(url, host) {{
         except:
             os._exit(0)
 
-    def init_tray_icon():
-        global TRAY_ICON
-        try:
-            image = nova_desktop_ui.app_icon(64, SETTINGS_THEME["accent"])
-
-            menu = (pystray.MenuItem('Открыть', on_tray_open, default=True), pystray.MenuItem('Выход', on_tray_quit))
-            TRAY_ICON = pystray.Icon("name", image, "Nova", menu)
-            TRAY_ICON.run()
-        except Exception as e:
-            safe_trace(f"Tray Error: {e}")
-            # Restore window if tray fails
-            root.after(0, lambda: root.deiconify())
-
     def minimize_to_tray(event=None):
         # Only minimize if state is 'iconic' (minimized) and we are not already shutting down
-        if root.state() == 'iconic':
+        if root.state() == 'iconic' and not globals().get("is_closing"):
             try:
-                if TRAY_SUPPORT:
-                   root.withdraw() # Hide window
-                   threading.Thread(target=init_tray_icon, daemon=True).start()
-                else:
-                   pass # Standard minimize behavior (do nothing special)
-            except: pass
+                # Hide the window only once the icon is up: otherwise Nova would vanish with no way back.
+                if tray_show():
+                    root.withdraw()
+            except Exception as e:
+                safe_trace(f"Tray minimize error: {e}")
 
     # Bind minimize event
     # <Unmap> is triggered when window is minimized OR hidden. We need to distinguish.
@@ -22631,7 +22689,8 @@ function FindProxyForURLEx(url, host) {{
                                                 p_ratio = p_sc / p_total if p_total > 0 else 0
                                                 c_ratio = sc / len(doms) if len(doms) > 0 else 0
                                                 
-                                                if p_ratio > c_ratio:
+                                                if (p_ratio > c_ratio
+                                                        and nova_general_scope.general_swap_allowed(svc, sc, len(doms), p_sc, p_total)):
                                                     msg_t = f"   >>> Найдена более сильная стратегия для {svc} ({p_sc}/{p_total} > {sc}/{len(doms)}) [из очереди]"
                                                     if root: root.after(0, lambda m=msg_t: log_print(m))
                                                     
@@ -22665,7 +22724,8 @@ function FindProxyForURLEx(url, host) {{
                                         pending_hotswap.append((sc, strat, svc, len(doms)))
 
 
-                                    if baseline_ready and not is_current and curr_ratio > bl_ratio:
+                                    if (baseline_ready and not is_current and curr_ratio > bl_ratio
+                                            and nova_general_scope.general_swap_allowed(svc, bl_score, bl_total, sc, len(doms))):
                                          # Thread-safe логирование в GUI
                                          msg_t = f"   >>> Найдена более сильная стратегия для {svc} ({sc}/{len(doms)} > {bl_score}/{bl_total})"
                                          if root: root.after(0, lambda m=msg_t: log_print(m))
@@ -22969,8 +23029,22 @@ function FindProxyForURLEx(url, host) {{
                                     
                                     if svc == "general":
                                         if best_strat and "args" in best_strat:
-                                            main_data["general"] = best_strat["args"]
-                                            updated_active = True
+                                            # Замена активной general только при измеримом выигрыше у ТЕКУЩЕЙ
+                                            # на той же панели (оба счёта из этого прогона, не из кэша).
+                                            _san_g = lambda a: sanitize_service_strategy_args("general", a)
+                                            _cur_g = _san_g(main_data.get("general") or [])
+                                            _cur_c = next((c for c in active_candidates
+                                                           if c is not best_cand and _san_g(c["strat"].get("args") or []) == _cur_g), None)
+                                            if (not _cur_g or _san_g(best_strat["args"]) == _cur_g
+                                                    or (_cur_c is not None and _cur_c["total"] == best_cand["total"]
+                                                        and nova_general_scope.general_swap_allowed(
+                                                            "general", _cur_c["score"], _cur_c["total"],
+                                                            best_cand["score"], best_cand["total"]))):
+                                                main_data["general"] = best_strat["args"]
+                                                updated_active = True
+                                            else:
+                                                log_func("[Sorter] general: замена не принята — выигрыш у текущей меньше порога "
+                                                         f"({best_strat.get('name', '?')}: {best_cand['score']}/{best_cand['total']})")
                                         # Лестница по нишам, а не первые N по счёту.
                                         for key in [k for k in main_data
                                                     if k.startswith(ALT_SLOT_PREFIX) or k.startswith("hard_")]:
@@ -23788,7 +23862,8 @@ function FindProxyForURLEx(url, host) {{
                                         bl_ratio = bl_score / bl_total if bl_total > 0 else -1
                                         curr_ratio = sc / total_cnt if total_cnt > 0 else 0
                                         
-                                        if curr_ratio > bl_ratio:
+                                        if (curr_ratio > bl_ratio
+                                                and nova_general_scope.general_swap_allowed(svc_t, bl_score, bl_total, sc, total_cnt)):
                                              log_func(f"{prefix} >>> Улучшение для {svc_t}: {sc}/{total_cnt} (было {bl_score}/{bl_total}) -> {strat_t['name']}")
                                              service_baselines[svc_t] = sc
                                              service_totals[svc_t] = total_cnt
@@ -28683,14 +28758,46 @@ function FindProxyForURLEx(url, host) {{
         with _route_verdicts_lock:
             return store.bad_hosts()
 
+    MAX_UNLISTED_PAC_HOSTS = 300
+
+    def _unlisted_observed_path():
+        return os.path.join(get_base_dir(), "temp", "unlisted-observed.json")
+
+    def route_verdict_unlisted_hosts():
+        """(direct_ok, direct_bad) among the hosts the 1376 decision proxy has seen: the PAC's unlisted sets (D75)."""
+        seen = {row[0] for row in nova_unlisted_route.read_observed(_unlisted_observed_path())}
+        store = _route_verdict_store()
+        with _route_verdicts_lock:
+            ok = [h for h in store.direct_ok_hosts() if h in seen]
+            bad = [h for h in store.bad_hosts() if h in seen]
+        return ok, bad
+
+    def _ingest_unlisted_observations(store, seen_at):
+        """Book what the decision proxy saw as verdict samples. `seen_at`: host -> `at` already booked.
+
+        One sample per host per CONFIRM_GAP_SEC: a browser opens six connections at once, and six identical
+        rows must not count as six separate probes. Returns True when any effective verdict changed."""
+        changed = False
+        for host, route, why, at in nova_unlisted_route.read_observed(_unlisted_observed_path()):
+            key = nova_route_verdicts.host_key(host)
+            prev = seen_at.get(key, 0.0)
+            if not key or at <= prev or (prev and at - prev < nova_route_verdicts.CONFIRM_GAP_SEC):
+                continue
+            seen_at[key] = at
+            with _route_verdicts_lock:
+                if store.record(key, route == "direct", why or route):
+                    changed = True
+        return changed
+
     def _route_verdict_candidates():
         base = get_base_dir()
         pac = globals().get("pac_manager")
         load = pac._load_domain_list if pac is not None else (lambda _path: [])
         youtube = list(sanitize_youtube_domain_list(load(os.path.join(base, "list", "youtube.txt"))))
         youtube.extend(sorted(nova_vpn_slots.YOUTUBE_ROUTE_FOLLOWERS))
+        observed = [row[0] for row in reversed(nova_unlisted_route.read_observed(_unlisted_observed_path()))][:MAX_UNLISTED_PAC_HOSTS]
         return nova_route_verdicts.candidate_hosts(
-            youtube, nova_route_verdicts.DISCORD_PROBE_HOSTS, sorted(load(os.path.join(base, "list", "main.txt"))))
+            youtube, nova_route_verdicts.DISCORD_PROBE_HOSTS, observed, sorted(load(os.path.join(base, "list", "main.txt"))))
 
     def _route_verdicts_may_run():
         if is_closing or globals().get("is_vpn_active"):
@@ -28706,9 +28813,10 @@ function FindProxyForURLEx(url, host) {{
     def route_verdict_worker(log_func):
         my_run_id = SERVICE_RUN_ID
         PROBE_GAP_SEC = 5.0
-        IDLE_SEC = 60.0
+        IDLE_SEC = 15.0  # also the lag before a decision-proxy observation (D75) becomes a verdict
         REGEN_GAP_SEC = 20.0
         store = _route_verdict_store()
+        observed_seen_at = {}
         last_regen = 0.0
         pending_regen = False
         candidates = []
@@ -28723,7 +28831,11 @@ function FindProxyForURLEx(url, host) {{
                         candidates_at = now
                         with _route_verdicts_lock:
                             store.forget_except(candidates)
+                    if _ingest_unlisted_observations(store, observed_seen_at):
+                        pending_regen = True
                     with _route_verdicts_lock:
+                        if store.dirty:
+                            store.save()
                         due = store.due(candidates, now, limit=1)
                     if due:
                         host = due[0]
@@ -31771,11 +31883,15 @@ function FindProxyForURLEx(url, host) {{
                 return
             self._rendered_font = self.font_spec
             text = self.formatter(self.text_val) if self.formatter is not None else self.text_val
+            is_status = self.formatter is nova_desktop_ui.status_text
+            if is_status:
+                text = nova_desktop_ui.status_caption(text)   # neon tube: capitals, tracked
             width = max(self.canvas.winfo_width(), self.canvas.winfo_reqwidth()) - round(48 * UI_SCALE)
             text = nova_desktop_ui.fit_caption(text, width, self.tk_font.measure)
             anchor = "e" if self.anchor in ("e", "se", "ne") else "w" if self.anchor in ("w", "sw", "nw") else "center"
             self.text_items.append(self.canvas.create_text(
-                self.x, self.y, text=text, font=self.font_spec, fill=self.fg, anchor=anchor,
+                self.x, self.y, text=text, font=self.font_spec,
+                fill=nova_desktop_ui.tube_core(self.fg) if is_status else self.fg, anchor=anchor,
                 tags=("zone_" + self.zone,) if self.zone else ()))
             self._zone_changed()
             if self.formatter is nova_desktop_ui.status_text or self.glow:
@@ -33214,7 +33330,7 @@ function FindProxyForURLEx(url, host) {{
                                    outline_width=0, formatter=nova_desktop_ui.status_text, zone="status")
         status_label.bind("<Button-1>", start_move)
         status_label.bind("<B1-Motion>", do_move)
-        btn_toggle = RoundedButton(main_canvas, *initial_layout["action"], round(232 * UI_SCALE), round(48 * UI_SCALE),
+        btn_toggle = RoundedButton(main_canvas, *initial_layout["action"], round(197 * UI_SCALE), round(48 * UI_SCALE),
                                    round(24 * UI_SCALE), COLOR_BLUEBERRY_YOGURT,
                                    "ПОДКЛЮЧИТЬ", toggle_service,
                                    fg=SETTINGS_THEME["accent"])
@@ -35854,6 +35970,9 @@ function FindProxyForURLEx(url, host) {{
             try: apply_window_icon(root)
             except: pass
             root.withdraw()
+            # Nothing else would create the icon here, and a hidden window with no icon cannot be reopened.
+            if not tray_show():
+                root.deiconify()
             if IS_DEBUG_MODE: log_print("[Init] Запуск в свернутом режиме (--minimized). Проверьте трей.")
         else:
             try: apply_window_icon(root)
@@ -35931,7 +36050,9 @@ function FindProxyForURLEx(url, host) {{
         
         # FIX: Bind minimize event here, where root is defined
         root.bind("<Unmap>", lambda e: minimize_to_tray(e) if root.state() == 'iconic' else None)
-        
+        # Whatever shows the window again (tray menu, restart, second launch) takes the tray icon down.
+        root.bind("<Map>", lambda e: tray_hide() if e.widget is root else None, add="+")
+
         root.protocol("WM_DELETE_WINDOW", on_closing)
         if IS_DEBUG_MODE:
             # Debug runs name whoever holds the Tk thread for >150 ms (resources/nova_stall_monitor.py).

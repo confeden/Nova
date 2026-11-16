@@ -24,6 +24,10 @@ for _root in (REPO_ROOT / "resources", REPO_ROOT):
 
 APP_ROOT = REPO_ROOT.parent if REPO_ROOT.name.lower() == "resources" else REPO_ROOT
 from nova_routing_profiles import is_dns_ai_endpoint, dns_ai_route_labels
+try:
+    import nova_unlisted_route as _unlisted  # noqa: E402  (D75: decision proxy for hosts on no list)
+except Exception:  # pragma: no cover - an old install without the module simply has no decision proxy
+    _unlisted = None
 
 # `temp/` надо считать опубликованным: его прикладывают к отчётам о проблеме.
 # Имя пользователя Windows внутри пути программы опознаёт человека, а для
@@ -321,6 +325,10 @@ TLS_HELLO_READ_TIMEOUT = 1.5
 # заранее, чтобы прямой путь (winws) можно было проверить по первому байту ответа и при
 # молчании перейти на VPN, а не повиснуть на 19 секунд.
 DISCORD_VERIFY_PORTS = frozenset({443, 2053, 2083, 2087, 2096, 8443})
+# D75: loopback CONNECT listener for browser https to hosts on no list (the spare port of the 1369..1379 band).
+UNLISTED_PROXY_PORT = 1376
+UNLISTED_MAX_CONNECTIONS = 400
+UNLISTED_HEAD_TIMEOUT = 5.0
 
 
 def _looks_like_tls_server_handshake(data: bytes) -> bool:
@@ -2453,8 +2461,19 @@ class NovaWfpTcpProxy:
                 self.log_func(f"[DNS-AI] IPv6-прокси недоступен: {error}")
         self.log_func(f"[NovaWFP][Proxy] listening on {self.host}:{self.port}")
         self._schedule_startup_prewarm()
+        unlisted_server = None
+        if _unlisted is not None and _unlisted.unlisted_proxy_enabled():
+            try:
+                self._unlisted = UnlistedConnectProxy(self)
+                unlisted_server = await asyncio.start_server(self._unlisted.handle, "127.0.0.1", UNLISTED_PROXY_PORT)
+                self.log_func(f"[NovaWFP][Unlisted] decision proxy listening on 127.0.0.1:{UNLISTED_PROXY_PORT}")
+            except OSError as error:
+                unlisted_server = None
+                self.log_func(f"[NovaWFP][Unlisted] port {UNLISTED_PROXY_PORT} unavailable: {error}")
         async with contextlib.AsyncExitStack() as servers:
             await servers.enter_async_context(self.server)
+            if unlisted_server is not None:
+                await servers.enter_async_context(unlisted_server)
             if ipv6_server is not None:
                 await servers.enter_async_context(ipv6_server)
             serve_task = asyncio.create_task(self.server.serve_forever())
@@ -2474,6 +2493,143 @@ class NovaWfpTcpProxy:
             if serve_task in done:
                 with contextlib.suppress(Exception):
                     await serve_task
+class UnlistedConnectProxy:
+    """CONNECT front end of the hedged direct -> main -> second race (resources/nova_unlisted_route.py, D75)."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.log = owner.log_func
+        self.syn_dead = _unlisted.SynDeadCache()
+        self.health = _unlisted.DirectHealth()
+        self.memory = _unlisted.HostMemory()
+        self.observed = _unlisted.ObservedStore(str(_data_path("temp", "unlisted-observed.json")))
+        self.timings = _unlisted.Timings()
+        self._active = 0
+        self._stats = {"direct": 0, "vpn": 0, "failed": 0}
+        self._stats_logged = time.monotonic()
+
+    def _vpn_labels(self):
+        """main then second, only slots whose measured exit is outside RU/BY (D43/D68); never `direct`."""
+        if _vpn_slots is None:
+            return []
+        try:
+            state = _egress_state()
+            return [{"primary": "warp-socks", "secondary": "opera-http"}[slot]
+                    for slot in _vpn_slots.ai_apps_auto_slots_from_state(state)]
+        except Exception as exc:
+            self.log(f"[NovaWFP][Unlisted] labels: {exc}")
+            return []
+
+    async def _direct_dial(self, host, port, phase):
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=3.0)
+        except Exception as exc:
+            raise _unlisted.PathError("dns", str(exc)[:40])
+        infos = sorted(infos, key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+        if not infos:
+            raise _unlisted.PathError("dns", "no address")
+        ip = infos[0][4][0]
+        phase.ip = ip
+        if self.syn_dead.dead(ip):
+            phase.hedge_now = True
+        try:
+            reader, writer = await asyncio.open_connection(ip, port)
+        except OSError as exc:
+            self.syn_dead.note(ip)
+            raise _unlisted.PathError("tcp", str(exc)[:40])
+        self.health.ok()
+        self.syn_dead.alive(ip)
+        return reader, writer
+
+    async def _vpn_dial(self, label, host, port):
+        attempt = NovaWfpTcpProxy._attempt_by_label(label)
+        if not attempt:
+            raise OSError(f"no attempt for {label}")
+        reader, writer, _route = await open_stream(host, int(port), timeout=self.timings.vpn_dial_cap, attempts=[attempt])
+        return reader, writer
+
+    async def handle(self, reader, writer):
+        if self._active >= UNLISTED_MAX_CONNECTIONS:
+            with contextlib.suppress(Exception):
+                writer.write(b"HTTP/1.1 503 Busy\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+            writer.close()
+            return
+        self._active += 1
+        up_writer = None
+        try:
+            try:
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=UNLISTED_HEAD_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, OSError):
+                return
+            target = _unlisted.parse_connect(head)
+            if target is None:
+                writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                return
+            host, port = target
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            hello = await self.owner._read_tls_client_hello(reader)
+            labels = self._vpn_labels()
+            if _unlisted._is_ip_literal(host) or host.endswith((".ru", ".su", ".local", ".lan")):
+                labels = []  # not what this proxy is for: direct only, as before the proxy existed
+            prefer_vpn = bool(labels) and self.memory.get(host) == "vpn"
+            result = None
+            try:
+                result = await _unlisted.race(
+                    host, port, hello, direct_dial=self._direct_dial, vpn_labels=labels, vpn_dial=self._vpn_dial,
+                    timings=self.timings, prefer_vpn=prefer_vpn)
+            except _unlisted.RaceFailed as failure:
+                if prefer_vpn:
+                    self.memory.forget(host)
+                    with contextlib.suppress(_unlisted.RaceFailed):
+                        result = await _unlisted.race(
+                            host, port, hello, direct_dial=self._direct_dial, vpn_labels=labels,
+                            vpn_dial=self._vpn_dial, timings=self.timings, prefer_vpn=False)
+                if result is None:
+                    self._stats["failed"] += 1
+                    self.log(f"[NovaWFP][Unlisted] failed {host}:{port} direct={failure.direct_why} vpn={failure.vpn_why}")
+                    return
+            up_writer = result.writer
+            self._note(host, port, result, bool(labels))
+            writer.write(result.first)
+            await writer.drain()
+            await _bridge_streams(reader, writer, result.reader, result.writer,
+                                  initial_up=len(hello), initial_down=len(result.first))
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            self.log(f"[NovaWFP][Unlisted] handler: {type(exc).__name__}: {exc}")
+        finally:
+            self._active -= 1
+            for stream in (writer, up_writer):
+                if stream is not None:
+                    with contextlib.suppress(Exception):
+                        stream.close()
+
+    def _note(self, host, port, result, had_vpn):
+        self._stats[result.route] += 1
+        obs = _unlisted.observation_for(result, self.health.fresh()) if (had_vpn or result.route == "direct") else None
+        if obs is not None:
+            route, why = obs
+            self.memory.note(host, route)
+            self.observed.add(host, route, why)
+            if not self.observed.flush():
+                # throttled: flush once the window is over, or a lone observation would wait for the next visit
+                asyncio.get_running_loop().call_later(_unlisted.OBSERVED_FLUSH_GAP_SEC + 0.2, self.observed.flush)
+        if result.route == "vpn" or result.ms >= 700:
+            self.log(
+                f"[NovaWFP][Unlisted] {host}:{port} route={result.route}"
+                f"{'/' + result.label if result.route == 'vpn' else ''} ms={result.ms} "
+                f"direct_why={result.direct_why or '-'} ip={result.direct_ip or '-'}")
+        now = time.monotonic()
+        if now - self._stats_logged >= 300.0:
+            self._stats_logged = now
+            self.log(f"[NovaWFP][Unlisted] stats {self._stats}")
+
+
 def _default_log_file() -> Path:
     return _data_path("temp", "NovaWfpTcpProxy.log")
 

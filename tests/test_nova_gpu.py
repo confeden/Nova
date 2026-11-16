@@ -600,6 +600,38 @@ class SceneWiringTests(unittest.TestCase):
             self.assertTrue(self.pump(lambda: scene._gpu is None and not scene._gpu_mode))
         self.assertTrue(self.pump(lambda: scene._photo is not None), "CPU frames did not resume after the crash")
 
+    def test_a_dead_engine_is_restarted_and_the_gpu_background_returns(self):
+        # A display-driver install kills the GL child mid-session; Nova must not stay on the CPU look.
+        modes = iter(["crash", "ok"])
+
+        def make_engine():
+            return nova_gpu.GpuEngine(argv=[sys.executable, self.script, next(modes)],
+                                      temp_dir=os.path.join(self.temporary.name, "temp"))
+
+        with mock.patch.object(ui, "GPU_RESTART_DELAYS", (0.05,)), \
+                mock.patch.object(ui.DesktopScene, "_gpu_new_engine", autospec=True,
+                                  side_effect=lambda _scene: make_engine()):
+            canvas = tk.Canvas(self.root, width=560, height=420)
+            canvas.pack()
+            self.root.update()
+            values = dict(nova_appearance.DEFAULT_PREFERENCES, texture="fractal")
+            scene = ui.DesktopScene(canvas, values, "test",
+                                    preferences_path=Path(self.temporary.name) / "appearance.json")
+            self.scenes.append(scene)
+            scene.draw(560, 420)
+            with self.assertLogs(nova_gpu._log, "WARNING"):
+                self.assertTrue(self.pump(lambda: scene._gpu is None and not scene._gpu_mode))
+            self.assertTrue(self.pump(lambda: scene._gpu_mode and scene._gpu_photo is not None),
+                            "the GPU background did not come back after the engine died")
+            self.assertEqual(scene._gpu_restarts, 0)
+
+    def test_a_broken_frame_pump_is_not_restarted(self):
+        scene, engine = self.scene()
+        self.assertTrue(self.pump(lambda: scene._gpu_mode))
+        scene._gpu_owned = True
+        scene._gpu_abandon("сбой показа кадра")
+        self.assertIsNone(scene._gpu_restart_job)
+
     def test_unusable_engine_keeps_the_old_path(self):
         scene, engine = self.scene("old")
         with self.assertLogs(nova_gpu._log, "WARNING"):

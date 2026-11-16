@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'resources'))
 
 import pytest
 import nova_tor
+import nova_unlisted_route
 import nova_vpn_slots as slots
 
 
@@ -32,6 +33,7 @@ def render(tmp_path):
     direct_hosts = []
     app_modes = {}
     cf = {'on': False}
+    unlisted = {'ok': [], 'bad': []}
     ns = dict(os=os, threading=threading, contextlib=contextlib, nova_vpn_slots=slots, nova_tor=nova_tor,
               get_base_dir=lambda: str(tmp_path), load_routing_settings=lambda: {},
               get_routing_pac_config=lambda _: mode, get_routing_app_mode=lambda name, *a: app_modes.get(name, 'auto'),
@@ -44,7 +46,9 @@ def render(tmp_path):
               _env_bool_global=lambda *a: False, _nrpt_state={'system_dns_ai': True},
               _ai_region_lock=threading.Lock(), _ai_region_state={'unblockers': True},
               nova_ai_region=types.SimpleNamespace(direct_domains=lambda *a: {'ai.second.test'}),
-              route_verdict_direct_hosts=lambda: list(direct_hosts))
+              route_verdict_direct_hosts=lambda: list(direct_hosts), nova_unlisted_route=nova_unlisted_route,
+              route_verdict_unlisted_hosts=lambda: (list(unlisted['ok']), list(unlisted['bad'])),
+              MAX_UNLISTED_PAC_HOSTS=300)
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), ns)
     pac = types.SimpleNamespace(warp_port=1370, pac_file=str(tmp_path / 'nova.pac'),
                                 _sync_winhttp_proxy=False, _winhttp_proxy_applied=False,
@@ -70,6 +74,7 @@ def render(tmp_path):
         assert Path(pac.pac_file).is_file(), 'PAC generation failed'
         return Path(pac.pac_file).read_text(encoding='utf-8')
     make.cf = cf
+    make.unlisted = unlisted
     return make
 
 
@@ -121,6 +126,56 @@ def test_rendered_auto_pac_routes_both_lists_and_ai(render):
                                                 'second.test': second_class, 'user.second.test': second_class,
                                                 'ai.second.test': second_class}))
     run_node(cases)
+
+
+def _run_urls(pac, expected):
+    script = """
+const vm = require('vm');
+const c = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const ctx = {isPlainHostName: h => !h.includes('.'), isInNet: () => false, dnsResolve: () => null, shExpMatch: () => false};
+vm.createContext(ctx); vm.runInContext(c.pac, ctx);
+for (const [url, expected] of Object.entries(c.expected)) {
+  const host = new URL(url).hostname;
+  const actual = ctx.FindProxyForURL(url, host);
+  if (actual !== expected) throw Error(url + ': ' + actual + ' != ' + expected);
+}
+"""
+    result = subprocess.run(['node', '-e', script], input=json.dumps(dict(pac=pac, expected=expected)),
+                            capture_output=True, text=True, timeout=30,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    assert result.returncode == 0, result.stderr
+
+
+DECIDER = 'PROXY 127.0.0.1:1376; DIRECT'
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+def test_unlisted_https_goes_through_the_decision_proxy_only_while_a_vpn_can_carry_main(render):
+    """D75: an https host on no list takes the 1376 decision proxy; http, .ru, plain names stay DIRECT."""
+    expected = {'https://new.example/': DECIDER, 'https://a.b.example/x': DECIDER, 'http://new.example/': 'DIRECT',
+                'https://shop.ru/': 'DIRECT', 'https://box.local/': 'DIRECT', 'https://plain/': 'DIRECT',
+                'https://main.test/': MAIN}
+    _run_urls(render(True, False, True, False), expected)
+    # no VPN able to carry main: nothing to hedge to, the proxy would only add a hop
+    _run_urls(render(False, False), {'https://new.example/': 'DIRECT'})
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+def test_judged_unlisted_hosts_leave_the_decision_proxy(render):
+    render.unlisted['ok'] = ['fine.example']
+    render.unlisted['bad'] = ['blocked.example']
+    pac = render(True, False, True, False)
+    _run_urls(pac, {'https://fine.example/': 'DIRECT', 'https://cdn.fine.example/': 'DIRECT',
+                    'https://blocked.example/': MAIN, 'https://other.example/': DECIDER})
+    # a host that is on a list never takes the unlisted verdict
+    render.unlisted['ok'] = ['main.test']
+    _run_urls(render(True, False, True, False), {'https://main.test/': MAIN})
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')
+def test_unlisted_proxy_env_switch_restores_plain_direct(render, monkeypatch):
+    monkeypatch.setenv('NOVA_UNLISTED_PROXY', '0')
+    _run_urls(render(True, False, True, False), {'https://new.example/': 'DIRECT'})
 
 
 @pytest.mark.skipif(not shutil.which('node'), reason='node is not installed')

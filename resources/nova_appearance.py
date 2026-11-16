@@ -309,7 +309,7 @@ def font_roles(theme_id='aurora'):
         'body': (body, 10),
         'control': (body, 9),
         'action': ('Segoe UI Semibold', 11),
-        'status': (display, 12),
+        'status': (display, 14),
         'section': (body, 9),
         'caption': (body, 9),
         # The «Обновить до …» notice: larger than a caption and a real Bold cut (Semibold has none).
