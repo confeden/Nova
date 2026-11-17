@@ -1,0 +1,38 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    pkg-config \
+    nftables \
+    iproute2 \
+    libssl-dev \
+    libwebkit2gtk-4.1-dev \
+    libappindicator3-dev \
+    librsvg2-dev \
+    patchelf \
+    python3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+# Copy repository
+COPY . /app
+
+# Run dependencies setup script (downloads sing-box & ByeDPI)
+RUN bash scripts/setup-dependencies.sh
+
+# Build novad and nova-gui
+RUN cargo build --release -p novad
+RUN cargo build --release -p nova-gui
+
+# Verification script
+CMD ["bash", "tests/integration_test.sh"]
